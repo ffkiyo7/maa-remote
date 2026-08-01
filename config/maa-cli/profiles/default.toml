@@ -1,0 +1,9 @@
+[connection]
+adb_path = "/Applications/BlueStacks.app/Contents/MacOS/hd-adb"
+address = "127.0.0.1:5555"
+
+[instance_options]
+touch_mode = "MaaTouch"
+deployment_with_pause = false
+adb_lite_enabled = false
+kill_adb_on_exit = false

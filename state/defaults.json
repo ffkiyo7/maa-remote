@@ -1,0 +1,13 @@
+{
+  "stage": "",
+  "medicine": "expiring",
+  "skip": false,
+  "stone": 0,
+  "tasks": {
+    "fight": true,
+    "infrast": true,
+    "recruit": true,
+    "mall": true,
+    "award": true
+  }
+}

@@ -1,0 +1,70 @@
+[[tasks]]
+name = "启动国服"
+type = "StartUp"
+[tasks.params]
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+name = "刷理智"
+type = "Fight"
+[tasks.params]
+stage = ""
+medicine = 0
+medicine_expire_days = 2
+stone = 0
+series = 0
+times = 2147483647
+server = "CN"
+client_type = "Official"
+
+[[tasks]]
+name = "基建换班"
+type = "Infrast"
+[tasks.params]
+mode = 20000
+facility = ["Mfg", "Trade", "Reception"]
+drones = "_NotUse"
+threshold = 0.3
+replenish = false
+dorm_trust_enabled = false
+
+[[tasks]]
+name = "公开招募"
+type = "Recruit"
+[tasks.params]
+refresh = true
+select = [4, 5, 6]
+confirm = [3, 4, 5, 6]
+times = 4
+set_time = true
+expedite = false
+server = "CN"
+
+[[tasks]]
+name = "信用商店"
+type = "Mall"
+[tasks.params]
+visit_friends = true
+shopping = true
+force_shopping_if_credit_full = false
+credit_fight = false
+
+[[tasks]]
+name = "领取奖励"
+type = "Award"
+[tasks.params]
+award = true
+mail = false
+recruit = false
+orundum = false
+mining = false
+
+[[tasks]]
+name = "返回主界面"
+type = "Custom"
+[tasks.params]
+task_names = ["Home", "QuickSwitch@ToHome", "ReturnButtons"]
+
+# CloseDown intentionally does not belong here. The final Custom task returns
+# to Home, maa_daily.py takes the screenshot, then closes the game separately.

@@ -1,0 +1,8 @@
+[core]
+channel = "Beta"
+
+[resource]
+# Resources are updated by maa_plan_card.py on a seven-day interval.
+auto_update = false
+warn_on_update_failure = false
+backend = "libgit2"

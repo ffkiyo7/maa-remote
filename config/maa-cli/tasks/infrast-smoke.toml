@@ -1,0 +1,19 @@
+# Diagnostic task for validating the in-game preset queue rotation without
+# traversing all production facility maintenance.
+[[tasks]]
+name = "启动国服"
+type = "StartUp"
+[tasks.params]
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+name = "预设队列轮换验证"
+type = "Infrast"
+[tasks.params]
+mode = 20000
+facility = []
+drones = "_NotUse"
+threshold = 0.3
+replenish = false
+dorm_trust_enabled = false

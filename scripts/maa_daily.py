@@ -1,0 +1,963 @@
+#!/usr/bin/env python3
+"""Run one complete MAA daily session and stream its progress to Discord."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Any, TextIO
+
+from maa_common import (
+    BEIJING,
+    MAA_CONFIG_DIR,
+    RUNS_DIR,
+    atomic_write_json,
+    atomic_write_text,
+    cleanup_run_files,
+    create_thread,
+    discord_request,
+    discord_token,
+    discord_upload,
+    effective_plan,
+    load_config,
+    maa_subprocess_env,
+    medicine_label,
+    merge_last_run,
+    now_beijing,
+    plan_stage_label,
+    require_executable,
+    run_lock,
+)
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
+SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
+PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
+TASK_STEPS = (
+    ("StartUp", "🚀", "启动游戏", "正在启动游戏并进入主界面"),
+    ("Fight", "⚔️", "刷理智", "正在刷理智"),
+    ("Infrast", "🏭", "基建换班", "正在按游戏内预设队列轮换"),
+    ("Recruit", "🎫", "公开招募", "正在处理公开招募"),
+    ("Mall", "🛒", "信用商店", "正在领取信用并购买物资"),
+    ("Award", "🎁", "领取奖励", "正在领取日常与周常奖励"),
+    ("Custom", "🏠", "返回主界面", "正在返回游戏主界面，准备截图"),
+)
+
+
+def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
+    if len(argv) == 2 and argv[1] in PHASE_LABELS:
+        return argv[1]
+    if len(argv) > 1:
+        raise ValueError("场次只接受 am、pm 或 now")
+    marker = (cwd or Path.cwd()).name.lower()
+    if marker in {"am", "pm"}:
+        return marker
+    hour = (at or now_beijing()).hour
+    if 7 <= hour < 14:
+        return "am"
+    if 20 <= hour or hour < 2:
+        return "pm"
+    return "now"
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
+    """Render the exact immutable plan used for this run; no CloseDown task."""
+    tasks = plan.get("tasks", {})
+    blocks = [
+        "[[tasks]]\n"
+        'name = "启动国服"\n'
+        'type = "StartUp"\n'
+        "[tasks.params]\n"
+        'client_type = "Official"\n'
+        "start_game_enabled = true\n"
+    ]
+    if tasks.get("fight", True):
+        # Fixed safety policy: never use ordinary medicine or Originite Prime;
+        # only consume medicine MaaCore identifies as expiring soon.
+        medicine_days = max(1, int(config.get("medicine_expire_days", 2)))
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "刷理智"\n'
+            'type = "Fight"\n'
+            "[tasks.params]\n"
+            f"stage = {_toml_string(str(plan.get('stage', '')))}\n"
+            "medicine = 0\n"
+            f"medicine_expire_days = {max(0, medicine_days)}\n"
+            # This literal is not derived from any state or user input.
+            "stone = 0\n"
+            # Let MaaCore select the largest series currently affordable in
+            # the connected client instead of forcing a fixed multiplier.
+            "series = 0\n"
+            f"times = {int(config.get('fight_times', 2147483647))}\n"
+            'server = "CN"\n'
+            'client_type = "Official"\n'
+        )
+    if tasks.get("infrast", True):
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "基建换班"\n'
+            'type = "Infrast"\n'
+            "[tasks.params]\n"
+            # Use the in-game preset queue rotation. MaaCore does not select
+            # individual operators in this mode.
+            "mode = 20000\n"
+            'facility = ["Mfg", "Trade", "Reception"]\n'
+            'drones = "_NotUse"\n'
+            "threshold = 0.3\n"
+            "replenish = false\n"
+            "dorm_trust_enabled = false\n"
+        )
+    if tasks.get("recruit", True):
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "公开招募"\n'
+            'type = "Recruit"\n'
+            "[tasks.params]\n"
+            "refresh = true\n"
+            "select = [4, 5, 6]\n"
+            "confirm = [3, 4, 5, 6]\n"
+            f"times = {int(config.get('recruit_times', 4))}\n"
+            "set_time = true\n"
+            "expedite = false\n"
+            'server = "CN"\n'
+        )
+    if tasks.get("mall", True):
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "信用商店"\n'
+            'type = "Mall"\n'
+            "[tasks.params]\n"
+            "visit_friends = true\n"
+            "shopping = true\n"
+            "force_shopping_if_credit_full = false\n"
+            "credit_fight = false\n"
+        )
+    if tasks.get("award", True):
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "领取奖励"\n'
+            'type = "Award"\n'
+            "[tasks.params]\n"
+            "award = true\n"
+            "mail = false\n"
+            "recruit = false\n"
+            "orundum = false\n"
+            "mining = false\n"
+        )
+    blocks.append(
+        "[[tasks]]\n"
+        'name = "返回主界面"\n'
+        'type = "Custom"\n'
+        "[tasks.params]\n"
+        'task_names = ["Home", "QuickSwitch@ToHome", "ReturnButtons"]\n'
+    )
+    return "\n".join(blocks)
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _clean_line(line: str, limit: int = 150) -> str:
+    line = ANSI_RE.sub("", line).rstrip().replace("```", "``\u200b`")
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _task_state(lines: list[str], key: str, label: str) -> str:
+    if any(f"{key} Completed" in line or (f"[{label}]" in line and "Completed" in line) for line in lines):
+        return "completed"
+    if any(f"{key} Stopped" in line or f"{key} Error" in line for line in lines):
+        return "failed"
+    if any(f"{key} Start" in line or f"[{label}]" in line for line in lines):
+        return "running"
+    return "pending"
+
+
+def _last_match(lines: list[str], pattern: str) -> re.Match[str] | None:
+    compiled = re.compile(pattern, re.IGNORECASE)
+    result = None
+    for line in lines:
+        match = compiled.search(line)
+        if match:
+            result = match
+    return result
+
+
+def _fight_times(lines: list[str]) -> int:
+    summary = _last_match(lines, r"\bFight\s+(\d+)\s+times\b")
+    if summary:
+        return int(summary.group(1))
+    return sum(
+        int(match.group(1))
+        for line in lines
+        if (match := re.search(r"Mission started\s*\((\d+)\s+times", line, re.I))
+    )
+
+
+def _expiring_medicine_used(lines: list[str]) -> int:
+    summary = _last_match(lines, r"used\s+\d+\s+medicine\s*\((\d+)\s+expiring\)")
+    if summary:
+        return int(summary.group(1))
+    return sum(
+        int(match.group(1))
+        for line in lines
+        if (match := re.search(r"Use\s+(\d+)\s+expiring medicine", line, re.I))
+    )
+
+
+def _drop_pairs(lines: list[str]) -> list[tuple[str, int]]:
+    totals: dict[str, int] = {}
+    drop_lines = [line for line in lines if re.search(r"(?:total\s+)?Drops:\s*.+$", line, re.I)]
+    total_lines = [line for line in drop_lines if re.search(r"total\s+Drops:", line, re.I)]
+    # maa-cli can emit per-batch Drops events and one final total. Prefer the
+    # latter when present so a result is never double-counted.
+    for line in total_lines or drop_lines:
+        marker = re.search(r"(?:total\s+)?Drops:\s*(.+)$", line, re.I)
+        if not marker:
+            continue
+        raw = marker.group(1).strip()
+        parsed: Any = None
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        pairs: list[tuple[str, int]] = []
+        if isinstance(parsed, dict):
+            pairs = [
+                (str(name), int(quantity))
+                for name, quantity in parsed.items()
+                if isinstance(quantity, (int, float))
+            ]
+        elif isinstance(parsed, list):
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("itemName") or item.get("name")
+                quantity = item.get("quantity") or item.get("count")
+                if name and isinstance(quantity, (int, float)):
+                    pairs.append((str(name), int(quantity)))
+        if not pairs:
+            pairs = [
+                (name.strip(" \"'{}[]"), int(quantity))
+                for name, quantity in re.findall(
+                    r"([A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff· _-]{0,30})\s*(?:[:x×])\s*(\d+)",
+                    raw,
+                )
+            ]
+        for name, quantity in pairs:
+            if name and quantity:
+                totals[name] = totals.get(name, 0) + quantity
+    return list(totals.items())[:8]
+
+
+def progress_content(
+    lines: list[str],
+    *,
+    plan: dict[str, Any] | None = None,
+    final: str | None = None,
+) -> str:
+    clean = [_clean_line(line, 300) for line in lines if line.strip()]
+    heading = final or "🌱 MAA 正在执行"
+    status_lines: list[str] = []
+    for key, emoji, label, running_text in TASK_STEPS:
+        state = _task_state(clean, key, label)
+        if state == "completed":
+            status_lines.append(f"✅ {emoji} {label}：完成")
+        elif state == "failed":
+            status_lines.append(f"❌ {emoji} {label}：未完成")
+        elif state == "running":
+            detail = running_text
+            if key == "Fight" and plan is not None:
+                detail = f"正在刷 {plan_stage_label(plan)}，自动选择最大连战次数"
+            status_lines.append(f"⏳ {emoji} {detail}")
+
+    sanity = _last_match(clean, r"Current sanity:\s*(\d+)\s*/\s*(\d+)")
+    if sanity and _task_state(clean, "Fight", "刷理智") != "pending":
+        status_lines.append(f"🧠 当前理智：{sanity.group(1)}/{sanity.group(2)}")
+    fight_times = _fight_times(clean)
+    if fight_times:
+        status_lines.append(f"🔁 已完成作战：{fight_times} 次")
+    refresh = _last_match(clean, r"RecruitTagsRefreshed:\s*(\d+)\s+times")
+    if refresh:
+        status_lines.append(f"🔄 公招已刷新：{refresh.group(1)} 次")
+    if not status_lines:
+        status_lines.append("⏳ 正在连接模拟器并准备任务…")
+    return (heading + "\n" + "\n".join(status_lines))[:1990]
+
+
+def extract_summary(
+    stdout_lines: list[str],
+    stderr_lines: list[str],
+    *,
+    plan: dict[str, Any] | None = None,
+    ok: bool | None = None,
+) -> str:
+    lines = [_clean_line(line, 500) for line in stdout_lines + stderr_lines if line.strip()]
+    tasks = (plan or {}).get("tasks", {})
+    enabled = {
+        "StartUp": True,
+        "Fight": bool(tasks.get("fight", True)),
+        "Infrast": bool(tasks.get("infrast", True)),
+        "Recruit": bool(tasks.get("recruit", True)),
+        "Mall": bool(tasks.get("mall", True)),
+        "Award": bool(tasks.get("award", True)),
+        "Custom": True,
+    }
+    result = [f"🌟 总体：{'✅ 成功' if ok is not False else '❌ 未完成'}"]
+    for key, emoji, label, _running_text in TASK_STEPS:
+        if not enabled[key]:
+            continue
+        state = _task_state(lines, key, label)
+        status = {"completed": "✅ 完成", "failed": "❌ 未完成", "running": "❌ 中断", "pending": "⏸️ 未执行"}[state]
+        details: list[str] = []
+        if key == "Fight":
+            details.append(f"关卡 {plan_stage_label(plan or {})}")
+            count = _fight_times(lines)
+            if count:
+                details.append(f"{count} 次")
+            medicine = _expiring_medicine_used(lines)
+            if medicine:
+                details.append(f"临期理智药 ×{medicine}")
+            sanity = _last_match(lines, r"Current sanity:\s*(\d+)\s*/\s*(\d+)")
+            if sanity:
+                details.append(f"结束理智 {sanity.group(1)}/{sanity.group(2)}")
+            drops = _drop_pairs(lines)
+            if drops:
+                details.append("掉落 " + "、".join(f"{name} ×{quantity}" for name, quantity in drops))
+        elif key == "Infrast":
+            facilities = []
+            for raw_name, display in (("Mfg", "制造站"), ("Trade", "贸易站"), ("Reception", "会客室")):
+                count = sum(1 for line in lines if f"EnterFacility {raw_name}" in line)
+                if count:
+                    facilities.append(f"{display} ×{count}")
+            if facilities:
+                details.append("、".join(facilities))
+        elif key == "Recruit":
+            recruited = _last_match(lines, r"Recruited\s+(\d+)\s+times")
+            refreshed = _last_match(lines, r"Refreshed\s+(\d+)\s+times")
+            if recruited:
+                details.append(f"招募 {recruited.group(1)} 次")
+            if refreshed:
+                details.append(f"刷新 {refreshed.group(1)} 次")
+        suffix = f"（{'；'.join(details)}）" if details else ""
+        result.append(f"{emoji} {label}：{status}{suffix}")
+    return "\n".join(result)[:3900]
+
+
+def _reader(
+    stream: TextIO,
+    recent: deque[str],
+    all_lines: list[str],
+    log_handle: TextIO | None = None,
+    log_lock: threading.Lock | None = None,
+) -> None:
+    for line in iter(stream.readline, ""):
+        clean = line.rstrip("\n")
+        recent.append(clean)
+        if len(all_lines) < 10000:
+            all_lines.append(clean)
+        if log_handle is not None and log_lock is not None:
+            with log_lock:
+                log_handle.write(line)
+                log_handle.flush()
+    stream.close()
+
+
+def open_emulator(config: dict[str, Any]) -> None:
+    app = str(config.get("emulator_app", "BlueStacks"))
+    if not SAFE_APP_RE.fullmatch(app):
+        raise RuntimeError("emulator_app 名称含非法字符")
+    result = subprocess.run(["open", "-a", app], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"无法启动 {app}: {(result.stderr or result.stdout).strip()}")
+
+
+def wait_for_android(config: dict[str, Any]) -> None:
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    timeout = int(config.get("emulator_boot_timeout", 180))
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        try:
+            connect = subprocess.run(
+                [adb, "connect", address],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            boot = subprocess.run(
+                [adb, "-s", address, "shell", "getprop", "sys.boot_completed"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = "ADB 命令超时"
+            time.sleep(3)
+            continue
+        if connect.returncode == 0 and boot.returncode == 0 and boot.stdout.strip() == "1":
+            return
+        last_error = (boot.stderr or connect.stderr or connect.stdout).strip()
+        time.sleep(3)
+    raise RuntimeError(f"ADB 等待 {timeout}s 超时：{last_error or '设备未就绪'}")
+
+
+def verify_game_installed(config: dict[str, Any]) -> None:
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    package = str(config.get("game_package", "com.hypergryph.arknights")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.]{3,160}", package):
+        raise RuntimeError("game_package 格式非法")
+    result = subprocess.run(
+        [adb, "-s", address, "shell", "pm", "path", package],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    if result.returncode != 0 or not result.stdout.strip().startswith("package:"):
+        raise RuntimeError(f"未检测到明日方舟国服客户端（{package}）")
+
+
+def capture_screenshot(config: dict[str, Any], path: Path) -> tuple[bool, str]:
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    try:
+        with path.open("wb") as handle:
+            result = subprocess.run(
+                [adb, "-s", address, "exec-out", "screencap", "-p"],
+                stdout=handle,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        if result.returncode != 0 or path.stat().st_size < 8:
+            raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip())
+        with path.open("rb") as handle:
+            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
+                raise RuntimeError("ADB 返回的不是 PNG")
+        os.chmod(path, 0o600)
+        return True, ""
+    except Exception as exc:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def close_everything(config: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    app = str(config.get("emulator_app", "BlueStacks"))
+    bundle_id = str(config.get("emulator_bundle_id", "com.now.gg.BlueStacks"))
+    if not SAFE_APP_RE.fullmatch(app):
+        return ["emulator_app 名称含非法字符，拒绝清理"]
+    if not SAFE_BUNDLE_ID_RE.fullmatch(bundle_id):
+        return ["emulator_bundle_id 含非法字符，拒绝清理"]
+    try:
+        closedown = subprocess.run(
+            [maa, "closedown", "Official"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            env=maa_subprocess_env(config),
+        )
+        if closedown.returncode != 0:
+            errors.append("maa closedown 失败")
+    except Exception as exc:
+        errors.append(f"maa closedown 异常：{type(exc).__name__}")
+    graceful_error = ""
+    try:
+        quit_result = subprocess.run(
+            ["osascript", "-e", f'tell application id "{bundle_id}" to quit'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if quit_result.returncode != 0:
+            graceful_error = "模拟器正常退出请求失败"
+    except Exception as exc:
+        graceful_error = f"模拟器正常退出异常：{type(exc).__name__}"
+    time.sleep(max(0, int(config.get("quit_grace_seconds", 10))))
+    try:
+        subprocess.run(["pkill", "-f", app], capture_output=True, check=False)
+    except Exception as exc:
+        errors.append(f"模拟器兜底退出异常：{type(exc).__name__}")
+    try:
+        subprocess.run([adb, "disconnect", address], capture_output=True, check=False)
+    except Exception as exc:
+        errors.append(f"ADB 断开异常：{type(exc).__name__}")
+    try:
+        # A bracketed first character still matches the target but prevents
+        # pgrep from matching its own command line.
+        process_pattern = f"[{re.escape(app[0])}]{re.escape(app[1:])}"
+        verify_deadline = time.monotonic() + max(
+            1, int(config.get("cleanup_verify_timeout", 10))
+        )
+        while True:
+            remaining = subprocess.run(
+                ["pgrep", "-fi", process_pattern],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if remaining.returncode == 1 or not remaining.stdout.strip():
+                break
+            if time.monotonic() >= verify_deadline:
+                if graceful_error:
+                    errors.append(graceful_error)
+                errors.append(f"仍有 {app} 进程存活")
+                break
+            time.sleep(0.5)
+    except Exception as exc:
+        errors.append(f"进程清理确认异常：{type(exc).__name__}")
+    return errors
+
+
+def run_maa(
+    config: dict[str, Any],
+    log_path: Path,
+    token: str,
+    thread_id: str,
+    progress_message_id: str,
+    plan: dict[str, Any] | None = None,
+) -> tuple[int, list[str], list[str]]:
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    # maa-cli 0.7.5's --log-file redirects logs away from stderr.  Capture the
+    # live streams ourselves and tee both to disk so Discord progress remains
+    # observable without sacrificing the full local log.
+    command = [maa, "run", "daily", "-v", "--batch"]
+    env = maa_subprocess_env(config)
+    env["MAA_LOG_PREFIX"] = "Never"
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    stderr_recent: deque[str] = deque(maxlen=12)
+    stderr_lines: list[str] = []
+    stdout_recent: deque[str] = deque(maxlen=12)
+    stdout_lines: list[str] = []
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_lock = threading.Lock()
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
+        stderr_thread = threading.Thread(
+            target=_reader,
+            args=(process.stderr, stderr_recent, stderr_lines, log_handle, log_lock),
+            daemon=True,
+        )
+        stdout_thread = threading.Thread(
+            target=_reader,
+            args=(process.stdout, stdout_recent, stdout_lines, log_handle, log_lock),
+            daemon=True,
+        )
+        stderr_thread.start()
+        stdout_thread.start()
+        previous = ""
+        next_update = time.monotonic()
+        # Hermes' outer no-agent cron timeout is 3600s. Keep ten minutes of
+        # headroom for boot, screenshot, cleanup and the final report.
+        deadline = time.monotonic() + max(60, int(config.get("maa_run_timeout", 3000)))
+        timed_out = False
+        interrupted = False
+        try:
+            while process.poll() is None:
+                now = time.monotonic()
+                if now >= deadline:
+                    timed_out = True
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    break
+                if now >= next_update:
+                    content = progress_content(
+                        list(stdout_lines) + list(stderr_lines),
+                        plan=plan,
+                    )
+                    if content != previous:
+                        try:
+                            discord_request(
+                                token,
+                                "PATCH",
+                                f"/channels/{thread_id}/messages/{progress_message_id}",
+                                {"content": content, "allowed_mentions": {"parse": []}},
+                            )
+                            previous = content
+                        except Exception:
+                            # Streaming is best-effort; final report is the hard signal.
+                            pass
+                    next_update = now + 5
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            interrupted = True
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        return_code = process.wait()
+        stderr_thread.join(timeout=2)
+        stdout_thread.join(timeout=2)
+    if interrupted:
+        interrupt_message = "maa run 已按人工指令终止。"
+        stderr_lines.append(interrupt_message)
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(interrupt_message + "\n")
+        return_code = 130
+    elif timed_out:
+        timeout_message = "maa run 超时，已终止；可能是客户端更新、登录提示或识别流程卡住。"
+        stderr_lines.append(timeout_message)
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(timeout_message + "\n")
+        return_code = 124
+    return return_code, stdout_lines, stderr_lines
+
+
+def report_payload(
+    *,
+    ok: bool,
+    phase: str,
+    plan: dict[str, Any],
+    duration: float,
+    summary: str,
+    screenshot_ok: bool,
+    screenshot_error: str,
+    cleanup_errors: list[str],
+) -> dict[str, Any]:
+    label = PHASE_LABELS[phase]
+    notes: list[str] = []
+    if not screenshot_ok:
+        notes.append(f"截图失败：{screenshot_error}")
+    if cleanup_errors:
+        notes.append("清理异常：" + "；".join(cleanup_errors))
+    embed: dict[str, Any] = {
+        "title": f"{'✅' if ok else '❌'} MAA 日常·{label}{'完成' if ok else '失败'}",
+        "color": 0x57F287 if ok else 0xED4245,
+        "fields": [
+            {"name": "关卡", "value": plan_stage_label(plan), "inline": True},
+            {
+                "name": "理智药",
+                "value": medicine_label(str(plan.get("medicine", "none"))),
+                "inline": True,
+            },
+            {"name": "碎石", "value": "0", "inline": True},
+            {"name": "总耗时", "value": _format_duration(duration), "inline": True},
+            {"name": "📋 执行结果", "value": summary[:1024], "inline": False},
+        ],
+        "footer": {"text": "模拟器与 ADB 已执行清理"},
+        "timestamp": now_beijing().isoformat(),
+    }
+    if notes:
+        embed["fields"].append({"name": "备注", "value": "\n".join(notes)[:1024]})
+    if screenshot_ok:
+        embed["image"] = {"url": "attachment://shot.png"}
+    payload: dict[str, Any] = {
+        "embeds": [embed],
+        "allowed_mentions": {"parse": []},
+    }
+    if screenshot_ok:
+        payload["attachments"] = [{"id": 0, "filename": "shot.png"}]
+    return payload
+
+
+def send_report(
+    token: str,
+    channel_id: str,
+    payload: dict[str, Any],
+    screenshot: Path,
+    config: dict[str, Any],
+) -> None:
+    if "attachments" in payload:
+        try:
+            discord_upload(token, channel_id, payload, screenshot)
+            return
+        except Exception as exc:
+            embed = dict(payload["embeds"][0])
+            embed.pop("image", None)
+            fields = list(embed.get("fields", []))
+            fields.append({"name": "图片上传", "value": f"内嵌上传失败：{type(exc).__name__}"})
+            embed["fields"] = fields
+            discord_request(
+                token,
+                "POST",
+                f"/channels/{channel_id}/messages",
+                {"embeds": [embed], "allowed_mentions": {"parse": []}},
+            )
+            hermes = str(config.get("hermes_bin", Path.home() / ".local" / "bin" / "hermes"))
+            subprocess.run(
+                [hermes, "send", "--to", f"discord:{channel_id}", f"MEDIA:{screenshot}"],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            return
+    discord_request(token, "POST", f"/channels/{channel_id}/messages", payload)
+
+
+def send_direct_failure(
+    token: str,
+    channel_id: str,
+    phase: str,
+    plan: dict[str, Any],
+    message: str,
+) -> None:
+    discord_request(
+        token,
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {
+            "embeds": [
+                {
+                    "title": f"❌ MAA 日常·{PHASE_LABELS[phase]}启动失败",
+                    "description": message[:3500],
+                    "color": 0xED4245,
+                    "fields": [
+                        {"name": "计划关卡", "value": plan_stage_label(plan), "inline": True},
+                        {"name": "碎石", "value": "0", "inline": True},
+                    ],
+                    "timestamp": now_beijing().isoformat(),
+                }
+            ],
+            "allowed_mentions": {"parse": []},
+        },
+    )
+
+
+def execute(phase: str) -> int:
+    started = now_beijing()
+    config = load_config()
+    channel_id = str(config.get("channel_id", "")).strip()
+    if not channel_id.isdigit():
+        raise RuntimeError("config.json 中尚未配置 Discord channel_id")
+    token = discord_token()
+    plan = effective_plan(started)
+    run_stem = f"{started.date().isoformat()}-{phase}"
+    snapshot_path = RUNS_DIR / f"{run_stem}.json"
+    log_path = RUNS_DIR / f"{run_stem}.log"
+    screenshot_path = RUNS_DIR / f"{run_stem}.png"
+
+    with run_lock(blocking=False) as acquired:
+        if not acquired:
+            return 0
+        cleanup_run_files(int(config.get("retention_days", 14)), started)
+        snapshot = {
+            "date": started.date().isoformat(),
+            "phase": phase,
+            "started_at": started.isoformat(),
+            "plan": plan,
+        }
+        # This is the immutable per-run plan snapshot. Later plan.json writes
+        # cannot change this Python object or this file.
+        atomic_write_json(snapshot_path, snapshot)
+        merge_last_run(
+            {
+                "status": "running",
+                "phase": phase,
+                "started_at": started.isoformat(),
+                "plan": plan,
+                "snapshot": str(snapshot_path),
+                # Do not expose terminal fields from the previous run while
+                # this run is still booting and has not created its thread.
+                "thread_id": None,
+                "finished_at": None,
+                "duration_seconds": None,
+                "return_code": None,
+                "log": None,
+                "screenshot": None,
+                "screenshot_error": None,
+                "cleanup_errors": [],
+                "summary": "",
+            }
+        )
+
+        if plan.get("skip"):
+            discord_request(
+                token,
+                "POST",
+                f"/channels/{channel_id}/messages",
+                {
+                    "embeds": [
+                        {
+                            "title": f"⏭️ MAA 日常·{PHASE_LABELS[phase]}已跳过",
+                            "description": "今日计划设置了跳过；未启动模拟器。",
+                            "color": 0x99AAB5,
+                            "timestamp": started.isoformat(),
+                        }
+                    ],
+                    "allowed_mentions": {"parse": []},
+                },
+            )
+            merge_last_run({"status": "skipped", "finished_at": now_beijing().isoformat()})
+            return 0
+
+        emulator_opened = False
+        thread_id = ""
+        progress_message_id = ""
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        return_code = 1
+        screenshot_ok = False
+        screenshot_error = "未执行"
+        cleanup_errors: list[str] = []
+        try:
+            require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
+            require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+            open_emulator(config)
+            emulator_opened = True
+            wait_for_android(config)
+            verify_game_installed(config)
+            opening = discord_request(
+                token,
+                "POST",
+                f"/channels/{channel_id}/messages",
+                {
+                    "content": (
+                        f"🌱 MAA 日常·{PHASE_LABELS[phase]}场开始\n"
+                        f"🎯 {plan_stage_label(plan)} · 🧪 {medicine_label(plan['medicine'])}"
+                    ),
+                    "allowed_mentions": {"parse": []},
+                },
+            )
+            thread_name = f"MAA日常·{PHASE_LABELS[phase]} · {started:%m-%d %H:%M}"
+            thread = create_thread(token, channel_id, str(opening["id"]), thread_name)
+            thread_id = str(thread["id"])
+            placeholder = discord_request(
+                token,
+                "POST",
+                f"/channels/{thread_id}/messages",
+                {
+                    "content": progress_content([], plan=plan),
+                    "allowed_mentions": {"parse": []},
+                },
+            )
+            progress_message_id = str(placeholder["id"])
+            merge_last_run(
+                {
+                    "thread_id": thread_id,
+                    "threads": [{"thread_id": thread_id, "created_at": started.isoformat()}],
+                }
+            )
+            task_path = Path(str(config.get("maa_config_dir", MAA_CONFIG_DIR))) / "tasks" / "daily.toml"
+            atomic_write_text(task_path, render_daily_toml(plan, config))
+            return_code, stdout_lines, stderr_lines = run_maa(
+                config, log_path, token, thread_id, progress_message_id, plan
+            )
+            # The final Custom task has returned to Home. Let the last UI
+            # animation settle, then capture before the separate CloseDown.
+            time.sleep(max(0, float(config.get("home_screenshot_delay", 1))))
+            screenshot_ok, screenshot_error = capture_screenshot(config, screenshot_path)
+        except Exception as exc:
+            stderr_lines.append(f"{type(exc).__name__}: {exc}")
+            return_code = 1
+            if not thread_id:
+                try:
+                    send_direct_failure(token, channel_id, phase, plan, stderr_lines[-1])
+                except Exception:
+                    pass
+        finally:
+            if emulator_opened:
+                try:
+                    cleanup_errors = close_everything(config)
+                except Exception as exc:
+                    cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
+
+        duration = (now_beijing() - started).total_seconds()
+        ok = return_code == 0 and not cleanup_errors
+        summary = extract_summary(stdout_lines, stderr_lines, plan=plan, ok=ok)
+        if thread_id and progress_message_id:
+            final_heading = f"{'✅' if ok else '❌'} 结束 · 总耗时 {_format_duration(duration)}"
+            try:
+                discord_request(
+                    token,
+                    "PATCH",
+                    f"/channels/{thread_id}/messages/{progress_message_id}",
+                    {
+                        "content": progress_content(
+                            stdout_lines + stderr_lines,
+                            plan=plan,
+                            final=final_heading,
+                        ),
+                        "allowed_mentions": {"parse": []},
+                    },
+                )
+            except Exception:
+                pass
+        # Startup failures were already reported directly. All runs that made
+        # a thread get a deterministic battle report, with screenshot if valid.
+        if thread_id:
+            payload = report_payload(
+                ok=ok,
+                phase=phase,
+                plan=plan,
+                duration=duration,
+                summary=summary,
+                screenshot_ok=screenshot_ok,
+                screenshot_error=screenshot_error,
+                cleanup_errors=cleanup_errors,
+            )
+            send_report(token, channel_id, payload, screenshot_path, config)
+        merge_last_run(
+            {
+                "status": "success" if ok else "failed",
+                "finished_at": now_beijing().isoformat(),
+                "duration_seconds": int(duration),
+                "return_code": return_code,
+                "log": str(log_path),
+                "screenshot": str(screenshot_path) if screenshot_ok else None,
+                "screenshot_error": screenshot_error if not screenshot_ok else None,
+                "cleanup_errors": cleanup_errors,
+                "summary": summary,
+            }
+        )
+        return 0 if ok else 1
+
+
+def main(argv: list[str]) -> int:
+    phase = select_phase(argv)
+    return execute(phase)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv))
+    except Exception as exc:
+        print(f"MAA 日常失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(1)

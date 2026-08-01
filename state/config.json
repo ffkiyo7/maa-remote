@@ -1,0 +1,28 @@
+{
+  "channel_id": "REPLACE_WITH_DISCORD_CHANNEL_ID",
+  "emulator_app": "BlueStacks",
+  "emulator_bundle_id": "com.now.gg.BlueStacks",
+  "adb_path": "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+  "adb_address": "127.0.0.1:5555",
+  "game_package": "com.hypergryph.arknights",
+  "maa_bin": "/opt/homebrew/bin/maa",
+  "maa_config_dir": "/Users/wadorudi/.config/maa-cli",
+  "maa_disable_proxy": true,
+  "hermes_bin": "/Users/wadorudi/.local/bin/hermes",
+  "emulator_boot_timeout": 180,
+  "maa_run_timeout": 3000,
+  "quit_grace_seconds": 10,
+  "cleanup_verify_timeout": 10,
+  "home_screenshot_delay": 1,
+  "medicine_expire_days": 2,
+  "fight_times": 2147483647,
+  "recruit_times": 4,
+  "retention_days": 14,
+  "resource_update_interval_days": 7,
+  "resource_update_timeout": 300,
+  "activity_stages": [
+    "TO-9",
+    "TO-8",
+    "TO-7"
+  ]
+}
