@@ -1,14 +1,15 @@
 # 二期（prts.plus 抄作业）代码评审 — 修复清单
 
-> ## ⚠️ 第四轮已开启：`4e88b28`（解锁预检）有 1 个 P0 待修
+> ## ⚠️ 第五轮：`add4616` 剩 2 条 P2（都在同一行文案上）
 >
-> 前三轮共 21 条问题全部关闭并实测验收通过，收敛于 `d052461`。
-> `4e88b28` 新增「搜索阶段预检解锁状态」，第四轮评审发现 **1 个 P0 + 1 个 P1 + 4 个 P2**，
-> 见文末[第四轮](#第四轮4e88b28--解锁预检)。P0-22 会输出自相矛盾的警告，请先修这条。
+> 前四轮共 27 条全部关闭并实测验收通过。`add4616` 的 P0-22 / P1-23 / P2-25~27
+> 我逐条复验都对，P0-22 的新判据**在多 zone 下也是可证成立的**（见第五轮开头）。
+> 只剩 P2-24 那个时效标注本身写坏了：括号套括号 + 同一张卡上重复两遍年龄，
+> 且 85 项测试没有一项覆盖到它。见文末[第五轮](#第五轮add4616--复验与-2-条遗留)。
 >
-> 前三轮的小节保留是为了记录**为什么**某些地方要那样写（尤其是 P0-1 的响应形状、
-> P0-4 的 lost update、NEW-2 的半分语义）——改到这些位置前先读对应小节，
-> 别把已经踩过的坑再踩一遍。**前三轮不需要再做任何修复。**
+> 前四轮的小节保留是为了记录**为什么**某些地方要那样写（尤其是 P0-1 的响应形状、
+> P0-4 的 lost update、NEW-2 的半分语义、P1-23 的单向语义）——改到这些位置前先读
+> 对应小节，别把已经踩过的坑再踩一遍。**前四轮不需要再做任何修复。**
 
 **基线**：`f558ac1`（`PLAN_PHASE2.md`）　**结案于**：`d052461`（`main`，已推送 origin）
 
@@ -831,3 +832,176 @@ python3 -c "import sys; sys.path.insert(0,'scripts'); import maa_skland as s; \
 ```
 
 回归确认同前三轮：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。
+
+---
+
+# 第五轮：`add4616` — 复验与 2 条遗留
+
+**评审对象**：`add4616`（4 files / +94 −42）　**测试**：85 全绿　
+**结论**：第四轮 6 条中 5 条实测通过；P2-24 的实现本身写坏了，另发现 1 条测试盲区。
+
+## 先说好消息：P0-22 的新判据在多 zone 下是可证成立的
+
+改成「只认第一个非空 zone，序号超出即静默」之后，我担心的是另一种情况：
+`seq <= zone1.total` 但那一关其实在 zone2 里（zone1 被剧情关撑大了）。
+推了一遍，这种情况下判据**依然成立**：
+
+> 要通关 zone2 里的关，必须先打完整个 zone1，即 `cleared₁ == total₁ >= seq`。
+> 逆否：`cleared₁ < seq <= total₁` ⟹ zone1 没打完 ⟹ zone2 根本没解锁 ⟹ 第 seq 关必然没通。
+
+所以「有警告 = 基本锁着」这个方向在跨 zone 时也没有漏洞。**这不是碰巧对的，别再改回累计映射。**
+
+实测复验（全部通过）：
+
+```
+act17side zone1 6/6 + zone2 3/3（全通）→ X-7/X-8/X-10 全部 None   ← P0-22 已修
+用户真实 roster TO-9 → ⚠️ act53side_zone1 仅通关 1/13：…            ← 回归未破
+_normalize_activity_progress 脏数据 [1] / 'abc' / None / 1.9 → 全部归 0，不抛  ← P2-25 已修
+docstring 已改为 cannot conclude；EX/ST 注释已挪到正则那一行         ← P1-23 / P2-27 已修
+DEV_GUIDE 不变量 #6 已记「有警告=基本锁着，没警告=不知道」           ← P1-23 已修
+两处废断言已改正向，cumulative 用例已改写为溢出静默                  ← P2-26 已修
+```
+
+## NEW-28（P2）时效标注括号套括号，且同一张卡上重复两遍
+
+**位置**：`scripts/maa_copilot.py` `zone_progress_warning()`
+
+```python
+    age = roster_age_hint(roster)
+    suffix = f"（{age}，如已推进请忽略）" if age else ""
+```
+
+`roster_age_hint()` 的返回值**自带全角括号**（`（森空岛数据 4 天前）`），外面再包一层就成了：
+
+```
+⚠️ act53side_zone1 仅通关 1/13：TO-9 大概率未解锁（突袭更不可能），点了可能空跑。（（森空岛数据 4 天前），如已推进请忽略）
+```
+
+而且卡片 description 已经在上一行单独打过一次同样的年龄，整张卡长这样：
+
+```
+🔍 TO-9 的作业候选：
+1. **作业 1** — … · 练度未知
+（森空岛数据 4 天前）                                    ← roster_hint 行
+⚠️ … 点了可能空跑。（（森空岛数据 4 天前），如已推进请忽略）  ← 又一遍，还套了括号
+```
+
+**修法**：把「算天数」和「拼文案」拆开，两个调用点各拼各的。
+
+```python
+def roster_age_days(roster: dict[str, Any]) -> int | None:
+    """Days since the skland snapshot, or None when unknown."""
+    try:
+        age = now_beijing() - datetime.fromisoformat(str(roster.get("fetched_at") or ""))
+    except (ValueError, TypeError):
+        return None
+    return age.days
+
+
+def roster_age_hint(roster: dict[str, Any]) -> str:
+    days = roster_age_days(roster)
+    return f"（森空岛数据 {days} 天前）" if days and days > 0 else ""
+```
+
+`zone_progress_warning()` 里改成：
+
+```python
+    days = roster_age_days(roster)
+    suffix = f"（森空岛数据 {days} 天前，如已推进请忽略）" if days and days > 0 else ""
+```
+
+顺带修掉一个原有隐患：旧 `roster_age_hint` 只 `except ValueError`，
+`fetched_at` 若是 naive 时间戳，`now_beijing() - naive` 抛的是 **TypeError**，会一路冒出去。
+上面的写法把两个都接住了。
+
+**重复问题**：warning 行的标注是必要的（`roster_hint` 只在 `roster_ok` 为真时才加，
+而 warning 在 roster 有 `activity_progress` 时就会出现，两者不总是同时在场），
+所以**保留 warning 里的标注，不要删**。如果嫌卡片啰嗦，就把 `roster_hint` 那一行去掉，
+别去掉 warning 里的——警告脱离时效就会被当成当前事实。
+
+## NEW-29（P2）时效标注这条路径 85 项测试一项都没覆盖到
+
+**位置**：`tests/test_copilot.py` `ZoneProgressTests._roster_with_progress`
+
+```python
+    def _roster_with_progress(self, zones):
+        return {"chars": {}, "activity_progress": {"act53side": zones}}
+```
+
+**没有 `fetched_at`** → `roster_age_hint` 走 `fromisoformat("")` 抛 ValueError → 返回 `""`
+→ `suffix` 恒为 `""`。于是 `ZoneProgressTests` 里每一个用例走的都是「无标注」分支，
+P2-24 新加的那段格式化代码**一行都没被执行过**，所以括号套括号能带着 85 全绿进主干。
+
+这已经是第四次同一个模式了（NEW-1 没测 `copilot_cancel`、NEW-2 只断言分类不断言分数、
+P2-26 两处断言恒真、这次是新分支完全没进测试）。**改了用户可见文案，就必须有一条逐字断言。**
+
+**修法**：helper 加可选 `fetched_at`，并补一条逐字断言。
+
+```python
+    def _roster_with_progress(self, zones, fetched_at=None):
+        roster = {"chars": {}, "activity_progress": {"act53side": zones}}
+        if fetched_at:
+            roster["fetched_at"] = fetched_at
+        return roster
+
+    def test_warning_stamps_snapshot_age_without_nesting_parens(self) -> None:
+        # NEW-28: roster_age_hint() already carries its own （）— re-wrapping
+        # produced （（森空岛数据 4 天前），如已推进请忽略）.
+        stale = (now_beijing() - timedelta(days=4)).isoformat()
+        r = self._roster_with_progress(
+            [{"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13}],
+            fetched_at=stale,
+        )
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertTrue(warning.endswith("（森空岛数据 4 天前，如已推进请忽略）"))
+        self.assertNotIn("））", warning)
+        self.assertNotIn("（（", warning)
+
+    def test_fresh_roster_omits_age_stamp(self) -> None:
+        r = self._roster_with_progress(
+            [{"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13}],
+            fetched_at=now_beijing().isoformat(),
+        )
+        self.assertTrue(
+            maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+            .endswith("点了可能空跑。")
+        )
+```
+
+## 可选加固（不做也行）
+
+`zone_progress_warning()` 里读 zone 用的是裸 `int(z.get("totalStage") or 0)`。
+数据来自本进程自己写的 `roster.json`（`_safe_int` 已归一化过），所以现在不会炸；
+但这个函数跑在 `build_candidate_card` 里，真抛异常会**整张候选卡片发不出去**。
+想彻底防住就把 `_safe_int` 提到 `maa_common.py` 两边共用。优先级很低。
+
+---
+
+## 第五轮验证
+
+```bash
+python3 -m unittest discover -s tests -v        # 应 ≥ 87 项全绿
+
+# NEW-28：括号不得嵌套，年龄只出现一次
+python3 -c "import sys,json,os; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  r=json.load(open(os.path.expanduser('~/.hermes/state/maa/copilot/roster.json'))); \
+  r['fetched_at']='2026-07-29T10:00:00+08:00'; \
+  w=c.zone_progress_warning('TO-9','act53side_09',r); print(w); \
+  assert '（（' not in w and '））' not in w, '括号仍然嵌套'"
+# 期望结尾是 …点了可能空跑。（森空岛数据 4 天前，如已推进请忽略）
+
+# NEW-28 回归：新鲜 roster 不得出现标注
+python3 -c "import sys,json,os; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  r=json.load(open(os.path.expanduser('~/.hermes/state/maa/copilot/roster.json'))); \
+  print(repr(c.zone_progress_warning('TO-9','act53side_09',r)))"
+# 期望以「点了可能空跑。」结尾，无时效后缀
+
+# 第四轮判据不得被改坏
+python3 -c "import sys; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  r={'chars':{},'activity_progress':{'act17side':[ \
+    {'zoneId':'act17side_zone1','clearedStage':6,'totalStage':6}, \
+    {'zoneId':'act17side_zone2','clearedStage':3,'totalStage':3}]}}; \
+  assert [c.zone_progress_warning(f'X-{s}', f'act17side_{s:02d}', r) for s in (7,8,10)] == [None]*3"
+```
+
+回归确认同前四轮：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。
