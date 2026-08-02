@@ -677,6 +677,30 @@ class SklandTests(unittest.TestCase):
         # would shift module_levels[req_module-1] onto the wrong module.
         self.assertEqual(entry["module_levels"], [1, 0])
 
+    def test_refresh_roster_packs_chars_and_progress_flat(self) -> None:
+        # Regression: fetch_roster returning {"chars":…, "activity_progress":…}
+        # must be unpacked, not nested under roster["chars"] (which made
+        # load_roster see a 2-entry "chars" and lose every operator).
+        import maa_skland
+        with tempfile.TemporaryDirectory() as raw:
+            roster_path = Path(raw) / "roster.json"
+            with patch.object(maa_skland, "ROSTER_PATH", roster_path), \
+                 patch.object(maa_skland, "load_skland_state",
+                              return_value={"uid": "1"}), \
+                 patch.object(maa_skland, "fetch_roster", return_value={
+                     "chars": {"char_002_amiya": {"name": "阿米娅"}},
+                     "activity_progress": {
+                         "act53side": [{"zoneId": "act53side_zone1",
+                                        "clearedStage": 1, "totalStage": 13}],
+                     },
+                 }):
+                roster = maa_skland.refresh_roster()
+            self.assertEqual(list(roster["chars"].keys()), ["char_002_amiya"])
+            self.assertEqual(
+                roster["activity_progress"]["act53side"][0]["clearedStage"], 1
+            )
+            self.assertEqual(roster_path.stat().st_mode & 0o777, 0o600)
+
     def test_skland_files_are_0600_after_link(self) -> None:
         import maa_skland
         with tempfile.TemporaryDirectory() as raw:
@@ -893,6 +917,113 @@ class ReviewFixTests(unittest.TestCase):
             )
         self.assertEqual(len(result), 1)
 
+
+
+class ZoneProgressTests(unittest.TestCase):
+    """Preflight unlock warning (zone-level heuristic, skland data)."""
+
+    def _roster_with_progress(self, zones: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "chars": {},
+            "activity_progress": {"act53side": zones},
+        }
+
+    def test_normalize_activity_progress_real_shape(self) -> None:
+        import maa_skland
+        activity = [
+            {
+                "actId": "act53side",
+                "actReplicaId": "",
+                "zones": [
+                    {"zoneId": "act53side_zone1", "zoneReplicaId": "",
+                     "clearedStage": 1, "totalStage": 13},
+                    {"zoneId": "act53side_zone2", "zoneReplicaId": "",
+                     "clearedStage": 0, "totalStage": 0},
+                ],
+            },
+            {"actId": "", "zones": []},  # junk entry skipped
+            "not-a-dict",
+        ]
+        progress = maa_skland._normalize_activity_progress(activity)
+        self.assertEqual(progress["act53side"][0]["zoneId"], "act53side_zone1")
+        self.assertEqual(progress["act53side"][0]["clearedStage"], 1)
+        self.assertEqual(progress["act53side"][0]["totalStage"], 13)
+        self.assertEqual(progress["act53side"][1]["clearedStage"], 0)
+        self.assertEqual(len(progress), 1)
+
+    def test_far_from_cleared_warns_both_modes(self) -> None:
+        # The user's real situation: zone1 1/13 -> TO-9 almost surely locked.
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
+        ])
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertIsNotNone(warning)
+        self.assertIn("act53side_zone1", warning)
+        self.assertIn("1/13", warning)
+        self.assertIn("大概率未解锁", warning)
+        self.assertIn("突袭更不可能", warning)
+
+    def test_zone_just_before_stage_warns_raid_only(self) -> None:
+        # cleared == seq-1: stage 9's normal just unlocked, raid surely not.
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 8, "totalStage": 13},
+        ])
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertIsNotNone(warning)
+        self.assertIn("突袭大概率未解锁", warning)
+        self.assertNotIn("大概率未解锁\n", warning)
+        self.assertIn("8/13", warning)
+
+    def test_zone_cleared_through_stage_silent(self) -> None:
+        # cleared >= seq: normal AND raid both plausible -> no warning.
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 9, "totalStage": 13},
+        ])
+        self.assertIsNone(maa_copilot.zone_progress_warning("TO-9", "act53side_09", r))
+
+    def test_stage_in_second_zone_maps_by_cumulative_total(self) -> None:
+        # zone1 holds stages 1..6, zone2 holds 7..13 -> TO-9 lands in zone2.
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 6, "totalStage": 6},
+            {"zoneId": "act53side_zone2", "clearedStage": 0, "totalStage": 7},
+        ])
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertIsNotNone(warning)
+        self.assertIn("act53side_zone2", warning)
+        self.assertIn("0/7", warning)
+
+    def test_resource_and_main_stages_silent(self) -> None:
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
+        ])
+        # resource stage: no matching activity
+        self.assertIsNone(maa_copilot.zone_progress_warning("CE-6", "wk_melee_6", r))
+        # main stage: stage_id shape has no trailing _<digits>
+        self.assertIsNone(maa_copilot.zone_progress_warning("1-7", "main_01-07", r))
+
+    def test_missing_progress_or_roster_silent(self) -> None:
+        self.assertIsNone(
+            maa_copilot.zone_progress_warning("TO-9", "act53side_09", None)
+        )
+        self.assertIsNone(
+            maa_copilot.zone_progress_warning("TO-9", "act53side_09", {"chars": {}})
+        )
+
+    def test_candidate_card_includes_warning_line(self) -> None:
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
+        ])
+        cand = maa_copilot.evaluate_candidate(
+            op_item(1, "act53side_09", opers=[{"name": "阿米娅", "skill": 1}]),
+            None,
+            {},
+        )
+        self.assertIsNotNone(cand)
+        embed, _components, _registry = maa_copilot.build_candidate_card(
+            "a" * 12, [cand], True, "TO-9", stage_id="act53side_09", roster=r
+        )
+        self.assertIn("1/13", embed["description"])
+        self.assertIn("大概率未解锁", embed["description"])
 
 
 if __name__ == "__main__":

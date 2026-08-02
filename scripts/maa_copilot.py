@@ -669,17 +669,82 @@ def prune_expired_searches(registry: dict[str, Any] | None = None) -> int:
     return len(expired)
 
 
+def zone_progress_warning(
+    stage_label: str, stage_id: str, roster: dict[str, Any] | None
+) -> str | None:
+    """One-line preflight warning for the candidate card (strong hint only).
+
+    skland reports zone-level progress (clearedStage/totalStage) with no
+    per-stage granularity.  Under sequential unlocking, stage N is playable
+    once clearedStage >= N-1; its raid additionally requires clearing N
+    itself (raids unlock only after the normal clear).  So:
+
+      cleared >= seq     -> both plausible, no warning
+      cleared == seq-1   -> normal just unlocked, raid surely locked
+      cleared <  seq-1   -> stage itself probably still locked
+
+    Main/resource stages (no zone data, or no activity match) yield None.
+    """
+    if not isinstance(roster, dict):
+        return None
+    progress = roster.get("activity_progress")
+    if not isinstance(progress, dict):
+        return None
+    match = re.match(r"^([A-Za-z0-9]+?)_(\d+)$", stage_id)
+    if not match:
+        return None
+    act_id, seq = match.group(1), int(match.group(2))
+    zones = progress.get(act_id)
+    if not isinstance(zones, list) or not zones:
+        return None
+    cumulative = 0
+    target: dict[str, Any] | None = None
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+        total = int(zone.get("totalStage") or 0)
+        if total <= 0:
+            continue
+        cumulative += total
+        if seq <= cumulative:
+            target = zone
+            break
+    if target is None:
+        # seq beyond every zone's total (EX/ST stages) -> no hint
+        return None
+    cleared = int(target.get("clearedStage") or 0)
+    total = int(target.get("totalStage") or 0)
+    zone_label = str(target.get("zoneId") or act_id)
+    if cleared >= seq:
+        return None
+    if cleared >= seq - 1:
+        return (
+            f"⚠️ {zone_label} 仅通关 {cleared}/{total}：{stage_label} 的突袭大概率未解锁"
+            "（需先通关普通），点了可能空跑。"
+        )
+    return (
+        f"⚠️ {zone_label} 仅通关 {cleared}/{total}：{stage_label} 大概率未解锁"
+        "（突袭更不可能），点了可能空跑。"
+    )
+
+
 def build_candidate_card(
     token: str,
     candidates: list[dict[str, Any]],
     roster_ok: bool,
     stage_label: str,
     roster_hint: str = "",
+    stage_id: str = "",
+    roster: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Embed + components + registry entries for a candidate card."""
     description = search_summary(stage_label, candidates, roster_ok)
     if roster_hint:
         description += f"\n{roster_hint}"
+    if stage_id:
+        zone_warning = zone_progress_warning(stage_label, stage_id, roster)
+        if zone_warning:
+            description += f"\n{zone_warning}"
     embed = {
         "title": f"🤖 {stage_label} 抄作业候选",
         "description": description[:4000],

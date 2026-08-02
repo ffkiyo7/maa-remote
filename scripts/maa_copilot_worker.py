@@ -155,6 +155,8 @@ def cmd_search(token: str) -> int:
                 roster_hint=maa_copilot.roster_age_hint(roster)
                 if roster_ok
                 else "",
+                stage_id=stage_id,
+                roster=roster,
             )
             channel_id = str(config.get("channel_id", ""))
             message = discord_request(

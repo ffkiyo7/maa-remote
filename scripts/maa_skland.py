@@ -206,6 +206,38 @@ def _normalize_chars(chars: list[dict[str, Any]], battle_data: dict[str, Any]) -
     return normalized
 
 
+def _normalize_activity_progress(activity: Any) -> dict[str, Any]:
+    """actId -> [zone progress dicts] from player/info `activity`.
+
+    Zone-level only (clearedStage/totalStage), no per-stage granularity —
+    consumers must treat it as a strong hint, never a precise unlock check.
+    """
+    progress: dict[str, Any] = {}
+    if not isinstance(activity, list):
+        return progress
+    for entry in activity:
+        if not isinstance(entry, dict):
+            continue
+        act_id = str(entry.get("actId") or "")
+        zones = entry.get("zones")
+        if not act_id or not isinstance(zones, list) or not zones:
+            continue
+        cleaned = []
+        for zone in zones:
+            if not isinstance(zone, dict):
+                continue
+            cleaned.append(
+                {
+                    "zoneId": str(zone.get("zoneId") or ""),
+                    "clearedStage": int(zone.get("clearedStage") or 0),
+                    "totalStage": int(zone.get("totalStage") or 0),
+                }
+            )
+        if cleaned:
+            progress[act_id] = cleaned
+    return progress
+
+
 def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
     """Full grant->cred->binding->player/info chain; returns normalized chars.
 
@@ -230,7 +262,12 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(chars, list):
             raise RuntimeError("player/info chars 格式异常")
         battle = maa_copilot.battle_data({})
-        return _normalize_chars(chars, battle)
+        return {
+            "chars": _normalize_chars(chars, battle),
+            "activity_progress": _normalize_activity_progress(
+                data.get("activity") if isinstance(data, dict) else None
+            ),
+        }
 
     try:
         return attempt()
@@ -256,12 +293,13 @@ def refresh_roster() -> dict[str, Any]:
     state = load_skland_state()
     if state is None:
         raise RuntimeError("未配置森空岛 token；请在本机终端运行 python3 maa_skland.py link")
-    chars = fetch_roster(state)
+    data = fetch_roster(state)
     roster = {
         "fetched_at": now_beijing().isoformat(),
         "uid": str(state.get("uid") or ""),
         "source": "skland",
-        "chars": chars,
+        "chars": data["chars"],
+        "activity_progress": data.get("activity_progress", {}),
     }
     atomic_write_json(ROSTER_PATH, roster)
     return roster
