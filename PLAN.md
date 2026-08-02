@@ -236,7 +236,7 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 ### P4 · 频道 + 子区 + 按钮 + 自然语言
 
 1. Discord UI 手建频道 `🌱maa长草助手`（`discord_admin` 没有 `create_channel`，手建 30 秒最快），ID 写进 `config.json`；确认 bot 有 **Manage Threads**（删子区要用）
-2. `.env` 的 `DISCORD_FREE_RESPONSE_CHANNELS` 追加该 ID（现值 `<CHANNEL_ID>,<CHANNEL_ID>`）
+2. `.env` 的 `DISCORD_FREE_RESPONSE_CHANNELS` 追加该 ID（原有值为另外两个频道，见本机 `.env`）
 3. 打白名单补丁（adapter.py:60 加 `"maa_action.py"`）+ 写进 `LOCAL_PATCHES.md`
 4. `maa_plan_card.py` 发卡片 + **merge** 写按钮登记（共享 agent-book 那把锁）+ 清理过期子区
 5. 写 `maa-operator` 技能（抄 `agent-book-tutor/SKILL.md` 的 frontmatter 结构）+ `config.yaml` 绑定
