@@ -1,11 +1,14 @@
 # 二期（prts.plus 抄作业）代码评审 — 修复清单
 
-> ## ✅ 本文档已结案，无待办事项
+> ## ⚠️ 第四轮已开启：`4e88b28`（解锁预检）有 1 个 P0 待修
 >
-> 三轮共 21 条问题全部关闭并实测验收通过，最终状态提交于 `d052461`。
-> 保留本文档是为了记录**为什么**某些地方要那样写（尤其是 P0-1 的响应形状、
+> 前三轮共 21 条问题全部关闭并实测验收通过，收敛于 `d052461`。
+> `4e88b28` 新增「搜索阶段预检解锁状态」，第四轮评审发现 **1 个 P0 + 1 个 P1 + 4 个 P2**，
+> 见文末[第四轮](#第四轮4e88b28--解锁预检)。P0-22 会输出自相矛盾的警告，请先修这条。
+>
+> 前三轮的小节保留是为了记录**为什么**某些地方要那样写（尤其是 P0-1 的响应形状、
 > P0-4 的 lost update、NEW-2 的半分语义）——改到这些位置前先读对应小节，
-> 别把已经踩过的坑再踩一遍。**不需要再按本文档做任何修复。**
+> 别把已经踩过的坑再踩一遍。**前三轮不需要再做任何修复。**
 
 **基线**：`f558ac1`（`PLAN_PHASE2.md`）　**结案于**：`d052461`（`main`，已推送 origin）
 
@@ -579,3 +582,252 @@ grep -rn "search_button_ids" scripts/ tests/    # 期望无输出
 ```
 
 回归确认同第一轮：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。
+
+---
+
+# 第四轮：`4e88b28` — 解锁预检
+
+**评审对象**：`4e88b28`（4 files / +239 −3）　**测试**：84 全绿　
+**结论**：1 个 P0、1 个 P1、4 个 P2。
+
+功能方向是对的，森空岛数据选得也对（`activity[].zones[]` 确实是唯一可得的进度源），
+`build_candidate_card` 的参数带默认值、`refresh_roster` 展平回归测试、旧 roster
+无 `activity_progress` 时静默降级——这几点都做得干净。问题全部集中在**一个隐含前提**上：
+
+> 代码假设 `stage_id` 里的序号（`act53side_09` → 9）和 `clearedStage` 是同一把尺子。
+> **它们不是。** `seq` 数的是「第几个战斗关」，`clearedStage` 数的是「zone 里通了几关，含剧情关」。
+
+下面所有问题都是这条前提的推论。**先读这段再动手，否则会按错误的方向修。**
+
+## 先明确一件事：现在的判据其实是「单向可靠」的
+
+这点很重要，别在修的时候把它改坏。设 zone 内共通关 `cleared` 关（含剧情关），
+要通关第 `seq` 个战斗关，至少得先通关 `seq` 关。所以：
+
+- `cleared < seq` ⟹ 第 `seq` 关**一定没通** ⟹ 突袭一定没解锁。**逻辑成立。**
+- `cleared < seq-1` ⟹ 第 `seq-1` 关一定没通 ⟹ 第 `seq` 关一定没解锁。**逻辑成立。**
+- `cleared >= seq` ⟹ **什么都推不出来**（必要条件不是充分条件）。
+
+也就是说：**它发出的警告不会错，但它该发的时候经常不发。**
+代码注释里写的 `cleared >= seq -> both plausible`（都有可能）措辞是错的，
+正确的措辞是 `cannot conclude`（推不出来）。这不是文字游戏——写成「都有可能」，
+下一个人就会试图去「优化」那条静默分支，然后引入假警告。
+
+---
+
+## P0-22（严重）多 zone 时拿全局序号比 zone 局部计数，会输出自相矛盾的警告
+
+**位置**：`scripts/maa_copilot.py` `zone_progress_warning()` 的 cumulative 循环
+
+```python
+cumulative += total
+if seq <= cumulative:
+    target = zone
+    break
+...
+cleared = int(target.get("clearedStage") or 0)
+if cleared >= seq: ...
+```
+
+定位 zone 用的是**累计** total，但取出 `cleared` 之后又拿它和**未减偏移的全局** `seq` 比。
+一旦命中的不是第一个 zone，这个比较就没有意义了。
+
+**实测（act17side 的真实 zone 结构，把进度调成全通）**：
+
+```
+zone1 6/6 + zone2 3/3 + zone3 2/2 —— 每个 zone 都 100% 通关
+  act17side_07: ⚠️ act17side_zone2 仅通关 3/3：X-7 大概率未解锁（突袭更不可能）
+  act17side_08: ⚠️ act17side_zone2 仅通关 3/3：X-8 大概率未解锁（突袭更不可能）
+  act17side_10: ⚠️ act17side_zone3 仅通关 2/2：X-10 大概率未解锁（突袭更不可能）
+```
+
+「仅通关 3/3」——3/3 是满的，还说未解锁。这是**自相矛盾的输出**，
+比不发警告更糟：用户会不信任整个提示。
+
+**不是假设的边界**：真实 roster 里 `act17side` 就是这个形状
+（zone1 total=6，但 Tile-Pos 里有 10 个编号关），序号 7~10 现在就走 zone2/zone3。
+只是用户当前 zone1 是 1/6，恰好让错误结论和正确结论撞在了一起，所以没暴露。
+
+**修法（推荐，比修偏移更简单也更正确）**：删掉 cumulative 循环，
+**只认第一个 `totalStage > 0` 的 zone；序号超出它就静默**。
+
+```python
+    target = next((z for z in zones
+                   if isinstance(z, dict) and int(z.get("totalStage") or 0) > 0), None)
+    if target is None:
+        return None
+    total = int(target.get("totalStage") or 0)
+    if seq > total:
+        # Numbered stages spill past the first zone (act17side).  We cannot
+        # map a global stage number onto a zone-local cleared count, and a
+        # wrong "not unlocked" on a fully cleared zone is worse than silence.
+        return None
+```
+
+为什么不推荐「减去 zone 偏移」那个修法：`totalStage` 里混着剧情关（见 P1-23），
+累计出来的边界跟战斗关序号本来就对不齐，减偏移只是把一个错误换成另一个错误。
+静默是这里唯一诚实的选项。实测 60 个活动里只有 `act17side` 1 个会因此变静默，
+其余 59 个行为不变。
+
+## P1-23 `clearedStage` 含剧情关而 `seq` 不含，导致警告在多数活动里整片静默
+
+**位置**：同上，`cleared >= seq` 的阈值判断。
+
+`totalStage` / `clearedStage` 把**剧情关也算进去**了，而 `seq` 只数战斗关。
+拿真实 roster 和本地 Tile-Pos 对了一遍 60 个活动：
+
+```
+60 个活动里，zone1.totalStage == 战斗关数 的只有 2 个
+其余 58 个 totalStage 都更大，多出来的是剧情关（+1 到 +8 个）
+  act53side  9 战斗关 → zone1 total 13（+4 剧情关）
+  act44side  8 战斗关 → zone1 total 16（+8 剧情关）
+  act25side 10 战斗关 → zone1 total 18（+8 剧情关）
+```
+
+剧情关把 `cleared` 顶高，于是 `cleared >= seq` 提前成立，警告提前闭嘴。
+**实测用户自己的 roster**，这几个「打了一半」的活动里，警告对**所有**战斗关都是静默：
+
+```
+act21side zone1 10/15（10 战斗关 + 5 剧情关）→ 01~10 全部静默，但还剩 5 关没通
+act23side zone1 11/13（ 9 战斗关 + 4 剧情关）→ 01~09 全部静默，但还剩 2 关没通
+act19side zone1  9/13（ 8 战斗关 + 5 剧情关）→ 01~08 全部静默，但还剩 4 关没通
+act38side zone1 15/18（10 战斗关 + 8 剧情关）→ 01~10 全部静默，但还剩 3 关没通
+```
+
+这正是这个功能存在的意义所在的那类场景（打了一半、不确定解锁到哪），
+而且「打了一半的活动」本来就是抄作业最高频的对象。
+
+**这不是 bug，是能力上限**——按上面那节的推理，`cleared >= seq` 本来就推不出结论，
+静默是正确的。想真正判准需要单关粒度，森空岛不给。所以**不要试图用启发式去猜**
+（比如按比例估算剧情关位置），那会引入假警告，得不偿失。
+
+**修法：改文档和措辞，不改判据。**
+
+1. `zone_progress_warning()` 的 docstring 把 `cleared >= seq -> both plausible`
+   改成 `-> cannot conclude (clearedStage counts 剧情关, seq does not)`，
+   并写明「本函数只在能确定锁着时发声，静默 ≠ 已解锁」。
+2. `REVIEW_PHASE2.md` / `DEV_GUIDE.md` 记一条：这个预检是**单向**的，
+   有警告 = 基本锁着；没警告 = 不知道。不要在别处把它当成「已解锁」的依据
+   （尤其别拿它去 gate `copilot pick` 的按钮）。
+
+## P2-24 进度按天变，roster 却 7 天才懒刷新一次，警告不带时效标注
+
+`skland_roster_refresh_days: 7`，且只有 `cmd_search` 会触发刷新。练度是慢变量，
+7 天没问题；**但解锁进度在活动期间是天天变的**，而这个警告恰恰只对当期活动生效。
+
+后果是**假警告**：用户今天推完 TO-1~TO-9，明天来抄 TO-9，roster 还是几天前的快照，
+卡片上照样写「TO-9 大概率未解锁」。按钮还能点（这点设计是对的），但提示就成了噪音。
+
+叠加上上一轮已经确认的一件事：森空岛返回的是**最后一次登出游戏时的快照**
+（`lastOnlineTs`），不是实时。所以「刚打完就搜」这个最常见的路径必然是过期的。
+
+**修法（二选一，我倾向 a）**：
+
+a. 警告行带上时效，让用户自己判断：
+```python
+    age = roster_age_hint(roster)   # 已有函数，返回「（练度数据 N 天前）」或 ""
+    suffix = f"（数据为 {age} 的快照，如已推进请忽略）" if age else ""
+```
+   顺带把 `roster_age_hint` 的措辞从「练度数据」改成「森空岛数据」——
+   现在这份快照已经不只是练度了。
+
+b. 搜索的关卡命中 `activity_progress` 里的当期活动时，把刷新阈值降到 1 天。
+   代价是当期活动的每次搜索几乎都会多一次森空岛往返（含一次 401 重认证）。
+
+## P2-25 `int()` 可抛异常，逃出 `fetch_roster` 的兜底，整份 roster 拉取失败
+
+**位置**：`scripts/maa_skland.py` `_normalize_activity_progress()`
+
+```python
+"clearedStage": int(zone.get("clearedStage") or 0),
+```
+
+`fetch_roster` 的重试兜底只 `except RuntimeError`。实测：
+
+```
+clearedStage=[1]     -> RAISES TypeError
+clearedStage='abc'   -> RAISES ValueError
+```
+
+这两个都会穿过 `fetch_roster` 一路冒到 `cmd_search` 的 `except Exception`，
+打印 `roster refresh skipped` ——**结果是为了一个可选的提示，把 269 个干员的练度数据整个丢掉**，
+候选卡片降级成「未接入森空岛」。新增的可选功能不该有能力搞挂主数据。
+
+**修法**：加个 `_safe_int`，并给整个 activity 解析包一层兜底。
+
+```python
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+```
+`fetch_roster` 里改成：
+```python
+        try:
+            progress = _normalize_activity_progress(data.get("activity"))
+        except Exception:
+            progress = {}       # optional hint data must never break the roster
+        return {"chars": _normalize_chars(chars, battle), "activity_progress": progress}
+```
+
+## P2-26 两处测试不判别，等于没测
+
+又是前两轮那个模式（NEW-1 / NEW-2 同因）：**断言只覆盖了改动的一半**。
+
+1. `test_zone_just_before_stage_warns_raid_only`：
+   ```python
+   self.assertNotIn("大概率未解锁\n", warning)
+   ```
+   `warning` 是**单行、不含换行**的字符串，这个断言恒真，永远不会失败。
+   想表达的应该是「不能误报成普通关也锁了」，改成正向断言：
+   ```python
+   self.assertIn("的突袭大概率未解锁", warning)
+   self.assertNotIn("（突袭更不可能）", warning)   # 这才是另一档的独有文案
+   ```
+
+2. `test_stage_in_second_zone_maps_by_cumulative_total`：
+   用的数据是 zone1 6/6、zone2 0/7、seq 9。**在正确实现和 P0-22 的错误实现下，
+   输出逐字相同**（都是 `act53side_zone2 仅通关 0/7 … 大概率未解锁`），
+   所以它没有测到它名字里声称测的那件事。
+   按 P0-22 的修法这个用例应该整个改写成「序号溢出第一个 zone → 返回 None」。
+
+## P2-27 docstring 里 EX/ST 那句和代码对不上
+
+```python
+    if target is None:
+        # seq beyond every zone's total (EX/ST stages) -> no hint
+```
+EX/ST 关的 `stage_id` 形如 `act5d0_ex01`、`act53side_sp01`，
+**连 `^([A-Za-z0-9]+?)_(\d+)$` 都匹配不上**，在函数开头就 `return None` 了，
+根本走不到这个分支。注释按 P0-22 的修法一起重写。
+
+---
+
+## 第四轮验证
+
+```bash
+python3 -m unittest discover -s tests -v        # 应 ≥ 84 项全绿
+
+# P0-22：zone 全通仍报未解锁（修好后应全部 None）
+python3 -c "import sys; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  r={'chars':{},'activity_progress':{'act17side':[ \
+    {'zoneId':'act17side_zone1','clearedStage':6,'totalStage':6}, \
+    {'zoneId':'act17side_zone2','clearedStage':3,'totalStage':3}]}}; \
+  print([c.zone_progress_warning(f'X-{s}', f'act17side_{s:02d}', r) for s in (7,8)])"
+# 期望 [None, None]，现在会打出两条「仅通关 3/3：…大概率未解锁」
+
+# P0-22 回归：用户当前真实场景必须仍然报警
+python3 -c "import sys,json,os; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  r=json.load(open(os.path.expanduser('~/.hermes/state/maa/copilot/roster.json'))); \
+  print(c.zone_progress_warning('TO-9','act53side_09',r))"
+# 期望仍是「⚠️ act53side_zone1 仅通关 1/13：TO-9 大概率未解锁（突袭更不可能），点了可能空跑。」
+
+# P2-25：脏数据不得搞挂 roster
+python3 -c "import sys; sys.path.insert(0,'scripts'); import maa_skland as s; \
+  print(s._normalize_activity_progress([{'actId':'a','zones':[ \
+    {'zoneId':'z','clearedStage':[1],'totalStage':'abc'}]}]))"
+# 期望正常返回（clearedStage/totalStage 归 0），不得抛 TypeError/ValueError
+```
+
+回归确认同前三轮：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。
