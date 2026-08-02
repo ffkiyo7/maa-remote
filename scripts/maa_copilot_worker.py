@@ -579,8 +579,10 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
             }
         )
         cleanup_run_files(int(config.get("retention_days", 14)))
+        print(f"copilot run ok={ok} return_code={return_code} cleanup_errors={cleanup_errors}")
         return 0 if ok else 1
     except Exception as exc:
+        print(f"copilot run EXCEPTION: {type(exc).__name__}: {exc}")
         cleanup_errors = []
         try:
             cleanup_errors = close_everything(config)
