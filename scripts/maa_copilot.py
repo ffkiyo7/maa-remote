@@ -722,9 +722,15 @@ def zone_progress_warning(
         return None
     # Unlock progress changes daily but the roster refreshes lazily (7d) and
     # skland returns the snapshot at last logout — stamp the age so a stale
-    # warning reads as stale instead of as a current fact.
-    age = roster_age_hint(roster)
-    suffix = f"（{age}，如已推进请忽略）" if age else ""
+    # warning reads as stale instead of as a current fact.  (Keep this even
+    # though roster_hint also prints the age: the hint only shows when
+    # roster_ok, the warning can appear without it.)
+    days = roster_age_days(roster)
+    suffix = (
+        f"（森空岛数据 {days} 天前，如已推进请忽略）"
+        if days and days > 0
+        else ""
+    )
     if cleared >= seq - 1:
         return (
             f"⚠️ {zone_label} 仅通关 {cleared}/{total}：{stage_label} 的突袭大概率未解锁"
@@ -843,16 +849,24 @@ def load_roster() -> dict[str, Any] | None:
     return None
 
 
-def roster_age_hint(roster: dict[str, Any]) -> str:
-    fetched_at = str(roster.get("fetched_at") or "")
+def roster_age_days(roster: dict[str, Any]) -> int | None:
+    """Days since the skland snapshot, or None when unknown.
+
+    Catches TypeError too: a naive fetched_at minus an aware now raises
+    TypeError, not ValueError.
+    """
     try:
-        age = now_beijing() - datetime.fromisoformat(fetched_at)
-        days = age.days
-    except ValueError:
-        return ""
-    if days <= 0:
-        return ""
-    return f"（森空岛数据 {days} 天前）"
+        age = now_beijing() - datetime.fromisoformat(
+            str(roster.get("fetched_at") or "")
+        )
+    except (ValueError, TypeError):
+        return None
+    return age.days
+
+
+def roster_age_hint(roster: dict[str, Any]) -> str:
+    days = roster_age_days(roster)
+    return f"（森空岛数据 {days} 天前）" if days and days > 0 else ""
 
 
 def search_summary(

@@ -922,11 +922,16 @@ class ReviewFixTests(unittest.TestCase):
 class ZoneProgressTests(unittest.TestCase):
     """Preflight unlock warning (zone-level heuristic, skland data)."""
 
-    def _roster_with_progress(self, zones: list[dict[str, Any]]) -> dict[str, Any]:
-        return {
+    def _roster_with_progress(
+        self, zones: list[dict[str, Any]], fetched_at: str | None = None
+    ) -> dict[str, Any]:
+        roster: dict[str, Any] = {
             "chars": {},
             "activity_progress": {"act53side": zones},
         }
+        if fetched_at:
+            roster["fetched_at"] = fetched_at
+        return roster
 
     def test_normalize_activity_progress_real_shape(self) -> None:
         import maa_skland
@@ -1050,6 +1055,40 @@ class ZoneProgressTests(unittest.TestCase):
         )
         self.assertIn("1/13", embed["description"])
         self.assertIn("大概率未解锁", embed["description"])
+
+    def test_warning_stamps_snapshot_age_without_nesting_parens(self) -> None:
+        # NEW-28/NEW-29: roster_age_hint() already carries its own （） —
+        # re-wrapping produced （（森空岛数据 4 天前），如已推进请忽略）.
+        # fetched_at present -> the suffix branch is actually exercised and
+        # must be verbatim, with no nested parens.
+        stale = (datetime.now(BEIJING) - timedelta(days=4)).isoformat()
+        r = self._roster_with_progress(
+            [{"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13}],
+            fetched_at=stale,
+        )
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertTrue(
+            warning.endswith("（森空岛数据 4 天前，如已推进请忽略）"),
+            f"unexpected warning: {warning!r}",
+        )
+        self.assertNotIn("））", warning)
+
+    def test_warning_without_fetched_at_has_no_suffix(self) -> None:
+        r = self._roster_with_progress([
+            {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
+        ])
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertTrue(warning.endswith("点了可能空跑。"))
+        self.assertNotIn("森空岛数据", warning)
+
+    def test_roster_age_hint_tolerates_naive_timestamp(self) -> None:
+        # NEW-28: naive fetched_at minus aware now raises TypeError, which
+        # the old code (except ValueError only) let escape.  Tolerated =
+        # returns None/"", never raises.
+        naive = (datetime.now() - timedelta(days=2)).isoformat()
+        roster = {"fetched_at": naive}
+        self.assertIsNone(maa_copilot.roster_age_days(roster))
+        self.assertEqual(maa_copilot.roster_age_hint(roster), "")
 
 
 if __name__ == "__main__":
