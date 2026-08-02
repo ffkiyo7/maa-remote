@@ -62,13 +62,17 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 | 文件 | 角色 | 触发方式 | 典型耗时 |
 |---|---|---|---|
-| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、两把锁、原子写、Discord REST/multipart、清理 | 被其他三个 import | — |
+| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、两把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 每日计划卡；周期性 `maa update`；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50 | 数秒～5 分钟（含 `maa update`） |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
-| `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 | 人工 | 秒级 |
+| `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、缺口文案、候选卡片 | 被 action/worker import | — |
+| `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 搜索发卡；`run <token> <n> <mode>` 真执行 | 仅由 `maa_action.py` 派发 | 搜索 5~20s；执行 8~15 分钟 |
+| `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度拉取、`link`（stdin 收 token） | 本机终端；worker 懒刷新 | 秒级 |
+| `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
+| `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
-| `tests/test_maa.py` | 27 个纯 stdlib 单测，全部 mock，不碰网络/模拟器 | 人工 | < 1s |
+| `tests/test_maa.py` + `tests/test_copilot.py` | 63 个纯 stdlib 单测，全部 mock，不碰网络/模拟器 | 人工 | < 1s |
 
 ---
 
@@ -229,6 +233,75 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 
 ---
 
+## 5.5 链路四：抄作业（`maa_copilot.py` + `maa_copilot_worker.py`）
+
+二期新增的按需链路。**互斥、不并行**：与日常刷理智共用 `run.lock`，且 08:00/22:00 前
+`copilot_blackout_minutes`（默认 25）内 `copilot pick` 直接拒绝。
+
+```
+计划卡第二下拉 / 聊天「抄 TO-9」
+   → maa_action.py copilot find TO-9     ~10ms（读本地 stage_index，零网络）
+       ├─ 写 searches/<token>.json {status:pending}（token=12 位 hex）
+       └─ Popen(maa_copilot_worker.py search <token>) 后立即返回
+                    worker search（5~20s，flock copilot_search.lock 防并发）
+       ├─ prts 搜索：limit=1 探针 → document=code/stage_id → level_keyword
+       │   （filtered.total < 全量 total 才可信，否则扫最新 8 页）
+       ├─ 客户端过滤 content.stage_name ∈ {stage_id, code}——永不信服务端
+       ├─ 练度匹配（roster 缺失→降级模式）+ 排序 → Top-3
+       ├─ state_lock() 下：清过期搜索 → merge hermes:btn:maa-copilot:* 键
+       └─ 发候选卡片（▶️/🔥 按钮 + ❌取消 + 🔄换一批）
+   用户点 ▶️ → maa_action.py copilot pick <token> <n> <mode>   ~50ms
+       ├─ 校验 token/index/mode/candidate id + blackout + run.lock 预检
+       └─ Popen(worker run <token> <n> <mode>) 后立即返回
+                    worker run（8~15 分钟）
+       ├─ run_lock(blocking=False) 抢锁，抢不到静默退出
+       ├─ 渲染 tasks/copilot-nav.toml（StartUp + Fight times=0 导航）——单作业
+       │   copilot 不会自己从主界面导航，必须先停在编队界面（C3 实测结论）
+       ├─ 模拟器 → maa run copilot-nav（导航失败=关卡未解锁/不可达，直接报错）
+       ├─ maa copilot <uri> --formation --batch -v --raid <mode>
+       │   [--ignore-requirements 仅当 ratio < 1.0]
+       │   └─ watchdog：每 2s OCR 屏幕，出现「确认要接管作战」弹窗就点确认
+       │      （代理指挥开关开着时点开始行动必弹窗，MaaCore 不处理）
+       ├─ 截图 → close_everything() → 战报 embed（含部署干员/进战斗次数）
+       └─ runs/<date>-copilot-<token>.{json,log,png}，并入 last_run.json
+```
+
+### 抄作业的关键事实（C3 实机验证，2026-08-02）
+
+1. **单作业 `maa copilot` 从主界面跑不起来**——任务链没有 StageNavigationTask，
+   必须从编队选择界面开始。解法：先跑 `Fight times=0` 的任务（完整导航链但不开打）
+   把游戏停在编队界面。资源本（CE-6 等）导航固定且快（~15s）；活动本在章节地图里
+   滑动找节点，**关卡未解锁时找不到节点会报错**——这是预期行为，报告会说明。
+2. **代理指挥开关**：点开始行动时代理开着会弹「确认要接管作战吗？」，MaaCore 的
+   copilot 链不处理 → 必失败。worker 内置 watchdog（`ocrbox` OCR + ADB tap）在弹窗
+   出现时点确认。正常路径（游戏新会话代理默认关）watchdog 不会触发。
+3. **prts 的 `-1` 是「无要求」哨兵**：requirements 的 elite/level/skill_level/module
+   为 -1 时视为无要求（实测踩坑：module=-1 曾导致 `module_levels[-1]` 越界）。
+4. **prts 服务端索引滞后**：当期活动关 `level_keyword` 会静默退化（total=全量），
+   必须用探针比对 + 客户端过滤兜底（对应测试 `test_level_keyword_degradation_*`）。
+5. **作业 stage_name 两种写法并存**（内部 id / 展示码）：展示码的作业执行时从
+   `/copilot/get/<id>` 取全文、改写 `stage_name` 为 stageId 后经 `file://` 传入。
+
+### 森空岛（`maa_skland.py`）
+
+- 签名公式黄金向量已冻结（`test_signing_golden_vector`）：`MD5(HMAC-SHA256(
+  path + query/body + t + header_ca))`，`t = now - 2`，GET query 不带 `?`，
+  请求头用小写键 `cred/sign/platform/timestamp/dId/vName`，`dId/platform/vName`
+  可为空串（数美风控放行，C0 实测）。
+- 链路：grant → cred（返回的 `token` 是签名密钥）→ binding（`data.list[]` 按
+  `appCode == "arknights"` 选，uid 取 `defaultUid`）→ `player/info?uid=` 的
+  `chars[]`（字段：`evolvePhase`=精英化、`skills[].specializeLevel`=专精、
+  `equip[].{id,level,locked}`=模组，锁着的模组不计数）。
+- 名字解析：skland 响应只有 charId；干员名→charId 用本地 `battle_data.json` 的
+  `chars` 字典（`names` 键不存在，C0 实测）。只解析到 `token_*`/`trap_*` 的视为
+  召唤物、不计缺口。
+- token 只从 stdin 进（`link` 子命令）或 `SKLAND_HG_TOKEN` 环境变量进（deploy），
+  永不经 argv/Discord/agent 上下文；`skland.json`/`roster.json` 0600。
+- cred 过期（10002/HTTP 401）→ 用存的 `hg_token` 重跑 grant，**只重试一次**，
+  再失败记 `last_error` 提示重新 `link`，绝不循环。
+
+---
+
 ## 6. 状态模型
 
 ```
@@ -350,13 +423,18 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 3 | `series = 0`（由 MaaCore 选当前理智支持的最大连战） | `render_daily_toml` 字面量 |
 | 4 | 基建只做 `mode = 20000` 预设队列轮换，facility 只列 `Mfg/Trade/Reception` | `render_daily_toml` |
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
-| 6 | 按钮脚本必须 < 20s 返回 | `run_now()` 用 `Popen`；活动关探测 0.7s |
+| 6 | 按钮脚本必须 < 20s 返回 | `run_now()`/`copilot_*` 用 `Popen`；活动关探测 0.7s |
 | 7 | `buttons.json` 只能 merge，且只碰 `hermes:btn:maa:` 前缀 | `maa_plan_card.main()` |
-| 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv | adapter 补丁 + `_stage_select()` |
-| 9 | 原始 CLI 文本不进 Discord | `progress_content` / `extract_summary` 是唯一出口 |
+| 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv | adapter 补丁 + `_stage_select()`/`_copilot_stage_select()` |
+| 9 | 原始 CLI 文本不进 Discord | `progress_content` / `extract_summary` / `_copilot_summary` 是唯一出口 |
 | 10 | 开跑后快照即冻结，改计划不影响本场 | `runs/<date>-<phase>.json` + 内存 plan |
 | 11 | 所有 maa-cli 子进程显式注入 `MAA_CONFIG_DIR` | `maa_subprocess_env()`（macOS 默认目录不是 `~/.config/maa-cli`） |
 | 12 | 代理变量只在 maa-cli 子进程里剔除，不动用户会话 | `maa_subprocess_env()` |
+| 13 | 抄作业与日常互斥：同一时刻只有一场 MAA（`run.lock`）；08:00/22:00 前 `copilot_blackout_minutes` 内拒绝 pick | `copilot_pick()` 预检 + worker `run_lock(blocking=False)` |
+| 14 | 抄作业按钮用 `hermes:btn:maa-copilot:` 前缀（连字符），早清扫 `hermes:btn:maa:` 碰不到；过期由 `prune_expired_searches()` 清理 | `maa_copilot.BUTTON_PREFIX` + `maa_plan_card` 锁块 |
+| 15 | 抄作业路径永不传 `--use-sanity-potion`（`--ignore-requirements` 只在用户点的候选 `ratio < 1.0` 时出现） | `_run_locked()` argv 构造 + 测试断言 |
+| 16 | 森空岛/鹰角 token 永不经 Discord、argv、agent 上下文；`copilot/` 下文件 0600 | `maa_skland.py` stdin/环境变量注入 + 测试 |
+| 17 | 抄作业关卡只接受本地 `stage_index` 精确查表，不许猜别名 | `valid_copilot_stage()` |
 
 ---
 
@@ -422,3 +500,13 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
    与本项目约定不同，所以每个子进程都要显式注入 `MAA_CONFIG_DIR`——新增调用 maa-cli 的代码时
    一定要用 `maa_subprocess_env()`，不要裸 `subprocess.run`。
 6. **删子区需要 bot 的 Manage Threads 权限**，没有就只能靠 `auto_archive_duration=1440` 归档。
+7. **MaaCore 资源目录与配置目录不同**：`maa update` 把资源装到
+   `~/Library/Application Support/com.loong.maa/resource`（Tile-Pos/battle_data.json 在那），
+   与 `MAA_CONFIG_DIR` 无关。`maa_resource_dir` 配错了抄作业关卡索引就是空的。
+8. **maa-cli 任务文件是 `[[tasks]]` 数组**（不是 `[tasks.X]` map），0.7.5 会直接 TOML 报错。
+9. **手动跑 maa 命令时记得剔除代理环境变量**（`maa_disable_proxy` 只对脚本生效）：
+   `env -u ALL_PROXY -u HTTPS_PROXY -u HTTP_PROXY ... maa run ...`，否则 hot update 连代理报错。
+10. **接管弹窗**：`maa copilot` 不处理「确认要接管作战吗？」，靠 worker 的 ocrbox watchdog；
+   手动复现问题时弹窗确认按钮在正文下方约 100px（1920×1080）。
+11. **关卡未解锁**：活动本按顺序解锁，没打前面的关时导航找不到节点、报「导航到编队界面失败」——
+    是预期行为不是 bug；用户应先打前面的关或换资源本/主线。

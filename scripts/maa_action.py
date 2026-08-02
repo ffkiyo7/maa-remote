@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import maa_copilot
 from maa_common import (
     BEIJING,
     CONFIG_PATH,
@@ -221,6 +223,184 @@ def log_tail() -> tuple[bool, str]:
     return True, f"📋 最近一次结果{when}\n{summary}"
 
 
+# ---------------------------------------------------------------------------
+# Copilot (prts.plus 抄作业) — all under 20s, real work goes to the worker
+# ---------------------------------------------------------------------------
+
+def valid_copilot_stage(
+    name: str, config: dict[str, Any]
+) -> tuple[str, str] | None:
+    """Exact lookup in the local stage index; never guess aliases."""
+    index = maa_copilot.load_stage_index(config)
+    return maa_copilot.resolve_copilot_stage(name, index)
+
+
+def _new_search_token() -> str:
+    return secrets.token_hex(6)
+
+
+def _search_path(token: str) -> Path:
+    return maa_copilot.SEARCHES_DIR / f"{token}.json"
+
+
+def _load_search(token: str) -> dict[str, Any] | None:
+    if not maa_copilot.SEARCH_TOKEN_RE.fullmatch(token or ""):
+        return None
+    state = load_json(_search_path(token), None)
+    return state if isinstance(state, dict) else None
+
+
+def _copilot_blackout_reason(config: dict[str, Any]) -> str | None:
+    """Refuse to start a copilot run close to the 08:00/22:00 daily runs."""
+    minutes = max(0, int(config.get("copilot_blackout_minutes", 25)))
+    if minutes == 0:
+        return None
+    now = now_beijing()
+    for hour in (8, 22):
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now > target:
+            target = target.replace(day=target.day + 1)
+        delta = (target - now).total_seconds() / 60
+        if delta <= minutes:
+            return (
+                f"距 {hour:02d}:00 日常场次不足 {minutes} 分钟，"
+                "为避免互斥抢占，请在日常结束后再抄作业。"
+            )
+    return None
+
+
+def copilot_find(stage: str) -> tuple[bool, str]:
+    config = load_config()
+    resolved = valid_copilot_stage(stage, config)
+    if resolved is None:
+        return False, f"关卡 {stage[:40]} 不在本地关卡索引里；只接受当期活动关、主线或资源关。"
+    stage_id, code = resolved
+    token = _new_search_token()
+    maa_copilot.ensure_private_dirs()
+    state = {
+        "token": token,
+        "status": "pending",
+        "stage": code,
+        "stage_id": stage_id,
+        "candidates": [],
+        "message_id": None,
+        "created_at": now_beijing().isoformat(),
+        "expires_at": (now_beijing() + maa_copilot.SEARCH_TTL).isoformat(),
+    }
+    atomic_write_json(_search_path(token), state)
+    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+    if not worker.is_file():
+        return False, "maa_copilot_worker.py 尚未部署。"
+    subprocess.Popen(
+        [sys.executable, str(worker), "search", token],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return True, f"🔍 正在为 {code} 匹配作业，结果稍后发到频道。"
+
+
+def copilot_again(token: str) -> tuple[bool, str]:
+    state = _load_search(token)
+    if state is None:
+        return False, "找不到这次搜索（可能已过期）。"
+    state["status"] = "pending"
+    state["candidates"] = []
+    state["message_id"] = None
+    state["created_at"] = now_beijing().isoformat()
+    state["expires_at"] = (now_beijing() + maa_copilot.SEARCH_TTL).isoformat()
+    atomic_write_json(_search_path(token), state)
+    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+    if not worker.is_file():
+        return False, "maa_copilot_worker.py 尚未部署。"
+    subprocess.Popen(
+        [sys.executable, str(worker), "search", token],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return True, f"🔄 正在重新为 {state.get('stage', '')} 匹配作业。"
+
+
+def copilot_cancel(token: str) -> tuple[bool, str]:
+    state = _load_search(token)
+    if state is None:
+        return False, "找不到这次搜索。"
+    state["status"] = "canceled"
+    atomic_write_json(_search_path(token), state)
+    with state_lock():
+        maa_copilot.prune_search_buttons(token)
+    return True, "❌ 已取消，相关按钮已清理。"
+
+
+def copilot_status(token: str) -> tuple[bool, str]:
+    state = _load_search(token)
+    if state is None:
+        return False, "找不到这次搜索（可能已过期）。"
+    status = str(state.get("status", ""))
+    if status == "done":
+        stage = str(state.get("stage", ""))
+        count = len(state.get("candidates", []) or [])
+        return True, f"✅ {stage} 的搜索已完成，共 {count} 个候选；结果卡片在频道里。"
+    if status == "running":
+        return True, "⏳ 还在匹配中，稍等片刻。"
+    if status == "failed":
+        return True, f"❌ 匹配失败：{state.get('error', '未知原因')}"
+    return True, "⏳ 等待匹配……"
+
+
+def copilot_pick(token: str, number: str, mode: str) -> tuple[bool, str]:
+    config = load_config()
+    if mode not in {"normal", "raid"}:
+        return False, "模式只接受 normal 或 raid。"
+    state = _load_search(token)
+    if state is None:
+        return False, "找不到这次搜索（可能已过期）。"
+    candidates = state.get("candidates", []) or []
+    if not isinstance(candidates, list):
+        candidates = []
+    try:
+        index = int(number)
+    except (TypeError, ValueError):
+        return False, "候选项编号无效。"
+    if not 1 <= index <= len(candidates):
+        return False, f"候选项编号超出范围（1..{len(candidates)}）。"
+    candidate = candidates[index - 1]
+    if not isinstance(candidate, dict):
+        return False, "候选项数据异常。"
+    cand_id = candidate.get("id")
+    try:
+        cand_id = int(cand_id)
+    except (TypeError, ValueError):
+        return False, "候选项 id 无效。"
+    if not 0 < cand_id < 1_000_000_000:
+        return False, "候选项 id 超出安全范围。"
+
+    reason = _copilot_blackout_reason(config)
+    if reason:
+        return False, reason
+    if is_run_locked():
+        return False, "已有 MAA 场次在跑，抄作业与日常互斥；请等本场结束后再点。"
+
+    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+    if not worker.is_file():
+        return False, "maa_copilot_worker.py 尚未部署。"
+    subprocess.Popen(
+        [sys.executable, str(worker), "run", token, str(index), mode],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    mode_label = "突袭" if mode == "raid" else "普通"
+    return True, f"▶️ 已派发 {state.get('stage', '')}（{mode_label}）的抄作业场次，后台开跑消息稍后出现。"
+
+
 def dispatch(argv: list[str]) -> tuple[bool, str]:
     if argv[:2] == ["plan", "set-stage"] and len(argv) == 3:
         return set_stage(argv[2])
@@ -232,7 +412,20 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return run_now()
     if argv == ["log", "tail"]:
         return log_tail()
-    return False, "不支持的动作；只允许 plan set-stage/skip-today/show、run now、log tail。"
+    if argv[:2] == ["copilot", "find"] and len(argv) == 3:
+        return copilot_find(argv[2])
+    if argv[:2] == ["copilot", "again"] and len(argv) == 3:
+        return copilot_again(argv[2])
+    if argv[:2] == ["copilot", "cancel"] and len(argv) == 3:
+        return copilot_cancel(argv[2])
+    if argv[:2] == ["copilot", "status"] and len(argv) == 3:
+        return copilot_status(argv[2])
+    if argv[:2] == ["copilot", "pick"] and len(argv) == 5:
+        return copilot_pick(argv[2], argv[3], argv[4])
+    return False, (
+        "不支持的动作；只允许 plan set-stage/skip-today/show、run now、log tail、"
+        "copilot find/again/cancel/status/pick。"
+    )
 
 
 def main(argv: list[str]) -> int:

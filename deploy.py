@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -102,8 +104,49 @@ def resolve_channel_id() -> str:
 def deploy_scripts() -> None:
     target = HERMES_HOME / "scripts"
     ensure_dir(target, 0o700)
-    for name in ("maa_common.py", "maa_plan_card.py", "maa_daily.py", "maa_action.py"):
+    for name in (
+        "maa_common.py",
+        "maa_plan_card.py",
+        "maa_daily.py",
+        "maa_action.py",
+        "maa_copilot.py",
+        "maa_copilot_worker.py",
+        "maa_skland.py",
+    ):
         copy_file(ROOT / "scripts" / name, target / name, 0o700)
+
+
+def deploy_skland_token() -> None:
+    """SKLAND_HG_TOKEN env -> copilot/hg_token.txt (0600); missing is fine."""
+    token = os.environ.get("SKLAND_HG_TOKEN", "").strip()
+    if not token:
+        return
+    target = HERMES_HOME / "state" / "maa" / "copilot" / "hg_token.txt"
+    write_text(target, token + "\n", 0o600)
+
+
+def deploy_ocrbox() -> None:
+    """Compile the Vision-based OCR helper (macOS) into ~/.hermes/scripts/."""
+    source = ROOT / "scripts" / "ocrbox.swift"
+    target = HERMES_HOME / "scripts" / "ocrbox"
+    if not source.is_file() or shutil.which("swiftc") is None:
+        return
+    if target.is_file() and target.stat().st_mtime >= source.stat().st_mtime:
+        return
+    try:
+        result = subprocess.run(
+            ["swiftc", "-O", str(source), "-o", str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=180,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-500:])
+        os.chmod(target, 0o700)
+        changed.append(str(target))
+    except Exception as exc:
+        print(f"ocrbox 编译跳过（{type(exc).__name__}）——接管弹窗自动处理不可用", file=sys.stderr)
 
 
 def deploy_state(channel_id: str) -> None:
@@ -112,6 +155,8 @@ def deploy_state(channel_id: str) -> None:
     ensure_dir(target / "runs")
     ensure_dir(target / "am")
     ensure_dir(target / "pm")
+    for sub in ("copilot", "copilot/cache", "copilot/searches", "copilot/prepared"):
+        ensure_dir(target / sub)
 
     desired_config = load_json(ROOT / "state" / "config.json", {})
     if isinstance(desired_config, dict):
@@ -342,7 +387,15 @@ def main() -> int:
     if args.check:
         checks = [
             HERMES_HOME / "scripts" / name
-            for name in ("maa_common.py", "maa_plan_card.py", "maa_daily.py", "maa_action.py")
+            for name in (
+                "maa_common.py",
+                "maa_plan_card.py",
+                "maa_daily.py",
+                "maa_action.py",
+                "maa_copilot.py",
+                "maa_copilot_worker.py",
+                "maa_skland.py",
+            )
         ]
         missing = [str(path) for path in checks if not path.is_file()]
         print(json.dumps({"ok": not missing, "missing": missing}, ensure_ascii=False))
@@ -353,6 +406,8 @@ def main() -> int:
     deploy_state(channel_id)
     deploy_maa_config()
     deploy_skill()
+    deploy_skland_token()
+    deploy_ocrbox()
     patch_adapter()
     patch_local_patches()
     patch_env(channel_id)

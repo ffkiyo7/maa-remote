@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
+import maa_copilot
 from maa_common import (
     BUTTONS_PATH,
     CONFIG_PATH,
@@ -268,12 +269,48 @@ def _stage_select(
     }
 
 
+def _copilot_stage_select(
+    plan: dict[str, Any],
+    config: dict[str, Any],
+    registry: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Second dropdown: pick a stage to match prts.plus ops for (抄作业)."""
+    custom_id = f"{maa_copilot.BUTTON_PREFIX}stage-select"
+    select_args: dict[str, list[str]] = {}
+    options: list[dict[str, Any]] = []
+    for index, (label, stage, description) in enumerate(_stage_choices(plan, config)):
+        value = f"copilot-choice:{index}"
+        options.append(
+            {
+                "label": label[:100],
+                "value": value,
+                "description": description[:100],
+                "emoji": {"name": "🤖"},
+            }
+        )
+        select_args[value] = ["copilot", "find", stage]
+    registry[custom_id] = {
+        "kind": "exec",
+        "script": "maa_action.py",
+        "select_args": select_args,
+    }
+    return {
+        "type": 3,
+        "custom_id": custom_id,
+        "placeholder": "🤖 抄作业：选择关卡匹配作业",
+        "min_values": 1,
+        "max_values": 1,
+        "options": options,
+    }
+
+
 def build_components(
     plan: dict[str, Any],
     config: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     registry: dict[str, dict[str, Any]] = {}
     stage_select = _stage_select(plan, config, registry)
+    copilot_select = _copilot_stage_select(plan, config, registry)
 
     skip_spec = (
         ("▶️ 恢复自动场次", "unskip", 3, ["plan", "skip-today", "off"])
@@ -307,6 +344,7 @@ def build_components(
     return (
         [
             {"type": 1, "components": [stage_select]},
+            {"type": 1, "components": [copilot_select]},
             {"type": 1, "components": action_buttons},
         ],
         registry,
@@ -404,6 +442,9 @@ def main() -> int:
         for custom_id in list(registry):
             if custom_id.startswith(BUTTON_PREFIX):
                 registry.pop(custom_id)
+        # Expire stale copilot candidate buttons (kept under their own
+        # hermes:btn:maa-copilot: prefix, untouched by the sweep above).
+        maa_copilot.prune_expired_searches()
         registry.update(entries)
         atomic_write_json(BUTTONS_PATH, registry)
 

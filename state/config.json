@@ -24,5 +24,9 @@
     "TO-9",
     "TO-8",
     "TO-7"
-  ]
+  ],
+  "maa_resource_dir": "/Users/wadorudi/Library/Application Support/com.loong.maa/resource",
+  "maa_core_version": "v6.16.0",
+  "copilot_blackout_minutes": 25,
+  "skland_roster_refresh_days": 7
 }

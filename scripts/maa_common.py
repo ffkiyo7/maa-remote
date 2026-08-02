@@ -128,6 +128,50 @@ def load_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+def http_get_json(url: str, *, timeout: int = 30, max_bytes: int = MAX_RESPONSE_BYTES) -> Any:
+    """Small dependency-free GET for JSON APIs (prts, etc.)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "Hermes-MAA/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise RuntimeError("HTTP 响应超过大小上限")
+            return json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(64 * 1024).decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"网络错误: {exc.reason}") from exc
+
+
+def prune_button_registry(
+    prefix: str,
+    keep: set[str] | None = None,
+    remove_only: set[str] | None = None,
+) -> None:
+    """Remove registry keys under a prefix, or only the ids in remove_only.
+
+    Must be called under state_lock().  Returns nothing; the caller decides
+    when to persist.  Never touches keys outside the prefix / remove list.
+    """
+    registry = load_json(BUTTONS_PATH, {})
+    if not isinstance(registry, dict):
+        return
+    keep = keep or set()
+    remove_only = remove_only or set()
+    changed = False
+    for custom_id in list(registry):
+        if remove_only:
+            if custom_id in remove_only:
+                registry.pop(custom_id)
+                changed = True
+        elif custom_id.startswith(prefix) and custom_id not in keep:
+            registry.pop(custom_id)
+            changed = True
+    if changed:
+        atomic_write_json(BUTTONS_PATH, registry)
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     """Write private JSON state atomically and durably."""
     ensure_private_dir(path.parent)
