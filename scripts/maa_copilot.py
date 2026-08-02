@@ -312,7 +312,10 @@ def check_op_requirements(
         return True, 1.0, [], []
     if char is None:
         if unknown:
-            return False, 0.5, [], [f"{name}（本地资源未收录，无法校验）"]
+            # Soft gap, half score — same semantics as the module soft
+            # constraint.  (returning False here would make evaluate_candidate
+            # drop the 0.5 via its `score if ok else 0.0` accumulator.)
+            return True, 0.5, [], [f"{name}（本地资源未收录，无法校验）"]
         return False, 0.0, [f"{name}（未拥有）"], []
 
     hard: list[str] = []
@@ -620,15 +623,6 @@ def ensure_private_dirs() -> None:
 def search_button_prefix(token: str) -> str:
     """Registry key prefix owned by one search (trailing ':' keeps it exact)."""
     return f"{BUTTON_PREFIX}{token}:"
-
-
-def search_button_ids(token: str, count: int) -> list[str]:
-    """All registry ids owned by one search (pick/raid/cancel/again)."""
-    ids = [f"{BUTTON_PREFIX}{token}:cancel", f"{BUTTON_PREFIX}{token}:again"]
-    for index in range(1, count + 1):
-        ids.append(f"{BUTTON_PREFIX}{token}:{index}")
-        ids.append(f"{BUTTON_PREFIX}{token}:raid-{index}")
-    return ids
 
 
 def prune_search_buttons(token: str, registry: dict[str, Any] | None = None) -> None:

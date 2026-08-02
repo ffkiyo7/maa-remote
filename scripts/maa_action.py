@@ -16,6 +16,7 @@ from typing import Any
 import maa_copilot
 from maa_common import (
     BEIJING,
+    BUTTONS_PATH,
     CONFIG_PATH,
     LAST_RUN_PATH,
     PLAN_PATH,

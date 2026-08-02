@@ -1,12 +1,19 @@
 # 二期（prts.plus 抄作业）代码评审 — 修复清单
 
-**评审对象**：`ee0dcbc`（`~/maa-remote-ph2`，detached HEAD，宿主仓库 `~/maa-remote-spike`）
 **基线**：`f558ac1`（`PLAN_PHASE2.md`）
-**评审日期**：2026-08-02
-**状态**：13 files / +2838 −15；`python3 -m unittest discover -s tests` 64 项全绿
+**位置**：`~/maa-remote-ph2`，分支 `ph2-fixes`，宿主仓库 `~/maa-remote-spike`
 
-> 注意：这些提交目前**不在** `~/Desktop/maa-remote` 里。修完之后需要把 `df00526`/`bbe1baa`/`ee0dcbc`
-> 加上本轮修复一起搬回主仓库。`~/maa-remote-spike` 里还有一条平行的抄作业历史
+| 轮次 | 评审对象 | 日期 | 规模 | 测试 | 结论 |
+|---|---|---|---|---|---|
+| 第一轮 | `ee0dcbc` | 2026-08-02 | 13 files / +2838 −15 | 64 全绿 | 4 个 P0、5 个 P1、8 个 P2 |
+| 第二轮 | `4ab6dc0` | 2026-08-02 | 9 files / +742 −57 | 73 全绿 | **第一轮 17 条全部实测通过**；新增 1 个阻断级回归 + 1 个半吊子修复 + 2 个小问题 |
+
+> **当前待办 = 文末「第二轮评审」一节。** 第一轮（P0-1 ~ P2-17）已全部关闭，保留在下面作为记录，
+> 不需要再动；但修 NEW-1/NEW-2 时不要把它们改坏。
+
+> 注意：这些提交目前**不在** `~/Desktop/maa-remote` 里。全部修完之后需要把
+> `df00526`/`bbe1baa`/`ee0dcbc`/`4ab6dc0` 加上后续修复一起搬回主仓库。
+> `~/maa-remote-spike` 里还有一条平行的抄作业历史
 > （`ada539f` merge PR #3 `feat/copilot-catalog-foundation`），与本实现无关，不要混用。
 
 ## 已经守住的（不要在修复中破坏）
@@ -408,3 +415,152 @@ python3 deploy.py && python3 deploy.py --check   # missing 必须为空（含 oc
 ```
 
 回归确认：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。
+
+---
+---
+
+# 第二轮评审（对象 `4ab6dc0`）
+
+## 第一轮 17 条的验收结果：全部通过
+
+逐条实测（不是只看 diff），结论如下，**这部分不需要再动**：
+
+| 编号 | 验证方式与结果 |
+|---|---|
+| P0-1 | 真实网络调 `/copilot/get/98660`：落盘 `prepared/98660.json`，`stage_name` 已改写为 `act53side_09`，返回 `file://…` ✅ |
+| P0-2 | 8/31 20:00、8/31 09:00、8/28 23:00 均返回 `None`，不再抛 ✅ |
+| P0-3 | 一次搜索的 8 个键全删；`stage-select`、`agent-book:x`、`maa:run-now` 三类完好 ✅ |
+| P0-4 | 模拟计划卡注册表合并段：落盘后只剩 `agent-book:x` + 新键，过期 search 文件也已 unlink ✅ |
+| P1-5 | 已接入 `cmd_search`；`refresh_roster` 抛异常时降级用旧 roster、搜索继续 ✅ |
+| P1-6 | `[{locked:True,level:0},{locked:False,level:3}]` → `[0, 3]` ✅ |
+| P1-7 | 顶层导入，无循环依赖，worker import 0.02s ✅ |
+| P1-8 | `ocrbox` 已入 `--check`；本机 `{"ok": true, "missing": []}` ✅ |
+| P1-9 | 6 个选项无一为空；卡片 3 行、第二行为 `maa-copilot:stage-select` ✅ |
+| P2-10/11/13/15/16/17 | 均已处理 ✅ |
+
+新测试里的 `test_prepare_op_file_rejects_flat_payload` 是正确的回归护栏，保留。
+
+---
+
+## NEW-1（阻断级，本轮引入的回归）`copilot_cancel` 抛 NameError，❌ 取消按钮全死
+
+**位置**：`scripts/maa_action.py:336,339`
+
+**问题**：P0-3/P0-4 的修改在 `copilot_cancel` 里新用了 `BUTTONS_PATH`，但没把它加进
+`from maa_common import (...)` 列表：
+
+```
+copilot_cancel -> !! NameError: name 'BUTTONS_PATH' is not defined
+maa_action 里有 BUTTONS_PATH: False
+```
+
+`tests/test_copilot.py` 里 `copilot_cancel` 零覆盖，所以 73 项全绿也没挡住。
+
+**修法**：在 `maa_action.py` 的 `from maa_common import (` 列表里补一行，按现有字母序排在 `BEIJING` 之后：
+
+```python
+from maa_common import (
+    BEIJING,
+    BUTTONS_PATH,
+    CONFIG_PATH,
+    ...
+)
+```
+
+**必须补的测试**：`copilot_cancel` 的正常路径——造一个 search state + 它的 8 个按钮，
+调用后断言 (a) 不抛异常、(b) 返回 `(True, "❌ 已取消，相关按钮已清理。")`、
+(c) `buttons.json` 里该 token 的键全没了、agent-book 的键还在。
+这是本轮唯一一个「改了代码但没有任何测试碰过」的函数，补上它。
+
+---
+
+## NEW-2（半吊子修复）P2-14 的 0.5 分被丢弃
+
+**位置**：`scripts/maa_copilot.py:311-314`（`check_op_requirements`）
+
+**问题**：未收录干员返回 `(False, 0.5, [], [soft])`，但调用方
+（`evaluate_candidate`，`maa_copilot.py:375`）是：
+
+```python
+total_score += score if ok else 0.0     # ok=False → 0.5 被扔掉
+```
+
+实测（两个位置，一个满足、一个未收录）：
+
+```
+ratio = 0.5      ← 期望 0.75
+hard gaps = []
+soft gaps = ['某个本地没有的新干员（本地资源未收录，无法校验）']
+```
+
+写下的 `0.5` 是死值。而同属软约束的模组走的是 `return True, 0.5 if soft else 1.0` ——
+两处语义不一致：模组给半分，未收录给零分。P2-14 的本意是「计入 soft_gaps 而非 hard_gaps」，
+即半分。
+
+**修法**：
+
+```python
+    if char is None:
+        if unknown:
+            return True, 0.5, [], [f"{name}（本地资源未收录，无法校验）"]
+        return False, 0.0, [f"{name}（未拥有）"], []
+```
+
+改完 ratio 仍 `< 1.0`，所以 `--ignore-requirements` 照常会带上，行为是安全的。
+
+**补测试**：现有的 `test_unknown_operator_is_soft_gap_not_hard` 只断言了 gap 的分类、
+没断言分数——这正是它漏掉的原因。加一条 ratio 断言：
+两个位置、一个满足、一个未收录 → `ratio == 0.75`。
+
+---
+
+## NEW-3（小）`search_button_ids()` 成了死代码
+
+**位置**：`scripts/maa_copilot.py:625`
+
+P0-3 改用前缀删除后，`search_button_ids` 已无任何调用方（`scripts/` 和 `tests/` 全库为零）。
+`build_candidate_card` 是自己内联拼 id 的。**删掉**。
+
+---
+
+## NEW-4（小）测试 stdout 又漏了一行
+
+**位置**：`tests/test_copilot.py` 中 P1-5 的新用例
+
+原来的 `✅ 森空岛接入成功…` 已修掉，但新测试又漏出：
+
+```
+............................roster refresh skipped: RuntimeError: skland down
+.............................................
+```
+
+`maa_copilot_worker.py` 里那条 print 是有用的运行期诊断，保留；在测试侧用
+`contextlib.redirect_stdout(io.StringIO())` 包住即可。
+
+---
+
+## 第二轮验收
+
+```bash
+python3 -m unittest discover -s tests -v    # 应 > 73 项，全绿，stdout 干净无杂行
+
+# NEW-1
+python3 -c "import sys,tempfile,pathlib,json; sys.path.insert(0,'scripts'); \
+  import maa_action, maa_copilot as c; \
+  t=pathlib.Path(tempfile.mkdtemp()); c.SEARCHES_DIR=t; tok='abcdef012345'; \
+  (t/f'{tok}.json').write_text(json.dumps({'token':tok,'status':'done','stage':'TO-9','candidates':[]})); \
+  print(maa_action.copilot_cancel(tok))"
+# 期望打印 (True, '❌ 已取消，相关按钮已清理。')，不得抛 NameError
+
+# NEW-2
+python3 -c "import sys; sys.path.insert(0,'scripts'); import maa_copilot as c; \
+  roster={'chars':{'char_002_amiya':{'name':'阿米娅','level':90,'elite':2,'main_skill_lvl':7,'skills':[3,3,3],'module_levels':[3]}}}; \
+  item={'id':1,'content':{'stage_name':'x','opers':[{'name':'阿米娅','skill':1,'requirements':{}},{'name':'本地没有的新干员','skill':1,'requirements':{}}]}}; \
+  print('ratio =', c.evaluate_candidate(item, roster, {})['ratio'])"
+# 期望 0.75
+
+# NEW-3
+grep -rn "search_button_ids" scripts/ tests/    # 期望无输出
+```
+
+回归确认同第一轮：08:00 / 22:00 的日常刷本不受影响，`buttons.json` 里 agent-book 的键完好。

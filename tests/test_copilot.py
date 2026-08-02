@@ -362,6 +362,9 @@ class SearchTests(unittest.TestCase):
             "data": [perfect, hot_but_gappy] if "order_by" not in params else [],
         }), patch.object(maa_copilot, "battle_data", return_value={
             "char_002_amiya": {"name": "阿米娅"},
+            # resolvable but NOT owned -> hard gap, 0 score (NEW-2 keeps
+            # the half-score path for *unresolvable* names only)
+            "char_350_surtr": {"name": "史尔特尔"},
         }), patch.object(maa_copilot, "CACHE_DIR", Path(tempfile.mkdtemp())):
             roster_ok = roster({"char_002_amiya": char(elite=2, level=90)})
             candidates = maa_copilot.search_copilots(
@@ -569,6 +572,43 @@ class PickValidationTests(unittest.TestCase):
             ok, _message = maa_action.copilot_pick("a" * 12, "0", "normal")
             self.assertFalse(ok)
 
+    def test_copilot_cancel_cleans_buttons_and_state(self) -> None:
+        # NEW-1: copilot_cancel used BUTTONS_PATH without importing it
+        # (NameError, ❌ button dead).  Full happy path: cancel a search,
+        # all owned keys gone from buttons.json, agent-book keys untouched.
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir(parents=True)
+            buttons = Path(raw) / "buttons.json"
+            tok = "a" * 12
+            (searches / f"{tok}.json").write_text(
+                json.dumps({
+                    "token": tok, "status": "done", "stage": "TO-9",
+                    "candidates": [],
+                }),
+                encoding="utf-8",
+            )
+            maa_common.atomic_write_json(buttons, {
+                f"hermes:btn:maa-copilot:{tok}:1": {},
+                f"hermes:btn:maa-copilot:{tok}:raid-1": {},
+                f"hermes:btn:maa-copilot:{tok}:cancel": {},
+                "hermes:btn:agent-book:x": {},
+            })
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_action, "BUTTONS_PATH", buttons), \
+                 patch.object(maa_action, "state_lock",
+                              return_value=contextlib.nullcontext()):
+                ok, message = maa_action.copilot_cancel(tok)
+            self.assertTrue(ok)
+            self.assertEqual(message, "❌ 已取消，相关按钮已清理。")
+            registry = json.loads(buttons.read_text(encoding="utf-8"))
+            self.assertNotIn(f"hermes:btn:maa-copilot:{tok}:1", registry)
+            self.assertNotIn(f"hermes:btn:maa-copilot:{tok}:raid-1", registry)
+            self.assertNotIn(f"hermes:btn:maa-copilot:{tok}:cancel", registry)
+            self.assertIn("hermes:btn:agent-book:x", registry)
+            state = json.loads((searches / f"{tok}.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "canceled")
+
     def test_pick_rejects_out_of_range_candidate(self) -> None:
         state = {"token": "a" * 12, "candidates": [{"id": 1}]}
         with patch.object(maa_action, "load_config", return_value=self.config), \
@@ -758,7 +798,8 @@ class ReviewFixTests(unittest.TestCase):
                  patch.object(maa_skland, "roster_needs_refresh", return_value=True), \
                  patch.object(maa_skland, "refresh_roster",
                               side_effect=RuntimeError("skland down")):
-                rc = worker.cmd_search("a" * 12)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = worker.cmd_search("a" * 12)
             self.assertEqual(rc, 0)
             state = json.loads((searches / ("a" * 12 + ".json")).read_text(encoding="utf-8"))
             self.assertEqual(state["status"], "done")
@@ -799,18 +840,44 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(_soft2, [])
 
     def test_unknown_operator_is_soft_gap_not_hard(self) -> None:
-        # P2-14: a name missing from local battle_data (new operator, stale
-        # resources) must be a soft gap, not a fake "未拥有" hard gap.
+        # P2-14/NEW-2: a name missing from local battle_data (new operator,
+        # stale resources) must be a soft gap with HALF score — not a fake
+        # "未拥有" hard gap, and not a zero score either.
         r = roster({"char_479_surtr": char(elite=2, level=90)})
         with patch.object(maa_copilot, "name_to_char_ids", return_value=[]):
             satisfied, score, hard, soft = maa_copilot.check_op_requirements(
                 {"name": "未来新干员", "requirements": {"elite": 2}}, r, {}
             )
-        self.assertFalse(satisfied)
+        self.assertTrue(satisfied)
+        self.assertEqual(score, 0.5)
         self.assertEqual(hard, [])
         self.assertEqual(len(soft), 1)
         self.assertIn("无法校验", soft[0])
-        self.assertLess(score, 1.0)
+
+    def test_unknown_operator_half_score_survives_evaluate_candidate(self) -> None:
+        # NEW-2: the 0.5 must actually reach the candidate ratio; the old
+        # code returned ok=False and evaluate_candidate's accumulator
+        # (`score if ok else 0.0`) silently dropped it.
+        r = roster({
+            "char_002_amiya": {
+                "name": "阿米娅", "level": 90, "elite": 2,
+                "main_skill_lvl": 7, "skills": [3, 3, 3], "module_levels": [3],
+            },
+        })
+        item = op_item(1, "act53side_09", opers=[
+            {"name": "阿米娅", "skill": 1, "requirements": {}},
+            {"name": "本地没有的新干员", "skill": 1, "requirements": {}},
+        ])
+
+        def fake_resolve(name: str, _config: dict[str, Any]) -> list[str]:
+            return ["char_002_amiya"] if name == "阿米娅" else []
+
+        with patch.object(maa_copilot, "name_to_char_ids", side_effect=fake_resolve):
+            cand = maa_copilot.evaluate_candidate(item, r, CONFIG)
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["ratio"], 0.75)
+        self.assertEqual(cand["gaps"], [])
+        self.assertEqual(len(cand["soft_gaps"]), 1)
 
     def test_search_limit_one_returns_one(self) -> None:
         # P2-10: candidates[:max(3, limit)] ignored limit<3.
