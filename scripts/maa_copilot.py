@@ -672,18 +672,20 @@ def prune_expired_searches(registry: dict[str, Any] | None = None) -> int:
 def zone_progress_warning(
     stage_label: str, stage_id: str, roster: dict[str, Any] | None
 ) -> str | None:
-    """One-line preflight warning for the candidate card (strong hint only).
+    """One-line preflight warning for the candidate card.
 
-    skland reports zone-level progress (clearedStage/totalStage) with no
-    per-stage granularity.  Under sequential unlocking, stage N is playable
-    once clearedStage >= N-1; its raid additionally requires clearing N
-    itself (raids unlock only after the normal clear).  So:
+    ONE-WAY heuristic: skland's zone progress counts EVERY stage including
+    story stages (clearedStage/totalStage), while stage_id's trailing number
+    counts BATTLE stages only — different rulers.  The only sound inferences:
 
-      cleared >= seq     -> both plausible, no warning
-      cleared == seq-1   -> normal just unlocked, raid surely locked
-      cleared <  seq-1   -> stage itself probably still locked
+      cleared < seq     -> stage N's normal is surely uncleared -> raid locked
+      cleared < seq-1   -> stage N-1 surely uncleared -> stage N surely locked
+      cleared >= seq    -> CANNOT CONCLUDE anything (necessary, not sufficient)
 
-    Main/resource stages (no zone data, or no activity match) yield None.
+    So this function only speaks when it can prove the stage is locked;
+    silence does NOT mean unlocked — never gate anything on its absence.
+    Numbered stages spilling past the first zone (act17side) stay silent:
+    a wrong "not unlocked" on a fully cleared zone is worse than silence.
     """
     if not isinstance(roster, dict):
         return None
@@ -692,39 +694,45 @@ def zone_progress_warning(
         return None
     match = re.match(r"^([A-Za-z0-9]+?)_(\d+)$", stage_id)
     if not match:
+        # story/EX/ST stages (act5d0_ex01, act53side_sp01) never match either
         return None
     act_id, seq = match.group(1), int(match.group(2))
     zones = progress.get(act_id)
     if not isinstance(zones, list) or not zones:
         return None
-    cumulative = 0
-    target: dict[str, Any] | None = None
-    for zone in zones:
-        if not isinstance(zone, dict):
-            continue
-        total = int(zone.get("totalStage") or 0)
-        if total <= 0:
-            continue
-        cumulative += total
-        if seq <= cumulative:
-            target = zone
-            break
+    # Only the first zone with stages counts: mapping a global battle-stage
+    # number onto a zone-local cleared count is unsound across zones (story
+    # stages pollute the boundaries), so anything past it stays silent.
+    target = next(
+        (
+            z
+            for z in zones
+            if isinstance(z, dict) and int(z.get("totalStage") or 0) > 0
+        ),
+        None,
+    )
     if target is None:
-        # seq beyond every zone's total (EX/ST stages) -> no hint
+        return None
+    total = int(target.get("totalStage") or 0)
+    if seq > total:
         return None
     cleared = int(target.get("clearedStage") or 0)
-    total = int(target.get("totalStage") or 0)
     zone_label = str(target.get("zoneId") or act_id)
     if cleared >= seq:
         return None
+    # Unlock progress changes daily but the roster refreshes lazily (7d) and
+    # skland returns the snapshot at last logout — stamp the age so a stale
+    # warning reads as stale instead of as a current fact.
+    age = roster_age_hint(roster)
+    suffix = f"（{age}，如已推进请忽略）" if age else ""
     if cleared >= seq - 1:
         return (
             f"⚠️ {zone_label} 仅通关 {cleared}/{total}：{stage_label} 的突袭大概率未解锁"
-            "（需先通关普通），点了可能空跑。"
+            f"（需先通关普通），点了可能空跑。{suffix}"
         )
     return (
         f"⚠️ {zone_label} 仅通关 {cleared}/{total}：{stage_label} 大概率未解锁"
-        "（突袭更不可能），点了可能空跑。"
+        f"（突袭更不可能），点了可能空跑。{suffix}"
     )
 
 
@@ -844,7 +852,7 @@ def roster_age_hint(roster: dict[str, Any]) -> str:
         return ""
     if days <= 0:
         return ""
-    return f"（练度数据 {days} 天前）"
+    return f"（森空岛数据 {days} 天前）"
 
 
 def search_summary(

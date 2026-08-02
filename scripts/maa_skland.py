@@ -206,6 +206,14 @@ def _normalize_chars(chars: list[dict[str, Any]], battle_data: dict[str, Any]) -
     return normalized
 
 
+def _safe_int(value: Any) -> int:
+    """int() that never raises (zone progress is optional hint data)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _normalize_activity_progress(activity: Any) -> dict[str, Any]:
     """actId -> [zone progress dicts] from player/info `activity`.
 
@@ -229,8 +237,8 @@ def _normalize_activity_progress(activity: Any) -> dict[str, Any]:
             cleaned.append(
                 {
                     "zoneId": str(zone.get("zoneId") or ""),
-                    "clearedStage": int(zone.get("clearedStage") or 0),
-                    "totalStage": int(zone.get("totalStage") or 0),
+                    "clearedStage": _safe_int(zone.get("clearedStage")),
+                    "totalStage": _safe_int(zone.get("totalStage")),
                 }
             )
         if cleaned:
@@ -262,11 +270,15 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(chars, list):
             raise RuntimeError("player/info chars 格式异常")
         battle = maa_copilot.battle_data({})
+        try:
+            progress = _normalize_activity_progress(
+                data.get("activity") if isinstance(data, dict) else None
+            )
+        except Exception:
+            progress = {}  # optional hint data must never break the roster
         return {
             "chars": _normalize_chars(chars, battle),
-            "activity_progress": _normalize_activity_progress(
-                data.get("activity") if isinstance(data, dict) else None
-            ),
+            "activity_progress": progress,
         }
 
     try:

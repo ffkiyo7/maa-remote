@@ -281,6 +281,12 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
    必须用探针比对 + 客户端过滤兜底（对应测试 `test_level_keyword_degradation_*`）。
 5. **作业 stage_name 两种写法并存**（内部 id / 展示码）：展示码的作业执行时从
    `/copilot/get/<id>` 取全文、改写 `stage_name` 为 stageId 后经 `file://` 传入。
+6. **解锁预检是单向的**（`zone_progress_warning`）：森空岛的 zone 进度含剧情关、
+   `stage_id` 序号只数战斗关——两把尺子。因此只有 `cleared < seq`（突袭必锁）和
+   `cleared < seq-1`（关卡必锁）两个方向成立；**有警告 = 基本锁着，没警告 = 不知道**，
+   绝不能在别处把「没警告」当成「已解锁」的依据（尤其不能拿去 gate 执行按钮）。
+   序号超出第一个 zone（act17side 型多 zone 活动）一律静默；警告带森空岛快照时效
+   标注（roster 7 天才懒刷新，进度却天天变）。
 
 ### 森空岛（`maa_skland.py`）
 

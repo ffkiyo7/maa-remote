@@ -951,6 +951,26 @@ class ZoneProgressTests(unittest.TestCase):
         self.assertEqual(progress["act53side"][1]["clearedStage"], 0)
         self.assertEqual(len(progress), 1)
 
+    def test_normalize_activity_progress_dirty_values_never_raise(self) -> None:
+        # P2-25: int() on garbage used to escape fetch_roster's RuntimeError
+        # retry guard and drop the whole roster for an optional hint field.
+        import maa_skland
+        activity = [
+            {
+                "actId": "act53side",
+                "zones": [
+                    {"zoneId": "act53side_zone1", "clearedStage": [1],
+                     "totalStage": "abc"},
+                    {"zoneId": "act53side_zone2", "clearedStage": None,
+                     "totalStage": 0},
+                ],
+            }
+        ]
+        progress = maa_skland._normalize_activity_progress(activity)
+        self.assertEqual(progress["act53side"][0]["clearedStage"], 0)
+        self.assertEqual(progress["act53side"][0]["totalStage"], 0)
+        self.assertEqual(progress["act53side"][1]["totalStage"], 0)
+
     def test_far_from_cleared_warns_both_modes(self) -> None:
         # The user's real situation: zone1 1/13 -> TO-9 almost surely locked.
         r = self._roster_with_progress([
@@ -970,27 +990,33 @@ class ZoneProgressTests(unittest.TestCase):
         ])
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
         self.assertIsNotNone(warning)
-        self.assertIn("突袭大概率未解锁", warning)
-        self.assertNotIn("大概率未解锁\n", warning)
+        self.assertIn("的突袭大概率未解锁", warning)
+        # the other tier's distinctive wording must be absent — this is the
+        # "raid only" case, not the "stage itself locked" case
+        self.assertNotIn("（突袭更不可能）", warning)
         self.assertIn("8/13", warning)
 
     def test_zone_cleared_through_stage_silent(self) -> None:
-        # cleared >= seq: normal AND raid both plausible -> no warning.
+        # cleared >= seq: cannot conclude anything -> no warning.  (silence
+        # means "unknown", never "unlocked" — see zone_progress_warning)
         r = self._roster_with_progress([
             {"zoneId": "act53side_zone1", "clearedStage": 9, "totalStage": 13},
         ])
         self.assertIsNone(maa_copilot.zone_progress_warning("TO-9", "act53side_09", r))
 
-    def test_stage_in_second_zone_maps_by_cumulative_total(self) -> None:
-        # zone1 holds stages 1..6, zone2 holds 7..13 -> TO-9 lands in zone2.
+    def test_stage_past_first_zone_silent(self) -> None:
+        # P0-22: numbered stages spilling past the first zone (real act17side
+        # shape: zone1 6 battle stages, zone2 3).  A global battle-stage
+        # number cannot be mapped onto a zone-local cleared count, so these
+        # must stay silent — even with every zone at 100% cleared, a wrong
+        # "not unlocked" on a fully cleared zone is worse than silence.
         r = self._roster_with_progress([
-            {"zoneId": "act53side_zone1", "clearedStage": 6, "totalStage": 6},
-            {"zoneId": "act53side_zone2", "clearedStage": 0, "totalStage": 7},
+            {"zoneId": "act17side_zone1", "clearedStage": 6, "totalStage": 6},
+            {"zoneId": "act17side_zone2", "clearedStage": 3, "totalStage": 3},
         ])
-        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
-        self.assertIsNotNone(warning)
-        self.assertIn("act53side_zone2", warning)
-        self.assertIn("0/7", warning)
+        self.assertIsNone(maa_copilot.zone_progress_warning("X-7", "act17side_07", r))
+        self.assertIsNone(maa_copilot.zone_progress_warning("X-8", "act17side_08", r))
+        self.assertIsNone(maa_copilot.zone_progress_warning("X-10", "act17side_10", r))
 
     def test_resource_and_main_stages_silent(self) -> None:
         r = self._roster_with_progress([
