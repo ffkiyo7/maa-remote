@@ -271,7 +271,8 @@ def cmd_run(token: str, number: str, mode: str) -> int:
 
     with run_lock(blocking=False) as acquired:
         if not acquired:
-            return 0  # daily run or another copilot owns the lock; stay silent
+            print("copilot run SKIPPED: run.lock 被占用（另一场 MAA 正在运行）")
+            return 0
         return _run_locked(state, candidate, index, mode)
 
 
@@ -579,10 +580,14 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
             }
         )
         cleanup_run_files(int(config.get("retention_days", 14)))
-        print(f"copilot run ok={ok} return_code={return_code} cleanup_errors={cleanup_errors}")
-        return 0 if ok else 1
+        print(f"copilot run ok={ok} return_code={return_code} cleanup_errors={cleanup_errors}", flush=True)
+        sys.stdout.flush()
+        # Force-exit: a lingering interpreter (threads/fds) once held run.lock
+        # for 10 minutes after a successful run, silently blocking the next
+        # copilot.  flock dies with the process, so this is safe.
+        os._exit(0 if ok else 1)
     except Exception as exc:
-        print(f"copilot run EXCEPTION: {type(exc).__name__}: {exc}")
+        print(f"copilot run EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
         cleanup_errors = []
         try:
             cleanup_errors = close_everything(config)
@@ -616,7 +621,8 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
                 "cleanup_errors": cleanup_errors,
             }
         )
-        return 1
+        sys.stdout.flush()
+        os._exit(1)
 
 
 def main(argv: list[str]) -> int:
