@@ -290,6 +290,15 @@ python3 deploy.py --check                  # 只检查 4 个脚本是否已部�
 3. **状态的部署策略不同**（`deploy_state()`，`deploy.py:90`）：
    - `config.json`：**逐键合并**，仓库的键覆盖同名键，本地新增键保留。
      注意仓库里的 `activity_stages` 会盖掉线上缓存，下一次计划卡会重新刷。
+   - **`channel_id` 例外**：仓库里存的是占位符 `REPLACE_WITH_DISCORD_CHANNEL_ID`，
+     真实频道 ID 不入库。`resolve_channel_id()`（`deploy.py:83`）按
+     `MAA_CHANNEL_ID` 环境变量 → 本机已部署的 `~/.hermes/state/maa/config.json`
+     的顺序解析，都拿不到就直接报错终止。已配置过的机器重跑 `deploy.py` 不需要带参数；
+     换新机器首次部署要写成：
+
+     ```bash
+     MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py
+     ```
    - `defaults.json` / `plan.json` / `last_run.json`：**只在不存在时**才复制种子，
      之后强制 `defaults.medicine="expiring"`、`defaults.stone=0`，并剥掉 `plan.json`
      里可能残留的 `medicine`/`stone`。

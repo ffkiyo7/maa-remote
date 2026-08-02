@@ -35,9 +35,13 @@
 `deploy.py` 会先在 `~/.hermes/backups/maa-setup/` 备份被修改的 Hermes 文件，再幂等部署
 脚本、状态、maa-cli 配置、技能、按钮白名单、频道绑定和免 @ 配置。
 
+真实 Discord 频道 ID 不入库：`state/config.json` 存的是占位符，部署时由
+`MAA_CHANNEL_ID` 或本机已部署的配置解析。
+
 ```bash
 python3 -m unittest discover -s tests -v
-python3 deploy.py
+python3 deploy.py                                  # 已配置过的机器
+MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py      # 新机器首次部署
 ```
 
 cron 的早晚任务使用不同工作目录传递场次标记，因为 Hermes 的 `--script` 不支持 argv：

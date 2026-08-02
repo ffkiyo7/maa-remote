@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 USER_HOME = Path.home()
 HERMES_HOME = USER_HOME / ".hermes"
 MAA_CONFIG_HOME = USER_HOME / ".config" / "maa-cli"
-CHANNEL_ID = "REPLACE_WITH_DISCORD_CHANNEL_ID"
+CHANNEL_PLACEHOLDER = "REPLACE_WITH_DISCORD_CHANNEL_ID"
 changed: list[str] = []
 backup_root = HERMES_HOME / "backups" / "maa-setup" / datetime.now().strftime("%Y%m%dT%H%M%S")
 backed_up: set[Path] = set()
@@ -80,6 +80,25 @@ def write_json(path: Path, value: Any) -> None:
     write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
+def resolve_channel_id() -> str:
+    """Resolve the Discord channel id without storing it in this repository.
+
+    Prefers an explicit MAA_CHANNEL_ID, then the value already deployed to this
+    machine, so a redeploy on a configured host needs no extra arguments.
+    """
+    configured = os.environ.get("MAA_CHANNEL_ID", "").strip()
+    if not configured:
+        deployed = load_json(HERMES_HOME / "state" / "maa" / "config.json", {})
+        if isinstance(deployed, dict):
+            configured = str(deployed.get("channel_id", "")).strip()
+    if configured in ("", CHANNEL_PLACEHOLDER) or not configured.isdigit():
+        raise RuntimeError(
+            "未解析到 Discord 频道 ID。首次部署请执行："
+            "MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py"
+        )
+    return configured
+
+
 def deploy_scripts() -> None:
     target = HERMES_HOME / "scripts"
     ensure_dir(target, 0o700)
@@ -87,7 +106,7 @@ def deploy_scripts() -> None:
         copy_file(ROOT / "scripts" / name, target / name, 0o700)
 
 
-def deploy_state() -> None:
+def deploy_state(channel_id: str) -> None:
     target = HERMES_HOME / "state" / "maa"
     ensure_dir(target)
     ensure_dir(target / "runs")
@@ -95,6 +114,9 @@ def deploy_state() -> None:
     ensure_dir(target / "pm")
 
     desired_config = load_json(ROOT / "state" / "config.json", {})
+    if isinstance(desired_config, dict):
+        # The repository only carries a placeholder; never let it reach disk.
+        desired_config["channel_id"] = channel_id
     current_config = load_json(target / "config.json", {})
     if not isinstance(current_config, dict):
         raise RuntimeError("existing MAA config.json is not an object")
@@ -263,7 +285,7 @@ def patch_local_patches() -> None:
     write_text(path, text, path.stat().st_mode & 0o777)
 
 
-def patch_env() -> None:
+def patch_env(channel_id: str) -> None:
     path = HERMES_HOME / ".env"
     lines = path.read_text(encoding="utf-8").splitlines()
     key = "DISCORD_FREE_RESPONSE_CHANNELS"
@@ -272,20 +294,20 @@ def patch_env() -> None:
         if line.startswith(key + "="):
             found = True
             values = [value.strip() for value in line.split("=", 1)[1].split(",") if value.strip()]
-            if CHANNEL_ID not in values:
-                values.append(CHANNEL_ID)
+            if channel_id not in values:
+                values.append(channel_id)
                 lines[index] = key + "=" + ",".join(values)
             break
     if not found:
-        lines.append(f"{key}={CHANNEL_ID}")
+        lines.append(f"{key}={channel_id}")
     write_text(path, "\n".join(lines) + "\n", 0o600)
 
 
-def patch_config_yaml() -> None:
+def patch_config_yaml(channel_id: str) -> None:
     path = HERMES_HOME / "config.yaml"
     text = path.read_text(encoding="utf-8")
     binding = (
-        f"      - id: '{CHANNEL_ID}'\n"
+        f"      - id: '{channel_id}'\n"
         "        skills:\n"
         "          - maa-operator\n"
     )
@@ -296,11 +318,11 @@ def patch_config_yaml() -> None:
         text = text.replace(marker, binding + marker)
 
     old_prompt = (
-        f"      '{CHANNEL_ID}': '你是 MAA 长草助手。只处理今天的关卡、临期理智药、跳过、立即运行和日志；"
+        f"      '{channel_id}': '你是 MAA 长草助手。只处理今天的关卡、临期理智药、跳过、立即运行和日志；"
         "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。'\n"
     )
     prompt = (
-        f"      '{CHANNEL_ID}': '你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
+        f"      '{channel_id}': '你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
         "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。'\n"
     )
     if old_prompt in text:
@@ -326,14 +348,15 @@ def main() -> int:
         print(json.dumps({"ok": not missing, "missing": missing}, ensure_ascii=False))
         return 0 if not missing else 1
 
+    channel_id = resolve_channel_id()
     deploy_scripts()
-    deploy_state()
+    deploy_state(channel_id)
     deploy_maa_config()
     deploy_skill()
     patch_adapter()
     patch_local_patches()
-    patch_env()
-    patch_config_yaml()
+    patch_env(channel_id)
+    patch_config_yaml(channel_id)
     print(json.dumps({"ok": True, "changed": changed, "backup": str(backup_root)}, ensure_ascii=False))
     return 0
 

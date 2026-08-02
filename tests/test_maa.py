@@ -504,6 +504,26 @@ Opening mini games:
         self.assertIn('(interaction.data or {}).get("values", [])', patched)
         self.assertEqual(deploy.patch_adapter_source(patched), patched)
 
+    def test_channel_id_is_resolved_and_placeholder_never_deploys(self) -> None:
+        repo_config = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
+        self.assertEqual(repo_config["channel_id"], deploy.CHANNEL_PLACEHOLDER)
+
+        with patch.dict(os.environ, {"MAA_CHANNEL_ID": "424242"}, clear=False):
+            self.assertEqual(deploy.resolve_channel_id(), "424242")
+
+        # Falls back to whatever this host already runs, so a redeploy on a
+        # configured machine needs no argument.
+        with patch.dict(os.environ, {"MAA_CHANNEL_ID": ""}, clear=False), patch.object(
+            deploy, "load_json", return_value={"channel_id": "999"}
+        ):
+            self.assertEqual(deploy.resolve_channel_id(), "999")
+
+        with patch.dict(os.environ, {"MAA_CHANNEL_ID": ""}, clear=False), patch.object(
+            deploy, "load_json", return_value={"channel_id": deploy.CHANNEL_PLACEHOLDER}
+        ):
+            with self.assertRaises(RuntimeError):
+                deploy.resolve_channel_id()
+
     def test_resource_update_due_uses_last_attempt(self) -> None:
         at = datetime(2026, 8, 8, 7, 50, tzinfo=BEIJING)
         self.assertTrue(maa_plan_card.resource_update_due({}, at, 7))
