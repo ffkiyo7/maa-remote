@@ -279,6 +279,10 @@ def _copilot_stage_select(
     select_args: dict[str, list[str]] = {}
     options: list[dict[str, Any]] = []
     for index, (label, stage, description) in enumerate(_stage_choices(plan, config)):
+        if not stage:
+            # "上次作战关卡" makes sense for farming, not for copilot: an
+            # empty stage would blow up `copilot find ""`.
+            continue
         value = f"copilot-choice:{index}"
         options.append(
             {
@@ -341,14 +345,15 @@ def build_components(
             "不要声称未从文件验证的执行结果。"
         ),
     }
-    return (
-        [
-            {"type": 1, "components": [stage_select]},
-            {"type": 1, "components": [copilot_select]},
-            {"type": 1, "components": action_buttons},
-        ],
-        registry,
-    )
+    rows: list[dict[str, Any]] = [
+        {"type": 1, "components": [stage_select]},
+        {"type": 1, "components": action_buttons},
+    ]
+    if copilot_select.get("options"):
+        # Discord rejects selects with zero options; skip the row entirely
+        # when there is nothing to offer (e.g. no known stages at all).
+        rows.insert(1, {"type": 1, "components": [copilot_select]})
+    return (rows, registry)
 
 
 def build_embed(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -444,7 +449,8 @@ def main() -> int:
                 registry.pop(custom_id)
         # Expire stale copilot candidate buttons (kept under their own
         # hermes:btn:maa-copilot: prefix, untouched by the sweep above).
-        maa_copilot.prune_expired_searches()
+        # Mutates this same registry so the write below can't resurrect them.
+        maa_copilot.prune_expired_searches(registry)
         registry.update(entries)
         atomic_write_json(BUTTONS_PATH, registry)
 

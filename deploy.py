@@ -146,7 +146,11 @@ def deploy_ocrbox() -> None:
         os.chmod(target, 0o700)
         changed.append(str(target))
     except Exception as exc:
-        print(f"ocrbox 编译跳过（{type(exc).__name__}）——接管弹窗自动处理不可用", file=sys.stderr)
+        print(
+            f"ocrbox 编译失败（{type(exc).__name__}: {exc}）——"
+            "接管弹窗 watchdog 将不可用，代理指挥开着的关卡会全部失败！",
+            file=sys.stderr,
+        )
 
 
 def deploy_state(channel_id: str) -> None:
@@ -395,6 +399,7 @@ def main() -> int:
                 "maa_copilot.py",
                 "maa_copilot_worker.py",
                 "maa_skland.py",
+                "ocrbox",
             )
         ]
         missing = [str(path) for path in checks if not path.is_file()]

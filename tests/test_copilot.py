@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -217,7 +218,11 @@ class MatchingTests(unittest.TestCase):
         item = op_item(1, "act53side_09", opers=[
             {"name": "史尔特尔", "skill": 2, "requirements": {"elite": 2}},
         ])
-        with patch.object(maa_copilot, "battle_data", return_value={}):
+        # battle_data resolves the name (char_350_surtr) but the roster does
+        # not own her -> hard gap "未拥有" (not the soft "无法校验" path).
+        with patch.object(maa_copilot, "battle_data", return_value={
+            "char_350_surtr": {"name": "史尔特尔"},
+        }):
             cand = maa_copilot.evaluate_candidate(item, r, CONFIG)
         self.assertEqual(cand["ratio"], 0.0)
         self.assertEqual(cand["gaps"], ["史尔特尔（未拥有）"])
@@ -452,12 +457,58 @@ class ButtonRegistryTests(unittest.TestCase):
                 "hermes:btn:maa-copilot:stage-select": {},
             })
             with patch.object(maa_common, "BUTTONS_PATH", buttons):
-                maa_copilot.prune_search_buttons("aaa111bbb222", count=3)
+                maa_copilot.prune_search_buttons("aaa111bbb222")
             registry = json.loads(buttons.read_text(encoding="utf-8"))
             self.assertNotIn("hermes:btn:maa-copilot:aaa111bbb222:1", registry)
             self.assertNotIn("hermes:btn:maa-copilot:aaa111bbb222:cancel", registry)
             self.assertIn("hermes:btn:maa-copilot:ccc333ddd444:1", registry)
             self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+
+    def test_prune_search_buttons_registry_in_place_removes_all_owned(self) -> None:
+        # P0-3: count=0 used to leave :1/:2/:3/:raid-* orphaned forever;
+        # now pruning is prefix-based and mutates the caller's registry.
+        registry: dict[str, Any] = {
+            "hermes:btn:maa-copilot:aaa111bbb222:1": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:2": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:3": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:raid-1": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:raid-2": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:raid-3": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:again": {},
+            "hermes:btn:maa-copilot:aaa111bbb222:cancel": {},
+            "hermes:btn:maa-copilot:stage-select": {},
+            "hermes:btn:agent-book:x": {},
+        }
+        maa_copilot.prune_search_buttons("aaa111bbb222", registry)
+        leftovers = [k for k in registry if "aaa111bbb222" in k]
+        self.assertEqual(leftovers, [])
+        self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+        self.assertIn("hermes:btn:agent-book:x", registry)
+
+    def test_prune_expired_searches_mutates_caller_registry(self) -> None:
+        # P0-4: plan_card used to read the registry, prune to disk, then
+        # overwrite with its stale copy -> buttons resurrected.  With the
+        # registry passed in, pruning and the final write share one dict.
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir(parents=True)
+            now = datetime.now().astimezone()
+            stale = {"token": "b" * 12, "expires_at": (now - timedelta(hours=1)).isoformat()}
+            (searches / ("b" * 12 + ".json")).write_text(json.dumps(stale), encoding="utf-8")
+            registry: dict[str, Any] = {
+                "hermes:btn:maa-copilot:" + "b" * 12 + ":1": {},
+                "hermes:btn:maa-copilot:" + "b" * 12 + ":raid-1": {},
+                "hermes:btn:maa-copilot:" + "b" * 12 + ":cancel": {},
+                "hermes:btn:agent-book:x": {},
+            }
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches):
+                removed = maa_copilot.prune_expired_searches(registry)
+            self.assertEqual(removed, 1)
+            self.assertFalse((searches / ("b" * 12 + ".json")).exists())
+            self.assertNotIn("hermes:btn:maa-copilot:" + "b" * 12 + ":1", registry)
+            self.assertNotIn("hermes:btn:maa-copilot:" + "b" * 12 + ":raid-1", registry)
+            self.assertNotIn("hermes:btn:maa-copilot:" + "b" * 12 + ":cancel", registry)
+            self.assertIn("hermes:btn:agent-book:x", registry)
 
     def test_expired_searches_are_pruned_fresh_kept(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -472,7 +523,7 @@ class ButtonRegistryTests(unittest.TestCase):
                  patch.object(maa_copilot, "prune_search_buttons") as prune:
                 removed = maa_copilot.prune_expired_searches()
             self.assertEqual(removed, 1)
-            prune.assert_called_once_with("b" * 12)
+            prune.assert_called_once_with("b" * 12, None)
             self.assertTrue((searches / ("a" * 12 + ".json")).exists())
 
 
@@ -490,6 +541,24 @@ class PickValidationTests(unittest.TestCase):
         at = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
         with patch.object(maa_action, "now_beijing", return_value=at):
             self.assertIsNone(maa_action._copilot_blackout_reason(self.config))
+
+    def test_blackout_month_end_never_raises(self) -> None:
+        # P0-2: day+1 arithmetic blew up on the last day of the month.
+        # The point is that these never raise; near-run times refuse,
+        # far-from-run times pass.
+        cases = [
+            (datetime(2026, 8, 31, 20, 0, tzinfo=BEIJING), None),
+            (datetime(2026, 8, 31, 9, 0, tzinfo=BEIJING), None),
+            (datetime(2026, 2, 28, 21, 50, tzinfo=BEIJING), "refuse"),
+            (datetime(2026, 12, 31, 7, 50, tzinfo=BEIJING), "refuse"),
+        ]
+        for at, expected in cases:
+            with patch.object(maa_action, "now_beijing", return_value=at):
+                reason = maa_action._copilot_blackout_reason(self.config)
+            if expected is None:
+                self.assertIsNone(reason, f"{at} 不应拒绝")
+            else:
+                self.assertIsNotNone(reason, f"{at} 应拒绝")
 
     def test_pick_rejects_bad_token_index_mode(self) -> None:
         with patch.object(maa_action, "load_config", return_value=self.config):
@@ -564,7 +633,9 @@ class SklandTests(unittest.TestCase):
         self.assertEqual(entry["name"], "史尔特尔")
         self.assertEqual(entry["elite"], 2)
         self.assertEqual(entry["skills"], [0, 2])
-        self.assertEqual(entry["module_levels"], [1])  # locked module excluded
+        # Locked modules keep their slot as 0 (P1-6): filtering them out
+        # would shift module_levels[req_module-1] onto the wrong module.
+        self.assertEqual(entry["module_levels"], [1, 0])
 
     def test_skland_files_are_0600_after_link(self) -> None:
         import maa_skland
@@ -574,7 +645,8 @@ class SklandTests(unittest.TestCase):
                  patch.object(maa_skland, "HG_TOKEN_FILE", root / "hg_token.txt"), \
                  patch.object(maa_skland, "refresh_roster", return_value={"chars": {}, "uid": "1"}), \
                  patch("sys.stdin", io.StringIO("tok123\n")):
-                rc = maa_skland.link_from_stdin()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = maa_skland.link_from_stdin()
             self.assertEqual(rc, 0)
             self.assertEqual((root / "skland.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((root / "hg_token.txt").stat().st_mode & 0o777, 0o600)
@@ -602,6 +674,158 @@ class DeployTokenTests(unittest.TestCase):
                 deploy.deploy_skland_token()
             token_file = hermes_home / "state" / "maa" / "copilot" / "hg_token.txt"
             self.assertFalse(token_file.exists())
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Regression tests for REVIEW_PHASE2.md findings (P0/P1/P2)."""
+
+    def test_prepare_op_file_unwraps_real_get_response_shape(self) -> None:
+        # P0-1: /copilot/get really returns
+        # {"status_code":…,"data":{…,"content":"<json string>"}}; the old
+        # code read payload["content"] which is always None -> every
+        # display-code op failed with "内容获取失败".
+        import maa_copilot_worker as worker
+        real_content = json.dumps(
+            {"version": 3, "stage_name": "TO-9", "opers": []}, ensure_ascii=False
+        )
+        real_payload = {
+            "status_code": 200,
+            "data": {"id": 98660, "title": "演示", "content": real_content},
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            prepared = Path(raw) / "prepared"
+            prepared.mkdir(parents=True)
+            with patch.object(maa_copilot, "http_get_json", return_value=real_payload), \
+                 patch.object(maa_copilot, "PREPARED_DIR", prepared):
+                uri, rewrite = worker._prepare_op_file(
+                    {"id": 98660, "stage_name": "TO-9"}, "act53side_09", {}
+                )
+            self.assertTrue(rewrite)
+            self.assertTrue(uri.startswith("file://"))
+            written = json.loads((prepared / "98660.json").read_text(encoding="utf-8"))
+            self.assertEqual(written["stage_name"], "act53side_09")
+
+    def test_prepare_op_file_rejects_flat_payload(self) -> None:
+        # The buggy shape (content at top level) must NOT be accepted.
+        import maa_copilot_worker as worker
+        flat = {"content": json.dumps({"version": 3, "stage_name": "TO-9"})}
+        with tempfile.TemporaryDirectory() as raw:
+            prepared = Path(raw) / "prepared"
+            prepared.mkdir(parents=True)
+            with patch.object(maa_copilot, "http_get_json", return_value=flat), \
+                 patch.object(maa_copilot, "PREPARED_DIR", prepared):
+                with self.assertRaises(RuntimeError):
+                    worker._prepare_op_file(
+                        {"id": 98660, "stage_name": "TO-9"}, "act53side_09", {}
+                    )
+
+    def test_roster_refresh_failure_degrades_to_stale_roster(self) -> None:
+        # P1-5: lazy refresh runs inside cmd_search; a throwing refresh must
+        # not abort the search — the stale roster still produces candidates.
+        import maa_copilot_worker as worker
+        import maa_skland
+        roster_data = roster({"char_479_surtr": char(elite=2, level=90)})
+        stale_state = {
+            "token": "a" * 12,
+            "status": "pending",
+            "stage": "TO-9",
+            "stage_id": "act53side_09",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir(parents=True)
+            buttons = Path(raw) / "buttons.json"
+            (searches / ("a" * 12 + ".json")).write_text(
+                json.dumps(stale_state), encoding="utf-8"
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "SEARCH_LOCK_PATH", Path(raw) / "search.lock"), \
+                 patch.object(maa_copilot, "prune_expired_searches", return_value=0), \
+                 patch.object(worker, "BUTTONS_PATH", buttons), \
+                 patch.object(worker, "load_config",
+                              return_value={"channel_id": "1"}), \
+                 patch.object(maa_copilot, "load_stage_index",
+                              return_value={"stages": {"act53side_09": {}}}), \
+                 patch.object(maa_copilot, "load_roster", return_value=roster_data), \
+                 patch.object(maa_copilot, "search_copilots",
+                              return_value=[op_item(1, "act53side_09")]), \
+                 patch.object(maa_copilot, "build_candidate_card",
+                              return_value=({"title": "x"}, [], {})), \
+                 patch.object(worker, "discord_request", return_value={"id": "111"}), \
+                 patch.object(worker, "discord_token", return_value="tok"), \
+                 patch.object(worker, "state_lock",
+                              return_value=contextlib.nullcontext()), \
+                 patch.object(maa_skland, "roster_needs_refresh", return_value=True), \
+                 patch.object(maa_skland, "refresh_roster",
+                              side_effect=RuntimeError("skland down")):
+                rc = worker.cmd_search("a" * 12)
+            self.assertEqual(rc, 0)
+            state = json.loads((searches / ("a" * 12 + ".json")).read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "done")
+
+    def test_module_levels_keep_locked_slots_in_place(self) -> None:
+        # P1-6: filtering locked equips collapsed the list and shifted
+        # module_levels[req_module-1] to the wrong module.
+        import maa_skland
+        chars = [
+            {
+                "charId": "char_350_surtr",
+                "level": 90,
+                "evolvePhase": 2,
+                "mainSkillLvl": 7,
+                "skills": [{"id": 1, "specializeLevel": 2}],
+                "equip": [
+                    {"id": "mod1", "locked": True, "level": 0},
+                    {"id": "mod2", "locked": False, "level": 3},
+                ],
+            }
+        ]
+        battle = {"char_350_surtr": {"name": "史尔特尔"}}
+        normalized = maa_skland._normalize_chars(chars, battle)
+        self.assertEqual(normalized["char_350_surtr"]["module_levels"], [0, 3])
+        r = roster(normalized)
+        satisfied, score, hard, soft = maa_copilot.check_op_requirements(
+            {"name": "史尔特尔", "requirements": {"module": 1}}, r, {}
+        )
+        # module is a soft constraint: satisfied stays True but score halves
+        self.assertTrue(satisfied)
+        self.assertEqual(score, 0.5)
+        self.assertTrue(any("模组1" in gap for gap in soft))
+        satisfied2, _score2, hard2, _soft2 = maa_copilot.check_op_requirements(
+            {"name": "史尔特尔", "requirements": {"module": 2}}, r, {}
+        )
+        self.assertTrue(satisfied2)
+        self.assertEqual(hard2, [])
+        self.assertEqual(_soft2, [])
+
+    def test_unknown_operator_is_soft_gap_not_hard(self) -> None:
+        # P2-14: a name missing from local battle_data (new operator, stale
+        # resources) must be a soft gap, not a fake "未拥有" hard gap.
+        r = roster({"char_479_surtr": char(elite=2, level=90)})
+        with patch.object(maa_copilot, "name_to_char_ids", return_value=[]):
+            satisfied, score, hard, soft = maa_copilot.check_op_requirements(
+                {"name": "未来新干员", "requirements": {"elite": 2}}, r, {}
+            )
+        self.assertFalse(satisfied)
+        self.assertEqual(hard, [])
+        self.assertEqual(len(soft), 1)
+        self.assertIn("无法校验", soft[0])
+        self.assertLess(score, 1.0)
+
+    def test_search_limit_one_returns_one(self) -> None:
+        # P2-10: candidates[:max(3, limit)] ignored limit<3.
+        with patch.object(maa_copilot, "load_roster", return_value=None), \
+             patch.object(maa_copilot, "prts_query") as query:
+            query.side_effect = [
+                {"data": {"total": 2, "filtered": 2}, "status_code": 200},  # probe
+                {"data": {"list": [op_item(1, "act53side_09"), op_item(2, "act53side_09")]},
+                 "status_code": 200},
+            ]
+            result = maa_copilot.search_copilots(
+                "act53side_09", "TO-9", {}, None, limit=1
+            )
+        self.assertEqual(len(result), 1)
+
 
 
 if __name__ == "__main__":

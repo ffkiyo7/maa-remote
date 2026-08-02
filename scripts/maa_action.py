@@ -9,7 +9,7 @@ import re
 import secrets
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -259,7 +259,7 @@ def _copilot_blackout_reason(config: dict[str, Any]) -> str | None:
     for hour in (8, 22):
         target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
         if now > target:
-            target = target.replace(day=target.day + 1)
+            target = target + timedelta(days=1)
         delta = (target - now).total_seconds() / 60
         if delta <= minutes:
             return (
@@ -333,7 +333,10 @@ def copilot_cancel(token: str) -> tuple[bool, str]:
     state["status"] = "canceled"
     atomic_write_json(_search_path(token), state)
     with state_lock():
-        maa_copilot.prune_search_buttons(token)
+        registry = load_json(BUTTONS_PATH, {})
+        if isinstance(registry, dict):
+            maa_copilot.prune_search_buttons(token, registry)
+            atomic_write_json(BUTTONS_PATH, registry)
     return True, "❌ 已取消，相关按钮已清理。"
 
 

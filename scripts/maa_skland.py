@@ -183,10 +183,12 @@ def _normalize_chars(chars: list[dict[str, Any]], battle_data: dict[str, Any]) -
         module_levels: list[int] = []
         equips = raw.get("equip") or []
         if isinstance(equips, list):
+            # Keep slot order intact: locked modules occupy their slot as 0,
+            # otherwise module_levels[req_module-1] would read the wrong one.
             module_levels = [
-                int(e.get("level") or 0)
+                0 if e.get("locked") else int(e.get("level") or 0)
                 for e in equips
-                if isinstance(e, dict) and not e.get("locked")
+                if isinstance(e, dict)
             ]
         normalized[char_id] = {
             "name": str(info.get("name") or char_id)[:40],

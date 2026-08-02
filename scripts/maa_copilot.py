@@ -42,8 +42,6 @@ SEARCH_LOCK_PATH = COPILOT_DIR / "copilot_search.lock"
 PREPARED_DIR = COPILOT_DIR / "prepared"
 
 PRTS_BASE = "https://prts.maa.plus"
-USER_AGENT = "Hermes-MAA-copilot/1.0"
-MAX_HTTP_BYTES = 8 * 1024 * 1024
 CACHE_TTL = timedelta(hours=12)
 SEARCH_TTL = timedelta(hours=25)
 SEARCH_TOKEN_RE = re.compile(r"^[0-9a-f]{12}$")
@@ -103,7 +101,6 @@ def build_stage_index(config: dict[str, Any]) -> dict[str, Any]:
         "resource_signature": resource_signature(config),
         "codes": codes,
         "stages": stages,
-        "raid_variants": [],
     }
     atomic_write_json(STAGE_INDEX_PATH, index)
     return index
@@ -258,27 +255,29 @@ def skill_label(level: int) -> str:
 
 def lookup_roster_char(
     roster: dict[str, Any], name: str, config: dict[str, Any]
-) -> tuple[dict[str, Any] | None, bool]:
+) -> tuple[dict[str, Any] | None, bool, bool]:
     """Resolve an op name against the roster.
 
-    Returns (char, summon): char is the roster entry or None; summon is True
-    when the name only resolves to token_*/trap_* (ignore, not a gap).
+    Returns (char, summon, unknown): char is the roster entry or None;
+    summon is True when the name only resolves to token_*/trap_* (ignore,
+    not a gap); unknown is True when the name cannot be resolved at all
+    (local battle_data lags new operators -> soft gap, not a hard one).
     """
     chars = roster.get("chars", {}) if isinstance(roster, dict) else {}
     if not isinstance(chars, dict) or not chars:
-        return None, False
+        return None, False, False
     resolved = name_to_char_ids(name, config)
     if not resolved:
-        return None, False  # unknown name -> not owned
+        return None, False, True  # unknown name -> cannot verify
     for char_id in resolved:
         if not char_id.startswith("char_"):
             continue
         entry = chars.get(char_id)
         if isinstance(entry, dict):
-            return entry, False
-        return None, False  # known operator absent from roster -> not owned
+            return entry, False, False
+        return None, False, False  # known operator absent from roster -> not owned
     # only summons matched -> treat as satisfied (e.g. Mon3tr)
-    return None, True
+    return None, True, False
 
 
 def check_op_requirements(
@@ -308,10 +307,12 @@ def check_op_requirements(
     if roster is None:
         return True, 1.0, [], []  # degraded mode: cannot verify
 
-    char, summon = lookup_roster_char(roster, name, config)
+    char, summon, unknown = lookup_roster_char(roster, name, config)
     if summon:
         return True, 1.0, [], []
     if char is None:
+        if unknown:
+            return False, 0.5, [], [f"{name}（本地资源未收录，无法校验）"]
         return False, 0.0, [f"{name}（未拥有）"], []
 
     hard: list[str] = []
@@ -508,7 +509,7 @@ def fetch_stage_copilots(
                 empty_pages += 1
             else:
                 empty_pages = 0
-            if empty_pages >= 2 or not inner.get("has_next"):
+            if empty_pages >= 4 or not inner.get("has_next"):
                 break
             page += 1
 
@@ -581,7 +582,7 @@ def search_copilots(
         ),
         reverse=True,
     )
-    return candidates[: max(3, limit)]
+    return candidates[: max(1, limit)]
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +617,11 @@ def ensure_private_dirs() -> None:
         os.chmod(path, 0o700)
 
 
+def search_button_prefix(token: str) -> str:
+    """Registry key prefix owned by one search (trailing ':' keeps it exact)."""
+    return f"{BUTTON_PREFIX}{token}:"
+
+
 def search_button_ids(token: str, count: int) -> list[str]:
     """All registry ids owned by one search (pick/raid/cancel/again)."""
     ids = [f"{BUTTON_PREFIX}{token}:cancel", f"{BUTTON_PREFIX}{token}:again"]
@@ -625,16 +631,25 @@ def search_button_ids(token: str, count: int) -> list[str]:
     return ids
 
 
-def prune_search_buttons(token: str, count: int = 0) -> None:
-    """Remove one search's registry keys (call under state_lock)."""
-    ids = set(search_button_ids(token, count))
-    prune_button_registry(BUTTON_PREFIX, remove_only=ids)
+def prune_search_buttons(token: str, registry: dict[str, Any] | None = None) -> None:
+    """Remove ALL registry keys owned by one search (call under state_lock).
+
+    registry given -> mutate it in place, caller persists (avoids lost update);
+    registry None  -> read-modify-write BUTTONS_PATH directly.
+    """
+    prefix = search_button_prefix(token)
+    if registry is not None:
+        for custom_id in [k for k in registry if k.startswith(prefix)]:
+            registry.pop(custom_id)
+        return
+    prune_button_registry(prefix)
 
 
-def prune_expired_searches() -> int:
+def prune_expired_searches(registry: dict[str, Any] | None = None) -> int:
     """Remove expired search state files and their buttons; returns count.
 
-    Call under state_lock so registry pruning shares the same lock.
+    Call under state_lock.  Pass the caller's in-memory registry when the
+    caller will persist it, otherwise this writes BUTTONS_PATH itself.
     """
     ensure_private_dirs()
     now = now_beijing()
@@ -652,7 +667,7 @@ def prune_expired_searches() -> int:
         if expired_flag:
             expired.append(path.stem)
     for token in expired:
-        prune_search_buttons(token)
+        prune_search_buttons(token, registry)
         try:
             (SEARCHES_DIR / f"{token}.json").unlink()
         except FileNotFoundError:

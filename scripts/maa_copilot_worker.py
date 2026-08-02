@@ -18,12 +18,20 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import maa_copilot
+from maa_daily import (
+    capture_screenshot,
+    close_everything,
+    open_emulator,
+    verify_game_installed,
+    wait_for_android,
+)
 from maa_common import (
     BUTTONS_PATH,
     LAST_RUN_PATH,
@@ -121,6 +129,16 @@ def cmd_search(token: str) -> int:
             code = str(state.get("stage") or "")
             if not stage_id or stage_id not in index.get("stages", {}):
                 raise RuntimeError(f"关卡 {code} 已不在本地索引中")
+            try:
+                import maa_skland
+
+                if maa_skland.roster_needs_refresh(config):
+                    maa_skland.refresh_roster()
+            except Exception as exc:
+                print(
+                    f"roster refresh skipped: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             roster = maa_copilot.load_roster()
             roster_ok = roster is not None
             candidates = maa_copilot.search_copilots(
@@ -149,10 +167,10 @@ def cmd_search(token: str) -> int:
             message_id = str(message.get("id", "")) if isinstance(message, dict) else ""
 
             with state_lock():
-                maa_copilot.prune_search_buttons(token)
                 registry = load_json(BUTTONS_PATH, {})
                 if not isinstance(registry, dict):
                     raise RuntimeError("共享按钮登记表格式错误")
+                maa_copilot.prune_search_buttons(token, registry)
                 registry.update(entries)
                 atomic_write_json(BUTTONS_PATH, registry)
 
@@ -196,10 +214,12 @@ def _prepare_op_file(candidate: dict[str, Any], stage_id: str, config: dict[str,
     if not needs_rewrite:
         return uri, False
     cand_id = int(candidate.get("id") or 0)
-    data = maa_copilot.http_get_json(
+    payload = maa_copilot.http_get_json(
         f"{maa_copilot.PRTS_BASE}/copilot/get/{cand_id}", timeout=30
     )
-    content = data.get("content") if isinstance(data, dict) else None
+    # Real shape: {"status_code":…, "data":{…, "content":"<json string>"}}
+    inner = payload.get("data") if isinstance(payload, dict) else None
+    content = inner.get("content") if isinstance(inner, dict) else None
     if isinstance(content, str):
         try:
             content = json.loads(content)
@@ -444,14 +464,6 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
         )
 
         # Emulator -> game ready -> navigate to formation screen -> copilot
-        from maa_daily import (
-            capture_screenshot,
-            close_everything,
-            open_emulator,
-            verify_game_installed,
-            wait_for_android,
-        )
-
         open_emulator(config)
         wait_for_android(config)
         verify_game_installed(config)
@@ -511,9 +523,9 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
             pass
         # Only the current run's section: everything after the last run marker.
         marker_index = -1
-        for index in range(len(raw_lines) - 1, -1, -1):
-            if raw_lines[index].startswith("# ") and "copilot" in raw_lines[index]:
-                marker_index = index
+        for line_index in range(len(raw_lines) - 1, -1, -1):
+            if raw_lines[line_index].startswith("# ") and "copilot" in raw_lines[line_index]:
+                marker_index = line_index
                 break
         if marker_index >= 0:
             raw_lines = raw_lines[marker_index + 1:]
@@ -580,7 +592,16 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
             }
         )
         cleanup_run_files(int(config.get("retention_days", 14)))
-        print(f"copilot run ok={ok} return_code={return_code} cleanup_errors={cleanup_errors}", flush=True)
+        # Diagnostic for the one observed hang: a successful run whose
+        # interpreter lingered ~10 min holding run.lock.  Neither
+        # discord_request nor discord_upload can block (both have timeouts);
+        # if this ever re-appears the next run's output shows what was alive.
+        threads = [t.name for t in threading.enumerate()]
+        print(
+            f"copilot run ok={ok} return_code={return_code} "
+            f"cleanup_errors={cleanup_errors} threads={threads}",
+            flush=True,
+        )
         sys.stdout.flush()
         # Force-exit: a lingering interpreter (threads/fds) once held run.lock
         # for 10 minutes after a successful run, silently blocking the next
