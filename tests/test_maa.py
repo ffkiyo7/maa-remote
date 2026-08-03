@@ -119,7 +119,19 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("medicine = 0", rendered)
         self.assertIn("medicine_expire_days = 2", rendered)
         self.assertIn('name = "返回主界面"', rendered)
-        self.assertIn('task_names = ["Home", "QuickSwitch@ToHome", "ReturnButtons"]', rendered)
+        # Every QuickSwitch/ReturnButtons name must carry the "Home@" caller
+        # prefix, otherwise `#back` resolves to a non-existent task and the
+        # chain errors out after it has already reached the home page.
+        self.assertIn(
+            'task_names = ["Home", "Home@QuickSwitch@ToHome@Entry", '
+            '"Home@QuickSwitch@ToHome@Open", "Home@ReturnButton", '
+            '"Home@FromStageSN", "Home@FromAnnihilation"]',
+            rendered,
+        )
+        self.assertNotIn('"QuickSwitch@ToHome"', rendered)
+        self.assertNotIn('"ReturnButtons"', rendered)
+        for name in maa_daily.HOME_TASK_NAMES[1:]:
+            self.assertTrue(name.startswith("Home@"), name)
 
     def test_persisted_medicine_choice_cannot_disable_fixed_expiry_policy(self) -> None:
         self.plan["medicine"] = "none"
@@ -579,6 +591,187 @@ class RetentionTests(unittest.TestCase):
             self.assertEqual(removed, ["old.log"])
             self.assertFalse(old.exists())
             self.assertTrue(fresh.exists())
+
+
+# Text columns copied verbatim from ocrbox output on real 1920x1080 captures.
+HOME_OCR = "\n".join(
+    [
+        "透明信笺\t[114,111,117,33]",
+        "wado\t[97,583,131,44]",
+        "2026/08/03 08:09\t[1216,17,255,66]",
+        "TERMINA\t[1382,163,206,47]",
+        "终端\t[1384,217,50,28]",
+        "理智/207\t[1239,314,120,33]",
+        "SANITY\t[1238,345,108,23]",
+        "SOUADS\t[1248,495,119,40]",
+        "编队\t[1311,538,50,28]",
+        "采购中心\t[1244,733,128,42]",
+        "公开招募\t[1509,722,103,36]",
+        "任务\t[1308,923,47,33]",
+        "基建\t[1643,962,55,33]",
+        "好友\t[608,867,30,17]",
+        "档案\t[605,948,33,22]",
+    ]
+)
+# The 任务 (mission) list page — where a broken return-to-home chain leaves us.
+# It also says 好友, which is why a single marker must never be enough.
+MISSION_OCR = "\n".join(
+    [
+        "日常任务\t[826,27,135,53]",
+        "台周常任务\t[1057,24,204,60]",
+        "主线任务\t[1426,33,131,36]",
+        "特勤任务\t[1685,30,142,39]",
+        "reauirement通关任意关卡10次\t[733,178,360,30]",
+        "使用好友助战干员完成任意关卡5次\t[816,640,503,39]",
+        "累计歼灭任意1000名敌兵\t[834,485,354,36]",
+    ]
+)
+SPLASH_OCR = "\n".join(
+    [
+        "鹰角网络\t[691,399,235,73]",
+        "HYPERGRYPH\t[736,462,142,30]",
+        "健康游戏忠告：抵制不良游戏，拒绝盗版游戏。\t[114,722,1691,33]",
+    ]
+)
+
+
+class HomeScreenshotTests(unittest.TestCase):
+    """The screenshot is the deliverable, so it gets verified on its own."""
+
+    def _verify(self, stdout: str, returncode: int = 0) -> tuple[bool | None, str]:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "ocrbox").write_text("#!/bin/sh\n")
+            shot = root / "shot.png"
+            shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+            with patch.object(maa_daily, "SCRIPTS_DIR", root), patch.object(
+                maa_daily.subprocess,
+                "run",
+                return_value=SimpleNamespace(returncode=returncode, stdout=stdout, stderr=""),
+            ):
+                return maa_daily.verify_home_screenshot(shot)
+
+    def test_real_home_capture_is_accepted(self) -> None:
+        verified, detail = self._verify(HOME_OCR)
+        self.assertIs(verified, True)
+        self.assertIn("终端", detail)
+        self.assertIn(f"/{len(maa_daily.HOME_MARKERS)}", detail)
+
+    def test_mission_page_and_splash_are_rejected(self) -> None:
+        for sample in (MISSION_OCR, SPLASH_OCR):
+            verified, _ = self._verify(sample)
+            self.assertIs(verified, False)
+
+    def test_one_incidental_marker_is_not_enough(self) -> None:
+        self.assertGreater(maa_daily.HOME_MARKER_MIN, 1)
+        verified, detail = self._verify("使用好友助战干员完成任意关卡5次\t[0,0,1,1]")
+        self.assertIs(verified, False)
+        self.assertIn("好友", detail)
+
+    def test_unreadable_ocr_never_turns_a_good_run_red(self) -> None:
+        # None means "cannot tell" and must stay distinct from False.
+        self.assertIsNone(self._verify("", returncode=1)[0])
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            shot = root / "shot.png"
+            shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+            with patch.object(maa_daily, "SCRIPTS_DIR", root):
+                verified, detail = maa_daily.verify_home_screenshot(shot)
+            self.assertIsNone(verified)
+            self.assertIn("ocrbox", detail)
+
+    def test_capture_retries_while_the_home_page_animates_in(self) -> None:
+        seen: list[str] = []
+
+        def fake_capture(config: dict[str, object], path: Path) -> tuple[bool, str]:
+            seen.append("capture")
+            return True, ""
+
+        results = [(False, "识别到 0/8 个主页标识"), (True, "识别到 8/8 个主页标识")]
+        with patch.object(maa_daily, "capture_screenshot", fake_capture), patch.object(
+            maa_daily, "verify_home_screenshot", lambda path: results.pop(0)
+        ), patch.object(maa_daily.time, "sleep", lambda seconds: None):
+            ok, error, verified, detail = maa_daily.capture_home_screenshot(
+                {"home_screenshot_attempts": 3}, Path("/tmp/shot.png")
+            )
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        self.assertIs(verified, True)
+        self.assertIn("8/8", detail)
+        self.assertEqual(len(seen), 2)
+
+    def test_capture_failure_short_circuits_without_ocr(self) -> None:
+        with patch.object(
+            maa_daily, "capture_screenshot", lambda config, path: (False, "adb 挂了")
+        ), patch.object(maa_daily, "verify_home_screenshot", lambda path: (True, "不该被调用")), patch.object(
+            maa_daily.time, "sleep", lambda seconds: None
+        ):
+            ok, error, verified, _ = maa_daily.capture_home_screenshot({}, Path("/tmp/shot.png"))
+        self.assertFalse(ok)
+        self.assertEqual(error, "adb 挂了")
+        self.assertIsNone(verified)
+
+    def test_a_screenshot_that_is_not_home_fails_the_run(self) -> None:
+        lines = ["StartUp Completed", "Award Completed", "Custom Start", "Custom Completed"]
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        summary = maa_daily.extract_summary(
+            lines,
+            [],
+            plan=plan,
+            ok=False,
+            home_verified=False,
+            home_verify_detail="识别到 0/8 个主页标识",
+        )
+        self.assertIn("🌟 总体：❌ 未完成", summary)
+        self.assertIn("🏠 返回主界面：❌ 未完成（截图不在主页：识别到 0/8 个主页标识）", summary)
+        payload = maa_daily.report_payload(
+            ok=False,
+            phase="am",
+            plan=plan,
+            duration=60,
+            summary=summary,
+            screenshot_ok=True,
+            screenshot_error="",
+            cleanup_errors=[],
+            home_verified=False,
+            home_verify_detail="识别到 0/8 个主页标识",
+        )
+        notes = [f for f in payload["embeds"][0]["fields"] if f["name"] == "备注"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("截图不是游戏主页", notes[0]["value"])
+
+    def test_a_verified_home_annotates_even_when_maa_errored(self) -> None:
+        # Exactly the 2026-08-03 早场 case: the chain errored, the game was home.
+        lines = ["StartUp Completed", "Custom Start", "Custom Error"]
+        summary = maa_daily.extract_summary(
+            lines,
+            [],
+            plan=maa_common.normalize_plan({"stage": "1-7"}),
+            ok=False,
+            home_verified=True,
+            home_verify_detail="识别到 8/8 个主页标识",
+        )
+        self.assertIn("🏠 返回主界面：❌ 未完成（截图已确认在主页）", summary)
+
+    def test_home_gate_does_not_touch_copilot(self) -> None:
+        # 抄作业 must keep using the plain capture; it never ends on the home page.
+        worker = (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8")
+        self.assertIn("capture_screenshot(config, png_path)", worker)
+        self.assertNotIn("capture_home_screenshot", worker)
+        self.assertNotIn("verify_home_screenshot", worker)
+
+    def test_checked_in_daily_toml_matches_the_renderer(self) -> None:
+        toml = (ROOT / "config" / "maa-cli" / "tasks" / "daily.toml").read_text(encoding="utf-8")
+        rendered = maa_daily.render_daily_toml(
+            maa_common.normalize_plan({"stage": "", "tasks": {}}),
+            {"medicine_expire_days": 2, "fight_times": 2147483647, "recruit_times": 4},
+        )
+        for line in rendered.splitlines():
+            if line.startswith("task_names = "):
+                self.assertIn(line, toml)
+                break
+        else:  # pragma: no cover - the renderer always emits the Custom task
+            self.fail("renderer emitted no task_names line")
 
 
 if __name__ == "__main__":

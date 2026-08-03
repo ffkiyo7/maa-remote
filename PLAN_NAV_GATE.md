@@ -318,7 +318,9 @@ python3 ~/.hermes/scripts/maa_action.py run now      # 必须照跑
 
 - **半自动模式**（手动进编队界面 + 「就地开打」按钮）——用户明确否决。
 - **用 `type = "Custom"` 自建导航链。** maa-cli 确实支持
-  （实测 `Custom Start` → 因界面状态而 `Custom Error`，类型本身可用），
+  （实测 `Custom Start` → `Custom Error`，类型本身可用。**订正**：当时归因为「界面状态」
+  是错的，真实原因是裸调 `QuickSwitch@ToHome` 让 `#back` 无从解析，见 DEV_GUIDE §步骤 7；
+  已于 2026-08-03 修复。这反而佐证了下面这条顾虑——自建链踩的就是未文档化的内部语义），
   理论上可用 `TOChapterToTO` + `FullStageNavigation` + `ClickStageName` 拼出
   TO-1~TO-6 的导航。**但依赖 MAA 未文档化的内部任务名，每次 `maa update` 都可能失效，
   收益只是活动本前几关。** 真要做单独立项，不要塞进本次。

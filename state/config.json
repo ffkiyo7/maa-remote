@@ -14,6 +14,7 @@
   "quit_grace_seconds": 10,
   "cleanup_verify_timeout": 10,
   "home_screenshot_delay": 1,
+  "home_screenshot_attempts": 3,
   "medicine_expire_days": 2,
   "fight_times": 2147483647,
   "recruit_times": 4,

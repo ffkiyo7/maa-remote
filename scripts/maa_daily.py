@@ -19,6 +19,7 @@ from maa_common import (
     BEIJING,
     MAA_CONFIG_DIR,
     RUNS_DIR,
+    SCRIPTS_DIR,
     atomic_write_json,
     atomic_write_text,
     cleanup_run_files,
@@ -51,6 +52,28 @@ TASK_STEPS = (
     ("Award", "🎁", "领取奖励", "正在领取日常与周常奖励"),
     ("Custom", "🏠", "返回主界面", "正在返回游戏主界面，准备截图"),
 )
+
+# MAA 的 QuickSwitch 是子程序：点完小房子里的首页图标后，只能靠 next 里的 `#back`
+# 回到调用方来确认成功，而 `#back` 取的是任务名第一个 `@` 之前的前缀。裸写
+# "QuickSwitch@ToHome" 时前缀是并不存在的 "QuickSwitch"，`#back` 被静默丢弃
+# （日志里 to_be_recognized 只剩 4 项，json 里是 5 项），于是画面已经回到主页却没有
+# 任何任务能判定成功，空转到 20 次重试耗尽报 Custom Error——2026-08-02、08-03 两个
+# 早场都是这样红的。加上 "Home@" 前缀后 `#back` → "Home"（action = Stop），认出主页
+# 立即成功收尾。这里手工展开 MAA 自己用的
+# ["Home@QuickSwitch@ToHome#next", "Home@ReturnButtons#next"]，因为顶层 task_names 是
+# 原样交给 ProcessTask 的，不走 next 列表那套 `#` 展开。
+HOME_TASK_NAMES = [
+    "Home",
+    "Home@QuickSwitch@ToHome@Entry",
+    "Home@QuickSwitch@ToHome@Open",
+    "Home@ReturnButton",
+    "Home@FromStageSN",
+    "Home@FromAnnihilation",
+]
+# 主页面独有的界面文案，用本机 Vision OCR（ocrbox）核对截图确实停在主页。
+# 只取在实机截图里稳定读出的词：任务列表页也有「好友」，所以单个命中不算数。
+HOME_MARKERS = ("终端", "编队", "采购中心", "公开招募", "基建", "好友", "档案", "SANITY")
+HOME_MARKER_MIN = 4
 
 
 def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
@@ -162,7 +185,7 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
         'name = "返回主界面"\n'
         'type = "Custom"\n'
         "[tasks.params]\n"
-        'task_names = ["Home", "QuickSwitch@ToHome", "ReturnButtons"]\n'
+        f"task_names = {json.dumps(HOME_TASK_NAMES, ensure_ascii=False)}\n"
     )
     return "\n".join(blocks)
 
@@ -311,6 +334,8 @@ def extract_summary(
     *,
     plan: dict[str, Any] | None = None,
     ok: bool | None = None,
+    home_verified: bool | None = None,
+    home_verify_detail: str = "",
 ) -> str:
     lines = [_clean_line(line, 500) for line in stdout_lines + stderr_lines if line.strip()]
     tasks = (plan or {}).get("tasks", {})
@@ -359,6 +384,14 @@ def extract_summary(
                 details.append(f"招募 {recruited.group(1)} 次")
             if refreshed:
                 details.append(f"刷新 {refreshed.group(1)} 次")
+        elif key == "Custom":
+            # 截图才是最终交付物，所以它说了算：MAA 报错但截图确实在主页时说清楚，
+            # 反之截图不在主页就把这一步判红，哪怕 MAA 自称完成。
+            if home_verified is True:
+                details.append("截图已确认在主页")
+            elif home_verified is False:
+                status = "❌ 未完成"
+                details.append(f"截图不在主页：{home_verify_detail}" if home_verify_detail else "截图不在主页")
         suffix = f"（{'；'.join(details)}）" if details else ""
         result.append(f"{emoji} {label}：{status}{suffix}")
     return "\n".join(result)[:3900]
@@ -467,6 +500,63 @@ def capture_screenshot(config: dict[str, Any], path: Path) -> tuple[bool, str]:
         except FileNotFoundError:
             pass
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def verify_home_screenshot(path: Path) -> tuple[bool | None, str]:
+    """Check that a captured screenshot really shows the game home page.
+
+    Returns (True | False | None, detail).  ``None`` means "could not tell"
+    (ocrbox missing, OCR crashed) — that must never turn a good run red, so the
+    caller only treats an explicit ``False`` as a failure.  Daily runs only:
+    抄作业 keeps using capture_screenshot directly and is not gated by this.
+    """
+    ocrbox = SCRIPTS_DIR / "ocrbox"
+    if not path.is_file():
+        return None, "没有截图可校验"
+    if not ocrbox.is_file():
+        return None, "ocrbox 未部署，跳过主页校验"
+    try:
+        result = subprocess.run(
+            [str(ocrbox), str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except Exception as exc:
+        return None, f"OCR 失败：{type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        return None, f"OCR 失败：{result.stderr.strip()[:120]}"
+    # ocrbox prints "文本\t[x,y,w,h]" per line; only the text column matters.
+    text = "\n".join(line.split("\t", 1)[0] for line in result.stdout.splitlines())
+    hits = [marker for marker in HOME_MARKERS if marker in text]
+    detail = (
+        f"识别到 {len(hits)}/{len(HOME_MARKERS)} 个主页标识"
+        + (f"（{'、'.join(hits)}）" if hits else "")
+    )
+    return len(hits) >= HOME_MARKER_MIN, detail
+
+
+def capture_home_screenshot(
+    config: dict[str, Any], path: Path
+) -> tuple[bool, str, bool | None, str]:
+    """Capture the end-of-run screenshot and confirm it is the home page.
+
+    Retries a few times because the home page animates in; each attempt waits
+    the same settle delay the single-shot version used.
+    """
+    delay = max(0.0, float(config.get("home_screenshot_delay", 1)))
+    attempts = max(1, int(config.get("home_screenshot_attempts", 3)))
+    ok, error, verified, detail = False, "未执行", None, ""
+    for _ in range(attempts):
+        time.sleep(delay)
+        ok, error = capture_screenshot(config, path)
+        if not ok:
+            return ok, error, None, "没有截图可校验"
+        verified, detail = verify_home_screenshot(path)
+        if verified is not False:
+            break
+    return ok, error, verified, detail
 
 
 def close_everything(config: dict[str, Any]) -> list[str]:
@@ -661,11 +751,15 @@ def report_payload(
     screenshot_ok: bool,
     screenshot_error: str,
     cleanup_errors: list[str],
+    home_verified: bool | None = None,
+    home_verify_detail: str = "",
 ) -> dict[str, Any]:
     label = PHASE_LABELS[phase]
     notes: list[str] = []
     if not screenshot_ok:
         notes.append(f"截图失败：{screenshot_error}")
+    if home_verified is False:
+        notes.append(f"截图不是游戏主页：{home_verify_detail}")
     if cleanup_errors:
         notes.append("清理异常：" + "；".join(cleanup_errors))
     embed: dict[str, Any] = {
@@ -836,6 +930,8 @@ def execute(phase: str) -> int:
         return_code = 1
         screenshot_ok = False
         screenshot_error = "未执行"
+        home_verified: bool | None = None
+        home_verify_detail = ""
         cleanup_errors: list[str] = []
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
@@ -881,9 +977,14 @@ def execute(phase: str) -> int:
                 config, log_path, token, thread_id, progress_message_id, plan
             )
             # The final Custom task has returned to Home. Let the last UI
-            # animation settle, then capture before the separate CloseDown.
-            time.sleep(max(0, float(config.get("home_screenshot_delay", 1))))
-            screenshot_ok, screenshot_error = capture_screenshot(config, screenshot_path)
+            # animation settle, then capture before the separate CloseDown and
+            # confirm by OCR that the frame we ship really is the home page.
+            (
+                screenshot_ok,
+                screenshot_error,
+                home_verified,
+                home_verify_detail,
+            ) = capture_home_screenshot(config, screenshot_path)
         except Exception as exc:
             stderr_lines.append(f"{type(exc).__name__}: {exc}")
             return_code = 1
@@ -900,8 +1001,15 @@ def execute(phase: str) -> int:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
         duration = (now_beijing() - started).total_seconds()
-        ok = return_code == 0 and not cleanup_errors
-        summary = extract_summary(stdout_lines, stderr_lines, plan=plan, ok=ok)
+        ok = return_code == 0 and not cleanup_errors and home_verified is not False
+        summary = extract_summary(
+            stdout_lines,
+            stderr_lines,
+            plan=plan,
+            ok=ok,
+            home_verified=home_verified,
+            home_verify_detail=home_verify_detail,
+        )
         if thread_id and progress_message_id:
             final_heading = f"{'✅' if ok else '❌'} 结束 · 总耗时 {_format_duration(duration)}"
             try:
@@ -932,6 +1040,8 @@ def execute(phase: str) -> int:
                 screenshot_ok=screenshot_ok,
                 screenshot_error=screenshot_error,
                 cleanup_errors=cleanup_errors,
+                home_verified=home_verified,
+                home_verify_detail=home_verify_detail,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
         merge_last_run(
@@ -943,6 +1053,8 @@ def execute(phase: str) -> int:
                 "log": str(log_path),
                 "screenshot": str(screenshot_path) if screenshot_ok else None,
                 "screenshot_error": screenshot_error if not screenshot_ok else None,
+                "home_verified": home_verified,
+                "home_verify_detail": home_verify_detail,
                 "cleanup_errors": cleanup_errors,
                 "summary": summary,
             }

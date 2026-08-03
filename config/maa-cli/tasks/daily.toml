@@ -64,7 +64,15 @@ mining = false
 name = "返回主界面"
 type = "Custom"
 [tasks.params]
-task_names = ["Home", "QuickSwitch@ToHome", "ReturnButtons"]
+task_names = ["Home", "Home@QuickSwitch@ToHome@Entry", "Home@QuickSwitch@ToHome@Open", "Home@ReturnButton", "Home@FromStageSN", "Home@FromAnnihilation"]
 
+# Every name is prefixed with "Home@" on purpose. QuickSwitch is a subroutine
+# that reports success through `#back`, which resolves to the prefix before the
+# first `@`; called bare, `#back` became the non-existent "QuickSwitch" task and
+# was dropped, so the chain span out and failed *after* reaching the home page.
+# This is MAA's own ["Home@QuickSwitch@ToHome#next", "Home@ReturnButtons#next"]
+# expanded by hand — top-level task_names go to ProcessTask verbatim and do not
+# get the `#` expansion that next-lists receive.
+#
 # CloseDown intentionally does not belong here. The final Custom task returns
 # to Home, maa_daily.py takes the screenshot, then closes the game separately.

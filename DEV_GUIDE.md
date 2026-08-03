@@ -156,6 +156,17 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 
    `StartUp → Fight → Infrast → Recruit → Mall → Award → Custom(Home)`
 
+   最后那个 `Custom` 的 `task_names` **每一项都必须带 `Home@` 前缀**（见
+   `maa_daily.HOME_TASK_NAMES`）。MAA 的 `QuickSwitch` 是子程序，点完小房子里的首页图标
+   之后只能靠 `next` 里的 `#back` 回到调用方来判定成功，而 `#back` 取的是任务名**第一个
+   `@` 之前**的前缀。裸写 `"QuickSwitch@ToHome"` 时前缀是并不存在的 `QuickSwitch`，
+   `#back` 被静默丢弃（asst.log 里 `to_be_recognized` 只剩 4 项，资源 json 里是 5 项），
+   于是画面明明已经回到主页，却没有任何任务能判定成功，空转到 20 次重试耗尽报
+   `Custom Error`——2026-08-02、08-03 两个早场都是这样红的。加前缀后 `#back` → `Home`
+   （`action = Stop`），认出主页立即成功收尾。列表是 MAA 自己那套
+   `["Home@QuickSwitch@ToHome#next", "Home@ReturnButtons#next"]` 手工展开的：顶层
+   `task_names` 原样交给 `ProcessTask`，不走 `next` 列表那套 `#` 展开。
+
    其中 `medicine = 0`、`stone = 0`、`series = 0` 是**硬编码字面量**，不从任何状态派生；
    `Infrast` 固定 `mode = 20000`（只点游戏内预设队列轮换）。**链里没有 CloseDown**——
    它被拆出去在截图之后单独跑。
@@ -166,12 +177,21 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
    - 超时 `maa_run_timeout`（默认 3000s = 50 分钟）→ terminate/kill，返回码记 **124**。
      外层 Hermes cron 的上限是 3600s，这 10 分钟余量留给截图与清理。
    - `KeyboardInterrupt` → 返回码 **130**。
-9. **截图** — 等 `home_screenshot_delay` 秒让动画稳定 → `adb exec-out screencap -p`，
-   校验 PNG magic 后 chmod 600。**失败不阻断**，只在战报里标一句。
+9. **截图 + 主页校验**（`capture_home_screenshot()`）— 等 `home_screenshot_delay` 秒让动画
+   稳定 → `adb exec-out screencap -p` → 校验 PNG magic 后 chmod 600 → 用本机 Vision OCR
+   （`~/.hermes/scripts/ocrbox`）核对画面里有没有 `HOME_MARKERS`（终端/编队/采购中心/
+   公开招募/基建/好友/档案/SANITY），命中 ≥ `HOME_MARKER_MIN`（4）才算真在主页；
+   不在就重截，最多 `home_screenshot_attempts`（默认 3）次。
+   - 截图**失败不阻断**，只在战报里标一句。
+   - 校验**判定为 False**（确实不在主页）会让整场判红，并在战报备注栏写明命中数。
+   - 校验**无法判定**（ocrbox 没部署 / OCR 崩了）记 `None`，不改变结论，只写进
+     `last_run.home_verify_detail`——宁可漏报也不能凭一个不确定的信号误杀好场次。
+   - 这条闸门只挂在日常链上。抄作业结束在战斗结算界面而不是主页，`maa_copilot_worker`
+     仍然直接调 `capture_screenshot()`，不受影响。
 10. **`close_everything()`**（`:472`，在 `finally` 里）— `maa closedown Official` →
     `osascript quit`（bundle id）→ sleep `quit_grace_seconds` → `pkill -f BlueStacks` 兜底 →
     `adb disconnect` → 用 `[B]lueStacks` 这种加方括号的模式 `pgrep` 复核残留（防止匹配到自己）。
-11. **判定与上报** — `ok = (return_code == 0 and not cleanup_errors)`。最后编辑一次子区消息
+11. **判定与上报** — `ok = (return_code == 0 and not cleanup_errors and home_verified is not False)`。最后编辑一次子区消息
     （✅/❌ + 总耗时），然后往频道发战报 Embed + `attachment://shot.png` 单条多段消息；
     多段上传失败时降级成「无图 Embed + `hermes send MEDIA:`」两条。最后写 `last_run.json`。
 
@@ -429,6 +449,8 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 3 | `series = 0`（由 MaaCore 选当前理智支持的最大连战） | `render_daily_toml` 字面量 |
 | 4 | 基建只做 `mode = 20000` 预设队列轮换，facility 只列 `Mfg/Trade/Reception` | `render_daily_toml` |
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
+| 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
+| 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |
 | 6 | 按钮脚本必须 < 20s 返回 | `run_now()`/`copilot_*` 用 `Popen`；活动关探测 0.7s |
 | 7 | `buttons.json` 只能 merge，且只碰 `hermes:btn:maa:` 前缀 | `maa_plan_card.main()` |
 | 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv | adapter 补丁 + `_stage_select()`/`_copilot_stage_select()` |
@@ -481,6 +503,8 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、�
 | 聊天改计划无效 | 看 agent 是否真的调了 `maa_action.py`；`plan.json` 的 `date` 是否是今天 |
 | 战报里步骤全是「未执行」 | maa-cli 输出格式变了 → 改 `_task_state()` / `TASK_STEPS` |
 | 截图失败 | ADB 断了或返回非 PNG；不阻断主流程，看 Embed 备注 |
+| 战报说「截图不是游戏主页」 | 看 `runs/<date>-<phase>.png` 到底停在哪一页；`last_run.home_verify_detail` 有命中了几个标识。UI 改版导致误杀就调 `HOME_MARKERS` |
+| `返回主界面` 报 Error 但截图确实在主页 | `maa update` 后 QuickSwitch 任务图变了 → 翻 `asst.log` 里 `taskchain":"Custom"` 的 `to_be_recognized`，对照资源 json 看少了哪一项 |
 | `deploy.py` 报 “no longer matches baseline” | Hermes 升级动了 adapter → 按 §7 更新补丁串 |
 
 现场排查常用：
