@@ -627,8 +627,12 @@ class PickValidationTests(unittest.TestCase):
 
     def test_pick_dispatches_worker_with_exact_argv(self) -> None:
         state = {"token": "a" * 12, "stage": "TO-9", "candidates": [{"id": 98774}]}
+        # Pin the clock: pick goes through _copilot_blackout_reason, so without
+        # this the test only passes outside 07:35-08:00 and 21:35-22:00.
+        noon = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
         with patch.object(maa_action, "load_config", return_value=self.config), \
              patch.object(maa_action, "_load_search", return_value=state), \
+             patch.object(maa_action, "now_beijing", return_value=noon), \
              patch.object(maa_action, "is_run_locked", return_value=False), \
              patch.object(maa_action.subprocess, "Popen") as popen, \
              patch.object(maa_action.Path, "is_file", return_value=True):
@@ -905,17 +909,32 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_search_limit_one_returns_one(self) -> None:
         # P2-10: candidates[:max(3, limit)] ignored limit<3.
-        with patch.object(maa_copilot, "load_roster", return_value=None), \
-             patch.object(maa_copilot, "prts_query") as query:
-            query.side_effect = [
-                {"data": {"total": 2, "filtered": 2}, "status_code": 200},  # probe
-                {"data": {"list": [op_item(1, "act53side_09"), op_item(2, "act53side_09")]},
-                 "status_code": 200},
-            ]
+        #
+        # Stub the fetch rather than prts_query: fetch_stage_copilots makes a
+        # variable number of queries (probe, level_keyword paging, two document
+        # searches, degraded scan), so a fixed side_effect list goes
+        # StopIteration the moment that shape changes.  CACHE_DIR is redirected
+        # too — this used to read and write the real ~/.hermes copilot cache and
+        # only passed while a fresh act53side_09.json happened to sit there.
+        # Each item needs at least one oper slot, otherwise evaluate_candidate
+        # drops it and the assertion below passes/fails for the wrong reason.
+        items = [
+            op_item(index, "act53side_09", opers=[{"name": "x", "skill": 1}])
+            for index in (1, 2)
+        ]
+        with tempfile.TemporaryDirectory() as raw, \
+             patch.object(maa_copilot, "CACHE_DIR", Path(raw)), \
+             patch.object(maa_copilot, "load_roster", return_value=None), \
+             patch.object(maa_copilot, "fetch_stage_copilots", return_value=items) as fetch:
             result = maa_copilot.search_copilots(
                 "act53side_09", "TO-9", {}, None, limit=1
             )
-        self.assertEqual(len(result), 1)
+            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(len(result), 1)
+            # Same fetch, default limit: proves the slice follows limit.
+            self.assertEqual(
+                len(maa_copilot.search_copilots("act53side_09", "TO-9", {}, None)), 2
+            )
 
 
 
