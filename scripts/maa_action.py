@@ -130,7 +130,10 @@ def _confirmation(plan: dict[str, Any], was_running: bool) -> str:
             target = "下一场仍在今天时会采用新计划"
         return f"{phase}正在跑 {running_stage}，不打断它；{target}。"
     if skip:
-        return f"今天（{now.month}/{now.day}）的自动场次已设为跳过。"
+        return (
+            f"今天（{now.month}/{now.day}）的自动场次已设为跳过；"
+            "说「现在跑」仍然可以手动开一场。"
+        )
     return (
         f"今天（{now.month}/{now.day}）刷 {stage}，{medicine}；"
         "早 8 点和晚 10 点各跑一次。"
@@ -194,7 +197,8 @@ def run_now() -> tuple[bool, str]:
         start_new_session=True,
         close_fds=True,
     )
-    return True, "▶️ 已派发手动场；后台会自行加锁，开跑消息稍后出现在频道。"
+    note = "（今天设了跳过自动场次，手动场照跑）" if effective_plan().get("skip") else ""
+    return True, f"▶️ 已派发手动场{note}；后台会自行加锁，开跑消息稍后出现在频道。"
 
 
 def log_tail() -> tuple[bool, str]:

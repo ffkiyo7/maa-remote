@@ -319,7 +319,7 @@ def build_components(
     skip_spec = (
         ("▶️ 恢复自动场次", "unskip", 3, ["plan", "skip-today", "off"])
         if plan.get("skip")
-        else ("⏭️ 今天跳过", "skip", 4, ["plan", "skip-today", "on"])
+        else ("⏭️ 跳过自动场次", "skip", 4, ["plan", "skip-today", "on"])
     )
     action_specs = [skip_spec, ("📋 最近结果", "log", 2, ["log", "tail"])]
     action_buttons: list[dict[str, Any]] = []
@@ -359,7 +359,8 @@ def build_components(
 def build_embed(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     activity_stages = config.get("activity_stages", [])
     activity_note = "、".join(str(item) for item in activity_stages) or "未配置"
-    skip = "是" if plan.get("skip") else "否"
+    # skip 只作用于 08:00/22:00；手动开跑是明确指令，永远照跑，别让卡片读成全停。
+    skip = "是（手动开跑不受影响）" if plan.get("skip") else "否"
     return {
         "title": "🌱 MAA 今日计划",
         "description": "从下拉菜单选择关卡；今天的覆盖会在明天自动失效。",
@@ -371,7 +372,7 @@ def build_embed(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
                 "value": medicine_label(str(plan.get("medicine", "none"))),
                 "inline": False,
             },
-            {"name": "跳过今天", "value": skip, "inline": True},
+            {"name": "跳过自动场次", "value": skip, "inline": True},
             {"name": "当前活动关", "value": activity_note[:1024], "inline": False},
             {
                 "name": "自动场次",

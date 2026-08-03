@@ -855,6 +855,17 @@ def send_direct_failure(
     )
 
 
+def should_skip(plan: dict[str, Any], phase: str) -> bool:
+    """Whether this run bails out before touching the emulator.
+
+    `skip` only silences the 08:00 / 22:00 cron sessions.  A manual run is the
+    user asking for it right now, which overrides today's plan by definition —
+    otherwise "跳过今天" would leave no way to run at all short of un-skipping,
+    which would also bring the automatic sessions back.
+    """
+    return bool(plan.get("skip")) and phase != "now"
+
+
 def execute(phase: str) -> int:
     started = now_beijing()
     config = load_config()
@@ -902,7 +913,7 @@ def execute(phase: str) -> int:
             }
         )
 
-        if plan.get("skip"):
+        if should_skip(plan, phase):
             discord_request(
                 token,
                 "POST",
@@ -911,7 +922,8 @@ def execute(phase: str) -> int:
                     "embeds": [
                         {
                             "title": f"⏭️ MAA 日常·{PHASE_LABELS[phase]}已跳过",
-                            "description": "今日计划设置了跳过；未启动模拟器。",
+                            "description": "今日计划设置了跳过自动场次；未启动模拟器。"
+                            "手动开跑（「现在跑」）不受影响。",
                             "color": 0x99AAB5,
                             "timestamp": started.isoformat(),
                         }

@@ -60,10 +60,10 @@ token 形如 12 位十六进制，来自搜索确认消息，不要猜测。
 - “刷 CE-6 / 今天 CE-6 / 改成 1-7” → `plan set-stage CE-6` / `1-7`
 - “刷上次的本 / 默认关卡” → `plan set-stage ""`
 - “吃药 / 不吃药 / 揉揉乐” → 说明规则已固定：普通药 0、只自动使用临期药、碎石 0
-- “今天别跑 / 跳过今天” → `plan skip-today on`
+- “今天别跑 / 跳过今天” → `plan skip-today on`（只关掉 08:00、22:00 两个自动场次）
 - “恢复今天” → `plan skip-today off`
 - “今天怎么跑 / 看计划” → `plan show`
-- “现在跑” → `run now`
+- “现在跑” → `run now`（手动场豁免 skip：设了跳过也照跑，这是明确指令）
 - “看日志 / 最近怎么了” → `log tail`（只返回中文结果，不展示 CLI 原文）
 - “抄 TO-9 / TO-9 有没有作业 / 帮我抄一下” → `copilot find TO-9`
 - “作业结果呢 / 匹配到哪了” → 让用户直接看频道里的候选卡片；也可 `copilot status <token>`

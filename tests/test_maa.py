@@ -68,6 +68,48 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(tomorrow["stage"], "1-7")
             self.assertEqual(tomorrow["medicine"], "expiring")
 
+    def test_skip_wording_everywhere_says_manual_still_runs(self) -> None:
+        skipped = maa_common.normalize_plan({"skip": True})
+        self.assertIn("现在跑", maa_action._confirmation(skipped, False))
+        card = maa_plan_card.build_embed(skipped, {})
+        field = next(f for f in card["fields"] if f["name"] == "跳过自动场次")
+        self.assertIn("手动开跑不受影响", field["value"])
+        components, registry = maa_plan_card.build_components(
+            maa_common.normalize_plan({"skip": False}), {"channel_id": "1"}
+        )
+        labels = [
+            component["label"]
+            for row in components
+            for component in row.get("components", [])
+            if "label" in component
+        ]
+        self.assertIn("⏭️ 跳过自动场次", labels)
+        self.assertNotIn("⏭️ 今天跳过", labels)
+        self.assertTrue(any(entry["kind"] == "exec" for entry in registry.values()))
+
+    def test_run_now_receipt_flags_the_skip_override(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            script = Path(raw) / "maa_daily.py"
+            script.write_text("#!/usr/bin/env python3\n")
+            with patch.object(maa_action, "SCRIPTS_DIR", Path(raw)), patch.object(
+                maa_action, "is_run_locked", lambda: False
+            ), patch.object(maa_action, "load_config", lambda: {}), patch.object(
+                maa_action, "require_executable", lambda *args: None
+            ), patch.object(
+                maa_action.subprocess, "Popen", lambda *args, **kwargs: None
+            ):
+                with patch.object(
+                    maa_action, "effective_plan", lambda: {"skip": True}
+                ):
+                    ok, message = maa_action.run_now()
+                self.assertTrue(ok)
+                self.assertIn("手动场照跑", message)
+                with patch.object(
+                    maa_action, "effective_plan", lambda: {"skip": False}
+                ):
+                    _ok, plain = maa_action.run_now()
+                self.assertNotIn("跳过", plain)
+
     def test_stage_allowlist(self) -> None:
         config = {"activity_stages": ["SSReopen-IC"], "maa_bin": "/missing/maa"}
         self.assertTrue(maa_action.valid_stage("", config))
@@ -146,6 +188,16 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("times = 0", rendered)
         self.assertIn("series = 0", rendered)
         self.assertIn("stone = 0", rendered)
+
+    def test_skip_only_silences_the_automatic_sessions(self) -> None:
+        skipped = maa_common.normalize_plan({"skip": True})
+        running = maa_common.normalize_plan({"skip": False})
+        self.assertTrue(maa_daily.should_skip(skipped, "am"))
+        self.assertTrue(maa_daily.should_skip(skipped, "pm"))
+        # 手动场是明确指令，否则「跳过今天」之后就完全没法开跑了。
+        self.assertFalse(maa_daily.should_skip(skipped, "now"))
+        for phase in ("am", "pm", "now"):
+            self.assertFalse(maa_daily.should_skip(running, phase))
 
     def test_phase_uses_cron_workdir_marker(self) -> None:
         at = datetime(2026, 8, 2, 16, 0, tzinfo=BEIJING)

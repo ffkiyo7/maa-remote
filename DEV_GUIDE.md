@@ -145,7 +145,9 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
    `last_run.json` 置 `status=running` 并把上一场的终态字段清空（避免运行中读到旧结果）。
    > 快照是「跑起来之后再改计划不影响本场」的实现基础——后续对 `plan.json` 的写入
    > 既改不了内存里这个 dict，也改不了这个文件。
-4. `plan.skip` 为真 → 发一条灰色「已跳过」Embed，`status=skipped`，结束。**不开模拟器。**
+4. `plan.skip` 为真**且 `phase != "now"`** → 发一条灰色「已跳过」Embed，`status=skipped`，
+   结束。**不开模拟器。** skip 只关掉 08:00/22:00 两个自动场次；手动场是用户当场下的
+   明确指令，本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会提示这一点）。
 5. **预检 → 起模拟器** — `require_executable` 校验 maa/adb 可执行（**在开模拟器之前**）→
    `open -a BlueStacks` → 轮询 `adb connect` + `getprop sys.boot_completed`（超时 180s）→
    `pm path com.hypergryph.arknights` 确认国服客户端已装。任一步失败且此时还没建子区，
@@ -451,6 +453,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
 | 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
 | 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |
+| 5d | `skip` 只挡自动场次；`phase == "now"` 永远照跑 | `execute()` 的 skip 分支带 `and phase != "now"` |
 | 6 | 按钮脚本必须 < 20s 返回 | `run_now()`/`copilot_*` 用 `Popen`；活动关探测 0.7s |
 | 7 | `buttons.json` 只能 merge，且只碰 `hermes:btn:maa:` 前缀 | `maa_plan_card.main()` |
 | 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv | adapter 补丁 + `_stage_select()`/`_copilot_stage_select()` |
