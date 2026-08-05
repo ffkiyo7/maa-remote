@@ -499,6 +499,7 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、�
 | 症状 | 先看 |
 |---|---|
 | 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fi bluestacks`；或 cron 被 pause |
+| 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `open_emulator()` 还早 → `ls /Applications/BlueStacks.app`。整个 bundle 不见了就是 §11.12 的自杀式清理 |
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
 | 点按钮/下拉没反应或报未登记 | 卡片过期（每天 07:50 会清前缀重写）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
@@ -543,3 +544,29 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
    手动复现问题时弹窗确认按钮在正文下方约 100px（1920×1080）。
 11. **关卡未解锁**：活动本按顺序解锁，没打前面的关时导航找不到节点、报「导航到编队界面失败」——
     是预期行为不是 bug；用户应先打前面的关或换资源本/主线。
+12. **动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带 LaunchDaemon
+    `/Library/LaunchDaemons/com.now.gg.BlueStacks.cleanup.plist`，`WatchPaths` 盯着
+    `/Applications/BlueStacks.app`、`/Applications/BlueAI.app`、
+    `/Applications/BlueStacks Air multi-instance manager.app`。任一路径变动即触发
+    `/Library/Application Support/BlueStacks/BlueStacksCleanup`，而该脚本的判定是
+    「三个里少任何一个」就把三个连同 `/Users/Shared/Library/Application Support/BlueStacks`
+    全部 `rm -rf`，收尾还会删掉自己和那个 plist（所以事后翻 `LaunchDaemons` 什么也找不到）。
+
+    2026-08-04 22:17:55 用 mole 卸载捆绑的 BlueAI，就这样把模拟器和实例数据一起清空了；
+    `/var/log/bst_cleanup.log` 留有带时间戳的完整记录，是排查这类「模拟器凭空消失」的第一现场。
+
+    - **症状**：场次 0.x 秒内 `return_code=1`、`runs/<date>-<phase>.log` 根本没生成、
+      `last_run.thread_id=null`、战报七项全「未执行」。因为 `adb_path` 指向
+      `/Applications/BlueStacks.app/Contents/MacOS/hd-adb`（见 §11.4），bundle 一没
+      `require_executable()` 就抛，比 `open_emulator()` 还早一步。
+    - **要卸 BlueAI 就先拆引信**：`sudo launchctl bootout system
+      /Library/LaunchDaemons/com.now.gg.BlueStacks.cleanup.plist` 并删掉该 plist，再动 app。
+      直接 `mo uninstall` / 拖废纸篓都会引爆。
+    - **重装不恢复实例数据**，得重走一遍：`brew install --cask bluestacks`（pkg 装机要 sudo，
+      无 TTY 时用 `open` 调 GUI 安装器）→ 重建实例（4 核 / 4GB / **1920×1080 横屏**，
+      默认实例是 1080×1920 竖屏，横屏不改 MAA 必然识别不到）→ 装国服 APK → 重新登录。
+    - **国服 APK 官方下载链**：`https://ak.hypergryph.com/downloads/android_lastest` → 302 →
+      `https://launcher.hypergryph.com/game/latest/GzD1CpaWgmSq1wew/1/1` → 302 → `ak.hycdn.cn`
+      上的 `arknights-hg-<版本>.apk`（2.7.61 约 2.0GB）。装前可验签名者应为
+      `CN=HyperGryph, O=HyperGryph, L=Shanghai`：
+      `unzip -p <apk> META-INF/ARKNIGHT.RSA | openssl pkcs7 -inform DER -print_certs -text`。
