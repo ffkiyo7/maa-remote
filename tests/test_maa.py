@@ -625,6 +625,303 @@ Opening mini games:
         self.assertEqual(request.call_args.args[1:3], ("POST", "/channels/123/messages"))
 
 
+# 2026-08-07 早场 TO-9 的真实日志骨架：代理指挥失误连着四批，理智全额返还，
+# 而 MaaCore 照样判 Fight Completed 并把返还的理智汇总成 `total drops`。
+PROXY_WIPEOUT_LOG = [
+    "StartUp Completed",
+    "Fight Start",
+    "Current sanity: 115/207",
+    "Mission started (1 times, use 105 sanity)",
+    "Drops: 理智 × 105",
+    "Current sanity: 116/207",
+    "Mission started (5 times, use 105 sanity)",
+    "Drops: 理智 × 105",
+    "Current sanity: 116/207",
+    "Mission started (5 times, use 105 sanity)",
+    "Drops: 理智 × 105",
+    "Current sanity: 117/207",
+    "Fight Completed",
+    "Fight TO-9 16 times, drops:",
+    "total drops: 理智 × 315",
+]
+
+
+class ProxyFailureTests(unittest.TestCase):
+    def test_returned_sanity_is_not_a_drop(self) -> None:
+        self.assertEqual(maa_daily._drop_pairs(PROXY_WIPEOUT_LOG), [])
+        self.assertEqual(maa_daily.proxy_failures(PROXY_WIPEOUT_LOG), (3, 315, 3))
+        self.assertEqual(maa_daily.fight_wiped_out(PROXY_WIPEOUT_LOG), (3, 315))
+
+    def test_wipeout_turns_fight_red_despite_maacore_reporting_completed(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "TO-9"})
+        summary = maa_daily.extract_summary(PROXY_WIPEOUT_LOG, [], plan=plan, ok=False)
+        self.assertIn("⚔️ 刷理智：❌ 未完成", summary)
+        self.assertIn("实际完成 0 次", summary)
+        self.assertIn("代理指挥失误 3 批，理智已返还 ×315", summary)
+        # MaaCore 汇总出来的 16 次和「掉落」都是假的，一个都不许出现在战报里。
+        self.assertNotIn("16 次", summary)
+        self.assertNotIn("掉落", summary)
+
+    def test_real_drops_keep_fight_green_and_report_partial_failures(self) -> None:
+        lines = [
+            "Fight Start",
+            "Drops: 理智 × 105",
+            "Drops: 固源岩 × 8, 龙门币 × 2160",
+            "Fight Completed",
+        ]
+        self.assertEqual(maa_daily.proxy_failures(lines), (1, 105, 0))
+        self.assertEqual(maa_daily.fight_wiped_out(lines), (0, 0))
+        plan = maa_common.normalize_plan({"stage": "TO-9"})
+        summary = maa_daily.extract_summary(lines, [], plan=plan, ok=True)
+        self.assertIn("⚔️ 刷理智：✅ 完成", summary)
+        self.assertIn("代理指挥失误 1 批，理智已返还 ×105", summary)
+        self.assertIn("固源岩 ×8", summary)
+        self.assertNotIn("理智 ×105、", summary)
+
+    def test_streak_resets_after_a_successful_batch(self) -> None:
+        lines = [
+            "Drops: 理智 × 105",
+            "Drops: 理智 × 105",
+            "Drops: 固源岩 × 8",
+            "Drops: 理智 × 105",
+        ]
+        # 熔断只看末尾连续段：中间打成一批就重新计数，不因随机性误伤。
+        self.assertEqual(maa_daily.proxy_failures(lines), (3, 315, 1))
+
+    def test_healthy_run_reports_no_proxy_failure(self) -> None:
+        lines = [
+            "Fight Start",
+            "Drops: 固源岩 × 8, 龙门币 × 2160",
+            "Fight Completed",
+            "total drops: 固源岩 × 8, 龙门币 × 2160",
+        ]
+        self.assertEqual(maa_daily.proxy_failures(lines), (0, 0, 0))
+        self.assertEqual(maa_daily.fight_wiped_out(lines), (0, 0))
+        self.assertEqual(
+            maa_daily._drop_pairs(lines), [("固源岩", 8), ("龙门币", 2160)]
+        )
+
+    def test_summary_only_total_line_still_detects_the_refund(self) -> None:
+        lines = ["Fight Completed", "total drops: 理智 × 210"]
+        self.assertEqual(maa_daily.proxy_failures(lines), (1, 210, 1))
+
+    def test_progress_hides_the_inflated_count_and_warns(self) -> None:
+        progress = maa_daily.progress_content(
+            PROXY_WIPEOUT_LOG, plan=maa_common.normalize_plan({"stage": "TO-9"})
+        )
+        self.assertIn("⚠️ 代理指挥失误 3 批，理智已返还 ×315", progress)
+        self.assertNotIn("已完成作战", progress)
+
+    def test_report_note_tells_the_user_to_refresh_the_recording(self) -> None:
+        payload = maa_daily.report_payload(
+            ok=False,
+            phase="am",
+            plan=maa_common.normalize_plan({"stage": "TO-9"}),
+            duration=877,
+            summary="",
+            screenshot_ok=True,
+            screenshot_error="",
+            cleanup_errors=[],
+            home_verified=True,
+            proxy_batches=3,
+            proxy_refunded=315,
+        )
+        note = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "备注")
+        self.assertIn("代理指挥失误 3 批", note["value"])
+        self.assertIn("三星", note["value"])
+
+
+class FakeMaaProcess:
+    """够 run_maa 用的 Popen 替身：吐完预设日志后一直挂着，等熔断来终止。"""
+
+    def __init__(self, stdout_text: str) -> None:
+        self.stdout = io.StringIO(stdout_text)
+        self.stderr = io.StringIO("")
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return 0 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+class CircuitBreakerTests(unittest.TestCase):
+    def _run(self, stdout_text: str, config: dict) -> tuple[int, list[str], list[str]]:
+        process = FakeMaaProcess(stdout_text)
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch.object(maa_daily.subprocess, "Popen", return_value=process),
+                patch.object(maa_daily, "discord_request"),
+                patch.object(maa_daily, "PROGRESS_INTERVAL_SECONDS", 0.05),
+                patch.object(maa_daily, "MIN_RUN_TIMEOUT_SECONDS", 1),
+                patch.object(maa_daily, "maa_subprocess_env", return_value={}),
+            ):
+                result = maa_daily.run_maa(
+                    {"maa_run_timeout": 60, **config},
+                    Path(raw) / "run.log",
+                    "token",
+                    "1",
+                    "2",
+                    maa_common.normalize_plan({"stage": "TO-9"}),
+                )
+        self.process = process
+        return result
+
+    def test_two_consecutive_proxy_failures_abort_the_run(self) -> None:
+        code, _out, err = self._run(
+            "Fight Start\nDrops: 理智 × 105\nDrops: 理智 × 105\n",
+            {"proxy_failure_limit": 2},
+        )
+        self.assertEqual(code, maa_daily.PROXY_BREAK_CODE)
+        self.assertTrue(self.process.terminated)
+        self.assertIn("连续 2 批代理指挥失误", err[-1])
+
+    def test_a_single_failure_does_not_trip_the_breaker(self) -> None:
+        # 只有一批失误时不该中止；用 1 秒超时让这一趟自然收尾。
+        code, _out, err = self._run(
+            "Fight Start\nDrops: 理智 × 105\nDrops: 固源岩 × 8\n",
+            {"proxy_failure_limit": 2, "maa_run_timeout": 1},
+        )
+        self.assertEqual(code, 124)
+        self.assertNotIn("代理指挥失误", "".join(err))
+
+    def test_breaker_can_be_disabled(self) -> None:
+        code, _out, err = self._run(
+            "Drops: 理智 × 105\nDrops: 理智 × 105\nDrops: 理智 × 105\n",
+            {"proxy_failure_limit": 0, "maa_run_timeout": 1},
+        )
+        self.assertEqual(code, 124)
+        self.assertNotIn("代理指挥失误", "".join(err))
+
+
+class SalvageTests(unittest.TestCase):
+    def test_salvage_plan_drops_fight_and_keeps_the_rest(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "TO-9"})
+        retry = maa_daily.salvage_plan(plan)
+        assert retry is not None
+        self.assertFalse(retry["tasks"]["fight"])
+        self.assertTrue(retry["tasks"]["infrast"])
+        self.assertNotIn("Fight", maa_daily.render_daily_toml(retry, {}))
+        self.assertIn("基建换班", maa_daily.render_daily_toml(retry, {}))
+        # 原计划必须原封不动，它还要进快照和战报。
+        self.assertTrue(plan["tasks"]["fight"])
+
+    def test_salvage_plan_is_none_when_only_fight_was_enabled(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "TO-9"})
+        plan["tasks"] = {
+            "fight": True,
+            "infrast": False,
+            "recruit": False,
+            "mall": False,
+            "award": False,
+        }
+        self.assertIsNone(maa_daily.salvage_plan(plan))
+
+    def test_salvage_is_skipped_when_the_time_budget_is_spent(self) -> None:
+        with patch.object(maa_daily, "run_maa") as runner:
+            code, out, err = maa_daily._salvage_run(
+                config={"maa_run_timeout": 3000},
+                plan=maa_common.normalize_plan({"stage": "TO-9"}),
+                task_path=Path("/nonexistent/daily.toml"),
+                log_path=Path("/nonexistent/salvage.log"),
+                token="t",
+                thread_id="1",
+                progress_message_id="2",
+                carry_lines=[],
+                elapsed=2900,
+            )
+        runner.assert_not_called()
+        self.assertIsNone(code)
+        self.assertIn("跳过补跑", err[0])
+
+    def test_salvage_can_be_turned_off(self) -> None:
+        with patch.object(maa_daily, "run_maa") as runner:
+            code, _out, err = maa_daily._salvage_run(
+                config={"proxy_failure_salvage": False},
+                plan=maa_common.normalize_plan({"stage": "TO-9"}),
+                task_path=Path("/nonexistent/daily.toml"),
+                log_path=Path("/nonexistent/salvage.log"),
+                token="t",
+                thread_id="1",
+                progress_message_id="2",
+                carry_lines=[],
+                elapsed=0,
+            )
+        runner.assert_not_called()
+        self.assertIsNone(code)
+        self.assertEqual(err, [])
+
+    def test_salvage_reruns_the_remaining_chain_within_the_leftover_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            task_path = Path(raw) / "daily.toml"
+            with patch.object(
+                maa_daily, "run_maa", return_value=(0, ["Infrast Completed"], [])
+            ) as runner:
+                code, out, err = maa_daily._salvage_run(
+                    config={"maa_run_timeout": 3000},
+                    plan=maa_common.normalize_plan({"stage": "TO-9"}),
+                    task_path=task_path,
+                    log_path=Path(raw) / "salvage.log",
+                    token="t",
+                    thread_id="1",
+                    progress_message_id="2",
+                    carry_lines=["Fight Start"],
+                    elapsed=600,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(out, ["Infrast Completed"])
+            self.assertIn("已补跑剩余任务", err[0])
+            self.assertEqual(runner.call_args.kwargs["timeout"], 2400)
+            self.assertEqual(runner.call_args.kwargs["carry_lines"], ["Fight Start"])
+            # 补跑用的 daily.toml 必须已经落盘，且不含 Fight。
+            self.assertNotIn("Fight", task_path.read_text(encoding="utf-8"))
+
+
+    def test_summary_merges_the_break_and_the_salvage_run(self) -> None:
+        broken = [
+            "StartUp Completed",
+            "Fight Start",
+            "Current sanity: 115/207",
+            "Drops: 理智 × 105",
+            "Current sanity: 116/207",
+            "Drops: 理智 × 105",
+        ]
+        salvaged = [
+            "StartUp Completed",
+            "Infrast Start",
+            "EnterFacility Mfg #0",
+            "Infrast Completed",
+            "Recruit Start",
+            "Recruited 4 times",
+            "Recruit Completed",
+            "Mall Completed",
+            "Award Completed",
+            "Custom Completed",
+        ]
+        summary = maa_daily.extract_summary(
+            broken + salvaged,
+            [],
+            plan=maa_common.normalize_plan({"stage": "TO-9"}),
+            ok=False,
+            home_verified=True,
+        )
+        # 刷理智照旧翻红，但补跑回来的四件事必须记成完成。
+        self.assertIn("⚔️ 刷理智：❌ 未完成", summary)
+        self.assertIn("代理指挥失误 2 批，理智已返还 ×210", summary)
+        self.assertIn("🏭 基建换班：✅ 完成", summary)
+        self.assertIn("🎫 公开招募：✅ 完成（招募 4 次）", summary)
+        self.assertIn("🛒 信用商店：✅ 完成", summary)
+        self.assertIn("🎁 领取奖励：✅ 完成", summary)
+        self.assertIn("🏠 返回主界面：✅ 完成", summary)
+
+
 class RetentionTests(unittest.TestCase):
     def test_cleanup_only_removes_old_regular_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

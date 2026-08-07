@@ -75,6 +75,21 @@ HOME_TASK_NAMES = [
 HOME_MARKERS = ("终端", "编队", "采购中心", "公开招募", "基建", "好友", "档案", "SANITY")
 HOME_MARKER_MIN = 4
 
+# 代理指挥失误时游戏结算页写「本场战斗已视为单次作战结算，未进行作战的理智已返还」，
+# 并把返还的理智画成一个道具图标。MaaCore 照单全收，于是日志里出现
+# `Drops: 理智 × 105`、汇总成 `total drops: 理智 × 315`。理智永远不可能是关卡掉落，
+# 所以掉落项里出现「理智」= 这一批代理失败、理智原路退回、一关没打成。
+# 2026-08-07 早场 TO-9 连着 4 批都栽在这里，MaaCore 仍判 Fight Completed，
+# 战报因此写成「✅ 完成（16 次；掉落 理智 ×315）」——见 DEV_GUIDE §11.13。
+SANITY_REFUND_ITEM = "理智"
+# maa run 被熔断中止时的返回码，跟超时的 124、人工中止的 130 区分开。
+PROXY_BREAK_CODE = 125
+# 进度消息的编辑节流，同时也是熔断的采样间隔——扫一遍全部日志行不便宜，
+# 不能放进 0.25 秒的主循环里跑。
+PROGRESS_INTERVAL_SECONDS = 5
+# maa run 的最短存活时间：配置写歪了也不能让整条链条秒退。
+MIN_RUN_TIMEOUT_SECONDS = 60
+
 
 def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
     if len(argv) == 2 and argv[1] in PHASE_LABELS:
@@ -248,49 +263,107 @@ def _expiring_medicine_used(lines: list[str]) -> int:
     )
 
 
-def _drop_pairs(lines: list[str]) -> list[tuple[str, int]]:
-    totals: dict[str, int] = {}
-    drop_lines = [line for line in lines if re.search(r"(?:total\s+)?Drops:\s*.+$", line, re.I)]
-    total_lines = [line for line in drop_lines if re.search(r"total\s+Drops:", line, re.I)]
-    # maa-cli can emit per-batch Drops events and one final total. Prefer the
-    # latter when present so a result is never double-counted.
-    for line in total_lines or drop_lines:
+def _parse_drop_items(raw: str) -> list[tuple[str, int]]:
+    """Parse one Drops payload into (item, quantity); JSON first, plain text as fallback."""
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    pairs: list[tuple[str, int]] = []
+    if isinstance(parsed, dict):
+        pairs = [
+            (str(name), int(quantity))
+            for name, quantity in parsed.items()
+            if isinstance(quantity, (int, float))
+        ]
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("itemName") or item.get("name")
+            quantity = item.get("quantity") or item.get("count")
+            if name and isinstance(quantity, (int, float)):
+                pairs.append((str(name), int(quantity)))
+    if not pairs:
+        pairs = [
+            (name.strip(" \"'{}[]"), int(quantity))
+            for name, quantity in re.findall(
+                r"([A-Za-z一-鿿][A-Za-z0-9一-鿿· _-]{0,30})\s*(?:[:x×])\s*(\d+)",
+                raw,
+            )
+        ]
+    return [(name, quantity) for name, quantity in pairs if name and quantity]
+
+
+def _drop_batches(
+    lines: list[str],
+) -> tuple[list[list[tuple[str, int]]], list[list[tuple[str, int]]]]:
+    """Split Drops events into per-batch results and maa-cli's final total lines."""
+    batches: list[list[tuple[str, int]]] = []
+    totals: list[list[tuple[str, int]]] = []
+    for line in lines:
         marker = re.search(r"(?:total\s+)?Drops:\s*(.+)$", line, re.I)
         if not marker:
             continue
-        raw = marker.group(1).strip()
-        parsed: Any = None
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        pairs: list[tuple[str, int]] = []
-        if isinstance(parsed, dict):
-            pairs = [
-                (str(name), int(quantity))
-                for name, quantity in parsed.items()
-                if isinstance(quantity, (int, float))
-            ]
-        elif isinstance(parsed, list):
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("itemName") or item.get("name")
-                quantity = item.get("quantity") or item.get("count")
-                if name and isinstance(quantity, (int, float)):
-                    pairs.append((str(name), int(quantity)))
-        if not pairs:
-            pairs = [
-                (name.strip(" \"'{}[]"), int(quantity))
-                for name, quantity in re.findall(
-                    r"([A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff· _-]{0,30})\s*(?:[:x×])\s*(\d+)",
-                    raw,
-                )
-            ]
-        for name, quantity in pairs:
-            if name and quantity:
-                totals[name] = totals.get(name, 0) + quantity
-    return list(totals.items())[:8]
+        items = _parse_drop_items(marker.group(1).strip())
+        if not items:
+            continue
+        if re.search(r"total\s+Drops:", line, re.I):
+            totals.append(items)
+        else:
+            batches.append(items)
+    return batches, totals
+
+
+def _sanity_refund(items: list[tuple[str, int]]) -> int:
+    return sum(quantity for name, quantity in items if name == SANITY_REFUND_ITEM)
+
+
+def _drop_pairs(lines: list[str]) -> list[tuple[str, int]]:
+    batches, totals = _drop_batches(lines)
+    aggregate: dict[str, int] = {}
+    # maa-cli can emit per-batch Drops events and one final total. Prefer the
+    # latter when present so a result is never double-counted.
+    for items in totals or batches:
+        for name, quantity in items:
+            # 返还的理智不是掉落，见 SANITY_REFUND_ITEM。
+            if name == SANITY_REFUND_ITEM:
+                continue
+            aggregate[name] = aggregate.get(name, 0) + quantity
+    return list(aggregate.items())[:8]
+
+
+def proxy_failures(lines: list[str]) -> tuple[int, int, int]:
+    """代理指挥失误统计：(失误批次, 累计返还理智, 末尾连续失误批次)。
+
+    「末尾连续」供熔断使用——有真掉落的批次会把连续计数清零，只有一直失败才中止。
+    """
+    batches, totals = _drop_batches(lines)
+    if not batches:
+        # 没有逐批事件（只拿到 maa-cli 汇总行）时退回汇总；批次数不可知，按 1 计。
+        refunded = sum(_sanity_refund(items) for items in totals)
+        return (1, refunded, 1) if refunded else (0, 0, 0)
+    failed = 0
+    refunded = 0
+    streak = 0
+    for items in batches:
+        batch_refund = _sanity_refund(items)
+        if batch_refund:
+            failed += 1
+            refunded += batch_refund
+            streak += 1
+        else:
+            streak = 0
+    return failed, refunded, streak
+
+
+def fight_wiped_out(lines: list[str]) -> tuple[int, int]:
+    """全部批次都是代理失误（一关没打成）时返回 (批次, 返还理智)，否则 (0, 0)。"""
+    failed, refunded, _streak = proxy_failures(lines)
+    if failed and not _drop_pairs(lines):
+        return failed, refunded
+    return 0, 0
 
 
 def progress_content(
@@ -317,9 +390,12 @@ def progress_content(
     sanity = _last_match(clean, r"Current sanity:\s*(\d+)\s*/\s*(\d+)")
     if sanity and _task_state(clean, "Fight", "刷理智") != "pending":
         status_lines.append(f"🧠 当前理智：{sanity.group(1)}/{sanity.group(2)}")
+    proxy_batches, refunded, _streak = proxy_failures(clean)
     fight_times = _fight_times(clean)
-    if fight_times:
+    if fight_times and not fight_wiped_out(clean)[0]:
         status_lines.append(f"🔁 已完成作战：{fight_times} 次")
+    if proxy_batches:
+        status_lines.append(f"⚠️ 代理指挥失误 {proxy_batches} 批，理智已返还 ×{refunded}")
     refresh = _last_match(clean, r"RecruitTagsRefreshed:\s*(\d+)\s+times")
     if refresh:
         status_lines.append(f"🔄 公招已刷新：{refresh.group(1)} 次")
@@ -357,9 +433,18 @@ def extract_summary(
         details: list[str] = []
         if key == "Fight":
             details.append(f"关卡 {plan_stage_label(plan or {})}")
+            proxy_batches, refunded, _streak = proxy_failures(lines)
+            wiped_batches, _wiped_refund = fight_wiped_out(lines)
             count = _fight_times(lines)
-            if count:
+            if wiped_batches:
+                # MaaCore 会把「一批都没打成」也判成 Fight Completed，而 count 数的是
+                # 发起的连战批次，不是真打完的次数。这里直接翻红，别让战报骗人。
+                status = "❌ 未完成"
+                details.append("实际完成 0 次")
+            elif count:
                 details.append(f"{count} 次")
+            if proxy_batches:
+                details.append(f"代理指挥失误 {proxy_batches} 批，理智已返还 ×{refunded}")
             medicine = _expiring_medicine_used(lines)
             if medicine:
                 details.append(f"临期理智药 ×{medicine}")
@@ -638,6 +723,9 @@ def run_maa(
     thread_id: str,
     progress_message_id: str,
     plan: dict[str, Any] | None = None,
+    *,
+    timeout: int | None = None,
+    carry_lines: list[str] | None = None,
 ) -> tuple[int, list[str], list[str]]:
     maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     # maa-cli 0.7.5's --log-file redirects logs away from stderr.  Capture the
@@ -680,9 +768,15 @@ def run_maa(
         next_update = time.monotonic()
         # Hermes' outer no-agent cron timeout is 3600s. Keep ten minutes of
         # headroom for boot, screenshot, cleanup and the final report.
-        deadline = time.monotonic() + max(60, int(config.get("maa_run_timeout", 3000)))
+        budget = int(config.get("maa_run_timeout", 3000) if timeout is None else timeout)
+        deadline = time.monotonic() + max(MIN_RUN_TIMEOUT_SECONDS, budget)
+        # 连着这么多批代理指挥失误就熔断：理智全额退回、一关没打成，再刷下去只会
+        # 空转到超时，还会把游戏钉在结算页拖垮后面的基建/公招/商店/奖励。0 = 关闭。
+        proxy_limit = max(0, int(config.get("proxy_failure_limit", 2)))
+        prefix = list(carry_lines or [])
         timed_out = False
         interrupted = False
+        proxy_tripped = 0
         try:
             while process.poll() is None:
                 now = time.monotonic()
@@ -696,10 +790,19 @@ def run_maa(
                         process.wait(timeout=5)
                     break
                 if now >= next_update:
-                    content = progress_content(
-                        list(stdout_lines) + list(stderr_lines),
-                        plan=plan,
-                    )
+                    live = list(stdout_lines) + list(stderr_lines)
+                    if proxy_limit:
+                        streak = proxy_failures(live)[2]
+                        if streak >= proxy_limit:
+                            proxy_tripped = streak
+                            process.terminate()
+                            try:
+                                process.wait(timeout=10)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(timeout=5)
+                            break
+                    content = progress_content(prefix + live, plan=plan)
                     if content != previous:
                         try:
                             discord_request(
@@ -712,7 +815,7 @@ def run_maa(
                         except Exception:
                             # Streaming is best-effort; final report is the hard signal.
                             pass
-                    next_update = now + 5
+                    next_update = now + PROGRESS_INTERVAL_SECONDS
                 time.sleep(0.25)
         except KeyboardInterrupt:
             interrupted = True
@@ -738,7 +841,62 @@ def run_maa(
         with log_path.open("a", encoding="utf-8") as log_handle:
             log_handle.write(timeout_message + "\n")
         return_code = 124
+    elif proxy_tripped:
+        break_message = (
+            f"连续 {proxy_tripped} 批代理指挥失误，理智全额返还、一关没打成，"
+            "已中止 maa run，避免空转到超时。"
+        )
+        stderr_lines.append(break_message)
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(break_message + "\n")
+        return_code = PROXY_BREAK_CODE
     return return_code, stdout_lines, stderr_lines
+
+
+def salvage_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
+    """去掉 Fight 的补跑计划；除 Fight 外无事可做时返回 None。"""
+    tasks = dict(plan.get("tasks", {}))
+    if not any(bool(tasks.get(key, True)) for key in ("infrast", "recruit", "mall", "award")):
+        return None
+    tasks["fight"] = False
+    return {**plan, "tasks": tasks}
+
+
+def _salvage_run(
+    *,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    task_path: Path,
+    log_path: Path,
+    token: str,
+    thread_id: str,
+    progress_message_id: str,
+    carry_lines: list[str],
+    elapsed: float,
+) -> tuple[int | None, list[str], list[str]]:
+    """熔断后补跑剩余任务链。返回码为 None 表示没跑（无事可做或时间不够）。"""
+    if not bool(config.get("proxy_failure_salvage", True)):
+        return None, [], []
+    retry_plan = salvage_plan(plan)
+    if retry_plan is None:
+        return None, [], []
+    # 两趟 maa run 共用同一个 maa_run_timeout 预算，别把 Hermes 的一小时撑爆。
+    remaining = int(config.get("maa_run_timeout", 3000)) - int(elapsed)
+    floor = max(60, int(config.get("proxy_failure_salvage_min_seconds", 300)))
+    if remaining < floor:
+        return None, [], [f"剩余预算 {max(0, remaining)}s 不足 {floor}s，跳过补跑。"]
+    atomic_write_text(task_path, render_daily_toml(retry_plan, config))
+    code, out, err = run_maa(
+        config,
+        log_path,
+        token,
+        thread_id,
+        progress_message_id,
+        retry_plan,
+        timeout=remaining,
+        carry_lines=carry_lines,
+    )
+    return code, out, ["代理指挥失误熔断，已补跑剩余任务（不含刷理智）。", *err]
 
 
 def report_payload(
@@ -753,9 +911,17 @@ def report_payload(
     cleanup_errors: list[str],
     home_verified: bool | None = None,
     home_verify_detail: str = "",
+    proxy_batches: int = 0,
+    proxy_refunded: int = 0,
 ) -> dict[str, Any]:
     label = PHASE_LABELS[phase]
     notes: list[str] = []
+    if proxy_batches:
+        notes.append(
+            f"代理指挥失误 {proxy_batches} 批，理智已返还 ×{proxy_refunded}，实际一关没打成。"
+            f"多半是 {plan_stage_label(plan)} 的作战录像跟不上随机性——"
+            "手动重打一次三星刷新录像，或换个关卡。"
+        )
     if not screenshot_ok:
         notes.append(f"截图失败：{screenshot_error}")
     if home_verified is False:
@@ -945,6 +1111,7 @@ def execute(phase: str) -> int:
         home_verified: bool | None = None
         home_verify_detail = ""
         cleanup_errors: list[str] = []
+        salvage_log_path: Path | None = None
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
             require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -988,6 +1155,29 @@ def execute(phase: str) -> int:
             return_code, stdout_lines, stderr_lines = run_maa(
                 config, log_path, token, thread_id, progress_message_id, plan
             )
+            # 125 也可能是 maa 自己的退出码，所以还要确认日志里真有代理失误，
+            # 免得凭一个数字就多跑一趟。
+            if return_code == PROXY_BREAK_CODE and fight_wiped_out(stdout_lines + stderr_lines)[0]:
+                # 熔断掐掉的是整条 maa run，基建/公招/商店/奖励也一起没了。补跑一趟
+                # 去掉 Fight 的链条把它们捞回来——StartUp 会顺手把卡在结算页的游戏
+                # 带回主界面。预算从总超时里扣，绝不额外撑长 Hermes 那一小时。
+                salvage_log = RUNS_DIR / f"{run_stem}-salvage.log"
+                salvage_code, salvage_out, salvage_err = _salvage_run(
+                    config=config,
+                    plan=plan,
+                    task_path=task_path,
+                    log_path=salvage_log,
+                    token=token,
+                    thread_id=thread_id,
+                    progress_message_id=progress_message_id,
+                    carry_lines=stdout_lines + stderr_lines,
+                    elapsed=(now_beijing() - started).total_seconds(),
+                )
+                if salvage_code is not None:
+                    return_code = salvage_code
+                    salvage_log_path = salvage_log
+                stdout_lines += salvage_out
+                stderr_lines += salvage_err
             # The final Custom task has returned to Home. Let the last UI
             # animation settle, then capture before the separate CloseDown and
             # confirm by OCR that the frame we ship really is the home page.
@@ -1013,7 +1203,15 @@ def execute(phase: str) -> int:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
         duration = (now_beijing() - started).total_seconds()
-        ok = return_code == 0 and not cleanup_errors and home_verified is not False
+        # 代理指挥失误到一关没打成，就算后面的链条都补回来了也不算成功——得让人
+        # 看见红色去修作战录像，否则理智白挂在那儿谁也不知道。
+        proxy_batches, proxy_refunded = fight_wiped_out(stdout_lines + stderr_lines)
+        ok = (
+            return_code == 0
+            and not cleanup_errors
+            and home_verified is not False
+            and not proxy_batches
+        )
         summary = extract_summary(
             stdout_lines,
             stderr_lines,
@@ -1054,6 +1252,8 @@ def execute(phase: str) -> int:
                 cleanup_errors=cleanup_errors,
                 home_verified=home_verified,
                 home_verify_detail=home_verify_detail,
+                proxy_batches=proxy_batches,
+                proxy_refunded=proxy_refunded,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
         merge_last_run(
@@ -1063,12 +1263,15 @@ def execute(phase: str) -> int:
                 "duration_seconds": int(duration),
                 "return_code": return_code,
                 "log": str(log_path),
+                "salvage_log": str(salvage_log_path) if salvage_log_path else None,
                 "screenshot": str(screenshot_path) if screenshot_ok else None,
                 "screenshot_error": screenshot_error if not screenshot_ok else None,
                 "home_verified": home_verified,
                 "home_verify_detail": home_verify_detail,
                 "cleanup_errors": cleanup_errors,
                 "summary": summary,
+                "proxy_failure_batches": proxy_batches,
+                "proxy_failure_sanity_refunded": proxy_refunded,
             }
         )
         return 0 if ok else 1

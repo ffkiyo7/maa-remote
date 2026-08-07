@@ -570,3 +570,32 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       上的 `arknights-hg-<版本>.apk`（2.7.61 约 2.0GB）。装前可验签名者应为
       `CN=HyperGryph, O=HyperGryph, L=Shanghai`：
       `unzip -p <apk> META-INF/ARKNIGHT.RSA | openssl pkcs7 -inform DER -print_certs -text`。
+
+13. **代理指挥失误会被 MaaCore 报成「掉落理智」，而且 Fight 仍判 Completed**——
+    代理失败时游戏结算页写「本场战斗已视为单次作战结算，未进行作战的理智已返还」，
+    并把返还的理智画成一个道具图标。MaaCore 照单全收，日志里出现
+    `Drops: 理智 × 105`，汇总成 `total drops: 理智 × 315`；`Fight <关卡> N times`
+    里的 N 数的是**发起**的连战批次，不是真打完的次数。
+
+    2026-08-07 早场 TO-9 就是这样：连着 4 批代理失误、理智 115 → 117（净消耗 0、
+    一关没打成），旧战报却写成「⚔️ 刷理智：✅ 完成（16 次；掉落 理智 ×315）」。
+    用户的作战录像跟不上关卡随机性时就会这样。
+
+    - **判据**：掉落项里出现「理智」= 代理失误。理智永远不可能是关卡掉落，
+      所以这个信号是确定的，不需要额外 OCR。见 `SANITY_REFUND_ITEM`。
+    - **战报**：`_drop_pairs()` 把「理智」剔出掉落；`fight_wiped_out()` 命中
+      （有失误批次且零真掉落）时 Fight 翻红、写「实际完成 0 次」、总体判 ❌，
+      并在备注里提示去手动重打三星刷新录像。
+    - **熔断**：`run_maa()` 每 `PROGRESS_INTERVAL_SECONDS` 采样一次末尾**连续**失误
+      批次，达到 `proxy_failure_limit`（默认 2）就终止 `maa run`，返回
+      `PROXY_BREAK_CODE = 125`。中间有真掉落的批次会把连续计数清零，不因随机性误伤。
+    - **补跑**：熔断掐掉的是整条链，所以 `_salvage_run()` 会用去掉 Fight 的
+      `daily.toml` 再跑一趟把基建/公招/商店/奖励捞回来（StartUp 顺手把卡在结算页的
+      游戏带回主界面）。两趟共用同一个 `maa_run_timeout` 预算，剩余不足
+      `proxy_failure_salvage_min_seconds`（默认 300s）就跳过；
+      `proxy_failure_salvage: false` 可整体关掉。日志落在
+      `runs/<date>-<phase>-salvage.log`，不覆盖第一趟。
+    - **未实机验收**：熔断与补跑的判定逻辑有单元测试（`ProxyFailureTests`、
+      `CircuitBreakerTests`、`SalvageTests`，并用 2026-08-07/08-06 两份真实日志回放
+      过解析），但「StartUp 能否从结算页把游戏带回主界面」只在真机上才算数，
+      下次遇到代理失误时要盯一眼补跑那趟的日志。
