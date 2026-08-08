@@ -501,6 +501,7 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、�
 | 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fi bluestacks`；或 cron 被 pause |
 | 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `open_emulator()` 还早 → `ls /Applications/BlueStacks.app`。整个 bundle 不见了就是 §11.12 的自杀式清理 |
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
+| 场次 30～40 秒就红，日志只有五行且有 `TouchModeNotAvailable`，截图是模拟器桌面 | 没连上模拟器，MaaCore 在 StartUp 里 SIGSEGV 了 → §11.14。看 `last_run.connect_retries` 确认重试有没有接上；`com.loong.maa/crash.log` 是第二现场 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
 | 点按钮/下拉没反应或报未登记 | 卡片过期（每天 07:50 会清前缀重写）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
 | 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `parse_activity_stages()` 的正则 |
@@ -599,3 +600,45 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       `CircuitBreakerTests`、`SalvageTests`，并用 2026-08-07/08-06 两份真实日志回放
       过解析），但「StartUp 能否从结算页把游戏带回主界面」只在真机上才算数，
       下次遇到代理失误时要盯一眼补跑那趟的日志。
+
+14. **MaaTouch 握手超 3 秒 → MaaCore SIGSEGV，整场 35 秒暴毙**——这一条和代理失误
+    （§11.13）毫无关系，是连模拟器都没连上，游戏里一个键都没点过。
+
+    MaaCore 起 MaaTouch 用的是 `app_process`，等于在安卓里现开一个 ART 虚拟机，
+    而它给这次握手的窗口**写死 3 秒**（`call_and_hup_minitouch`）。超时就写
+    `unable to find $ from pipe_str:`、抛 `TouchModeNotAvailable`，`Controller::connect`
+    返回 false。真正致命的是下一步：**maa-cli 不看这个返回值**，照样
+    `Assistant::start()`，`StartUpTask` 拿着没连上的 controller 直接
+    `SIGSEGV (Segmentation Fault)`，`maa run` 退 1。
+
+    2026-08-08 早场就是这样没的：08:00:41.105 起 MaaTouch → 3.001s 没回话 →
+    08:00:44.106 `TouchModeNotAvailable` + `connect failed` + SIGSEGV，35 秒结束，
+    截图停在 BlueStacks 的应用商店首页（游戏根本没启动）。
+
+    - **判据**：`runs/<date>-<phase>.log` 只有五行且含 `TouchModeNotAvailable`，
+      没有任何 `X Completed`；`~/Library/Application Support/com.loong.maa/crash.log`
+      多出一对 `SIGSEGV` / `Unhandled exception`；截图是模拟器桌面而不是游戏。
+      MaaCore 的原始现场在 `debug/asst.log` 里搜 `probe_minitouch | leave`。
+    - **它确实是偶发**：整份 asst.log 里历史握手全在 165–395 ms，只有出事那次是
+      3001 ms，而 6 秒后同一台机器上 `maa closedown` 的握手只花了 166 ms。
+    - **触发条件是模拟器冷启**：`sys.boot_completed=1` 只代表系统起来了，不代表安静。
+      2026-08-08 实测冷启：`boot_completed` 在 +7.5s，`app_process` 探针在 +0…+4.3s
+      全是 35 ms，**+5.4s 突然卡 2.8s**，+9.2s 恢复；而当天 runner 正好在
+      `boot_completed` 后约 5.5s 把场子交给了 MaaCore。同一天二次热启则全程无抖动。
+    - **两层修法**（`maa_daily.py`）：
+      1. `settle_android_runtime()`——`verify_game_installed` 之后、`maa run` 之前，
+         用同样走 `app_process` 的只读命令 `am get-current-user` 探路，要求连着
+         `emulator_settle_quiet_seconds`（默认 8s）都快过
+         `emulator_settle_slow_seconds`（默认 1.0s）才放行。**卡一次就把安静计时清零**
+         ——只数「连着几次快」会正好在抖动前开门。`emulator_settle_timeout`（默认 40s）
+         用尽也不阻断，只在战报备注里留一句，因为下面那层兜得住。
+      2. `run_maa_resilient()`——`connect_failed()` 认出这一类失败就重开 `maa run`，
+         默认 `connect_retry_limit: 2` 次、间隔 `connect_retry_delay: 8` 秒。
+         安全闸门是**日志里没有任何一条任务链 Completed**：只要有任务真跑过就绝不重开，
+         免得把已经做完的事再做一遍。124/125/130 是我们自己写的返回码，一律不重试。
+         所有重试共用同一个 `maa_run_timeout` 预算，日志**追加**进同一个
+         `runs/<date>-<phase>.log`，不覆盖上一趟的现场。
+    - **实机验收（2026-08-08）**：冷启下 `wait_for_android` 在 +9.2s 返回，闸门又花
+      8.5s，+17.7s 才交给 MaaCore，此后探针稳定在 40 ms——正好跨过了那个抖动窗口。
+      重试那一层只有单元测试（`ConnectFailureTests`、`ConnectRetryTests`，用当天的真实
+      五行日志回放），因为这个崩溃没法按需复现；下次再撞上要盯一眼第二趟是否接上。

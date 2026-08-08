@@ -646,6 +646,211 @@ PROXY_WIPEOUT_LOG = [
 ]
 
 
+# 2026-08-08 早场的真实日志，一字不改：MaaTouch 没在 MaaCore 的 3 秒窗口内握上手，
+# connect 判失败，maa-cli 却照样 start()，StartUpTask 直接 SIGSEGV，35 秒退 1。
+CONNECT_CRASH_LOG = [
+    "Updating hot update files...",
+    "Hot update completed successfully",
+    "Connected",
+    "TouchModeNotAvailable",
+    "StartUp Start",
+]
+
+
+class ConnectFailureTests(unittest.TestCase):
+    def test_the_2026_08_08_morning_crash_is_recognised(self) -> None:
+        self.assertEqual(
+            maa_daily.connect_failed(CONNECT_CRASH_LOG, 1), "TouchModeNotAvailable"
+        )
+
+    def test_a_run_that_completed_any_task_is_never_retried(self) -> None:
+        # 安全闸门：只要有任务真跑过，重开一趟就会重复已经做完的事。
+        lines = CONNECT_CRASH_LOG + ["StartUp Completed", "Infrast Error"]
+        self.assertEqual(maa_daily.connect_failed(lines, 1), "")
+        self.assertEqual(
+            maa_daily.connect_failed(CONNECT_CRASH_LOG + ["AllTasksCompleted"], 1), ""
+        )
+
+    def test_our_own_return_codes_are_not_connection_failures(self) -> None:
+        for code in (0, 124, maa_daily.PROXY_BREAK_CODE, 130):
+            self.assertEqual(maa_daily.connect_failed(CONNECT_CRASH_LOG, code), "", code)
+
+    def test_an_ordinary_failure_without_the_marker_is_not_retried(self) -> None:
+        lines = ["Connected", "FastestWayToScreencap RawByNc 108", "StartUp Start"]
+        self.assertEqual(maa_daily.connect_failed(lines, 1), "")
+
+    def test_summary_names_the_real_culprit_instead_of_blaming_the_game(self) -> None:
+        summary = maa_daily.extract_summary(
+            CONNECT_CRASH_LOG,
+            [],
+            plan=maa_common.normalize_plan({"stage": "TO-9"}),
+            ok=False,
+            home_verified=False,
+            home_verify_detail="识别到 0/8 个主页标识",
+        )
+        self.assertIn("🚀 启动游戏：❌ 中断（没连上模拟器（TouchModeNotAvailable）", summary)
+        self.assertIn("一个键都没点", summary)
+
+    def test_report_note_explains_the_retries(self) -> None:
+        payload = maa_daily.report_payload(
+            ok=True,
+            phase="am",
+            plan=maa_common.normalize_plan({"stage": "TO-9"}),
+            duration=900,
+            summary="",
+            screenshot_ok=True,
+            screenshot_error="",
+            cleanup_errors=[],
+            home_verified=True,
+            connect_retries=1,
+        )
+        note = next(f for f in payload["embeds"][0]["fields"] if f["name"] == "备注")
+        self.assertIn("已重开 1 趟", note["value"])
+
+    def test_no_note_when_the_first_attempt_connected(self) -> None:
+        payload = maa_daily.report_payload(
+            ok=True,
+            phase="am",
+            plan=maa_common.normalize_plan({"stage": "TO-9"}),
+            duration=900,
+            summary="",
+            screenshot_ok=True,
+            screenshot_error="",
+            cleanup_errors=[],
+            home_verified=True,
+        )
+        self.assertFalse(
+            [f for f in payload["embeds"][0]["fields"] if f["name"] == "备注"]
+        )
+
+
+class ConnectRetryTests(unittest.TestCase):
+    def _resilient(self, attempts: list[tuple[int, list[str], list[str]]], config: dict):
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = Path(raw) / "run.log"
+            with (
+                patch.object(maa_daily, "run_maa", side_effect=attempts) as runner,
+                patch.object(maa_daily.time, "sleep"),
+            ):
+                result = maa_daily.run_maa_resilient(
+                    {"maa_run_timeout": 3000, **config},
+                    log_path,
+                    "token",
+                    "1",
+                    "2",
+                    maa_common.normalize_plan({"stage": "TO-9"}),
+                )
+            self.runner = runner
+            self.log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        return result
+
+    def test_a_connect_crash_is_retried_and_the_second_attempt_stands(self) -> None:
+        code, out, err, retries = self._resilient(
+            [
+                (1, CONNECT_CRASH_LOG, []),
+                (0, ["StartUp Completed", "Fight Completed", "Custom Completed"], []),
+            ],
+            {},
+        )
+        self.assertEqual((code, retries), (0, 1))
+        # 两趟的日志都留着，第二趟必须是追加而不是覆盖。
+        self.assertIn("TouchModeNotAvailable", out)
+        self.assertIn("Fight Completed", out)
+        self.assertFalse(self.runner.call_args_list[0].kwargs["append"])
+        self.assertTrue(self.runner.call_args_list[1].kwargs["append"])
+        self.assertIn("等 8s 重开第 1 趟", "".join(err))
+        self.assertIn("重开第 1 趟", self.log_text)
+
+    def test_a_healthy_run_is_never_retried(self) -> None:
+        code, _out, err, retries = self._resilient([(0, ["Custom Completed"], [])], {})
+        self.assertEqual((code, retries), (0, 0))
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(err, [])
+
+    def test_retries_stop_at_the_limit_and_say_so(self) -> None:
+        code, _out, err, retries = self._resilient(
+            [(1, CONNECT_CRASH_LOG, [])] * 3, {"connect_retry_limit": 2}
+        )
+        self.assertEqual((code, retries), (1, 2))
+        self.assertEqual(self.runner.call_count, 3)
+        self.assertIn("重试 2 次仍未连上", "".join(err))
+
+    def test_retrying_can_be_turned_off(self) -> None:
+        code, _out, err, retries = self._resilient(
+            [(1, CONNECT_CRASH_LOG, [])], {"connect_retry_limit": 0}
+        )
+        self.assertEqual((code, retries), (1, 0))
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertIn("重试 0 次仍未连上", "".join(err))
+
+    def test_every_attempt_shares_one_timeout_budget(self) -> None:
+        self._resilient(
+            [(1, CONNECT_CRASH_LOG, []), (0, ["Custom Completed"], [])],
+            {"maa_run_timeout": 600},
+        )
+        budgets = [call.kwargs["timeout"] for call in self.runner.call_args_list]
+        self.assertLessEqual(budgets[1], budgets[0])
+        self.assertLessEqual(budgets[0], 600)
+
+    def test_no_retry_when_the_budget_cannot_fit_another_attempt(self) -> None:
+        # 预算只剩几十秒时重开一趟毫无意义，直接把结果交出去。
+        code, _out, err, retries = self._resilient(
+            [(1, CONNECT_CRASH_LOG, [])], {"maa_run_timeout": 30}
+        )
+        self.assertEqual(retries, 0)
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertIn("仍未连上", "".join(err))
+
+    def test_the_failed_attempt_feeds_the_next_progress_message(self) -> None:
+        self._resilient(
+            [(1, CONNECT_CRASH_LOG, []), (0, ["Custom Completed"], [])], {}
+        )
+        carried = self.runner.call_args_list[1].kwargs["carry_lines"]
+        self.assertIn("TouchModeNotAvailable", carried)
+
+
+class SettleTests(unittest.TestCase):
+    def _settle(self, costs: list[float], config: dict) -> tuple[str, float]:
+        """用假时钟跑闸门，返回 (告警, 花掉的秒数)。costs 是每次探针的耗时。"""
+        clock = {"now": 0.0}
+        sequence = list(costs)
+
+        def fake_run(*_args, **_kwargs):
+            clock["now"] += sequence.pop(0) if sequence else 0.02
+            return SimpleNamespace(returncode=0, stdout="0", stderr="")
+
+        def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        with (
+            patch.object(maa_daily.subprocess, "run", side_effect=fake_run),
+            patch.object(maa_daily.time, "monotonic", side_effect=lambda: clock["now"]),
+            patch.object(maa_daily.time, "sleep", side_effect=fake_sleep),
+        ):
+            warning = maa_daily.settle_android_runtime({"adb_path": "/adb", **config})
+        return warning, clock["now"]
+
+    def test_a_quiet_emulator_is_handed_over_after_one_quiet_window(self) -> None:
+        warning, spent = self._settle([0.03] * 40, {})
+        self.assertEqual(warning, "")
+        self.assertLess(spent, 12)
+
+    def test_a_stall_restarts_the_quiet_window(self) -> None:
+        # 2026-08-08 实测的形状：安静 4 秒 → 突然卡 2.8 秒 → 恢复。卡顿必须把安静
+        # 计时清零，否则闸门会在 8 秒刚过时开门，正好把场子交在抖动上。
+        warning, spent = self._settle([0.03] * 8 + [2.8] + [0.03] * 60, {})
+        self.assertEqual(warning, "")
+        self.assertGreater(spent, 15)
+
+    def test_a_permanently_busy_emulator_warns_but_does_not_block(self) -> None:
+        warning, _spent = self._settle([2.0] * 200, {"emulator_settle_timeout": 20})
+        self.assertIn("未在 20s 内稳定", warning)
+
+    def test_the_gate_can_be_turned_off(self) -> None:
+        self.assertEqual(self._settle([], {"emulator_settle_quiet_seconds": 0}), ("", 0.0))
+        self.assertEqual(self._settle([], {"emulator_settle_timeout": 0}), ("", 0.0))
+
+
 class ProxyFailureTests(unittest.TestCase):
     def test_returned_sanity_is_not_a_drop(self) -> None:
         self.assertEqual(maa_daily._drop_pairs(PROXY_WIPEOUT_LOG), [])

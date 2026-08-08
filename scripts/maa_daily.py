@@ -84,6 +84,14 @@ HOME_MARKER_MIN = 4
 SANITY_REFUND_ITEM = "理智"
 # maa run 被熔断中止时的返回码，跟超时的 124、人工中止的 130 区分开。
 PROXY_BREAK_CODE = 125
+# MaaCore 连接阶段就失败的标记。MaaTouch 的握手要 `app_process` 现开一个 ART 虚拟机，
+# 而 MaaCore 给这个握手的窗口写死 3 秒；模拟器冷启后头几十秒 system_server 还在忙，
+# 偶发就是卡过 3 秒 → 报 TouchModeNotAvailable、connect 返回失败。偏偏 maa-cli 不看
+# 这个返回值，照样 Assistant::start()，StartUpTask 拿着没连上的 controller 直接
+# SIGSEGV，maa run 秒退 1。此时一个键都没点过，重开一趟是安全的。见 DEV_GUIDE §11.14。
+CONNECT_FAILURE_MARKERS = ("TouchModeNotAvailable", "ConnectFailed", "Connect failed")
+# 这几个返回码是本脚本自己写上去的，不是「没连上」——重开一趟只会重复同一件事。
+SELF_ASSIGNED_CODES = (124, PROXY_BREAK_CODE, 130)
 # 进度消息的编辑节流，同时也是熔断的采样间隔——扫一遍全部日志行不便宜，
 # 不能放进 0.25 秒的主循环里跑。
 PROGRESS_INTERVAL_SECONDS = 5
@@ -366,6 +374,26 @@ def fight_wiped_out(lines: list[str]) -> tuple[int, int]:
     return 0, 0
 
 
+def connect_failed(lines: list[str], return_code: int) -> str:
+    """连接阶段就死了（一个键都没点过）时返回命中的标记，否则空串。
+
+    三个条件缺一不可：非零且不是我们自己写的返回码、日志里有连接失败标记、没有
+    任何一条任务链跑到 Completed。第三条是安全闸门——只要有任务真跑过，就不能拿
+    「重开一趟」当补救，那会重复已经做完的事。
+    """
+    if return_code == 0 or return_code in SELF_ASSIGNED_CODES:
+        return ""
+    task_keys = tuple(key for key, *_ in TASK_STEPS)
+    for line in lines:
+        if "AllTasksCompleted" in line or any(f"{key} Completed" in line for key in task_keys):
+            return ""
+    for line in lines:
+        for marker in CONNECT_FAILURE_MARKERS:
+            if marker in line:
+                return marker
+    return ""
+
+
 def progress_content(
     lines: list[str],
     *,
@@ -431,7 +459,15 @@ def extract_summary(
         state = _task_state(lines, key, label)
         status = {"completed": "✅ 完成", "failed": "❌ 未完成", "running": "❌ 中断", "pending": "⏸️ 未执行"}[state]
         details: list[str] = []
-        if key == "Fight":
+        if key == "StartUp" and state != "completed":
+            # 「启动游戏 ❌ 中断」看着像游戏那头的事，其实多半是根本没连上模拟器。
+            # 把 MaaCore 的原始标记摊开，省得每次都去翻 asst.log。见 §11.14。
+            marker = next(
+                (m for m in CONNECT_FAILURE_MARKERS if any(m in line for line in lines)), ""
+            )
+            if marker:
+                details.append(f"没连上模拟器（{marker}），游戏里一个键都没点")
+        elif key == "Fight":
             details.append(f"关卡 {plan_stage_label(plan or {})}")
             proxy_batches, refunded, _streak = proxy_failures(lines)
             wiped_batches, _wiped_refund = fight_wiped_out(lines)
@@ -541,6 +577,52 @@ def wait_for_android(config: dict[str, Any]) -> None:
         last_error = (boot.stderr or connect.stderr or connect.stdout).strip()
         time.sleep(3)
     raise RuntimeError(f"ADB 等待 {timeout}s 超时：{last_error or '设备未就绪'}")
+
+
+def settle_android_runtime(config: dict[str, Any]) -> str:
+    """等 `app_process` 的冷启抖动过去，再把场子交给 MaaCore。
+
+    `sys.boot_completed=1` 只说明系统起来了，不代表安静：BlueStacks 冷启后头几十秒
+    system_server 还在装自家 launcher，这期间任何 `app_process` 调用都可能卡上几秒。
+    MaaCore 起 MaaTouch 走的正是 `app_process`，而它只等 3 秒——撞上就判
+    TouchModeNotAvailable（§11.14）。这里用同样走 `app_process` 的只读命令
+    `am get-current-user` 探路，连着 quiet_seconds 秒都够快才放行。
+
+    2026-08-08 实测：冷启后 `sys.boot_completed=1` 在 +7.5s，探针在 +0…+4.3s 全是
+    35ms，+5.4s 突然卡了 2.8s，+9.2s 恢复——所以只看「连着几次快」不够，必须要求一段
+    连续安静的窗口。探不出安静窗口也不阻断：连接重试兜底比在这儿空等值钱。
+    """
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    budget = max(0, int(config.get("emulator_settle_timeout", 40)))
+    quiet_needed = max(0.0, float(config.get("emulator_settle_quiet_seconds", 8)))
+    slow = max(0.1, float(config.get("emulator_settle_slow_seconds", 1.0)))
+    if not budget or not quiet_needed:
+        return ""
+    deadline = time.monotonic() + budget
+    quiet_since = time.monotonic()
+    slowest = 0.0
+    while time.monotonic() < deadline:
+        begin = time.monotonic()
+        try:
+            probe = subprocess.run(
+                [adb, "-s", address, "shell", "am", "get-current-user"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=max(5, int(slow * 5)),
+            )
+            responsive = probe.returncode == 0
+        except subprocess.TimeoutExpired:
+            responsive = False
+        cost = time.monotonic() - begin
+        slowest = max(slowest, cost)
+        if not responsive or cost >= slow:
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= quiet_needed:
+            return ""
+        time.sleep(0.5)
+    return f"模拟器 app_process 未在 {budget}s 内稳定下来（最慢 {slowest:.1f}s），照常开跑。"
 
 
 def verify_game_installed(config: dict[str, Any]) -> None:
@@ -726,6 +808,7 @@ def run_maa(
     *,
     timeout: int | None = None,
     carry_lines: list[str] | None = None,
+    append: bool = False,
 ) -> tuple[int, list[str], list[str]]:
     maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     # maa-cli 0.7.5's --log-file redirects logs away from stderr.  Capture the
@@ -751,7 +834,7 @@ def run_maa(
     stdout_lines: list[str] = []
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_lock = threading.Lock()
-    with log_path.open("w", encoding="utf-8", buffering=1) as log_handle:
+    with log_path.open("a" if append else "w", encoding="utf-8", buffering=1) as log_handle:
         stderr_thread = threading.Thread(
             target=_reader,
             args=(process.stderr, stderr_recent, stderr_lines, log_handle, log_lock),
@@ -853,6 +936,72 @@ def run_maa(
     return return_code, stdout_lines, stderr_lines
 
 
+def run_maa_resilient(
+    config: dict[str, Any],
+    log_path: Path,
+    token: str,
+    thread_id: str,
+    progress_message_id: str,
+    plan: dict[str, Any] | None = None,
+    *,
+    timeout: int | None = None,
+    carry_lines: list[str] | None = None,
+) -> tuple[int, list[str], list[str], int]:
+    """跑 maa run；在连接阶段就崩掉的那种失败上重开。末位返回重试次数。
+
+    只重试 `connect_failed()` 认定的那一类：MaaTouch 没握上手 → MaaCore SIGSEGV，
+    一个键都没点过、一批理智都没花。所有重试共用同一个超时预算，绝不额外撑长
+    Hermes 那一小时；日志追加进同一个文件，不覆盖上一趟的现场。
+    """
+    budget = int(config.get("maa_run_timeout", 3000) if timeout is None else timeout)
+    limit = max(0, int(config.get("connect_retry_limit", 2)))
+    delay = max(0, int(config.get("connect_retry_delay", 8)))
+    started = time.monotonic()
+    stdout_all: list[str] = []
+    stderr_all: list[str] = []
+    retries = 0
+    while True:
+        remaining = budget - int(time.monotonic() - started)
+        code, out, err = run_maa(
+            config,
+            log_path,
+            token,
+            thread_id,
+            progress_message_id,
+            plan,
+            timeout=remaining,
+            carry_lines=list(carry_lines or []) + stdout_all + stderr_all,
+            append=retries > 0,
+        )
+        stdout_all += out
+        stderr_all += err
+        marker = connect_failed(out + err, code)
+        if not marker:
+            return code, stdout_all, stderr_all, retries
+        spent = int(time.monotonic() - started)
+        if retries >= limit or budget - spent - delay < MIN_RUN_TIMEOUT_SECONDS:
+            note = f"模拟器连接失败（{marker}），重试 {retries} 次仍未连上。"
+            stderr_all.append(note)
+            _append_log(log_path, note)
+            return code, stdout_all, stderr_all, retries
+        retries += 1
+        note = (
+            f"模拟器连接失败（{marker}）：MaaTouch 没在 MaaCore 的 3 秒窗口内握上手，"
+            f"游戏里一个键都没点过。等 {delay}s 重开第 {retries} 趟。"
+        )
+        stderr_all.append(note)
+        _append_log(log_path, note)
+        time.sleep(delay)
+
+
+def _append_log(log_path: Path, message: str) -> None:
+    try:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except OSError:
+        pass
+
+
 def salvage_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
     """去掉 Fight 的补跑计划；除 Fight 外无事可做时返回 None。"""
     tasks = dict(plan.get("tasks", {}))
@@ -913,9 +1062,15 @@ def report_payload(
     home_verify_detail: str = "",
     proxy_batches: int = 0,
     proxy_refunded: int = 0,
+    connect_retries: int = 0,
 ) -> dict[str, Any]:
     label = PHASE_LABELS[phase]
     notes: list[str] = []
+    if connect_retries:
+        notes.append(
+            f"模拟器连接失败（MaaTouch 握手超时），已重开 {connect_retries} 趟 maa run。"
+            "偶发可以不管；每天都撞上就把 emulator_settle_quiet_seconds 调大。"
+        )
     if proxy_batches:
         notes.append(
             f"代理指挥失误 {proxy_batches} 批，理智已返还 ×{proxy_refunded}，实际一关没打成。"
@@ -1112,6 +1267,7 @@ def execute(phase: str) -> int:
         home_verify_detail = ""
         cleanup_errors: list[str] = []
         salvage_log_path: Path | None = None
+        connect_retries = 0
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
             require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -1152,9 +1308,22 @@ def execute(phase: str) -> int:
             )
             task_path = Path(str(config.get("maa_config_dir", MAA_CONFIG_DIR))) / "tasks" / "daily.toml"
             atomic_write_text(task_path, render_daily_toml(plan, config))
-            return_code, stdout_lines, stderr_lines = run_maa(
-                config, log_path, token, thread_id, progress_message_id, plan
+            # 最后一道门：`sys.boot_completed` 之后 app_process 还会抖，撞上 MaaCore
+            # 那 3 秒的 MaaTouch 窗口就是一场空跑（§11.14）。探不出安静窗口不阻断。
+            settle_warning = settle_android_runtime(config)
+            if settle_warning:
+                stderr_lines.append(settle_warning)
+            prior_errors = list(stderr_lines)
+            return_code, stdout_lines, run_errors, connect_retries = run_maa_resilient(
+                config,
+                log_path,
+                token,
+                thread_id,
+                progress_message_id,
+                plan,
+                carry_lines=prior_errors,
             )
+            stderr_lines = prior_errors + run_errors
             # 125 也可能是 maa 自己的退出码，所以还要确认日志里真有代理失误，
             # 免得凭一个数字就多跑一趟。
             if return_code == PROXY_BREAK_CODE and fight_wiped_out(stdout_lines + stderr_lines)[0]:
@@ -1254,6 +1423,7 @@ def execute(phase: str) -> int:
                 home_verify_detail=home_verify_detail,
                 proxy_batches=proxy_batches,
                 proxy_refunded=proxy_refunded,
+                connect_retries=connect_retries,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
         merge_last_run(
@@ -1272,6 +1442,7 @@ def execute(phase: str) -> int:
                 "summary": summary,
                 "proxy_failure_batches": proxy_batches,
                 "proxy_failure_sanity_refunded": proxy_refunded,
+                "connect_retries": connect_retries,
             }
         )
         return 0 if ok else 1
