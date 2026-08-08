@@ -29,6 +29,7 @@ from maa_daily import (
     capture_screenshot,
     close_everything,
     open_emulator,
+    settle_android_runtime,
     verify_game_installed,
     wait_for_android,
 )
@@ -469,6 +470,9 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
         open_emulator(config)
         wait_for_android(config)
         verify_game_installed(config)
+        # 抄作业开的是同一台冷启模拟器，同样会撞上 MaaCore 那 3 秒的 MaaTouch 窗口
+        # （DEV_GUIDE §11.14）。这里没有日常那层重试兜底，闸门更不能省。
+        settle_android_runtime(config)
 
         maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
         env = maa_subprocess_env(config)
