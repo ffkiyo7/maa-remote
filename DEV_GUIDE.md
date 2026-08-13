@@ -156,7 +156,12 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 7. **渲染 `daily.toml`** — `render_daily_toml(plan, config)`（`:76`）把本场快照渲染成 TOML 并
    `atomic_write_text` 覆盖 `~/.config/maa-cli/tasks/daily.toml`。任务链固定：
 
-   `StartUp → Fight → Infrast → Recruit → Mall → Award → Custom(Home)`
+   `StartUp → [周一早场 Annihilation] → Fight → Infrast → Recruit → Mall → Award → Custom(Home)`
+
+   `StartUp` 本身已经复用 MaaCore 的首登处理链：登录后会处理签到/今日配给等弹窗，
+   不是另起一条自定义点击任务。剿灭复用第二个 `Fight(stage = "Annihilation")`，只在
+   官服周一 04:00–12:00 的 task variant 生效；MaaCore 从右上角待办进入当期剿灭，
+   每次结算 OCR 周进度，达到周上限就停。两个 Fight 都硬编码 `stone = 0`。
 
    最后那个 `Custom` 的 `task_names` **每一项都必须带 `Home@` 前缀**（见
    `maa_daily.HOME_TASK_NAMES`）。MAA 的 `QuickSwitch` 是子程序，点完小房子里的首页图标

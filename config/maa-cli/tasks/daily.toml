@@ -6,6 +6,26 @@ client_type = "Official"
 start_game_enabled = true
 
 [[tasks]]
+name = "每周剿灭"
+type = "Fight"
+[tasks.params]
+stage = "Annihilation"
+medicine = 0
+medicine_expire_days = 2
+stone = 0
+series = 0
+times = 2147483647
+server = "CN"
+client_type = "Official"
+[[tasks.variants]]
+[tasks.variants.condition]
+type = "And"
+conditions = [
+  { type = "Weekday", weekdays = ["Mon"], timezone = "Official" },
+  { type = "Time", start = "04:00:00", end = "12:00:00", timezone = "Official" },
+]
+
+[[tasks]]
 name = "刷理智"
 type = "Fight"
 [tasks.params]

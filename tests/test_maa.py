@@ -160,6 +160,11 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("dorm_trust_enabled = false", rendered)
         self.assertIn("medicine = 0", rendered)
         self.assertIn("medicine_expire_days = 2", rendered)
+        self.assertIn('name = "每周剿灭"', rendered)
+        self.assertIn('stage = "Annihilation"', rendered)
+        self.assertIn('weekdays = ["Mon"]', rendered)
+        self.assertIn('start = "04:00:00", end = "12:00:00"', rendered)
+        self.assertLess(rendered.index('name = "每周剿灭"'), rendered.index('name = "刷理智"'))
         self.assertIn('name = "返回主界面"', rendered)
         # Every QuickSwitch/ReturnButtons name must carry the "Home@" caller
         # prefix, otherwise `#back` resolves to a non-existent task and the
@@ -188,6 +193,12 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("times = 0", rendered)
         self.assertIn("series = 0", rendered)
         self.assertIn("stone = 0", rendered)
+
+    def test_disabling_fight_also_disables_weekly_annihilation(self) -> None:
+        self.plan["tasks"]["fight"] = False
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        self.assertNotIn('stage = "Annihilation"', rendered)
+        self.assertNotIn('name = "刷理智"', rendered)
 
     def test_skip_only_silences_the_automatic_sessions(self) -> None:
         skipped = maa_common.normalize_plan({"skip": True})
@@ -252,6 +263,25 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("招募 4 次", summary)
         self.assertIn("🏠 返回主界面：✅ 完成", summary)
         self.assertNotIn("Completed", summary)
+
+    def test_named_fight_summaries_keep_annihilation_separate(self) -> None:
+        lines = [
+            "Fight Start",
+            "Fight Completed",
+            "Fight Start",
+            "Fight Error",
+            "[每周剿灭] Completed",
+            "Fight Annihilation 5 times",
+            "total drops: 合成玉 ×1800",
+            "[刷理智] Error",
+            "Fight 1-7 3 times, drops:",
+            "total drops: 固源岩 ×3",
+        ]
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        summary = maa_daily.extract_summary(lines, [], plan=plan, ok=False)
+        self.assertIn("☄️ 每周剿灭：✅ 完成（当期剿灭 5 次", summary)
+        self.assertIn("⚔️ 刷理智：❌ 未完成（关卡 1-7；3 次；掉落 固源岩 ×3）", summary)
+        self.assertNotIn("合成玉", summary)
 
     def test_cleanup_continues_after_closedown_is_missing(self) -> None:
         results = [
@@ -688,7 +718,7 @@ class ConnectFailureTests(unittest.TestCase):
             home_verified=False,
             home_verify_detail="识别到 0/8 个主页标识",
         )
-        self.assertIn("🚀 启动游戏：❌ 中断（没连上模拟器（TouchModeNotAvailable）", summary)
+        self.assertIn("🚀 登录与首登领取：❌ 中断（没连上模拟器（TouchModeNotAvailable）", summary)
         self.assertIn("一个键都没点", summary)
 
     def test_report_note_explains_the_retries(self) -> None:
@@ -1320,12 +1350,10 @@ class HomeScreenshotTests(unittest.TestCase):
             maa_common.normalize_plan({"stage": "", "tasks": {}}),
             {"medicine_expire_days": 2, "fight_times": 2147483647, "recruit_times": 4},
         )
-        for line in rendered.splitlines():
-            if line.startswith("task_names = "):
-                self.assertIn(line, toml)
-                break
-        else:  # pragma: no cover - the renderer always emits the Custom task
-            self.fail("renderer emitted no task_names line")
+        # The checked-in file is the deploy seed plus explanatory comments;
+        # every executable line before those comments must exactly match what
+        # the runtime renderer will overwrite it with.
+        self.assertTrue(toml.startswith(rendered), "daily.toml drifted from runtime renderer")
 
 
 if __name__ == "__main__":

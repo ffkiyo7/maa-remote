@@ -44,7 +44,8 @@ SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
 SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
 TASK_STEPS = (
-    ("StartUp", "🚀", "启动游戏", "正在启动游戏并进入主界面"),
+    ("StartUp", "🚀", "登录与首登领取", "正在登录并处理首登弹窗"),
+    ("Annihilation", "☄️", "每周剿灭", "正在清理本周剿灭"),
     ("Fight", "⚔️", "刷理智", "正在刷理智"),
     ("Infrast", "🏭", "基建换班", "正在按游戏内预设队列轮换"),
     ("Recruit", "🎫", "公开招募", "正在处理公开招募"),
@@ -134,6 +135,27 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
         # Fixed safety policy: never use ordinary medicine or Originite Prime;
         # only consume medicine MaaCore identifies as expiring soon.
         medicine_days = max(1, int(config.get("medicine_expire_days", 2)))
+        blocks.append(
+            "[[tasks]]\n"
+            'name = "每周剿灭"\n'
+            'type = "Fight"\n'
+            "[tasks.params]\n"
+            'stage = "Annihilation"\n'
+            "medicine = 0\n"
+            f"medicine_expire_days = {max(0, medicine_days)}\n"
+            "stone = 0\n"
+            "series = 0\n"
+            f"times = {int(config.get('fight_times', 2147483647))}\n"
+            'server = "CN"\n'
+            'client_type = "Official"\n'
+            "[[tasks.variants]]\n"
+            "[tasks.variants.condition]\n"
+            'type = "And"\n'
+            "conditions = [\n"
+            '  { type = "Weekday", weekdays = ["Mon"], timezone = "Official" },\n'
+            '  { type = "Time", start = "04:00:00", end = "12:00:00", timezone = "Official" },\n'
+            "]\n"
+        )
         blocks.append(
             "[[tasks]]\n"
             'name = "刷理智"\n'
@@ -230,6 +252,16 @@ def _clean_line(line: str, limit: int = 150) -> str:
 
 
 def _task_state(lines: list[str], key: str, label: str) -> str:
+    # maa-cli uses the configured task name in its final ``[name]`` summary.
+    # Prefer that exact result when multiple tasks share one MaaCore type (the
+    # weekly annihilation and ordinary farming are both Fight tasks).
+    named = [line for line in lines if f"[{label}]" in line]
+    if named:
+        if any("Completed" in line for line in named):
+            return "completed"
+        if any("Stopped" in line or "Error" in line for line in named):
+            return "failed"
+        return "running"
     if any(f"{key} Completed" in line or (f"[{label}]" in line and "Completed" in line) for line in lines):
         return "completed"
     if any(f"{key} Stopped" in line or f"{key} Error" in line for line in lines):
@@ -249,8 +281,24 @@ def _last_match(lines: list[str], pattern: str) -> re.Match[str] | None:
     return result
 
 
+def _named_task_section(lines: list[str], label: str) -> list[str]:
+    """Return one maa-cli final-summary section, excluding later tasks."""
+    start = next((index for index, line in enumerate(lines) if f"[{label}]" in line), None)
+    if start is None:
+        return []
+    section: list[str] = []
+    for line in lines[start:]:
+        if section and re.match(r"^\[[^]]+\]", line):
+            break
+        section.append(line)
+    return section
+
+
 def _fight_times(lines: list[str]) -> int:
-    summary = _last_match(lines, r"\bFight\s+(\d+)\s+times\b")
+    # Final summaries normally include a stage code (``Fight CE-6 6 times``);
+    # older fixture/log shapes omitted it.  Accept both before falling back to
+    # streaming Mission-started events.
+    summary = _last_match(lines, r"\bFight(?:\s+\S+)?\s+(\d+)\s+times\b")
     if summary:
         return int(summary.group(1))
     return sum(
@@ -445,6 +493,10 @@ def extract_summary(
     tasks = (plan or {}).get("tasks", {})
     enabled = {
         "StartUp": True,
+        # This task is conditionally active only on Monday morning.  Its named
+        # maa-cli summary is the reliable signal that it actually joined this
+        # run; do not show "未执行" on every other day.
+        "Annihilation": any("[每周剿灭]" in line for line in lines),
         "Fight": bool(tasks.get("fight", True)),
         "Infrast": bool(tasks.get("infrast", True)),
         "Recruit": bool(tasks.get("recruit", True)),
@@ -467,11 +519,20 @@ def extract_summary(
             )
             if marker:
                 details.append(f"没连上模拟器（{marker}），游戏里一个键都没点")
+        elif key == "Annihilation":
+            annihilation_lines = _named_task_section(lines, "每周剿灭") or lines
+            count = _fight_times(annihilation_lines)
+            details.append(
+                f"当期剿灭 {count} 次；达到周上限后自动停止"
+                if count
+                else "当期剿灭；达到周上限后自动停止"
+            )
         elif key == "Fight":
+            fight_lines = _named_task_section(lines, "刷理智") or lines
             details.append(f"关卡 {plan_stage_label(plan or {})}")
-            proxy_batches, refunded, _streak = proxy_failures(lines)
-            wiped_batches, _wiped_refund = fight_wiped_out(lines)
-            count = _fight_times(lines)
+            proxy_batches, refunded, _streak = proxy_failures(fight_lines)
+            wiped_batches, _wiped_refund = fight_wiped_out(fight_lines)
+            count = _fight_times(fight_lines)
             if wiped_batches:
                 # MaaCore 会把「一批都没打成」也判成 Fight Completed，而 count 数的是
                 # 发起的连战批次，不是真打完的次数。这里直接翻红，别让战报骗人。
@@ -481,13 +542,13 @@ def extract_summary(
                 details.append(f"{count} 次")
             if proxy_batches:
                 details.append(f"代理指挥失误 {proxy_batches} 批，理智已返还 ×{refunded}")
-            medicine = _expiring_medicine_used(lines)
+            medicine = _expiring_medicine_used(fight_lines)
             if medicine:
                 details.append(f"临期理智药 ×{medicine}")
             sanity = _last_match(lines, r"Current sanity:\s*(\d+)\s*/\s*(\d+)")
             if sanity:
                 details.append(f"结束理智 {sanity.group(1)}/{sanity.group(2)}")
-            drops = _drop_pairs(lines)
+            drops = _drop_pairs(fight_lines)
             if drops:
                 details.append("掉落 " + "、".join(f"{name} ×{quantity}" for name, quantity in drops))
         elif key == "Infrast":
