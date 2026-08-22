@@ -42,11 +42,32 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertNotIn("HTTPS_PROXY", env)
 
+    def test_maa_update_keeps_proxy_when_requested(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HTTPS_PROXY": "http://127.0.0.1:7890", "KEEP_ME": "yes"},
+            clear=True,
+        ):
+            env = maa_common.maa_subprocess_env(
+                {
+                    "maa_config_dir": "/tmp/maa-config",
+                    "maa_disable_proxy": True,
+                },
+                keep_proxy=True,
+            )
+        self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7890")
+        self.assertEqual(env["KEEP_ME"], "yes")
+
     def test_normalize_plan_hard_resets_stone(self) -> None:
         plan = maa_common.normalize_plan(
             {"stage": "CE-6", "medicine": "expiring", "stone": 99}
         )
         self.assertEqual(plan["stone"], 0)
+
+    def test_default_stage_is_1_7(self) -> None:
+        self.assertEqual(maa_common.DEFAULT_PLAN["stage"], "1-7")
+        self.assertEqual(maa_common.normalize_plan({})["stage"], "1-7")
+        self.assertEqual(maa_common.normalize_plan({"stage": ""})["stage"], "")
 
     def test_today_override_applies_and_stale_override_expires(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -74,6 +95,8 @@ class PlanTests(unittest.TestCase):
         card = maa_plan_card.build_embed(skipped, {})
         field = next(f for f in card["fields"] if f["name"] == "跳过自动场次")
         self.assertIn("手动开跑不受影响", field["value"])
+        annihilation = next(f for f in card["fields"] if f["name"] == "每日剿灭")
+        self.assertIn("1800", annihilation["value"])
         components, registry = maa_plan_card.build_components(
             maa_common.normalize_plan({"skip": False}), {"channel_id": "1"}
         )
@@ -160,11 +183,13 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("dorm_trust_enabled = false", rendered)
         self.assertIn("medicine = 0", rendered)
         self.assertIn("medicine_expire_days = 2", rendered)
-        self.assertIn('name = "每周剿灭"', rendered)
+        self.assertIn("mail = true", rendered)
+        self.assertNotIn("mail = false", rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
         self.assertIn('stage = "Annihilation"', rendered)
-        self.assertIn('weekdays = ["Mon"]', rendered)
-        self.assertIn('start = "04:00:00", end = "12:00:00"', rendered)
-        self.assertLess(rendered.index('name = "每周剿灭"'), rendered.index('name = "刷理智"'))
+        self.assertNotIn("weekdays", rendered)
+        self.assertNotIn("[[tasks.variants]]", rendered)
+        self.assertLess(rendered.index('name = "每日剿灭"'), rendered.index('name = "刷理智"'))
         self.assertIn('name = "返回主界面"', rendered)
         # Every QuickSwitch/ReturnButtons name must carry the "Home@" caller
         # prefix, otherwise `#back` resolves to a non-existent task and the
@@ -199,6 +224,40 @@ class RenderingTests(unittest.TestCase):
         rendered = maa_daily.render_daily_toml(self.plan, self.config)
         self.assertNotIn('stage = "Annihilation"', rendered)
         self.assertNotIn('name = "刷理智"', rendered)
+
+    def test_annihilation_omitted_when_already_done_today(self) -> None:
+        self.plan["annihilation"] = False
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        self.assertNotIn('stage = "Annihilation"', rendered)
+        self.assertNotIn('name = "每日剿灭"', rendered)
+        self.assertIn('name = "刷理智"', rendered)
+        self.assertIn('stage = "CE-6"', rendered)
+
+    def test_annihilation_once_per_cn_game_day(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        monday_am = datetime(2026, 8, 17, 8, 0, tzinfo=BEIJING)
+        monday_pm = datetime(2026, 8, 17, 22, 0, tzinfo=BEIJING)
+        before_reset = datetime(2026, 8, 18, 3, 59, tzinfo=BEIJING)
+        after_reset = datetime(2026, 8, 18, 4, 0, tzinfo=BEIJING)
+        self.assertTrue(maa_daily.should_run_annihilation(plan, monday_am, {}))
+        last = {"annihilation_game_day": maa_daily.cn_game_day(monday_am)}
+        self.assertEqual(last["annihilation_game_day"], "2026-08-17")
+        self.assertFalse(maa_daily.should_run_annihilation(plan, monday_pm, last))
+        self.assertFalse(maa_daily.should_run_annihilation(plan, before_reset, last))
+        self.assertTrue(maa_daily.should_run_annihilation(plan, after_reset, last))
+        no_fight = maa_common.normalize_plan({"stage": "1-7", "tasks": {"fight": False}})
+        self.assertFalse(maa_daily.should_run_annihilation(no_fight, monday_am, {}))
+        attached = maa_daily.attach_annihilation(plan, monday_pm, last)
+        self.assertFalse(attached["annihilation"])
+
+    def test_annihilation_consumed_after_startup_or_named_task(self) -> None:
+        self.assertTrue(maa_daily.annihilation_consumed(["StartUp Completed"]))
+        self.assertTrue(maa_daily.annihilation_consumed(["[每日剿灭] Completed"]))
+        self.assertTrue(maa_daily.annihilation_consumed(["[每周剿灭] Completed"]))
+        self.assertTrue(maa_daily.annihilation_consumed(["Fight Annihilation 1 times"]))
+        self.assertFalse(
+            maa_daily.annihilation_consumed(["StartUp Start", "TouchModeNotAvailable"])
+        )
 
     def test_skip_only_silences_the_automatic_sessions(self) -> None:
         skipped = maa_common.normalize_plan({"skip": True})
@@ -279,9 +338,23 @@ class RenderingTests(unittest.TestCase):
         ]
         plan = maa_common.normalize_plan({"stage": "1-7"})
         summary = maa_daily.extract_summary(lines, [], plan=plan, ok=False)
-        self.assertIn("☄️ 每周剿灭：✅ 完成（当期剿灭 5 次", summary)
+        self.assertIn("☄️ 每日剿灭：✅ 完成（当期剿灭 5 次", summary)
+        self.assertIn("代理卡全权委托", summary)
+        self.assertIn("1800 合成玉/周", summary)
         self.assertIn("⚔️ 刷理智：❌ 未完成（关卡 1-7；3 次；掉落 固源岩 ×3）", summary)
-        self.assertNotIn("合成玉", summary)
+        self.assertNotIn("合成玉 ×1800", summary)
+
+    def test_summary_notes_annihilation_already_done(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        plan["annihilation"] = False
+        summary = maa_daily.extract_summary(
+            ["StartUp Completed", "[刷理智] Completed"],
+            [],
+            plan=plan,
+            ok=True,
+        )
+        self.assertIn("☄️ 每日剿灭：⏭️ 今日已刷过，本场跳过", summary)
+        self.assertNotIn("每日剿灭：⏸️ 未执行", summary)
 
     def test_cleanup_continues_after_closedown_is_missing(self) -> None:
         results = [
@@ -618,41 +691,205 @@ Opening mini games:
             with self.assertRaises(RuntimeError):
                 deploy.resolve_channel_id()
 
-    def test_resource_update_due_uses_last_attempt(self) -> None:
-        at = datetime(2026, 8, 8, 7, 50, tzinfo=BEIJING)
-        self.assertTrue(maa_plan_card.resource_update_due({}, at, 7))
-        self.assertFalse(
-            maa_plan_card.resource_update_due(
-                {"resource_update_attempted_at": "2026-08-02T07:50:00+08:00"},
-                at,
-                7,
-            )
+    def test_parse_maa_versions_from_cli_output(self) -> None:
+        cli, core = maa_plan_card.parse_maa_versions(
+            "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n"
         )
-        self.assertTrue(
-            maa_plan_card.resource_update_due(
-                {"resource_update_attempted_at": "2026-08-01T07:50:00+08:00"},
-                at,
-                7,
-            )
-        )
+        self.assertEqual(cli, "v0.7.5")
+        self.assertEqual(core, "v6.17.0-beta.1")
 
-    def test_failed_resource_update_is_recorded_and_alerted(self) -> None:
+    def test_update_summary_reports_today_upgrade_and_no_op(self) -> None:
+        upgraded = maa_plan_card.format_update_summary(
+            {
+                "ok": True,
+                "changed": True,
+                "cli_before": "v0.7.5",
+                "cli_after": "v0.7.5",
+                "core_before": "v6.17.0-beta.1",
+                "core_after": "v6.17.0-beta.4",
+            }
+        )
+        self.assertTrue(upgraded.startswith("今天已更新："))
+        self.assertIn("MaaCore v6.17.0-beta.1 → v6.17.0-beta.4", upgraded)
+        self.assertIn("maa-cli v0.7.5", upgraded)
+        unchanged = maa_plan_card.format_update_summary(
+            {
+                "ok": True,
+                "changed": False,
+                "cli_before": "v0.7.5",
+                "cli_after": "v0.7.5",
+                "core_before": "v6.17.0-beta.1",
+                "core_after": "v6.17.0-beta.1",
+            }
+        )
+        self.assertTrue(unchanged.startswith("今天已检查，无新版本"))
+        failed = maa_plan_card.format_update_summary(
+            {"ok": False, "detail": "failed to connect to github.com"}
+        )
+        self.assertTrue(failed.startswith("今天检查失败："))
+
+    def test_plan_card_embed_includes_today_update_field(self) -> None:
+        card = maa_plan_card.build_embed(
+            maa_common.normalize_plan({"skip": False}),
+            {},
+            {
+                "ok": True,
+                "changed": True,
+                "summary": "今天已更新：MaaCore v6.17.0-beta.1 → v6.17.0-beta.4",
+            },
+        )
+        field = next(item for item in card["fields"] if item["name"] == "上游更新")
+        self.assertIn("今天已更新", field["value"])
+
+    def test_failed_upstream_update_is_recorded_and_alerted(self) -> None:
         at = datetime(2026, 8, 8, 7, 50, tzinfo=BEIJING)
-        with patch.object(maa_plan_card, "now_beijing", return_value=at), patch.object(
-            maa_plan_card, "load_json", return_value={}
-        ), patch.object(
-            maa_plan_card.subprocess,
-            "run",
-            return_value=SimpleNamespace(returncode=1, stdout="", stderr="network down"),
-        ), patch.object(maa_plan_card, "merge_last_run") as merge, patch.object(
-            maa_plan_card, "discord_request"
-        ) as request:
-            ok = maa_plan_card.update_resources_if_due(
-                "token", "123", {"maa_bin": "/maa", "resource_update_timeout": 30}
-            )
-        self.assertFalse(ok)
+        calls = {"version": 0}
+
+        def fake_run(argv, **_kwargs):
+            if argv[:2] == ["/maa", "version"]:
+                calls["version"] += 1
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n",
+                    stderr="",
+                )
+            if argv[:2] == ["/opt/homebrew/bin/brew", "outdated"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["/maa", "update"]:
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="network down"
+                )
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            maa_common.atomic_write_json(config_path, {})
+            with patch.object(maa_plan_card, "now_beijing", return_value=at), patch.object(
+                maa_plan_card, "CONFIG_PATH", config_path
+            ), patch.object(maa_plan_card.shutil, "which", return_value="/opt/homebrew/bin/brew"), patch.object(
+                maa_plan_card.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(maa_plan_card, "merge_last_run") as merge, patch.object(
+                maa_plan_card, "discord_request"
+            ) as request:
+                result = maa_plan_card.check_and_update_upstream(
+                    "token",
+                    "123",
+                    {"maa_bin": "/maa", "resource_update_timeout": 30},
+                )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["summary"].startswith("今天检查失败："))
         self.assertEqual(merge.call_args.args[0]["resource_update_status"], "failed")
         self.assertEqual(request.call_args.args[1:3], ("POST", "/channels/123/messages"))
+        self.assertGreaterEqual(calls["version"], 2)
+
+    def test_daily_upstream_check_keeps_proxy_and_reports_core_upgrade(self) -> None:
+        at = datetime(2026, 8, 19, 7, 50, tzinfo=BEIJING)
+        versions = iter(
+            [
+                "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n",
+                "maa-cli v0.7.5\nMaaCore v6.17.0-beta.4\n",
+            ]
+        )
+        seen_env: list[dict[str, str]] = []
+
+        def fake_run(argv, **kwargs):
+            seen_env.append(kwargs.get("env") or {})
+            if argv[:2] == ["/maa", "version"]:
+                return SimpleNamespace(
+                    returncode=0, stdout=next(versions), stderr=""
+                )
+            if argv[:2] == ["/opt/homebrew/bin/brew", "outdated"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="Updated tap")
+            if argv[:2] == ["/maa", "update"]:
+                self.assertTrue(argv[-1] == "--batch" or "--batch" in argv)
+                return SimpleNamespace(
+                    returncode=0, stdout="updated maa-core", stderr=""
+                )
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            maa_common.atomic_write_json(
+                config_path, {"maa_bin": "/maa", "maa_disable_proxy": True}
+            )
+            with patch.dict(
+                os.environ,
+                {"HTTPS_PROXY": "http://127.0.0.1:7890"},
+                clear=False,
+            ), patch.object(maa_plan_card, "now_beijing", return_value=at), patch.object(
+                maa_plan_card, "CONFIG_PATH", config_path
+            ), patch.object(
+                maa_plan_card.shutil, "which", return_value="/opt/homebrew/bin/brew"
+            ), patch.object(
+                maa_plan_card.subprocess, "run", side_effect=fake_run
+            ), patch.object(maa_plan_card, "merge_last_run") as merge, patch.object(
+                maa_plan_card, "discord_request"
+            ) as request:
+                result = maa_plan_card.check_and_update_upstream(
+                    "token",
+                    "123",
+                    {
+                        "maa_bin": "/maa",
+                        "maa_config_dir": "/tmp/maa-config",
+                        "maa_disable_proxy": True,
+                        "resource_update_timeout": 30,
+                    },
+                )
+            persisted = maa_common.load_json(config_path, {})
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertIn("今天已更新", result["summary"])
+        self.assertIn("v6.17.0-beta.1 → v6.17.0-beta.4", result["summary"])
+        self.assertEqual(merge.call_args.args[0]["resource_update_status"], "ok")
+        request.assert_not_called()
+        self.assertEqual(persisted.get("maa_core_version"), "v6.17.0-beta.4")
+        update_envs = [
+            env for env in seen_env if env.get("MAA_CONFIG_DIR") == "/tmp/maa-config"
+        ]
+        self.assertTrue(update_envs)
+        self.assertIn("HTTPS_PROXY", update_envs[0])
+
+    def test_outdated_maa_cli_is_upgraded_via_brew(self) -> None:
+        argv_log: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            argv_log.append(list(argv))
+            if argv[:2] == ["/maa", "version"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n",
+                    stderr="",
+                )
+            if argv[:2] == ["/opt/homebrew/bin/brew", "outdated"]:
+                return SimpleNamespace(
+                    returncode=0, stdout="maa-cli", stderr=""
+                )
+            if argv[:2] == ["/opt/homebrew/bin/brew", "upgrade"]:
+                return SimpleNamespace(returncode=0, stdout="upgraded maa-cli", stderr="")
+            if argv[:2] == ["/maa", "update"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            maa_common.atomic_write_json(config_path, {})
+            with patch.object(maa_plan_card, "CONFIG_PATH", config_path), patch.object(
+                maa_plan_card.shutil, "which", return_value="/opt/homebrew/bin/brew"
+            ), patch.object(
+                maa_plan_card.subprocess, "run", side_effect=fake_run
+            ), patch.object(maa_plan_card, "merge_last_run"), patch.object(
+                maa_plan_card, "discord_request"
+            ):
+                result = maa_plan_card.check_and_update_upstream(
+                    "token", "123", {"maa_bin": "/maa"}
+                )
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["changed"])
+        self.assertTrue(
+            any(item[:2] == ["/opt/homebrew/bin/brew", "upgrade"] for item in argv_log)
+        )
 
 
 # 2026-08-07 早场 TO-9 的真实日志骨架：代理指挥失误连着四批，理智全额返还，
@@ -1347,7 +1584,7 @@ class HomeScreenshotTests(unittest.TestCase):
     def test_checked_in_daily_toml_matches_the_renderer(self) -> None:
         toml = (ROOT / "config" / "maa-cli" / "tasks" / "daily.toml").read_text(encoding="utf-8")
         rendered = maa_daily.render_daily_toml(
-            maa_common.normalize_plan({"stage": "", "tasks": {}}),
+            maa_common.normalize_plan({"stage": "1-7", "tasks": {}}),
             {"medicine_expire_days": 2, "fight_times": 2147483647, "recruit_times": 4},
         )
         # The checked-in file is the deploy seed plus explanatory comments;

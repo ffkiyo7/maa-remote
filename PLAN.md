@@ -255,7 +255,7 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 
 ### P5 · 加固
 
-每周 `maa update`（国服活动更新资源）；失败告警（非零退出 / adb 超时 / 游戏要更新卡住）发红色 Embed，**绝不静默**；`runs/` 日志与截图保留 14 天。
+每天计划卡检查并跟随 maa-cli / MaaCore（有更新就装，卡片写明今天是否升级）；失败告警（非零退出 / adb 超时 / 游戏要更新卡住）发红色 Embed，**绝不静默**；`runs/` 日志与截图保留 14 天。
 
 ---
 

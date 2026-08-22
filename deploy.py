@@ -169,7 +169,16 @@ def deploy_state(channel_id: str) -> None:
     current_config = load_json(target / "config.json", {})
     if not isinstance(current_config, dict):
         raise RuntimeError("existing MAA config.json is not an object")
+    # Plan-card version probes write the live maa-cli / MaaCore versions.
+    # Don't let a stale seed in the repo clobber them on every deploy.
+    preserved_versions = {
+        key: current_config[key]
+        for key in ("maa_core_version", "maa_cli_version")
+        if key in current_config
+    }
     current_config.update(desired_config)
+    current_config.update(preserved_versions)
+    current_config.pop("resource_update_interval_days", None)
     write_json(target / "config.json", current_config)
 
     for name in ("defaults.json", "plan.json", "last_run.json"):
@@ -184,6 +193,7 @@ def deploy_state(channel_id: str) -> None:
         raise RuntimeError("existing MAA defaults.json is not an object")
     current_defaults["medicine"] = "expiring"
     current_defaults["stone"] = 0
+    current_defaults["stage"] = "1-7"
     write_json(defaults_path, current_defaults)
 
     plan_path = target / "plan.json"

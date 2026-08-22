@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
 import sys
-import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -13,7 +15,6 @@ import maa_copilot
 from maa_common import (
     BUTTONS_PATH,
     CONFIG_PATH,
-    LAST_RUN_PATH,
     atomic_write_json,
     cleanup_old_threads,
     cleanup_run_files,
@@ -42,6 +43,8 @@ SUPPLY_STAGES: tuple[tuple[str, str, str, frozenset[int]], ...] = (
     ("LS-6 · 作战记录", "LS-6", "作战记录关卡", frozenset(range(7))),
     ("SK-5 · 基建材料", "SK-5", "碳素与家具零件关卡", frozenset({0, 2, 4, 5})),
 )
+DEFAULT_MAA_CLI_FORMULA = "MaaAssistantArknights/tap/maa-cli"
+_VERSION_RE = re.compile(r"(?im)^(maa-cli|MaaCore|maa)\s+(v?\d+\.\d+\.\d+\S*)")
 
 
 def parse_activity_stages(output: str) -> list[str]:
@@ -100,99 +103,231 @@ def refresh_activity_stages(config: dict[str, Any]) -> tuple[bool, str]:
     return True, "、".join(stages) if stages else "当前无开放活动关"
 
 
-def resource_update_due(
-    last_run: dict[str, Any],
-    at: datetime,
-    interval_days: int,
-) -> bool:
-    """Return whether the bounded weekly Maa resource refresh should run."""
-    raw = last_run.get("resource_update_attempted_at")
-    if not raw:
-        return True
-    try:
-        attempted = datetime.fromisoformat(str(raw)).astimezone(at.tzinfo)
-    except (TypeError, ValueError):
-        return True
-    return at - attempted >= timedelta(days=max(1, interval_days))
+def parse_maa_versions(output: str) -> tuple[str, str]:
+    """Return ``(maa-cli version, MaaCore version)`` from ``maa version`` output."""
+    cli = ""
+    core = ""
+    for match in _VERSION_RE.finditer(output or ""):
+        version = match.group(2)
+        if not version.lower().startswith("v"):
+            version = f"v{version}"
+        if match.group(1).lower() == "maacore":
+            core = version
+        else:
+            cli = version
+    return cli, core
 
 
-def update_resources_if_due(
-    token: str,
-    channel_id: str,
-    config: dict[str, Any],
-) -> bool:
-    """Run ``maa update`` at most once per configured interval and alert on failure."""
-    at = now_beijing()
-    last_run = load_json(LAST_RUN_PATH, {})
-    if not isinstance(last_run, dict):
-        last_run = {}
-    interval_days = int(config.get("resource_update_interval_days", 7))
-    if not resource_update_due(last_run, at, interval_days):
-        return True
+def format_update_summary(result: dict[str, Any]) -> str:
+    """One Discord field for today's maa-cli / MaaCore check."""
+    if not result.get("ok"):
+        detail = str(result.get("detail") or "未知错误").strip()
+        first = detail.splitlines()[0] if detail else "未知错误"
+        return f"今天检查失败：{first[:300]}"
 
-    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
-    timeout = max(30, int(config.get("resource_update_timeout", 300)))
-    ok = False
-    detail = ""
+    def _line(label: str, before: str, after: str) -> tuple[bool, str]:
+        before = before or "未知"
+        after = after or before
+        if before != after:
+            return True, f"{label} {before} → {after}"
+        return False, f"{label} {after}"
+
+    cli_changed, cli_text = _line(
+        "maa-cli",
+        str(result.get("cli_before") or ""),
+        str(result.get("cli_after") or ""),
+    )
+    core_changed, core_text = _line(
+        "MaaCore",
+        str(result.get("core_before") or ""),
+        str(result.get("core_after") or ""),
+    )
+    if result.get("changed") or cli_changed or core_changed:
+        return f"今天已更新：{cli_text}；{core_text}"
+    return f"今天已检查，无新版本（{cli_text} · {core_text}）"
+
+
+def _combined_output(stdout: str, stderr: str) -> str:
+    return "\n".join(part for part in (stdout, stderr) if part)
+
+
+def _run_captured(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None,
+    timeout: int,
+) -> tuple[int, str, str]:
     try:
         result = subprocess.run(
-            [maa, "update"],
+            argv,
             capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
-            env=maa_subprocess_env(config),
+            env=env,
         )
-        ok = result.returncode == 0
-        detail = (result.stderr or result.stdout).strip()
-        if not ok and not detail:
-            detail = f"maa update 退出码 {result.returncode}"
     except Exception as exc:
-        detail = f"{type(exc).__name__}: {exc}"
+        return 1, "", f"{type(exc).__name__}: {exc}"
+    return (
+        result.returncode,
+        (result.stdout or "").strip(),
+        (result.stderr or "").strip(),
+    )
 
+
+def _brew_env(*, auto_update: bool = True) -> dict[str, str]:
+    env = os.environ.copy()
+    env["HOMEBREW_NO_ENV_HINTS"] = "1"
+    if not auto_update:
+        env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    return env
+
+
+def read_maa_versions(config: dict[str, Any]) -> tuple[str, str]:
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    code, stdout, stderr = _run_captured(
+        [maa, "version"],
+        env=maa_subprocess_env(config, keep_proxy=True),
+        timeout=30,
+    )
+    if code != 0:
+        return "", ""
+    return parse_maa_versions(_combined_output(stdout, stderr))
+
+
+def persist_installed_versions(
+    config: dict[str, Any],
+    cli_version: str,
+    core_version: str,
+) -> None:
+    if not cli_version and not core_version:
+        return
+    current = load_json(CONFIG_PATH, {})
+    if not isinstance(current, dict):
+        current = {}
+    if cli_version:
+        current["maa_cli_version"] = cli_version
+        config["maa_cli_version"] = cli_version
+    if core_version:
+        current["maa_core_version"] = core_version
+        config["maa_core_version"] = core_version
+    atomic_write_json(CONFIG_PATH, current)
+
+
+def upgrade_maa_cli(config: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade the Homebrew maa-cli formula when a newer bottle exists."""
+    formula = str(config.get("maa_cli_formula", DEFAULT_MAA_CLI_FORMULA)).strip()
+    timeout = max(30, int(config.get("maa_cli_update_timeout", 180)))
+    brew = shutil.which("brew")
+    if not brew:
+        return {"ok": True, "changed": False, "detail": "未找到 brew，跳过 maa-cli"}
+    code, stdout, stderr = _run_captured(
+        [brew, "outdated", "--quiet", "--formula", formula],
+        env=_brew_env(auto_update=True),
+        timeout=timeout,
+    )
+    if code != 0:
+        detail = _combined_output(stdout, stderr) or f"brew outdated 退出码 {code}"
+        return {"ok": False, "changed": False, "detail": detail}
+    if not stdout:
+        return {"ok": True, "changed": False, "detail": "maa-cli 已是最新"}
+    code, up_out, up_err = _run_captured(
+        [brew, "upgrade", "--formula", formula],
+        env=_brew_env(auto_update=False),
+        timeout=timeout,
+    )
+    detail = _combined_output(up_out, up_err) or stdout
+    if code != 0:
+        return {
+            "ok": False,
+            "changed": False,
+            "detail": detail or f"brew upgrade 退出码 {code}",
+        }
+    return {"ok": True, "changed": True, "detail": detail or f"已升级 {formula}"}
+
+
+def update_maa_core(config: dict[str, Any]) -> dict[str, Any]:
+    """Download a newer Beta MaaCore (and bundled resources) when one exists."""
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    timeout = max(30, int(config.get("resource_update_timeout", 300)))
+    code, stdout, stderr = _run_captured(
+        [maa, "update", "--batch"],
+        env=maa_subprocess_env(config, keep_proxy=True),
+        timeout=timeout,
+    )
+    detail = _combined_output(stdout, stderr)
+    if code != 0:
+        return {
+            "ok": False,
+            "detail": detail or f"maa update 退出码 {code}",
+        }
+    return {"ok": True, "detail": detail}
+
+
+def check_and_update_upstream(
+    token: str,
+    channel_id: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Check maa-cli and MaaCore on every plan card; follow upstream if newer."""
+    at = now_beijing()
+    cli_before, core_before = read_maa_versions(config)
+    cli_step = upgrade_maa_cli(config)
+    core_step = update_maa_core(config)
+    cli_after, core_after = read_maa_versions(config)
+    cli_after = cli_after or cli_before
+    core_after = core_after or core_before
+    persist_installed_versions(config, cli_after, core_after)
+    ok = bool(cli_step.get("ok")) and bool(core_step.get("ok"))
+    changed = bool(cli_step.get("changed")) or (
+        bool(cli_before) and bool(cli_after) and cli_before != cli_after
+    ) or (bool(core_before) and bool(core_after) and core_before != core_after)
+    detail = "\n".join(
+        str(part)
+        for part in (cli_step.get("detail"), core_step.get("detail"))
+        if part
+    )
+    if not ok and not detail:
+        detail = "上游更新失败"
+    result = {
+        "ok": ok,
+        "changed": changed,
+        "cli_before": cli_before,
+        "cli_after": cli_after,
+        "core_before": core_before,
+        "core_after": core_after,
+        "detail": detail[-1000:],
+    }
+    result["summary"] = format_update_summary(result)
     merge_last_run(
         {
             "resource_update_attempted_at": at.isoformat(),
             "resource_update_status": "ok" if ok else "failed",
-            "resource_update_detail": detail[-1000:],
+            "resource_update_detail": result["detail"],
+            "resource_update_summary": result["summary"],
+            "resource_update_changed": changed,
+            "maa_cli_version": cli_after,
+            "maa_core_version": core_after,
         }
     )
-    if ok:
-        activity_ok, activity_detail = refresh_activity_stages(config)
-        if activity_ok:
-            merge_last_run(
-                {
-                    "activity_stages_updated_at": at.isoformat(),
-                    "activity_stages": list(config.get("activity_stages", [])),
-                }
-            )
-            return True
-        ok = False
-        detail = activity_detail
-        merge_last_run(
+    if not ok:
+        discord_request(
+            token,
+            "POST",
+            f"/channels/{channel_id}/messages",
             {
-                "resource_update_status": "failed",
-                "resource_update_detail": detail[-1000:],
-            }
+                "embeds": [
+                    {
+                        "title": "❌ MAA 上游更新失败",
+                        "description": f"```text\n{detail[-1500:]}\n```",
+                        "color": 0xED4245,
+                        "timestamp": at.isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
         )
-
-    discord_request(
-        token,
-        "POST",
-        f"/channels/{channel_id}/messages",
-        {
-            "embeds": [
-                {
-                    "title": "❌ MAA 每周资源更新失败",
-                    "description": f"```text\n{detail[-1500:]}\n```",
-                    "color": 0xED4245,
-                    "timestamp": at.isoformat(),
-                }
-            ],
-            "allowed_mentions": {"parse": []},
-        },
-    )
-    return False
+    return result
 
 
 def _button(
@@ -356,30 +491,48 @@ def build_components(
     return (rows, registry)
 
 
-def build_embed(plan: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def build_embed(
+    plan: dict[str, Any],
+    config: dict[str, Any],
+    update: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     activity_stages = config.get("activity_stages", [])
     activity_note = "、".join(str(item) for item in activity_stages) or "未配置"
     # skip 只作用于 08:00/22:00；手动开跑是明确指令，永远照跑，别让卡片读成全停。
     skip = "是（手动开跑不受影响）" if plan.get("skip") else "否"
+    fields: list[dict[str, Any]] = [
+        {"name": "刷什么", "value": plan_stage_label(plan), "inline": True},
+        {
+            "name": "🧪 理智规则",
+            "value": medicine_label(str(plan.get("medicine", "none"))),
+            "inline": False,
+        },
+        {
+            "name": "每日剿灭",
+            "value": "当天第一场用代理卡全权委托；满 1800 合成玉/周后自动停，当天不再进第二次",
+            "inline": False,
+        },
+        {"name": "跳过自动场次", "value": skip, "inline": True},
+        {"name": "当前活动关", "value": activity_note[:1024], "inline": False},
+        {
+            "name": "自动场次",
+            "value": "08:00 早场 · 22:00 晚场（北京时间）",
+            "inline": False,
+        },
+    ]
+    if update:
+        fields.append(
+            {
+                "name": "上游更新",
+                "value": str(update.get("summary") or format_update_summary(update))[:1024],
+                "inline": False,
+            }
+        )
     return {
         "title": "🌱 MAA 今日计划",
         "description": "从下拉菜单选择关卡；今天的覆盖会在明天自动失效。",
         "color": 0x57F287,
-        "fields": [
-            {"name": "刷什么", "value": plan_stage_label(plan), "inline": True},
-            {
-                "name": "🧪 理智规则",
-                "value": medicine_label(str(plan.get("medicine", "none"))),
-                "inline": False,
-            },
-            {"name": "跳过自动场次", "value": skip, "inline": True},
-            {"name": "当前活动关", "value": activity_note[:1024], "inline": False},
-            {
-                "name": "自动场次",
-                "value": "08:00 早场 · 22:00 晚场（北京时间）",
-                "inline": False,
-            },
-        ],
+        "fields": fields,
         "footer": {
             "text": "体力不足时停止 · 碎石永久关闭 · 计划变更不会打断已开始的场次"
         },
@@ -428,9 +581,9 @@ def main() -> int:
     if not channel_id.isdigit():
         raise RuntimeError("config.json 中尚未配置 Discord channel_id")
     token = discord_token()
-    update_ok = update_resources_if_due(token, channel_id, config)
+    update = check_and_update_upstream(token, channel_id, config)
     # Availability changes daily at the game reset and independently of the
-    # weekly resource package update, so probe it for every plan card.
+    # MaaCore package update, so probe it for every plan card.
     refresh_activity_stages(config)
     # A successful refresh rewrites config.json and mutates this copy; reload
     # so the card is always derived from the just-persisted source of truth.
@@ -458,7 +611,7 @@ def main() -> int:
     cleanup_result = cleanup_old_threads(token)
     cleanup_run_files(int(config.get("retention_days", 14)))
     retired = retire_old_plan_cards(token, channel_id)
-    embed = build_embed(plan, config)
+    embed = build_embed(plan, config, update)
     if cleanup_result["failed"]:
         embed["footer"]["text"] += f" · {cleanup_result['failed']} 个旧子区删除失败"
     if retired["failed"]:
@@ -473,8 +626,8 @@ def main() -> int:
             "allowed_mentions": {"parse": []},
         },
     )
-    if not update_ok:
-        raise RuntimeError("maa update 失败；已发送红色告警")
+    if not update.get("ok"):
+        raise RuntimeError("maa 上游更新失败；已发送红色告警")
     return 0
 
 

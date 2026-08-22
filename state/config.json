@@ -27,14 +27,16 @@
   "proxy_failure_salvage_min_seconds": 300,
   "recruit_times": 4,
   "retention_days": 14,
-  "resource_update_interval_days": 7,
   "resource_update_timeout": 300,
+  "maa_cli_update_timeout": 180,
+  "maa_cli_formula": "MaaAssistantArknights/tap/maa-cli",
   "activity_stages": [
     "TO-9",
     "TO-8",
     "TO-7"
   ],
-  "maa_core_version": "v6.16.0",
+  "maa_cli_version": "v0.7.5",
+  "maa_core_version": "v6.17.0-beta.1",
   "copilot_blackout_minutes": 25,
   "skland_roster_refresh_days": 7
 }

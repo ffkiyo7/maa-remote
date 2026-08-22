@@ -49,7 +49,7 @@ DEFAULT_TASKS = {
     "award": True,
 }
 DEFAULT_PLAN = {
-    "stage": "",
+    "stage": "1-7",
     # Kept in the normalized snapshot for backwards-compatible reporting.
     # The policy is fixed: no ordinary medicine, expiring medicine only.
     "medicine": "expiring",
@@ -231,14 +231,23 @@ def require_executable(
     return str(resolved)
 
 
-def maa_subprocess_env(config: dict[str, Any]) -> dict[str, str]:
-    """Build the deterministic environment shared by every maa-cli call."""
+def maa_subprocess_env(
+    config: dict[str, Any],
+    *,
+    keep_proxy: bool = False,
+) -> dict[str, str]:
+    """Build the deterministic environment shared by every maa-cli call.
+
+    Daily ``maa run`` strips proxy variables: MaaCore's in-run hot update
+    misbehaves when those are set. ``maa update`` must keep them so GitHub
+    downloads go through the machine's always-on proxy.
+    """
     env = os.environ.copy()
     config_dir = str(config.get("maa_config_dir", MAA_CONFIG_DIR)).strip()
     if not config_dir:
         raise RuntimeError("maa_config_dir 不能为空")
     env["MAA_CONFIG_DIR"] = config_dir
-    if bool(config.get("maa_disable_proxy", False)):
+    if bool(config.get("maa_disable_proxy", False)) and not keep_proxy:
         for key in PROXY_ENV_KEYS:
             env.pop(key, None)
     return env
@@ -256,7 +265,7 @@ def _normalized_tasks(value: Any) -> dict[str, bool]:
 def normalize_plan(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
     return {
-        "stage": str(raw.get("stage", "")),
+        "stage": str(raw.get("stage", DEFAULT_PLAN["stage"])),
         # Medication is intentionally not user-configurable. MaaCore receives
         # medicine=0 plus medicine_expire_days from the trusted local config.
         "medicine": "expiring",

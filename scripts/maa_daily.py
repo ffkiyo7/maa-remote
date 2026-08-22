@@ -11,12 +11,13 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
 from maa_common import (
     BEIJING,
+    LAST_RUN_PATH,
     MAA_CONFIG_DIR,
     RUNS_DIR,
     SCRIPTS_DIR,
@@ -29,6 +30,7 @@ from maa_common import (
     discord_upload,
     effective_plan,
     load_config,
+    load_json,
     maa_subprocess_env,
     medicine_label,
     merge_last_run,
@@ -45,12 +47,12 @@ SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
 TASK_STEPS = (
     ("StartUp", "🚀", "登录与首登领取", "正在登录并处理首登弹窗"),
-    ("Annihilation", "☄️", "每周剿灭", "正在清理本周剿灭"),
+    ("Annihilation", "☄️", "每日剿灭", "正在用代理卡全权委托清剿灭"),
     ("Fight", "⚔️", "刷理智", "正在刷理智"),
     ("Infrast", "🏭", "基建换班", "正在按游戏内预设队列轮换"),
     ("Recruit", "🎫", "公开招募", "正在处理公开招募"),
     ("Mall", "🛒", "信用商店", "正在领取信用并购买物资"),
-    ("Award", "🎁", "领取奖励", "正在领取日常与周常奖励"),
+    ("Award", "🎁", "领取奖励", "正在领取日常、周常与全部邮件奖励"),
     ("Custom", "🏠", "返回主界面", "正在返回游戏主界面，准备截图"),
 )
 
@@ -98,6 +100,12 @@ SELF_ASSIGNED_CODES = (124, PROXY_BREAK_CODE, 130)
 PROGRESS_INTERVAL_SECONDS = 5
 # maa run 的最短存活时间：配置写歪了也不能让整条链条秒退。
 MIN_RUN_TIMEOUT_SECONDS = 60
+# 国服日刷新 04:00。剿灭按游戏日只进一次，避免早晚场各刷一轮。
+CN_GAME_DAY_RESET = timedelta(hours=4)
+# 周合成玉上限由 MaaCore 识别（待办消失 / 代理卡不可用）后停，这里只用于战报文案。
+ANNIHILATION_WEEKLY_ORUNDUM = 1800
+# maa-cli 最终汇总用任务名；旧日志仍是「每周剿灭」。
+ANNIHILATION_TASK_NAMES = ("每日剿灭", "每周剿灭")
 
 
 def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
@@ -114,6 +122,49 @@ def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None =
     if 20 <= hour or hour < 2:
         return "pm"
     return "now"
+
+
+def cn_game_day(at: datetime | None = None) -> str:
+    """Official-server calendar date: resets at 04:00 Beijing time."""
+    moment = at or now_beijing()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=BEIJING)
+    return (moment.astimezone(BEIJING) - CN_GAME_DAY_RESET).date().isoformat()
+
+
+def should_run_annihilation(
+    plan: dict[str, Any],
+    at: datetime | None = None,
+    last_run: dict[str, Any] | None = None,
+) -> bool:
+    """Include annihilation in this run: fight is on, and not yet done this game day."""
+    if not bool(plan.get("tasks", {}).get("fight", True)):
+        return False
+    state = last_run if isinstance(last_run, dict) else {}
+    return str(state.get("annihilation_game_day") or "") != cn_game_day(at)
+
+
+def attach_annihilation(
+    plan: dict[str, Any],
+    at: datetime | None = None,
+    last_run: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a per-run plan copy with the once-per-game-day annihilation flag."""
+    return {**plan, "annihilation": should_run_annihilation(plan, at, last_run)}
+
+
+def annihilation_consumed(lines: list[str]) -> bool:
+    """True when today's annihilation slot was used and must not run again today.
+
+    Named maa-cli summaries and Annihilation Start are the hard signals. If
+    StartUp already completed, the next task in the rendered chain is
+    annihilation, so later sessions in the same game day must not retry it.
+    """
+    if any(f"[{name}]" in line for line in lines for name in ANNIHILATION_TASK_NAMES):
+        return True
+    if any("Annihilation Start" in line or "Fight Annihilation" in line for line in lines):
+        return True
+    return _task_state(lines, "StartUp", "登录与首登领取") == "completed"
 
 
 def _toml_string(value: str) -> str:
@@ -135,27 +186,26 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
         # Fixed safety policy: never use ordinary medicine or Originite Prime;
         # only consume medicine MaaCore identifies as expiring soon.
         medicine_days = max(1, int(config.get("medicine_expire_days", 2)))
-        blocks.append(
-            "[[tasks]]\n"
-            'name = "每周剿灭"\n'
-            'type = "Fight"\n'
-            "[tasks.params]\n"
-            'stage = "Annihilation"\n'
-            "medicine = 0\n"
-            f"medicine_expire_days = {max(0, medicine_days)}\n"
-            "stone = 0\n"
-            "series = 0\n"
-            f"times = {int(config.get('fight_times', 2147483647))}\n"
-            'server = "CN"\n'
-            'client_type = "Official"\n'
-            "[[tasks.variants]]\n"
-            "[tasks.variants.condition]\n"
-            'type = "And"\n'
-            "conditions = [\n"
-            '  { type = "Weekday", weekdays = ["Mon"], timezone = "Official" },\n'
-            '  { type = "Time", start = "04:00:00", end = "12:00:00", timezone = "Official" },\n'
-            "]\n"
-        )
+        # Default True so the deploy seed and isolated renderer tests still
+        # include annihilation. execute() sets the flag from last_run.
+        if plan.get("annihilation", True):
+            # Fight(Annihilation) turns on 全权委托 and consumes a PRTS
+            # 代理指挥卡. MaaCore stops when the weekly 1800 orundum cap is
+            # reached (todo gone / cards refused).
+            blocks.append(
+                "[[tasks]]\n"
+                'name = "每日剿灭"\n'
+                'type = "Fight"\n'
+                "[tasks.params]\n"
+                'stage = "Annihilation"\n'
+                "medicine = 0\n"
+                f"medicine_expire_days = {max(0, medicine_days)}\n"
+                "stone = 0\n"
+                "series = 0\n"
+                f"times = {int(config.get('fight_times', 2147483647))}\n"
+                'server = "CN"\n'
+                'client_type = "Official"\n'
+            )
         blocks.append(
             "[[tasks]]\n"
             'name = "刷理智"\n'
@@ -220,7 +270,7 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             'type = "Award"\n'
             "[tasks.params]\n"
             "award = true\n"
-            "mail = false\n"
+            "mail = true\n"
             "recruit = false\n"
             "orundum = false\n"
             "mining = false\n"
@@ -251,22 +301,33 @@ def _clean_line(line: str, limit: int = 150) -> str:
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
+def _task_display_names(key: str, label: str) -> tuple[str, ...]:
+    if key == "Annihilation":
+        return ANNIHILATION_TASK_NAMES
+    return (label,)
+
+
 def _task_state(lines: list[str], key: str, label: str) -> str:
     # maa-cli uses the configured task name in its final ``[name]`` summary.
     # Prefer that exact result when multiple tasks share one MaaCore type (the
-    # weekly annihilation and ordinary farming are both Fight tasks).
-    named = [line for line in lines if f"[{label}]" in line]
+    # daily annihilation and ordinary farming are both Fight tasks).
+    names = _task_display_names(key, label)
+    named = [line for line in lines if any(f"[{name}]" in line for name in names)]
     if named:
         if any("Completed" in line for line in named):
             return "completed"
         if any("Stopped" in line or "Error" in line for line in named):
             return "failed"
         return "running"
-    if any(f"{key} Completed" in line or (f"[{label}]" in line and "Completed" in line) for line in lines):
+    if any(
+        f"{key} Completed" in line
+        or any(f"[{name}]" in line and "Completed" in line for name in names)
+        for line in lines
+    ):
         return "completed"
     if any(f"{key} Stopped" in line or f"{key} Error" in line for line in lines):
         return "failed"
-    if any(f"{key} Start" in line or f"[{label}]" in line for line in lines):
+    if any(f"{key} Start" in line or any(f"[{name}]" in line for name in names) for line in lines):
         return "running"
     return "pending"
 
@@ -491,12 +552,15 @@ def extract_summary(
 ) -> str:
     lines = [_clean_line(line, 500) for line in stdout_lines + stderr_lines if line.strip()]
     tasks = (plan or {}).get("tasks", {})
+    annihilation_in_logs = any(
+        f"[{name}]" in line for line in lines for name in ANNIHILATION_TASK_NAMES
+    )
+    annihilation_planned = (plan or {}).get("annihilation")
     enabled = {
         "StartUp": True,
-        # This task is conditionally active only on Monday morning.  Its named
-        # maa-cli summary is the reliable signal that it actually joined this
-        # run; do not show "未执行" on every other day.
-        "Annihilation": any("[每周剿灭]" in line for line in lines),
+        # Show the step when this run included it, or when older logs still
+        # have the named summary.  A False flag means "already done today".
+        "Annihilation": annihilation_in_logs or annihilation_planned is True,
         "Fight": bool(tasks.get("fight", True)),
         "Infrast": bool(tasks.get("infrast", True)),
         "Recruit": bool(tasks.get("recruit", True)),
@@ -507,6 +571,8 @@ def extract_summary(
     result = [f"🌟 总体：{'✅ 成功' if ok is not False else '❌ 未完成'}"]
     for key, emoji, label, _running_text in TASK_STEPS:
         if not enabled[key]:
+            if key == "Annihilation" and annihilation_planned is False:
+                result.append(f"{emoji} {label}：⏭️ 今日已刷过，本场跳过")
             continue
         state = _task_state(lines, key, label)
         status = {"completed": "✅ 完成", "failed": "❌ 未完成", "running": "❌ 中断", "pending": "⏸️ 未执行"}[state]
@@ -520,12 +586,17 @@ def extract_summary(
             if marker:
                 details.append(f"没连上模拟器（{marker}），游戏里一个键都没点")
         elif key == "Annihilation":
-            annihilation_lines = _named_task_section(lines, "每周剿灭") or lines
+            annihilation_lines = []
+            for name in ANNIHILATION_TASK_NAMES:
+                annihilation_lines = _named_task_section(lines, name)
+                if annihilation_lines:
+                    break
+            annihilation_lines = annihilation_lines or lines
             count = _fight_times(annihilation_lines)
             details.append(
-                f"当期剿灭 {count} 次；达到周上限后自动停止"
+                f"当期剿灭 {count} 次；代理卡全权委托；满 {ANNIHILATION_WEEKLY_ORUNDUM} 合成玉/周后停止"
                 if count
-                else "当期剿灭；达到周上限后自动停止"
+                else f"代理卡全权委托；满 {ANNIHILATION_WEEKLY_ORUNDUM} 合成玉/周后停止"
             )
         elif key == "Fight":
             fight_lines = _named_task_section(lines, "刷理智") or lines
@@ -1255,7 +1326,10 @@ def execute(phase: str) -> int:
     if not channel_id.isdigit():
         raise RuntimeError("config.json 中尚未配置 Discord channel_id")
     token = discord_token()
-    plan = effective_plan(started)
+    last_run_state = load_json(LAST_RUN_PATH, {})
+    if not isinstance(last_run_state, dict):
+        last_run_state = {}
+    plan = attach_annihilation(effective_plan(started), started, last_run_state)
     run_stem = f"{started.date().isoformat()}-{phase}"
     snapshot_path = RUNS_DIR / f"{run_stem}.json"
     log_path = RUNS_DIR / f"{run_stem}.log"
@@ -1343,7 +1417,9 @@ def execute(phase: str) -> int:
                 {
                     "content": (
                         f"🌱 MAA 日常·{PHASE_LABELS[phase]}场开始\n"
-                        f"🎯 {plan_stage_label(plan)} · 🧪 {medicine_label(plan['medicine'])}"
+                        f"🎯 {plan_stage_label(plan)}"
+                        + (" · ☄️ 今日剿灭" if plan.get("annihilation") else " · ☄️ 剿灭今日已刷")
+                        + f" · 🧪 {medicine_label(plan['medicine'])}"
                     ),
                     "allowed_mentions": {"parse": []},
                 },
@@ -1487,25 +1563,27 @@ def execute(phase: str) -> int:
                 connect_retries=connect_retries,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
-        merge_last_run(
-            {
-                "status": "success" if ok else "failed",
-                "finished_at": now_beijing().isoformat(),
-                "duration_seconds": int(duration),
-                "return_code": return_code,
-                "log": str(log_path),
-                "salvage_log": str(salvage_log_path) if salvage_log_path else None,
-                "screenshot": str(screenshot_path) if screenshot_ok else None,
-                "screenshot_error": screenshot_error if not screenshot_ok else None,
-                "home_verified": home_verified,
-                "home_verify_detail": home_verify_detail,
-                "cleanup_errors": cleanup_errors,
-                "summary": summary,
-                "proxy_failure_batches": proxy_batches,
-                "proxy_failure_sanity_refunded": proxy_refunded,
-                "connect_retries": connect_retries,
-            }
-        )
+        finished: dict[str, Any] = {
+            "status": "success" if ok else "failed",
+            "finished_at": now_beijing().isoformat(),
+            "duration_seconds": int(duration),
+            "return_code": return_code,
+            "log": str(log_path),
+            "salvage_log": str(salvage_log_path) if salvage_log_path else None,
+            "screenshot": str(screenshot_path) if screenshot_ok else None,
+            "screenshot_error": screenshot_error if not screenshot_ok else None,
+            "home_verified": home_verified,
+            "home_verify_detail": home_verify_detail,
+            "cleanup_errors": cleanup_errors,
+            "summary": summary,
+            "proxy_failure_batches": proxy_batches,
+            "proxy_failure_sanity_refunded": proxy_refunded,
+            "connect_retries": connect_retries,
+        }
+        if plan.get("annihilation") and annihilation_consumed(stdout_lines + stderr_lines):
+            finished["annihilation_game_day"] = cn_game_day(started)
+            finished["annihilation_finished_at"] = now_beijing().isoformat()
+        merge_last_run(finished)
         return 0 if ok else 1
 
 
