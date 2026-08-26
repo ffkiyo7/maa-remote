@@ -678,6 +678,34 @@ def open_emulator(config: dict[str, Any]) -> None:
         raise RuntimeError(f"无法启动 {app}: {(result.stderr or result.stdout).strip()}")
 
 
+def emulator_boot_diagnostic(config: dict[str, Any]) -> str:
+    """Explain the BlueStacks host-open/Android-not-started failure mode.
+
+    BlueStacks checks for host updates before it starts the Android VM.  When
+    an update is available it opens a modal dialog and does not emit the usual
+    ``[QTUI] Start Virtual Machine`` line until somebody closes that dialog.
+    ``open -a`` still returns success, so ADB alone can only report a vague
+    connection refusal.  Read only the current Player.log session and turn
+    that otherwise invisible host-side state into an actionable error.
+    """
+    configured = str(config.get("emulator_player_log", "")).strip()
+    player_log = Path(configured) if configured else Path(
+        "/Users/Shared/Library/Application Support/BlueStacks/Logs/Player.log"
+    )
+    try:
+        text = player_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    marker = "=================== xlogStart"
+    current = text.rsplit(marker, 1)[-1]
+    if "/bs3/check_upgrade" in current and "[QTUI] Start Virtual Machine" not in current:
+        return (
+            "BlueStacks 宿主已打开，但升级检查没有放行 Android 虚拟机；"
+            "通常是“有可用更新”弹窗正在等待关闭"
+        )
+    return ""
+
+
 def wait_for_android(config: dict[str, Any]) -> None:
     adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
     address = str(config.get("adb_address", "127.0.0.1:5555"))
@@ -708,7 +736,9 @@ def wait_for_android(config: dict[str, Any]) -> None:
             return
         last_error = (boot.stderr or connect.stderr or connect.stdout).strip()
         time.sleep(3)
-    raise RuntimeError(f"ADB 等待 {timeout}s 超时：{last_error or '设备未就绪'}")
+    diagnostic = emulator_boot_diagnostic(config)
+    detail = diagnostic or last_error or "设备未就绪"
+    raise RuntimeError(f"ADB 等待 {timeout}s 超时：{detail}")
 
 
 def settle_android_runtime(config: dict[str, Any]) -> str:
@@ -1364,6 +1394,7 @@ def execute(phase: str) -> int:
                 "log": None,
                 "screenshot": None,
                 "screenshot_error": None,
+                "startup_error": None,
                 "cleanup_errors": [],
                 "summary": "",
             }
@@ -1403,6 +1434,7 @@ def execute(phase: str) -> int:
         cleanup_errors: list[str] = []
         salvage_log_path: Path | None = None
         connect_retries = 0
+        startup_error = ""
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
             require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -1494,11 +1526,13 @@ def execute(phase: str) -> int:
                 home_verify_detail,
             ) = capture_home_screenshot(config, screenshot_path)
         except Exception as exc:
-            stderr_lines.append(f"{type(exc).__name__}: {exc}")
+            exception_detail = f"{type(exc).__name__}: {exc}"
+            stderr_lines.append(exception_detail)
             return_code = 1
             if not thread_id:
+                startup_error = exception_detail
                 try:
-                    send_direct_failure(token, channel_id, phase, plan, stderr_lines[-1])
+                    send_direct_failure(token, channel_id, phase, plan, exception_detail)
                 except Exception:
                     pass
         finally:
@@ -1572,6 +1606,7 @@ def execute(phase: str) -> int:
             "salvage_log": str(salvage_log_path) if salvage_log_path else None,
             "screenshot": str(screenshot_path) if screenshot_ok else None,
             "screenshot_error": screenshot_error if not screenshot_ok else None,
+            "startup_error": startup_error or None,
             "home_verified": home_verified,
             "home_verify_detail": home_verify_detail,
             "cleanup_errors": cleanup_errors,

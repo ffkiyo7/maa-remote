@@ -264,6 +264,24 @@ def update_maa_core(config: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "detail": detail}
 
 
+def update_hot_resources(config: dict[str, Any]) -> dict[str, Any]:
+    """Keep the MaaResource overlay compatible with the installed MaaCore."""
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    timeout = max(30, int(config.get("resource_update_timeout", 300)))
+    code, stdout, stderr = _run_captured(
+        [maa, "hot-update", "--batch"],
+        env=maa_subprocess_env(config, keep_proxy=True),
+        timeout=timeout,
+    )
+    detail = _combined_output(stdout, stderr)
+    if code != 0:
+        return {
+            "ok": False,
+            "detail": detail or f"maa hot-update 退出码 {code}",
+        }
+    return {"ok": True, "detail": detail}
+
+
 def check_and_update_upstream(
     token: str,
     channel_id: str,
@@ -274,17 +292,35 @@ def check_and_update_upstream(
     cli_before, core_before = read_maa_versions(config)
     cli_step = upgrade_maa_cli(config)
     core_step = update_maa_core(config)
+    # The hot-update directory overrides files bundled with MaaCore. Updating
+    # only MaaCore can therefore leave an older infrast.json pointing at
+    # templates that no longer exist in the new bundle. Do not advance the
+    # overlay when the core update itself failed, because the inverse mismatch
+    # (new resources on an old core) is unsafe too.
+    hot_step = (
+        update_hot_resources(config)
+        if core_step.get("ok")
+        else {"ok": False, "detail": "MaaCore 更新失败，未更新热更新资源"}
+    )
     cli_after, core_after = read_maa_versions(config)
     cli_after = cli_after or cli_before
     core_after = core_after or core_before
     persist_installed_versions(config, cli_after, core_after)
-    ok = bool(cli_step.get("ok")) and bool(core_step.get("ok"))
+    ok = (
+        bool(cli_step.get("ok"))
+        and bool(core_step.get("ok"))
+        and bool(hot_step.get("ok"))
+    )
     changed = bool(cli_step.get("changed")) or (
         bool(cli_before) and bool(cli_after) and cli_before != cli_after
     ) or (bool(core_before) and bool(core_after) and core_before != core_after)
     detail = "\n".join(
         str(part)
-        for part in (cli_step.get("detail"), core_step.get("detail"))
+        for part in (
+            cli_step.get("detail"),
+            core_step.get("detail"),
+            hot_step.get("detail"),
+        )
         if part
     )
     if not ok and not detail:

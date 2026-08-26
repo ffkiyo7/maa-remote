@@ -541,6 +541,34 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("maa run 已按人工指令终止", log)
 
 
+class EmulatorBootDiagnosticTests(unittest.TestCase):
+    def test_reports_upgrade_gate_before_vm_start(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            player_log = Path(raw) / "Player.log"
+            player_log.write_text(
+                "old session\n[QTUI] Start Virtual Machine\n"
+                "=================== xlogStart [5.21] =================\n"
+                'cldDoPostRequest url: "https://cloud.bluestacks.com/bs3/check_upgrade"\n'
+            )
+            detail = maa_daily.emulator_boot_diagnostic(
+                {"emulator_player_log": str(player_log)}
+            )
+        self.assertIn("升级检查没有放行", detail)
+
+    def test_ignores_session_that_started_the_vm(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            player_log = Path(raw) / "Player.log"
+            player_log.write_text(
+                "=================== xlogStart [5.21] =================\n"
+                'cldDoPostRequest url: "https://cloud.bluestacks.com/bs3/check_upgrade"\n'
+                "[QTUI] Start Virtual Machine\n"
+            )
+            detail = maa_daily.emulator_boot_diagnostic(
+                {"emulator_player_log": str(player_log)}
+            )
+        self.assertEqual(detail, "")
+
+
 class DiscordCardTests(unittest.TestCase):
     def test_activity_output_parser(self) -> None:
         output = """Opening side story stages:
@@ -807,6 +835,11 @@ Opening mini games:
                 return SimpleNamespace(
                     returncode=0, stdout="updated maa-core", stderr=""
                 )
+            if argv[:2] == ["/maa", "hot-update"]:
+                self.assertIn("--batch", argv)
+                return SimpleNamespace(
+                    returncode=0, stdout="updated hot resources", stderr=""
+                )
             raise AssertionError(argv)
 
         with tempfile.TemporaryDirectory() as raw:
@@ -849,7 +882,44 @@ Opening mini games:
             env for env in seen_env if env.get("MAA_CONFIG_DIR") == "/tmp/maa-config"
         ]
         self.assertTrue(update_envs)
-        self.assertIn("HTTPS_PROXY", update_envs[0])
+        self.assertGreaterEqual(len(update_envs), 2)
+        self.assertTrue(all("HTTPS_PROXY" in env for env in update_envs))
+
+    def test_hot_resource_failure_fails_the_upstream_check(self) -> None:
+        def fake_run(argv, **_kwargs):
+            if argv[:2] == ["/maa", "version"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="maa-cli v0.7.5\nMaaCore v6.17.0-beta.6\n",
+                    stderr="",
+                )
+            if argv[:2] == ["/opt/homebrew/bin/brew", "outdated"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["/maa", "update"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["/maa", "hot-update"]:
+                return SimpleNamespace(
+                    returncode=1, stdout="", stderr="missing resource"
+                )
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            maa_common.atomic_write_json(config_path, {})
+            with patch.object(
+                maa_plan_card, "CONFIG_PATH", config_path
+            ), patch.object(
+                maa_plan_card.shutil, "which", return_value="/opt/homebrew/bin/brew"
+            ), patch.object(
+                maa_plan_card.subprocess, "run", side_effect=fake_run
+            ), patch.object(maa_plan_card, "merge_last_run"), patch.object(
+                maa_plan_card, "discord_request"
+            ):
+                result = maa_plan_card.check_and_update_upstream(
+                    "token", "123", {"maa_bin": "/maa"}
+                )
+        self.assertFalse(result["ok"])
+        self.assertIn("missing resource", result["detail"])
 
     def test_outdated_maa_cli_is_upgraded_via_brew(self) -> None:
         argv_log: list[list[str]] = []
@@ -869,6 +939,8 @@ Opening mini games:
             if argv[:2] == ["/opt/homebrew/bin/brew", "upgrade"]:
                 return SimpleNamespace(returncode=0, stdout="upgraded maa-cli", stderr="")
             if argv[:2] == ["/maa", "update"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["/maa", "hot-update"]:
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             raise AssertionError(argv)
 

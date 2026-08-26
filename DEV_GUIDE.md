@@ -72,7 +72,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
-| `tests/test_maa.py` + `tests/test_copilot.py` | 63 个纯 stdlib 单测，全部 mock，不碰网络/模拟器 | 人工 | < 1s |
+| `tests/test_maa.py` + `tests/test_copilot.py` | 151 个 stdlib 单测，不碰模拟器 | 人工 | 约 10s |
 
 ---
 
@@ -81,7 +81,8 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 `main()`（`scripts/maa_plan_card.py:381`）严格按这个顺序：
 
 1. **`check_and_update_upstream()`** — 每次计划卡都跑：`brew outdated/upgrade` 跟随
-   maa-cli，再 `maa update --batch` 跟随 Beta MaaCore（超时分别 180s / 300s）。
+   maa-cli，再依次用 `maa update --batch` 和 `maa hot-update --batch` 更新 Beta
+   MaaCore 与 MaaResource 热更新层（超时分别 180s / 300s）。
    **这条必须保留本机代理**（`maa_subprocess_env(..., keep_proxy=True)`），否则直连
    GitHub 会超时。有新版本就装上，把版本写回 `config.json`，摘要进计划卡「上游更新」
    字段。失败发红色 Embed 告警，并在 `main()` 末尾 `raise` 让 cron 记为失败。
@@ -617,7 +618,6 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       `CircuitBreakerTests`、`SalvageTests`，并用 2026-08-07/08-06 两份真实日志回放
       过解析），但「StartUp 能否从结算页把游戏带回主界面」只在真机上才算数，
       下次遇到代理失误时要盯一眼补跑那趟的日志。
-
 14. **MaaTouch 握手超 3 秒 → MaaCore SIGSEGV，整场 35 秒暴毙**——这一条和代理失误
     （§11.13）毫无关系，是连模拟器都没连上，游戏里一个键都没点过。
 
@@ -659,3 +659,15 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       8.5s，+17.7s 才交给 MaaCore，此后探针稳定在 40 ms——正好跨过了那个抖动窗口。
       重试那一层只有单元测试（`ConnectFailureTests`、`ConnectRetryTests`，用当天的真实
       五行日志回放），因为这个崩溃没法按需复现；下次再撞上要盯一眼第二趟是否接上。
+
+15. **BlueStacks 的“有可用更新”弹窗会卡死自动启动**——宿主进程已经打开，`open -a`
+    也返回成功，但弹窗关闭前 Android 虚拟机根本不会启动，ADB 5555 因而持续拒绝连接。
+    `Player.log` 的本次 session 会停在 `/bs3/check_upgrade`，看不到正常启动必有的
+    `[QTUI] Start Virtual Machine`。`maa_daily.py` 超时后会据此给出明确诊断，并把原始
+    启动错误写入 `last_run.startup_error`；关闭弹窗后 VM 会立即继续启动，无需重装实例。
+
+16. **MaaCore 包与 MaaResource 热更新层必须同步更新**——MaaCore 启动时会用
+    `MaaResource` 覆盖包内资源。只跑 `maa update` 可能留下旧 `infrast.json`，它再
+    引用新包中已经改名的模板，导致 MaaCore 在真正连模拟器前直接退出。
+    计划卡因此在 MaaCore 更新成功后紧接着跑 `maa hot-update --batch`；任一步
+    失败都会红卡报错，不再把半更新状态当成可用。

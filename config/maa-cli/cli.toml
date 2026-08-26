@@ -2,8 +2,9 @@
 channel = "Beta"
 
 [resource]
-# MaaCore + bundled resources are updated by maa_plan_card.py every morning.
-# Per-run git hot-update stays off: that path ignores the machine proxy.
+# MaaCore, bundled resources, and the MaaResource overlay are updated together
+# by maa_plan_card.py every morning. Per-run git hot-update stays off: that path
+# ignores the machine proxy.
 auto_update = false
 warn_on_update_failure = false
 backend = "libgit2"
