@@ -33,7 +33,7 @@
 
 ## 环境现状（2026-08-01 实测）
 
-已有：Hermes gateway 常驻（LaunchAgent `ai.hermes.gateway`）、Discord 已连 `wadoruru的服务器`、8 个 cron 在跑、Homebrew。
+已有：Hermes gateway 常驻（LaunchAgent `ai.hermes.gateway`）、Discord 已连上自建服务器、8 个 cron 在跑、Homebrew。
 
 缺失，需 P0 安装：BlueStacks、maa-cli + MaaCore、adb、国服客户端。
 
@@ -285,4 +285,6 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 
 ---
 
-> 本文件是方案最终版（2026-08-01）。参考图：`IMG_8701.JPG`。旧 Windows 方案在 `~/maa-remote-spike`，仅作概念参考。
+> 本文件是方案最终版（2026-08-01）。参考图是一张第三方的「5 步全自动」流程示意（定时叫醒 →
+> 自动开模拟器 → 刷理智 → 基建/公招/商店/领奖 → 关进程 + 推送），因版权原因不随仓库分发。
+> 旧 Windows 方案在 `~/maa-remote-spike`，仅作概念参考。
