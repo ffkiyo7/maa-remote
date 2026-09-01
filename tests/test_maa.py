@@ -613,6 +613,97 @@ Opening mini games:
 """
         self.assertEqual(maa_plan_card.activity_snapshot(output)["stages"], ["NEW-8"])
 
+    def test_activity_snapshot_returns_empty_during_recognized_gap(self) -> None:
+        output = "Opening mini games:\n- XX-1: 小游戏\n"
+        self.assertEqual(
+            maa_plan_card.activity_snapshot(output),
+            {
+                "stages": [],
+                "events": [],
+                "all_supply_stages_open": False,
+            },
+        )
+
+    def test_activity_snapshot_fails_closed_when_upstream_format_changes(self) -> None:
+        for output in ("", "not a maa activity response\n"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(RuntimeError, "输出格式已变化"):
+                    maa_plan_card.activity_snapshot(output)
+
+    def test_activity_snapshot_fails_closed_on_a_decorated_heading(self) -> None:
+        """A heading the parser cannot match must raise, not read as a gap.
+
+        The gate and parse_activity_events() share is_side_story_heading(), so
+        a reflowed or decorated heading can never silently produce zero events
+        and clear the live stage list.
+        """
+        for heading in (
+            "Opening side story stages: (2)",
+            "Opening side story stages:!",
+            "**Opening side story stages:**",
+            "  Opening side story stages:",
+        ):
+            output = f"{heading}\n- SideStory「活动」\n  - NEW-8: 材料\nOpening mini games:\n"
+            with self.subTest(heading=heading):
+                with self.assertRaisesRegex(RuntimeError, "输出格式已变化"):
+                    maa_plan_card.activity_snapshot(output)
+
+    def test_snapshot_gate_and_parser_agree_on_what_a_heading_is(self) -> None:
+        """The gate may only fall through to the parser on headings it parses."""
+        for heading in (
+            "Opening side story stages:",
+            "Opening side story stages:   ",
+            "Opening side story stages: (2)",
+            "  Opening side story stages:",
+        ):
+            output = f"{heading}\n- SideStory「活动」\n  - NEW-8: 材料\n"
+            with self.subTest(heading=heading):
+                parsed = bool(maa_plan_card.parse_activity_events(output))
+                try:
+                    gated = bool(maa_plan_card.activity_snapshot(output)["stages"])
+                except RuntimeError:
+                    gated = False
+                self.assertEqual(parsed, gated)
+
+    def test_empty_activity_snapshot_clears_persisted_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            config = {"activity_stages": ["OLD-8"]}
+            with patch.object(maa_plan_card, "CONFIG_PATH", config_path):
+                maa_plan_card.persist_activity_snapshot(
+                    config,
+                    maa_plan_card.activity_snapshot(
+                        "Opening mini games:\n- 当前开放小游戏\n"
+                    ),
+                )
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config["activity_stages"], [])
+        self.assertEqual(persisted["activity_stages"], [])
+
+    def test_activity_snapshot_does_not_clear_on_unrecognized_output(self) -> None:
+        config = {"activity_stages": ["OLD-8"]}
+        with self.assertRaisesRegex(RuntimeError, "输出格式已变化"):
+            maa_plan_card.activity_snapshot("garbled output")
+        self.assertEqual(config["activity_stages"], ["OLD-8"])
+
+    def test_persist_activity_snapshot_drops_the_obsolete_event_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config_path = Path(raw) / "config.json"
+            config = {"activity_events": [{"title": "旧活动"}]}
+            with patch.object(maa_plan_card, "CONFIG_PATH", config_path):
+                maa_plan_card.persist_activity_snapshot(
+                    config,
+                    {
+                        "stages": ["NEW-8"],
+                        "events": [{"title": "新活动", "stages": ["NEW-8"]}],
+                        "all_supply_stages_open": False,
+                    },
+                )
+            persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertNotIn("activity_events", config)
+        self.assertNotIn("activity_events", persisted)
+        self.assertEqual(persisted["activity_stages"], ["NEW-8"])
+
     def test_buttons_fit_limits_and_registry_is_deterministic(self) -> None:
         plan = maa_common.normalize_plan({"stage": "CE-6", "medicine": "none"})
         components, registry = maa_plan_card.build_components(

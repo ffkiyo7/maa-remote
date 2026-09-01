@@ -1204,6 +1204,131 @@ class ActivityAutomationTests(unittest.TestCase):
                 self.assertEqual(changed["target_stage"], "NEW-9")
                 self.assertEqual(start.call_count, 3)
 
+    def test_watcher_enters_idle_on_recognized_empty_snapshot(self) -> None:
+        import maa_activity_watch
+
+        token = "a" * 12
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            searches = root / "searches"
+            searches.mkdir()
+            watch = root / "activity_watch.json"
+            buttons = root / "buttons.json"
+            watch.write_text(
+                json.dumps({
+                    "observation_key": "SideStory「墟」复刻|AT",
+                    "activity_title": "SideStory「墟」复刻",
+                    "target_stage": "AT-8",
+                    "search_token": token,
+                    "status": "ready",
+                }),
+                encoding="utf-8",
+            )
+            search_path = searches / f"{token}.json"
+            search_path.write_text(
+                json.dumps({"token": token, "status": "done", "message_id": "123"}),
+                encoding="utf-8",
+            )
+            button_key = f"hermes:btn:maa-copilot:{token}:confirm"
+            buttons.write_text(json.dumps({button_key: {}}), encoding="utf-8")
+            empty_snapshot = {
+                "stages": [],
+                "events": [],
+                "all_supply_stages_open": False,
+            }
+            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
+                 patch.object(maa_activity_watch, "BUTTONS_PATH", buttons), \
+                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "BUTTONS_PATH", buttons), \
+                 patch.object(maa_copilot, "state_lock",
+                              return_value=contextlib.nullcontext()), \
+                 patch.object(maa_activity_watch, "load_config",
+                              return_value={"channel_id": "1"}), \
+                 patch.object(maa_activity_watch, "state_lock",
+                              return_value=contextlib.nullcontext()), \
+                 patch.object(maa_activity_watch.maa_plan_card,
+                              "query_activity_snapshot", return_value=empty_snapshot), \
+                 patch.object(maa_activity_watch.maa_plan_card,
+                              "persist_activity_snapshot") as persist, \
+                 patch.object(maa_activity_watch, "_notify") as notify, \
+                 patch.object(maa_activity_watch,
+                              "retire_discord_components") as retire:
+                debounced = maa_activity_watch.run_once()
+                idle = maa_activity_watch.run_once()
+
+            # Retiring a prepared card is one-way: the first empty read only
+            # arms the counter and must leave the card and the stage list alone.
+            self.assertEqual(debounced["status"], "ready")
+            self.assertEqual(debounced["empty_observations"], 1)
+
+            self.assertEqual(idle["status"], "idle")
+            self.assertEqual(idle["observation_key"], "")
+            self.assertEqual(
+                json.loads(search_path.read_text(encoding="utf-8"))["status"],
+                "superseded",
+            )
+            self.assertNotIn(
+                button_key,
+                json.loads(buttons.read_text(encoding="utf-8")),
+            )
+            persist.assert_called_once_with({"channel_id": "1"}, empty_snapshot)
+            retire.assert_called_once_with({"channel_id": "1"}, "123")
+            # Guardrail: retiring a live card is never silent.
+            self.assertEqual(notify.call_count, 1)
+            self.assertIn("SideStory「墟」复刻", notify.call_args.args[2])
+
+    def test_watcher_debounce_resets_when_the_activity_reappears(self) -> None:
+        """One flaky empty read must not linger and shorten the next gap."""
+        import maa_activity_watch
+
+        token = "b" * 12
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            searches = root / "searches"
+            searches.mkdir()
+            watch = root / "activity_watch.json"
+            watch.write_text(
+                json.dumps({
+                    "observation_key": "SideStory「墟」复刻|AT",
+                    "activity_title": "SideStory「墟」复刻",
+                    "target_stage": "AT-8",
+                    "search_token": token,
+                    "status": "ready",
+                    "empty_observations": 1,
+                }),
+                encoding="utf-8",
+            )
+            searches.joinpath(f"{token}.json").write_text(
+                json.dumps({"token": token, "status": "done", "message_id": "9"}),
+                encoding="utf-8",
+            )
+            live_snapshot = {
+                "stages": ["AT-8"],
+                "events": [{
+                    "title": "SideStory「墟」复刻",
+                    "stages": ["AT-8"],
+                }],
+                "all_supply_stages_open": False,
+            }
+            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
+                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_activity_watch, "load_config",
+                              return_value={"channel_id": "1"}), \
+                 patch.object(maa_activity_watch.maa_plan_card,
+                              "query_activity_snapshot", return_value=live_snapshot), \
+                 patch.object(maa_activity_watch.maa_plan_card,
+                              "persist_activity_snapshot"), \
+                 patch.object(maa_activity_watch, "_notify") as notify:
+                record = maa_activity_watch.run_once()
+
+            self.assertEqual(record["status"], "ready")
+            self.assertNotIn("empty_observations", record)
+            self.assertNotIn(
+                "empty_observations",
+                json.loads(watch.read_text(encoding="utf-8")),
+            )
+            notify.assert_not_called()
+
     def test_search_claim_does_not_revive_a_superseded_pending_state(self) -> None:
         import maa_copilot_worker as worker
 
@@ -1647,6 +1772,114 @@ class SklandTests(unittest.TestCase):
             self.assertEqual((root / "skland.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((root / "hg_token.txt").stat().st_mode & 0o777, 0o600)
             self.assertEqual((root / "hg_token.txt").read_text(encoding="utf-8"), "tok123\n")
+
+    def test_expired_skland_cred_raises_link_guidance_after_one_retry(self) -> None:
+        import maa_skland
+
+        initial = {
+            "hg_token": "secret",
+            "cred": "expired",
+            "sign_token": "expired-sign",
+            "uid": "1",
+        }
+        refreshed = {
+            "hg_token": "secret",
+            "cred": "refreshed",
+            "sign_token": "refreshed-sign",
+            "uid": "1",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            state_path = Path(raw) / "skland.json"
+            with patch.object(maa_skland, "SKLAND_PATH", state_path), \
+                 patch.object(maa_skland, "_ensure_cred",
+                              side_effect=[initial, refreshed]) as ensure, \
+                 patch.object(maa_skland, "_signed_get",
+                              side_effect=RuntimeError("skland HTTP 401: 登录已过期")):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"python3 ~/.hermes/scripts/maa_skland.py link",
+                ):
+                    maa_skland.fetch_roster(initial)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(ensure.call_count, 2)
+        self.assertIn("maa_skland.py link", persisted["last_error"])
+
+    def test_expired_skland_grant_failure_also_raises_link_guidance(self) -> None:
+        import maa_skland
+
+        initial = {
+            "hg_token": "expired-secret",
+            "cred": "expired",
+            "sign_token": "expired-sign",
+            "uid": "1",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            state_path = Path(raw) / "skland.json"
+            with patch.object(maa_skland, "SKLAND_PATH", state_path), \
+                 patch.object(maa_skland, "_ensure_cred", side_effect=[
+                     initial,
+                     RuntimeError("skland HTTP 401: 登录已过期"),
+                 ]) as ensure, \
+                 patch.object(maa_skland, "_signed_get",
+                              side_effect=RuntimeError("skland HTTP 401: 用户未登录")):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"python3 ~/.hermes/scripts/maa_skland.py link",
+                ):
+                    maa_skland.fetch_roster(initial)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(ensure.call_count, 2)
+        self.assertIn("maa_skland.py link", persisted["last_error"])
+
+    def test_link_guidance_keeps_the_original_failure_cause(self) -> None:
+        """`link` does not fix a network outage, so never hide why we failed."""
+        import maa_skland
+
+        initial = {
+            "hg_token": "secret",
+            "cred": "expired",
+            "sign_token": "expired-sign",
+            "uid": "1",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            state_path = Path(raw) / "skland.json"
+            with patch.object(maa_skland, "SKLAND_PATH", state_path), \
+                 patch.object(maa_skland, "_ensure_cred", side_effect=[
+                     initial,
+                     RuntimeError("鹰角登录接口连接超时"),
+                 ]), \
+                 patch.object(maa_skland, "_signed_get",
+                              side_effect=RuntimeError("skland HTTP 401: 用户未登录")):
+                with self.assertRaises(RuntimeError) as caught:
+                    maa_skland.fetch_roster(initial)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        # Callers format this as f"{type}: {exc}" and never print a traceback,
+        # so the cause has to survive in the message itself.
+        self.assertIn("鹰角登录接口连接超时", str(caught.exception))
+        self.assertIn("maa_skland.py link", str(caught.exception))
+        self.assertIn("鹰角登录接口连接超时", persisted["last_error"])
+
+    def test_link_guidance_truncates_a_runaway_cause(self) -> None:
+        import maa_skland
+
+        initial = {"hg_token": "secret", "cred": "expired", "uid": "1"}
+        with tempfile.TemporaryDirectory() as raw:
+            state_path = Path(raw) / "skland.json"
+            with patch.object(maa_skland, "SKLAND_PATH", state_path), \
+                 patch.object(maa_skland, "_ensure_cred", side_effect=[
+                     initial,
+                     RuntimeError("x" * 5000),
+                 ]), \
+                 patch.object(maa_skland, "_signed_get",
+                              side_effect=RuntimeError("skland HTTP 401: 用户未登录")):
+                with self.assertRaises(RuntimeError) as caught:
+                    maa_skland.fetch_roster(initial)
+
+        self.assertLess(len(str(caught.exception)), 400)
+
 
 class DeployTokenTests(unittest.TestCase):
     def test_skland_token_env_writes_hg_token_file_not_config(self) -> None:

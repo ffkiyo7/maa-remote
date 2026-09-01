@@ -136,7 +136,23 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 
 watcher 每 15 分钟调用 `query_activity_snapshot()`，解析 `maa activity Official` 的活动标题与
 推荐关。`activity_watch.lock` 防止两次 cron 重叠；一个轮换只取 MAA 输出的第一推荐关，避免
-多关并发撞 `copilot_search.lock`。活动 identity 真正变化时，
+多关并发撞 `copilot_search.lock`。
+
+判定「空窗」还是「格式变了」只有一个判据：`is_side_story_heading()`，闸门与
+`parse_activity_events()` 共用它，两边不可能对「什么算分区标题」有分歧。三种结局：
+
+| 输出 | 结论 |
+|---|---|
+| 有活动关分区标题行 | 正常解析 |
+| 没有标题行，但有解析器认识的其它 `Opening …` 分区 | **查询成功的活动空窗** → 空快照 |
+| 标题文本出现了、却不是完整一行（被装饰/缩进/换行） | **格式已变** → 抛异常 |
+| 连一个认识的分区都没有 | 同上，抛异常 |
+
+标题下方的缩进是有语义的（区分活动标题与关卡条目），所以缩进过的标题算格式变化，不做归一。
+
+收卡是单向操作，因此要**连续 `EMPTY_OBSERVATIONS_BEFORE_IDLE`（2）次**读到空快照才真的
+清空活动关、进入 idle 并撤掉旧卡；第一次只记数，不落盘、不动卡。真收卡时会发一条
+「活动已结束」通知——撤掉用户手里的卡不允许无声发生。活动 identity 真正变化时，
 旧搜索在 `state_lock()` 内原子改为 `superseded` 并同步删登记，旧 worker 即使稍后返回也不能
 覆盖新状态或重新挂回按钮。watcher 若在派发 child 后、写 `activity_watch.json` 前崩溃，下一轮会
 按 `activity_key + stage` 接管已落盘的孤儿搜索，不会再发第二张卡。
@@ -538,6 +554,9 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 16 | 森空岛/鹰角 token 永不经 Discord、argv、agent 上下文；`copilot/` 下文件 0600 | `maa_skland.py` stdin/环境变量注入 + 测试 |
 | 17 | 抄作业关卡只接受本地 `stage_index` 精确查表，不许猜别名 | `valid_copilot_stage()` |
 | 18 | 活动自动作业只给完全满足练度且无软硬缺口的 Top-1 普通模式；自动搜索绕过 12h 缓存，开模拟器前和进战前都复核活动与实时理智 | watcher 状态机 + `cmd_search()` + `copilot_pick()` + `_require_auto_run_preflight()` |
+| 19 | 只有「查询成功且确实无活动」才允许清空活动关；格式不可辨认一律抛异常。闸门与解析器必须共用 `is_side_story_heading()`，不许各判各的 | `activity_snapshot()` + `test_snapshot_gate_and_parser_agree_on_what_a_heading_is` |
+| 20 | 收掉用户手里的作业卡必须连续 2 次空快照才发生，且发生时必发 Discord 通知 | `run_once()` 的 `EMPTY_OBSERVATIONS_BEFORE_IDLE` + `test_watcher_enters_idle_on_recognized_empty_snapshot` |
+| 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 
 ---
 

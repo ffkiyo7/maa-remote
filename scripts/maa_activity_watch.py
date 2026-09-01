@@ -30,6 +30,8 @@ from maa_common import (
 
 WATCH_PATH = STATE_DIR / "activity_watch.json"
 WATCH_LOCK_PATH = STATE_DIR / "activity_watch.lock"
+# Consecutive empty snapshots required before a prepared card is retired.
+EMPTY_OBSERVATIONS_BEFORE_IDLE = 2
 
 
 def _search_path(token: str) -> Path:
@@ -197,13 +199,18 @@ def run_once() -> dict[str, Any]:
     now = now_beijing()
 
     if target is None:
+        retired_title = ""
         if previous.get("observation_key"):
+            # Retiring a prepared card is one-way, so never do it on a single
+            # empty read: require the gap to hold across consecutive ticks and
+            # leave activity_stages untouched until then.
             empty_observations = int(previous.get("empty_observations") or 0) + 1
-            if empty_observations < 2:
+            if empty_observations < EMPTY_OBSERVATIONS_BEFORE_IDLE:
                 previous["empty_observations"] = empty_observations
                 previous["updated_at"] = now.isoformat()
                 atomic_write_json(WATCH_PATH, previous)
                 return previous
+            retired_title = str(previous.get("activity_title") or "当前活动")
             token = str(previous.get("search_token") or "")
             if token:
                 _supersede_search(token, config)
@@ -214,6 +221,16 @@ def run_once() -> dict[str, Any]:
             "updated_at": now.isoformat(),
         }
         atomic_write_json(WATCH_PATH, idle)
+        # Settle the state first: a Discord failure here must not replay the
+        # supersede on the next tick.  Announce afterwards so retiring a live
+        # card is never silent.
+        if retired_title:
+            _notify(
+                config,
+                "🏁 活动已结束",
+                f"{retired_title} 已从 MAA 活动视图消失；作业卡已收起，活动关清单已清空。",
+                0x5865F2,
+            )
         return idle
 
     maa_plan_card.persist_activity_snapshot(config, snapshot)

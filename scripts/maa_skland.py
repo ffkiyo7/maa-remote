@@ -319,13 +319,26 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
         # expired cred: one re-grant, one retry
         state.pop("cred", None)
         state.pop("sign_token", None)
-        state = _ensure_cred(state)
+        guidance = (
+            "cred 过期且重认证失败；请在本机终端运行 "
+            "python3 ~/.hermes/scripts/maa_skland.py link"
+        )
         try:
+            state = _ensure_cred(state)
             return attempt()
-        except RuntimeError:
-            state["last_error"] = "cred 过期且重认证失败；请在本机终端重新运行 maa_skland.py link"
+        except RuntimeError as retry_exc:
+            # Re-auth fails for reasons other than an expired 鹰角 token too
+            # (network, HG 5xx, rate limit).  Keep the original cause in the
+            # message or the card tells the user to run `link` for a problem
+            # `link` cannot fix.  ``from`` alone is not enough: the callers
+            # format this as ``{type}: {exc}`` and never print a traceback.
+            detail = f"{guidance}（原始错误：{str(retry_exc)[:200]}）"
+            state["last_error"] = detail
             atomic_write_json(SKLAND_PATH, state)
-            raise
+            # The watcher reports this exception through its existing
+            # last_notified_error deduplication path, so the recovery action
+            # must be in the raised message rather than only on disk.
+            raise RuntimeError(detail) from retry_exc
 
 
 def refresh_roster() -> dict[str, Any]:

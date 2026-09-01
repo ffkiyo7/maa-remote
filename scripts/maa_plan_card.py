@@ -37,6 +37,7 @@ ACTIVITY_LINE_RE = re.compile(
     r"^\s*-\s+([A-Za-z0-9][A-Za-z0-9_-]{0,30}-\d{1,2})(?::|\s|$)"
 )
 SIDE_STORY_SECTION = "Opening side story stages:"
+OPENING_SECTION_PREFIX = "Opening "
 SUPPLY_STAGES: tuple[tuple[str, str, str, frozenset[int]], ...] = (
     ("AP-5 · 红票", "AP-5", "采购凭证（红票）关卡", frozenset({0, 3, 5, 6})),
     ("CA-5 · 技能书", "CA-5", "技能概要关卡", frozenset({1, 2, 4, 6})),
@@ -46,6 +47,23 @@ SUPPLY_STAGES: tuple[tuple[str, str, str, frozenset[int]], ...] = (
 )
 DEFAULT_MAA_CLI_FORMULA = "MaaAssistantArknights/tap/maa-cli"
 _VERSION_RE = re.compile(r"(?im)^(maa-cli|MaaCore|maa)\s+(v?\d+\.\d+\.\d+\S*)")
+
+
+def is_side_story_heading(line: str) -> bool:
+    """The one place that decides whether a line *is* the side-story heading.
+
+    ``activity_snapshot()`` gates on this exact predicate, so the gate and the
+    parser can never disagree about what counts as a recognized heading.
+    Indentation is load-bearing below the heading — it is what separates an
+    activity title from its stage bullets — so a shifted heading is a format
+    change, not something to normalize away.
+    """
+    return line.rstrip() == SIDE_STORY_SECTION
+
+
+def is_section_heading(line: str) -> bool:
+    """Any ``Opening …`` section heading the parser already knows how to end on."""
+    return line.rstrip().startswith(OPENING_SECTION_PREFIX)
 
 
 def parse_activity_events(output: str) -> list[dict[str, Any]]:
@@ -61,11 +79,11 @@ def parse_activity_events(output: str) -> list[dict[str, Any]]:
     in_side_stories = False
     for raw_line in output.splitlines():
         line = raw_line.rstrip()
-        if line == SIDE_STORY_SECTION:
+        if is_side_story_heading(line):
             in_side_stories = True
             current = None
             continue
-        if in_side_stories and line.startswith("Opening "):
+        if in_side_stories and is_section_heading(line):
             break
         if not in_side_stories:
             continue
@@ -82,8 +100,26 @@ def parse_activity_events(output: str) -> list[dict[str, Any]]:
 
 
 def activity_snapshot(output: str) -> dict[str, Any]:
-    if SIDE_STORY_SECTION not in output:
-        raise RuntimeError("maa activity 输出格式已变化：找不到活动关分区")
+    lines = output.splitlines()
+    if not any(is_side_story_heading(line) for line in lines):
+        # Three outcomes, and only the middle one may clear live state:
+        #
+        #   heading text present but never as a heading *line*  -> format
+        #     changed under us (a decorated or reflowed heading).  The parser
+        #     would silently yield zero events here, so fail loudly instead.
+        #   no heading text, but some other recognized ``Opening …`` section
+        #     -> the query succeeded during an activity gap.  Empty snapshot.
+        #   nothing recognizable at all -> untrustworthy output.  Fail loudly.
+        recognized_gap = SIDE_STORY_SECTION not in output and any(
+            is_section_heading(line) for line in lines
+        )
+        if not recognized_gap:
+            raise RuntimeError("maa activity 输出格式已变化：找不到活动关分区")
+        return {
+            "stages": [],
+            "events": [],
+            "all_supply_stages_open": all_supply_stages_open(output),
+        }
     events = parse_activity_events(output)
     stages: list[str] = []
     for event in events:
@@ -163,7 +199,7 @@ def persist_activity_snapshot(
 ) -> None:
     updated = dict(config)
     updated["activity_stages"] = list(snapshot.get("stages", []))
-    updated["activity_events"] = list(snapshot.get("events", []))
+    updated.pop("activity_events", None)
     updated["all_supply_stages_open"] = bool(
         snapshot.get("all_supply_stages_open", False)
     )
@@ -171,10 +207,10 @@ def persist_activity_snapshot(
     config.update(
         {
             "activity_stages": updated["activity_stages"],
-            "activity_events": updated["activity_events"],
             "all_supply_stages_open": updated["all_supply_stages_open"],
         }
     )
+    config.pop("activity_events", None)
 
 
 def all_supply_stages_open(output: str) -> bool:
