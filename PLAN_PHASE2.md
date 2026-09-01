@@ -1,5 +1,11 @@
 # 二期：prts.plus 作业站接入（抄作业代打）
 
+> 本文保留二期“手动按需搜索”的原始方案。当前实现又增加了每 15 分钟运行的活动轮换 watcher：
+> 连续两次空观察才结束旧轮换；自动搜索绕过 12 小时缓存，只取上游第一推荐关中完全满足练度、
+> 没有软硬缺口的 Top-1 普通作业。Discord 只确认/取消，开模拟器前和真正进战前都会强制复核
+> 活动与实时理智；尚未开始战斗的失败在安全清理后可再次确认。
+> 运行时现状以 `README.md` 与 `DEV_GUIDE.md` 为准。
+
 ## Context
 
 一期已上线：Hermes gateway 常驻接管 Discord，仓库只提供「跑完就退」的短命脚本，
@@ -58,7 +64,7 @@
    `skill_level>=8` 219、`elite` 34。
 
 7. **不需要动 Hermes adapter。** `_load_hermes_button_registry()` 在每次交互时
-   （`adapter.py:5871`）从磁盘重读 `buttons.json`，且 `maa_action.py` 已在
+   从磁盘重读 `buttons.json`，且 `maa_action.py` 已在
    `_HERMES_BUTTON_SCRIPTS` 白名单里。→ **本期新增按钮零 adapter 补丁、零
    `LOCAL_PATCHES.md`、零 gateway 重启**，一切走 `maa_action.py`。
 
@@ -93,9 +99,9 @@
 `deploy.py`、`skills/games/maa-operator/SKILL.md`、三份文档。
 
 `maa_copilot_worker.py` **复用 `maa_daily.py` 的设备层**（`open_emulator`、`wait_for_android`、
-`capture_screenshot`、`close_everything`、`send_report` 等）—— 这是仓库既有惯例，
-`maa_action.py:207` 已经在 `from maa_daily import extract_summary`。
-不把设备层上提到 `maa_common.py`：那会打乱现有 28 个测试的覆盖边界，收益不抵风险。
+`capture_screenshot`、`close_everything`、`send_report` 等）—— 这是仓库既有惯例，动作脚本也
+已经复用 `maa_daily.extract_summary`。不把设备层上提到 `maa_common.py`：这会打乱现有测试的
+覆盖边界，收益不抵风险。
 
 ### 20 秒预算怎么绕开
 
@@ -118,7 +124,7 @@
 
 **按钮前缀用 `hermes:btn:maa-copilot:`（是 `-` 不是 `:`）。**
 `"hermes:btn:maa-copilot:x".startswith("hermes:btn:maa:")` 为 `False`，
-所以 `maa_plan_card.py:404-406` 每早的前缀清扫**碰不到**它，
+所以 `maa_plan_card.py` 每早对 `hermes:btn:maa:` 的前缀清扫**碰不到**它，
 DEV_GUIDE 不变量 #7「只碰 `hermes:btn:maa:` 前缀」原文照旧成立。
 清理分三层：新搜索时清过期、07:50 在已有锁块里清、`copilot cancel` 时即时清。
 
@@ -126,11 +132,12 @@ DEV_GUIDE 不变量 #7「只碰 `hermes:btn:maa:` 前缀」原文照旧成立。
 
 ```
 ~/.hermes/state/maa/copilot/           0700
-  skland.json          0600  {hg_token, cred, sign_token, uid, cred_updated_at, last_error}
+  hg_token.txt         0600  鹰角 token 种子；只由部署环境变量或本机 link 写入
+  skland.json          0600  {hg_token,cred,sign_token,uid,cred_updated_at,last_error}
   roster.json          0600  {fetched_at, uid, chars:{charId:{name,level,elite,
                                 main_skill_lvl,skills:[spec…],module_levels:[…],rarity}}}
   stage_index.json     0600  {built_at, resource_signature, codes:{}, stages:{}, raid_variants:[]}
-  cache/<stage_id>.json 0600 搜索结果，裁掉 actions，TTL 12h
+  cache/<stage_id>.json 0600 搜索结果，裁掉 actions；手动搜索 TTL 12h，活动自动搜索绕过读取
   searches/<token>.json 0600 {token,status,expires_at,stage,stage_id,candidates:[…],message_id}
   copilot_search.lock         flock，搜索去重
 runs/<date>-copilot-<token>.{json,log,png}   复用现有 cleanup_run_files()
@@ -204,7 +211,7 @@ token 两种注入方式，都不经过 Discord、不进 argv、不进 agent 上
 SKLAND_HG_TOKEN=<token> python3 deploy.py          # 对齐现有 MAA_CHANNEL_ID 的做法
 python3 ~/.hermes/scripts/maa_skland.py link       # 本机终端，从 stdin 读
 ```
-`deploy.resolve_skland_token()` 仿 `deploy.py:83 resolve_channel_id()`，但**缺失时不报错**
+`deploy_skland_token()` 只在 `SKLAND_HG_TOKEN` 存在时写 `copilot/hg_token.txt`，缺失时不报错
 （没配森空岛也要能正常部署）。仓库不带占位符，`config.json` 永不存 token。
 过期处理：`10002` → 用存着的 `hg_token` 重跑 grant，**只重试一次**，再失败就记 `last_error`
 并在下张卡片提示「请在本机终端重新运行 maa_skland.py link」。绝不循环重试。
@@ -221,7 +228,7 @@ python3 ~/.hermes/scripts/maa_skland.py link       # 本机终端，从 stdin �
    Discord 下拉值仍是不透明 `choice:N` 经 `select_args` 查表。
 3. `stone = 0` 不变量保持：抄作业路径不渲染 `daily.toml`、不碰 `plan.json`/`defaults.json`。
 4. **互斥 + 防饿死**：worker 取 `run_lock(blocking=False)`；`copilot pick` 用
-   `is_run_locked()` 预检。另外 `maa_daily.py:777` 在拿不到锁时是静默 `return 0` ——
+   `is_run_locked()` 预检。另外 `maa_daily.execute()` 在拿不到锁时是静默 `return 0` ——
    07:58 起跑的作业会无声吃掉 08:00 的日常。故 `copilot pick` 在 08:00/22:00 前
    `copilot_blackout_minutes`(25) 内拒绝并说明原因。
 5. `SKILL.md` 增补：只允许 `copilot find/pick/again/cancel/status`；
@@ -268,7 +275,7 @@ python3 ~/.hermes/scripts/maa_skland.py link       # 本机终端，从 stdin �
 - **C5 — 突袭 + 加固 + 文档**：🔥 按钮与模式回报、blackout、TTL GC、`SKILL.md`、
   DEV_GUIDE 新增不变量与「链路四」、PLAN.md/README。
   DoD：突袭跑报告里回报实际模式；25 小时前的卡片按钮返回「已失效」；
-  `deploy.py` 幂等且 `--check` 覆盖全部 7 个脚本。
+  `deploy.py` 幂等且 `--check` 覆盖当前 8 个 Python 脚本、`ocrbox` 与 4 个关键基建配置。
 
 ---
 
@@ -297,7 +304,7 @@ python3 -c "import json,os; d=json.load(open(os.path.expanduser( \
   ('hermes:btn:agent-book:','hermes:btn:maa:','hermes:btn:maa-copilot:')})"
 ```
 
-关键测试（新 `tests/test_copilot.py`，仿现有 28 个用例的风格）：
+关键测试（`tests/test_copilot.py`，沿用现有用例风格）：
 展示码作业被本地改写后可执行、`level_keyword` 退化检测、客户端过滤永不信服务端、
 备选组任一满足即满足、专精映射 8/9/10、缺口文案逐字断言、召唤物不计缺口、
 排序分桶、`argv` 精确断言（不含 `--use-sanity-potion`）、

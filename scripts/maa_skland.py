@@ -246,6 +246,33 @@ def _normalize_activity_progress(activity: Any) -> dict[str, Any]:
     return progress
 
 
+def _normalize_sanity(data: Any) -> dict[str, int] | None:
+    """Keep only the AP fields needed for a bounded execution preflight."""
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    ap = status.get("ap") if isinstance(status, dict) else None
+    if not isinstance(ap, dict):
+        return None
+    try:
+        normalized = {
+            "current": int(ap["current"]),
+            "max": int(ap["max"]),
+            "last_ap_add_at": int(ap["lastApAddTime"]),
+            "server_current_at": int(data["currentTs"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        normalized["current"] < 0
+        or normalized["max"] <= 0
+        or normalized["last_ap_add_at"] <= 0
+        or normalized["server_current_at"] <= 0
+    ):
+        return None
+    return normalized
+
+
 def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
     """Full grant->cred->binding->player/info chain; returns normalized chars.
 
@@ -279,6 +306,7 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
         return {
             "chars": _normalize_chars(chars, battle),
             "activity_progress": progress,
+            "sanity": _normalize_sanity(data),
         }
 
     try:
@@ -313,6 +341,8 @@ def refresh_roster() -> dict[str, Any]:
         "chars": data["chars"],
         "activity_progress": data.get("activity_progress", {}),
     }
+    if isinstance(data.get("sanity"), dict):
+        roster["sanity"] = data["sanity"]
     atomic_write_json(ROSTER_PATH, roster)
     return roster
 

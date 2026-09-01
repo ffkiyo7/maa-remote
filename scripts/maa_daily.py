@@ -49,7 +49,7 @@ TASK_STEPS = (
     ("StartUp", "🚀", "登录与首登领取", "正在登录并处理首登弹窗"),
     ("Annihilation", "☄️", "每日剿灭", "正在用代理卡全权委托清剿灭"),
     ("Fight", "⚔️", "刷理智", "正在刷理智"),
-    ("Infrast", "🏭", "基建换班", "正在按游戏内预设队列轮换"),
+    ("Infrast", "🏭", "基建换班", "正在根据干员心情自动排班"),
     ("Recruit", "🎫", "公开招募", "正在处理公开招募"),
     ("Mall", "🛒", "信用商店", "正在领取信用并购买物资"),
     ("Award", "🎁", "领取奖励", "正在领取日常、周常与全部邮件奖励"),
@@ -229,10 +229,10 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             'name = "基建换班"\n'
             'type = "Infrast"\n'
             "[tasks.params]\n"
-            # Use the in-game preset queue rotation. MaaCore does not select
-            # individual operators in this mode.
-            "mode = 20000\n"
-            'facility = ["Mfg", "Trade", "Reception"]\n'
+            # Let MaaCore calculate efficient assignments from the operators
+            # and morale currently visible in every shiftable base facility.
+            "mode = 0\n"
+            'facility = ["Mfg", "Trade", "Power", "Control", "Reception", "Office", "Dorm"]\n'
             'drones = "_NotUse"\n'
             "threshold = 0.3\n"
             "replenish = false\n"
@@ -624,7 +624,15 @@ def extract_summary(
                 details.append("掉落 " + "、".join(f"{name} ×{quantity}" for name, quantity in drops))
         elif key == "Infrast":
             facilities = []
-            for raw_name, display in (("Mfg", "制造站"), ("Trade", "贸易站"), ("Reception", "会客室")):
+            for raw_name, display in (
+                ("Mfg", "制造站"),
+                ("Trade", "贸易站"),
+                ("Power", "发电站"),
+                ("Control", "控制中枢"),
+                ("Reception", "会客室"),
+                ("Office", "办公室"),
+                ("Dorm", "宿舍"),
+            ):
                 count = sum(1 for line in lines if f"EnterFacility {raw_name}" in line)
                 if count:
                     facilities.append(f"{display} ×{count}")

@@ -35,8 +35,8 @@ client_type = "Official"
 name = "基建换班"
 type = "Infrast"
 [tasks.params]
-mode = 20000
-facility = ["Mfg", "Trade", "Reception"]
+mode = 0
+facility = ["Mfg", "Trade", "Power", "Control", "Reception", "Office", "Dorm"]
 drones = "_NotUse"
 threshold = 0.3
 replenish = false

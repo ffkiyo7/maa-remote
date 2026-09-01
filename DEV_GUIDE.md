@@ -33,6 +33,7 @@
         ├── cron 调度器（UTC）                    ├── Discord 适配器（网关连接）
         │                                          │
    ┌────┴──────────────────────────────┐      ┌────┴─────────────────────────┐
+   │ */15 * * * * maa_activity_watch  │      │                              │
    │ 50 23 * * *  maa_plan_card.py     │      │ 组件交互 hermes:btn:maa:*    │
    │ (京 07:50)                        │      │   → buttons.json 查登记      │
    │  0  0 * * *  maa_daily.py  am     │      │   → exec 白名单校验          │
@@ -53,7 +54,7 @@
                                  └─ 截图 ─ closedown/退出/断 ADB ─ 战报 embed
 ```
 
-三条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
+四条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
 stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）。
 
 ---
@@ -64,21 +65,22 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 |---|---|---|---|
 | `scripts/maa_common.py` | 无第三方依赖的公共层：时区、两把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 每日计划卡；每次先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50 | 数秒～5 分钟（含 `maa update` / `brew`） |
+| `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；活动切换时派发 Top-1 作业搜索，维护重试/取消/完成状态 | cron 每 15 分钟 | 通常 <1s；需要搜索时后台 5~20s |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、缺口文案、候选卡片 | 被 action/worker import | — |
 | `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 搜索发卡；`run <token> <n> <mode>` 真执行 | 仅由 `maa_action.py` 派发 | 搜索 5~20s；执行 8~15 分钟 |
-| `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度拉取、`link`（stdin 收 token） | 本机终端；worker 懒刷新 | 秒级 |
+| `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度与理智拉取、`link`（stdin 收 token） | 本机终端；worker 懒刷新或执行前强制刷新 | 秒级 |
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
-| `tests/test_maa.py` + `tests/test_copilot.py` | 151 个 stdlib 单测，不碰模拟器 | 人工 | 约 10s |
+| `tests/test_maa.py` + `tests/test_copilot.py` | stdlib 单测，不碰模拟器 | 人工 | 约 10s |
 
 ---
 
 ## 3. 链路一：计划卡（`maa_plan_card.py`，京 07:50）
 
-`main()`（`scripts/maa_plan_card.py:381`）严格按这个顺序：
+`main()`（`scripts/maa_plan_card.py`）严格按这个顺序：
 
 1. **`check_and_update_upstream()`** — 每次计划卡都跑：`brew outdated/upgrade` 跟随
    maa-cli，再依次用 `maa update --batch` 和 `maa hot-update --batch` 更新 Beta
@@ -90,7 +92,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
    的活动关列表写回 `config.json`；同时检测公告里的「资源收集」字样，命中则置
    `all_supply_stages_open=true`（全部资源本开放）。
 3. **重新 `load_config()`** — 上一步刚改过磁盘上的 config，卡片必须从落盘后的真值渲染。
-4. **`build_components()`** — 组装一个下拉 + 三个按钮，同时产出登记表条目。
+4. **`build_components()`** — 组装刷图/抄作业两个下拉 + 三个按钮，同时产出登记表条目。
 5. **写按钮登记（关键）** — 在 `state_lock()` 里 **先删所有 `hermes:btn:maa:` 前缀的 key，
    再 merge 写回** `~/.hermes/state/agent-book/buttons.json`。这个文件是**全局共享**的，
    agent-book 的按钮也在里面，**绝不能整体覆盖**。删前缀的副作用是旧卡片上的
@@ -102,11 +104,11 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 ### 关卡下拉是怎么构成的
 
-`_stage_choices()`（`:213`）顺序拼接，上限 25 项：
+`_stage_choices()` 顺序拼接，上限 25 项：
 
 - `上次作战关卡`（空串 → MAA 自动沿用游戏内上次关卡）
 - `1-7`
-- **当天开放的资源本** — `current_supply_choices()`（`:60`）用 `(now - 4h).weekday()` 算「游戏日」
+- **当天开放的资源本** — `current_supply_choices()` 用 `(now - 4h).weekday()` 算「游戏日」
   （国服 04:00 刷新），按 `SUPPLY_STAGES` 的星期表过滤；`all_supply_stages_open` 为真时全给。
 - `config.activity_stages` 里的活动关
 - 若当前计划关卡不在以上任何一项里，插到第 2 位
@@ -130,11 +132,55 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 
 ---
 
+## 3.5 链路一半：活动上线自动备好作业（`maa_activity_watch.py`）
+
+watcher 每 15 分钟调用 `query_activity_snapshot()`，解析 `maa activity Official` 的活动标题与
+推荐关。`activity_watch.lock` 防止两次 cron 重叠；一个轮换只取 MAA 输出的第一推荐关，避免
+多关并发撞 `copilot_search.lock`。活动 identity 真正变化时，
+旧搜索在 `state_lock()` 内原子改为 `superseded` 并同步删登记，旧 worker 即使稍后返回也不能
+覆盖新状态或重新挂回按钮。watcher 若在派发 child 后、写 `activity_watch.json` 前崩溃，下一轮会
+按 `activity_key + stage` 接管已落盘的孤儿搜索，不会再发第二张卡。
+
+新观察通过 `maa_action.start_copilot_search(auto_confirm=True)` 进入现有搜索 worker：prts 客户端
+过滤、森空岛练度打分都不复制。自动搜索强制刷新 roster，并以 `use_cache=False` 绕过手动搜索
+的 12 小时作业缓存，所以新活动首次暂无作业时，后续重试能看到上游刚上传的作业。候选必须同时
+满足 `ratio == 1.0`、`gaps == []`、`soft_gaps == []`，然后只展示 Top-1 普通作业与
+**确认 / 取消**；自动路径不做“按热度且练度未校验”的降级。
+
+搜索抢锁、prts 暂无完全满足的作业或资源尚无理智消耗时进入 waiting，默认每 30 分钟重试；
+同一错误只告警一次。取消会把本轮记为 dismissed，活动不变就不再打扰；成功或失败执行后
+worker 写执行终态，watcher 统一记 completed。
+
+关卡索引同时扫描 MaaCore 自带 resource 与 `MaaResource/resource` 热更新覆盖层，基础资源先读、
+覆盖层后读；否则活动已经被 `maa activity` 看见、导航图却还只在覆盖层时会永远匹配失败。
+
+活动与理智按三个安全点复核：`stages.json` 按 stageId 精确查理智消耗、复刻时按 code 精确兜底；
+按钮点击先现场读取活动，并按最近一次森空岛快照加自然恢复估算当前理智；worker 抢到 `run.lock`
+后、打开模拟器前再次读取活动并强制刷新森空岛理智；导航到编队界面后、真正调用 `maa copilot`
+前还会再做一次相同的实时复核。活动已轮换、消耗未知、API 失败或理智不足都明确拒绝。
+
+确认后的底层状态依次是 `queued → preparing → executing → executed/execution_failed`。`queued` 是
+动作脚本已原子接单但 worker 尚未拿锁，`preparing` 已过第一轮复核但还没碰模拟器，`executing`
+从准备打开模拟器开始持续到战报终态。确认按钮只在最后一次进战复核通过后才撤掉；在此之前，
+作业下载、可执行文件、模拟器、ADB、导航或复核失败，只要还没有调用 `maa copilot` 且清理成功，
+就恢复为 `done`，原卡可以再点。战斗一旦开始，或清理失败导致是否安全重跑不确定，就写
+`execution_failed`，绝不自动重跑。
+
+`queued/preparing` 超过 20 分钟且 `run.lock` 已空闲，说明 worker 在触碰战斗前失联：watcher 或下一次
+手动点击会原子恢复为 `done`。`executing` 超过运行上限且锁已释放时只能写
+`execution_failed` 并撤掉按钮，不能猜测这场是否已经消耗理智。
+
+`activity_watch.json` 是面向轮换的粗状态：`idle`（无活动）、`searching` / `waiting`（搜索或退避）、
+`ready`（待确认）、`preparing`（确认后进战前）、`executing`、`dismissed`（本轮取消）、
+`completed`（本轮成功或失败已有终态）。`searches/<token>.json` 保存上面更细的执行状态。
+
+---
+
 ## 4. 链路二：执行一场日常（`maa_daily.py`）
 
-`execute(phase)`（`scripts/maa_daily.py:764`）：
+`execute(phase)`（`scripts/maa_daily.py`）：
 
-1. **定场次** — `select_phase()`（`:56`）优先级：argv (`am|pm|now`) > **当前工作目录名**
+1. **定场次** — `select_phase()` 优先级：argv (`am|pm|now`) > **当前工作目录名**
    > 按北京时间的小时猜。cron 用 workdir 传场次，是因为 Hermes 的 `--script` 不支持 argv：
 
    ```
@@ -156,7 +202,7 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
    `pm path com.hypergryph.arknights` 确认国服客户端已装。任一步失败且此时还没建子区，
    走 `send_direct_failure()` 直接在频道发红色告警。
 6. **发开跑消息 → 建子区 → 发进度占位消息**，thread_id 记进 `last_run.threads`（供 24h 清理）。
-7. **渲染 `daily.toml`** — `render_daily_toml(plan, config)`（`:76`）把本场快照渲染成 TOML 并
+7. **渲染 `daily.toml`** — `render_daily_toml(plan, config)` 把本场快照渲染成 TOML 并
    `atomic_write_text` 覆盖 `~/.config/maa-cli/tasks/daily.toml`。任务链固定：
 
    `StartUp → [当日第一场 Annihilation] → Fight(1-7) → Infrast → Recruit → Mall → Award → Custom(Home)`
@@ -183,9 +229,12 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
    `task_names` 原样交给 `ProcessTask`，不走 `next` 列表那套 `#` 展开。
 
    其中 `medicine = 0`、`stone = 0`、`series = 0` 是**硬编码字面量**，不从任何状态派生；
-   `Infrast` 固定 `mode = 20000`（只点游戏内预设队列轮换）。**链里没有 CloseDown**——
-   它被拆出去在截图之后单独跑。
-8. **`run_maa()`**（`:544`）— `maa run daily -v --batch`，注入 `MAA_CONFIG_DIR` /
+   `Infrast` 固定 `mode = 0`，让 MaaCore 从游戏内实时识别的干员、基建技能和心情计算
+   七类设施的排班；不使用无人机、不补源石碎片订单、宿舍不刷信赖。**链里没有 CloseDown**——
+   它被拆出去在截图之后单独跑。`profiles/default.toml` 开启 maa-cli 用户资源层，
+   `resource/tasks/tasks.json` 只覆盖 `InfrastDormDoubleConfirmButton`：上游旧蓝色确认模板已经
+   不符合国服当前红色确认条，因此复用现成 `PopupConfirm.png` 识别后点击右侧对勾。
+8. **`run_maa()`** — `maa run daily -v --batch`，注入 `MAA_CONFIG_DIR` /
    `MAA_LOG_PREFIX=Never` /（可选）剔除代理变量。两个 reader 线程把 stdout+stderr
    同时 tee 到 `runs/<date>-<phase>.log`；主循环每 5 秒把**解析后的中文状态** PATCH 进
    子区那条消息，内容无变化就不发，Discord 异常一律吞掉（流式是尽力而为，不能拖垮主流程）。
@@ -203,7 +252,7 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
      `last_run.home_verify_detail`——宁可漏报也不能凭一个不确定的信号误杀好场次。
    - 这条闸门只挂在日常链上。抄作业结束在战斗结算界面而不是主页，`maa_copilot_worker`
      仍然直接调 `capture_screenshot()`，不受影响。
-10. **`close_everything()`**（`:472`，在 `finally` 里）— `maa closedown Official` →
+10. **`close_everything()`**（在 `finally` 里）— `maa closedown Official` →
     `osascript quit`（bundle id）→ sleep `quit_grace_seconds` → `pkill -f BlueStacks` 兜底 →
     `adb disconnect` → 用 `[B]lueStacks` 这种加方括号的模式 `pgrep` 复核残留（防止匹配到自己）。
 11. **判定与上报** — `ok = (return_code == 0 and not cleanup_errors and home_verified is not False)`。最后编辑一次子区消息
@@ -212,7 +261,7 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 
 ### CLI 输出 → 中文的转换
 
-`progress_content()`（`:273`）和 `extract_summary()`（`:308`）是两个**纯函数**：输入 CLI 行数组，
+`progress_content()` 和 `extract_summary()` 是两个**纯函数**：输入 CLI 行数组，
 输出 Discord 文本。**原始 CLI 文本从不进 Discord**，只落 `runs/*.log`。
 它们靠 `TASK_STEPS` 表 + 一组正则识别任务状态、理智、连战次数、临期药、掉落、
 设施进入次数、公招次数。maa-cli / MaaCore 升级后输出格式变了，通常只需要改这两个函数
@@ -238,7 +287,7 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 | exec 白名单是**精确文件名**集合 | 必须由 `deploy.py` 显式加入 `maa_action.py`，不能用通配。 |
 | `buttons.json` 路径写死且全局共享 | 必须 merge，必须用 agent-book 那把 `state.lock`。 |
 
-子命令（`dispatch()`，`scripts/maa_action.py:224`）：
+子命令（`dispatch()`，`scripts/maa_action.py`）：
 
 | 命令 | 行为 |
 |---|---|
@@ -248,16 +297,16 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 | `run now` | 抢锁探测 → 预检 → `Popen` 派发 `maa_daily.py now` 后立即返回 |
 | `log tail` | 读 `last_run.summary`；若是旧版格式则回读 log 用 `extract_summary` 重建 |
 
-关卡白名单 `valid_stage()`（`:76`）：空串 ✔ / `^[A-Za-z0-9]{1,8}-\d{1,2}$` ✔ /
+关卡白名单 `valid_stage()`：空串 ✔ / `^[A-Za-z0-9]{1,8}-\d{1,2}$` ✔ /
 在 `config.activity_stages` 里 ✔ / 否则**现场跑 `maa activity Official` 并按词边界精确匹配**
 （超时只给 **0.7s**，因为整体预算是 20s）。其余一律拒。
 
 写状态时的两个细节：
-- `_today_override()`（`:80`）只保留 `date/stage/skip/source/updated_at` 五个键，其余字段丢弃；
+- `_today_override()` 只保留 `date/stage/skip/source/updated_at` 五个键，其余字段丢弃；
   日期不是今天就整个重置。所以 `plan.json` 天然「今天说的话明天失效」，不需要清理任务。
 - `is_run_locked()` 决定确认话术：正在跑就明确回「不打断本场，X 生效于……」。
 
-`emit()`（`:40`）把输出压在 7900 字节内——组件运行器只接受 ≤8192 字节的 JSON。
+`emit()` 把输出压在 7900 字节内——组件运行器只接受 ≤8192 字节的 JSON。
 
 ### 技能这一层为什么必要
 
@@ -333,6 +382,9 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
   `appCode == "arknights"` 选，uid 取 `defaultUid`）→ `player/info?uid=` 的
   `chars[]`（字段：`evolvePhase`=精英化、`skills[].specializeLevel`=专精、
   `equip[].{id,level,locked}`=模组，锁着的模组不计数）。
+- 同一响应的 `currentTs` 与 `status.ap.{current,max,lastApAddTime,completeRecoveryTime}`
+  归一化进 `roster.sanity`。候选卡可按 6 分钟/点估算缓存后的自然恢复，但自动作业真正执行前
+  必须再次调用 `refresh_roster()`，缓存估算不能替代最终真值。
 - 名字解析：skland 响应只有 charId；干员名→charId 用本地 `battle_data.json` 的
   `chars` 字典（`names` 键不存在，C0 实测）。只解析到 `token_*`/`trap_*` 的视为
   召唤物、不计缺口。
@@ -351,6 +403,8 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
   defaults.json   持久默认：stage="1-7" / medicine=expiring / tasks 全开
   plan.json       今日覆盖：{date, stage, skip, source, updated_at}
   last_run.json   最近一次运行状态 + threads[] + 资源更新时间戳
+  activity_watch.json 当前活动观察 + 搜索 token + idle/searching/waiting/ready/
+                      preparing/executing/dismissed/completed 状态
   run.lock        flock 独占锁（执行）
   am/ pm/         空目录，仅用于给 cron 传场次
   runs/<date>-<phase>.{json,log,png}   本场快照 / 完整日志 / 截图（保留 14 天）
@@ -360,7 +414,7 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
   state.lock      共享写锁
 ```
 
-**计划的求值**（`effective_plan()`，`scripts/maa_common.py:226`）：
+**计划的求值**（`effective_plan()`，`scripts/maa_common.py`）：
 
 ```
 result = normalize_plan(defaults.json)
@@ -379,7 +433,7 @@ result = normalize_plan(result)             ← 再规范化一次
 | `run.lock` | 「同一时刻只有一场 MAA」 | runner 用非阻塞抢，抢不到就退；`maa_action` 只用它做只读探测 |
 | `agent-book/state.lock` | 按钮登记表 + `plan.json` 写入 | 阻塞式，跨功能共享 |
 
-`merge_last_run()`（`:420`）语义特殊：普通字段覆盖，`threads` 数组**按 thread_id 去重后追加**——
+`merge_last_run()` 语义特殊：普通字段覆盖，`threads` 数组**按 thread_id 去重后追加**——
 子区清理依赖这份累积列表，不能改成整体覆盖。
 
 同一天同场次的 `runs/` 文件名会复用（`<date>-<phase>`），所以一天里多次 `run now`
@@ -392,7 +446,7 @@ result = normalize_plan(result)             ← 再规范化一次
 ```bash
 python3 -m unittest discover -s tests -v   # 必须在仓库根目录跑（测试要 import 根目录的 deploy.py）
 python3 deploy.py                          # 幂等；输出 {"ok":true,"changed":[…],"backup":"…"}
-python3 deploy.py --check                  # 只检查 4 个脚本是否已部署
+python3 deploy.py --check                  # 检查 8 个 Python 脚本、ocrbox 与 4 个关键基建配置
 ```
 
 做的事：
@@ -401,13 +455,13 @@ python3 deploy.py --check                  # 只检查 4 个脚本是否已部�
    `~/.hermes/backups/maa-setup/<YYYYMMDDTHHMMSS>/`。
 2. **幂等写** — `write_bytes()` 内容一致就跳过（不写、不记 changed、不备份），
    否则 `mkstemp + fsync + os.replace` 原子替换，权限 0600/0700。
-3. **状态的部署策略不同**（`deploy_state()`，`deploy.py:90`）：
+3. **状态的部署策略不同**（`deploy_state()`，`deploy.py`）：
    - `config.json`：**逐键合并**，仓库的键覆盖同名键，本地新增键保留。
      注意仓库里的 `activity_stages` 会盖掉线上缓存，下一次计划卡会重新刷。
      `maa_core_version` / `maa_cli_version` 以本机已写入的为准，避免种子版本盖掉计划卡刚探测到的真值。
      同时丢掉已废弃的 `resource_update_interval_days`。
    - **`channel_id` 例外**：仓库里存的是占位符 `REPLACE_WITH_DISCORD_CHANNEL_ID`，
-     真实频道 ID 不入库。`resolve_channel_id()`（`deploy.py:83`）按
+     真实频道 ID 不入库。`resolve_channel_id()` 按
      `MAA_CHANNEL_ID` 环境变量 → 本机已部署的 `~/.hermes/state/maa/config.json`
      的顺序解析，都拿不到就直接报错终止。已配置过的机器重跑 `deploy.py` 不需要带参数；
      换新机器首次部署要写成：
@@ -427,7 +481,7 @@ python3 deploy.py --check                  # 只检查 4 个脚本是否已部�
 | `~/.hermes/.env` | `DISCORD_FREE_RESPONSE_CHANNELS` 追加频道 ID（免 @） |
 | `~/.hermes/config.yaml` | 频道绑定 `maa-operator` 技能 + 频道提示词 |
 
-> `patch_adapter_source()`（`deploy.py:152`）用**精确字符串匹配**，匹配不到就 `RuntimeError`
+> `patch_adapter_source()` 用**精确字符串匹配**，匹配不到就 `RuntimeError`
 > 而不是硬改。因此 **`hermes update` 之后 `deploy.py` 可能直接报错**——这是刻意的：
 > 宁可失败，也不要在改了结构的 adapter 上瞎打补丁。届时需要读新 adapter 源码更新这些 old/new 串。
 
@@ -444,14 +498,16 @@ python3 deploy.py --check                  # 只检查 4 个脚本是否已部�
 cron 本身只在首次创建时需要注册：
 
 ```bash
+hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
 hermes cron create "50 23 * * *" --name "MAA 计划卡"  --script maa_plan_card.py --no-agent --deliver local
 hermes cron create "0 0 * * *"   --name "MAA 日常·早" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/am
 hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
 cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部一律用 `Asia/Shanghai`。
-改时间时两边都要想清楚。当前在册：`03d5e98ce8d4`（计划卡）、`50cd1fb095f2`（早）、
-`4f48cf619d9f`（晚），可用 `hermes cron list` 复核。
+改时间时两边都要想清楚。当前在册：`3ba48fb85d0b`（活动作业监控）、
+`03d5e98ce8d4`（计划卡）、`50cd1fb095f2`（早）、`4f48cf619d9f`（晚），可用
+`hermes cron list` 复核。
 
 ---
 
@@ -464,7 +520,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 1 | `stone = 0`，永不提供任何入口 | `render_daily_toml` 字面量 + `normalize_plan` 强制 + 技能第 3 条 |
 | 2 | `medicine = 0`，只用 `medicine_expire_days` 吃临期药 | 同上；`set_medicine()` 直接返回 `ok:false` |
 | 3 | `series = 0`（由 MaaCore 选当前理智支持的最大连战） | `render_daily_toml` 字面量 |
-| 4 | 基建只做 `mode = 20000` 预设队列轮换，facility 只列 `Mfg/Trade/Reception` | `render_daily_toml` |
+| 4 | 基建用 `mode = 0` 实时自动排班，facility 覆盖七类设施；不使用无人机、不补源石碎片订单、宿舍不刷信赖；新版红色锁定位置确认条必须能自动通过 | `render_daily_toml` + `infrast-smoke.toml` + 用户资源 `InfrastDormDoubleConfirmButton` |
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
 | 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
 | 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |
@@ -481,6 +537,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 15 | 抄作业路径永不传 `--use-sanity-potion`（`--ignore-requirements` 只在用户点的候选 `ratio < 1.0` 时出现） | `_run_locked()` argv 构造 + 测试断言 |
 | 16 | 森空岛/鹰角 token 永不经 Discord、argv、agent 上下文；`copilot/` 下文件 0600 | `maa_skland.py` stdin/环境变量注入 + 测试 |
 | 17 | 抄作业关卡只接受本地 `stage_index` 精确查表，不许猜别名 | `valid_copilot_stage()` |
+| 18 | 活动自动作业只给完全满足练度且无软硬缺口的 Top-1 普通模式；自动搜索绕过 12h 缓存，开模拟器前和进战前都复核活动与实时理智 | watcher 状态机 + `cmd_search()` + `copilot_pick()` + `_require_auto_run_preflight()` |
 
 ---
 
@@ -500,10 +557,10 @@ python3 ~/.hermes/scripts/maa_action.py plan show
 hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、真的耗理智）
 ```
 
-**单测不能替代真机验收。** 图像识别、连战倍率选择、基建轮换这些只有实机能验。
+**单测不能替代真机验收。** 图像识别、连战倍率选择、基建自动排班这些只有实机能验。
 需要跑完整链路又不想耗理智时，把 `config.json` 的 `fight_times` 临时设成 `0`
 （Fight 立即达限但任务链完整），验完**务必**改回 `2147483647`。
-`config/maa-cli/tasks/infrast-smoke.toml` 是单独验证预设队列轮换的诊断任务。
+`config/maa-cli/tasks/infrast-smoke.toml` 是单独验证七类设施实时自动排班的诊断任务。
 
 调试期间想避免定时任务插进来：`hermes cron pause <id>`，完事 `hermes cron resume <id>`。
 
@@ -519,12 +576,15 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、�
 | 场次 30～40 秒就红，日志只有五行且有 `TouchModeNotAvailable`，截图是模拟器桌面 | 没连上模拟器，MaaCore 在 StartUp 里 SIGSEGV 了 → §11.14。看 `last_run.connect_retries` 确认重试有没有接上；`com.loong.maa/crash.log` 是第二现场 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
 | 点按钮/下拉没反应或报未登记 | 卡片过期（每天 07:50 会清前缀重写）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
-| 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `parse_activity_stages()` 的正则 |
+| 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `activity_snapshot()` / `parse_activity_events()` 的分区解析与正则 |
+| 新活动上线后没有确认卡 | `hermes cron list` 看“MAA 活动作业监控”；再看 `activity_watch.json` 与对应 `copilot/searches/<token>.json`。waiting 会按 `activity_search_retry_minutes` 自动重试 |
+| 自动确认提示理智读取失败 | 森空岛凭据已过期或 API 变化；只在本机终端重新跑 `maa_skland.py link`，不要把 token 发到 Discord |
 | 聊天改计划无效 | 看 agent 是否真的调了 `maa_action.py`；`plan.json` 的 `date` 是否是今天 |
 | 战报里步骤全是「未执行」 | maa-cli 输出格式变了 → 改 `_task_state()` / `TASK_STEPS` |
 | 截图失败 | ADB 断了或返回非 PNG；不阻断主流程，看 Embed 备注 |
 | 战报说「截图不是游戏主页」 | 看 `runs/<date>-<phase>.png` 到底停在哪一页；`last_run.home_verify_detail` 有命中了几个标识。UI 改版导致误杀就调 `HOME_MARKERS` |
 | `返回主界面` 报 Error 但截图确实在主页 | `maa update` 后 QuickSwitch 任务图变了 → 翻 `asst.log` 里 `taskchain":"Custom"` 的 `to_be_recognized`，对照资源 json 看少了哪一项 |
+| 基建在制造站或宿舍停住，截图显示“撤下宿舍锁定位置的干员”或“预设队列中的干员撤下” | 检查 profile 的 `user_resource = true`，以及 `~/.config/maa-cli/resource/tasks/tasks.json` 是否部署；诊断任务应出现 `InfrastDormDoubleConfirmed` 后继续到 `Infrast Completed` |
 | `deploy.py` 报 “no longer matches baseline” | Hermes 升级动了 adapter → 按 §7 更新补丁串 |
 
 现场排查常用：

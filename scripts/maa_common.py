@@ -383,6 +383,26 @@ def discord_request(
     raise RuntimeError("Discord API retry limit reached")
 
 
+def retire_discord_components(config: dict[str, Any], message_id: Any) -> bool:
+    """Remove controls from one tracked Discord message.
+
+    Old search records may not have a message id; that is reported as False.
+    API failures deliberately propagate so callers can make the UI error
+    visible even though the local registry has already been made safe.
+    """
+    channel_id = str(config.get("channel_id") or "")
+    message = str(message_id or "")
+    if not channel_id.isdigit() or not message.isdigit():
+        return False
+    discord_request(
+        discord_token(),
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message}",
+        {"components": []},
+    )
+    return True
+
+
 def discord_upload(
     token: str,
     channel_id: str,

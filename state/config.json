@@ -36,5 +36,6 @@
   "maa_cli_version": "v0.7.5",
   "maa_core_version": "v6.17.0-beta.1",
   "copilot_blackout_minutes": 25,
+  "activity_search_retry_minutes": 30,
   "skland_roster_refresh_days": 7
 }

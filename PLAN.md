@@ -6,9 +6,9 @@
 
 `~/maa-remote-spike` 是旧方案，平台完全不同（Windows + MuMu + 飞书 + DeepSeek 常驻服务），已重新做过本机 spike，只保留概念（揉揉乐、安全阀、StartUp 恒开），代码与架构不复用。
 
-**最终形态**：每天早 7:50 在专用频道收到「今日计划卡」，通过原生下拉菜单选择常用关卡和当前开放活动关；早 8 点和晚 10 点各自动跑一遍完整日常，子区只显示带 emoji 的中文步骤，跑完在频道发中文战报卡片 + 游戏主页面截图，并把模拟器和游戏进程清干净。
+**最终形态**：每天早 7:50 在专用频道收到「今日计划卡」，通过原生下拉菜单选择常用关卡和当前开放活动关；新活动上线后自动匹配一份作业，只等 Discord 确认；早 8 点和晚 10 点各自动跑一遍完整日常，子区只显示带 emoji 的中文步骤，跑完在频道发中文战报卡片 + 游戏主页面截图，并把模拟器和游戏进程清干净。
 
-**核心简化**：不新增任何常驻进程。Hermes gateway 已常驻并接管 Discord，所以只需要 3 个 cron 脚本 + 1 个动作脚本，全是「跑完就退」的短命进程，状态落盘在 `~/.hermes/state/maa/`。旧方案那套 DeepSeek 意图识别 + prompts/schema/evals 三件套被 Discord 原生按钮取代，只在「自然语言临时改计划」这一条兜底通道上保留 LLM，且有脚本级硬校验兜底。
+**核心简化**：不新增任何常驻进程。Hermes gateway 已常驻并接管 Discord，所以只需要 4 个 cron 脚本 + 1 个动作脚本，全是「跑完就退」的短命进程，状态落盘在 `~/.hermes/state/maa/`。旧方案那套 DeepSeek 意图识别 + prompts/schema/evals 三件套被 Discord 原生按钮取代，只在「自然语言临时改计划」这一条兜底通道上保留 LLM，且有脚本级硬校验兜底。
 
 ---
 
@@ -19,12 +19,13 @@
 | exec 按钮白名单 | **打本地补丁**（一行） |
 | Mac 睡眠 | **不用管** —— 已关自动睡眠，关显示器不影响 |
 | 晚 10 点跑什么 | **与早场完全一致**的任务链 |
-| 默认关卡 | **上次的本**（MAA `stage = ""` 自动识别当前/上次作战） |
+| 默认关卡 | **1-7**；计划卡仍保留“上次作战关卡”（`stage = ""`）供当天手动选择 |
 | 自然语言可改范围 | **关卡 + 跳过今天**（脚本级白名单校验） |
 | 已开跑后才发指令 | **写入并应用到晚场**，明确告知不打断早场 |
 | 碎石 | 永不提供入口，`stone` 恒 0，脚本级硬拒 |
 | 连战次数 | Fight 固定 `series = 0`，由 MaaCore 选择当前理智支持的最大次数；倍率上限跟随当前客户端与 MaaCore，不写死 |
-| 基建换班 | 固定 `mode = 20000`，只使用游戏内预设队列轮换；设施仅列 `Mfg/Trade/Reception`，MAA 不自行挑选或清空进驻干员 |
+| 基建换班 | 固定 `mode = 0`，由 MaaCore 按游戏内实时干员、技能和心情为七类设施自动排班；不用无人机、不补源石碎片订单、宿舍不刷信赖 |
+| 活动作业 | 每 15 分钟读 MAA 活动视图；轮换变化时绕过 12 小时缓存，只取第一推荐关中完全满足练度且无软硬缺口的 Top-1 普通作业；确认与进战前复核活动和理智 |
 | 流式步骤 | 滚在**当次子区**里，每 5 秒编辑同一条消息 |
 | 子区命名 / 生命周期 | `MAA日常·早 · 08-02 08:00`；**24h 后自动删除** |
 | 截图 | MaaCore 返回游戏主页面后截图，**随战报卡片发到频道** |
@@ -45,6 +46,7 @@
 
 ```
         ┌──────── Hermes cron（UTC，北京时间 −8）────────┐
+        │ */15 * * * *  → maa_activity_watch.py  活动轮换 → 自动备好作业
         │  50 23 * * *  → maa_plan_card.py   京 07:50 计划卡 + 清理过期子区
         │   0  0 * * *  → maa_daily.py am    京 08:00 执行
         │   0 14 * * *  → maa_daily.py pm    京 22:00 执行
@@ -73,7 +75,7 @@
 ### 计划的状态模型（覆盖自动过期）
 
 ```
-defaults.json   持久默认：stage="" / 固定临期药策略 / 任务全开
+defaults.json   持久默认：stage="1-7" / 固定临期药策略 / 任务全开
 plan.json       今日覆盖：{date:"2026-08-02", stage:"CE-6",
                           skip:false, source:"discord", updated_at:...}
 ```
@@ -82,6 +84,22 @@ Runner 取计划：`plan = defaults`，若 `plan.json.date == 今天(Asia/Shangh
 → **今天说的话明天自动失效**，不需要任何清理任务。
 
 > 正确性细节：runner 启动时把「本场实际使用的计划」快照到 `runs/<date>-<phase>.json` 再开跑。之后写入 `plan.json` 的指令不会影响正在跑的那一场——这是「已开跑 → 应用到晚场」能成立的基础。
+
+### 活动作业的状态模型
+
+watcher 用活动标题与关卡 family 组成确定性轮换键，每 15 分钟读一次 MAA 当前活动。已存在的活动
+连续两次读空才转成 `idle`，单次空结果只防抖；检测到新键时，旧搜索立即标为 `superseded`。
+自动搜索不读手动作业的 12 小时缓存，每次尝试都重新查询上游，并且只接纳
+`ratio = 1.0`、硬缺口为空、软缺口为空的 Top-1 普通作业。
+
+```
+idle → searching ↔ waiting → ready → preparing → executing → completed
+                                   └──────────────→ dismissed
+```
+
+点确认时先核对实时活动与缓存恢复后的理智；worker 拿到 `run.lock` 后、开模拟器前强制刷新
+森空岛并复核，导航完成后、真正进战前再复核一次。尚未调用 `maa copilot` 的失败在清理成功时
+恢复 `ready` 供再次确认；已经可能消耗理智，或清理状态不确定时进入失败终态，不自动重跑。
 
 ---
 
@@ -92,8 +110,8 @@ Hermes 已有一套重启不失效的原生按钮（`hermes:btn:` 前缀，`agen
 | # | 约束 | 位置 | 对策 |
 |---|---|---|---|
 | 1 | exec 脚本**硬超时 20 秒** | `_run_hermes_button_script` | MAA 跑十几分钟，按钮**只能**写状态或 `Popen(start_new_session=True)` 派发后台任务后立刻返回 |
-| 2 | exec 白名单**只有 `agent_book_action.py`** | `adapter.py:60` `_HERMES_BUTTON_SCRIPTS` | 加 `"maa_action.py"`。原注释特意说明不能用通配模式（会误放行日推脚本），只能显式加名字 |
-| 3 | 登记表路径写死且**全局共享** | `adapter.py:5758` → `state/agent-book/buttons.json` | MAA 按钮用 `hermes:btn:maa:*` 前缀写进**同一个文件**，必须 **merge 不能覆盖**，并复用 `agent_book_common.py` 的同一把 `state.lock` |
+| 2 | exec 白名单**只有 `agent_book_action.py`** | `adapter.py` 的 `_HERMES_BUTTON_SCRIPTS` | 加 `"maa_action.py"`。原注释特意说明不能用通配模式（会误放行日推脚本），只能显式加名字 |
+| 3 | 登记表路径写死且**全局共享** | `adapter.py` 的按钮登记加载逻辑 → `state/agent-book/buttons.json` | MAA 按钮用 `hermes:btn:maa:*` 前缀写进**同一个文件**，必须 **merge 不能覆盖**，并复用 `agent_book_common.py` 的同一把 `state.lock` |
 
 **已验证可以直接用的**：
 
@@ -105,9 +123,9 @@ Hermes 已有一套重启不失效的原生按钮（`hermes:btn:` 前缀，`agen
 
 ## 「说一句就改今天计划」怎么走通
 
-1. 频道 ID 加进 `.env` 的 `DISCORD_FREE_RESPONSE_CHANNELS` → 不用 @ 就能触达 agent（`adapter.py:1374-1377`）
+1. 频道 ID 加进 `.env` 的 `DISCORD_FREE_RESPONSE_CHANNELS` → 不用 @ 就能触达 agent（见 `adapter.py` 的免 @ 判定）
 2. `config.yaml` 的 `platforms.discord.channel_skill_bindings` 把 `maa-operator` 技能绑到该频道（子区自动继承）
-3. Discord 会话的 `hermes-discord` toolset = `_HERMES_CORE_TOOLS` + discord/discord_admin，**含 `terminal` 和 `write_file`**（`toolsets.py:31,457`）→ agent 有能力执行脚本
+3. Discord 会话的 `hermes-discord` toolset = `_HERMES_CORE_TOOLS` + discord/discord_admin，**含 `terminal` 和 `write_file`**（见 `toolsets.py` 的对应定义）→ agent 有能力执行脚本
 4. 技能强制 agent 走 `maa_action.py`，脚本校验后写 `plan.json`
 5. runner 只认 `plan.json`
 
@@ -151,10 +169,11 @@ Hermes 已有一套重启不失效的原生按钮（`hermes:btn:` 前缀，`agen
                      # / discord_token（从 .env 只读一个键）/ discord_request
                      # 新增：discord_upload（multipart）/ thread 建与删
   maa_plan_card.py   # 07:50 发计划卡 + merge 写按钮登记 + 清理 >24h 子区
+  maa_activity_watch.py # 每 15 分钟检测活动轮换，派发严格练度匹配的 Top-1 作业搜索
   maa_daily.py       # 执行主体：起模拟器 → 建子区 → 流式 → 截图 → 关进程 → 战报
   maa_action.py      # 唯一的计划变更入口（按钮 + 聊天共用）← 需加进 exec 白名单
 
-~/.hermes/state/maa/{config,defaults,plan,last_run}.json · run.lock
+~/.hermes/state/maa/{config,defaults,plan,last_run,activity_watch}.json · run.lock
                     runs/<date>-<phase>.{json,log,png}
 
 ~/.hermes/skills/games/maa-operator/SKILL.md    # 绑定到新频道
@@ -162,7 +181,7 @@ Hermes 已有一套重启不失效的原生按钮（`hermes:btn:` 前缀，`agen
 ~/.config/maa-cli/profiles/default.toml
 ~/.config/maa-cli/tasks/daily.toml              # 不含 CloseDown
 
-改动：adapter.py:60（加白名单）· LOCAL_PATCHES.md（登记）
+改动：`adapter.py` 的 `_HERMES_BUTTON_SCRIPTS`（加白名单）· `LOCAL_PATCHES.md`（登记）
      .env（FREE_RESPONSE_CHANNELS 追加）· config.yaml（技能绑定 + 频道提示词）
 ```
 
@@ -182,7 +201,7 @@ run now                             log tail
 
 `profiles/default.toml`：`adb_path="/opt/homebrew/bin/adb"`、`address="127.0.0.1:5555"`、`touch_mode="MaaTouch"`、`[resource] global_resource=""`（国服留空）。
 
-`tasks/daily.toml` 顺序：`StartUp` → `Fight(series=0, medicine=0, medicine_expire_days=2, stone=0)` → `Infrast(mode=20000)` → `Recruit` → `Mall` → `Award` → `Custom(Home)`。基建只触发游戏内预设队列轮换。**CloseDown 不进链**。runner 将 stderr/stdout 只写入本地日志，并把识别出的任务事件转成中文步骤后更新 Discord 子区。
+`tasks/daily.toml` 顺序：`StartUp` → `Fight(series=0, medicine=0, medicine_expire_days=2, stone=0)` → `Infrast(mode=0)` → `Recruit` → `Mall` → `Award` → `Custom(Home)`。基建由 MaaCore 实时自动排班。**CloseDown 不进链**。runner 将 stderr/stdout 只写入本地日志，并把识别出的任务事件转成中文步骤后更新 Discord 子区。
 
 ---
 
@@ -224,9 +243,10 @@ Beta 在有限 `times=6` 下改选倍率后，偶发无法立即重识别倍率�
 ### P3 · 挂 cron
 
 ```bash
+hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
 hermes cron create "50 23 * * *" --name "MAA 计划卡"  --script maa_plan_card.py --no-agent --deliver local
-hermes cron create "0 0 * * *"   --name "MAA 日常·早" --script maa_daily.py     --no-agent --deliver local
-hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py     --no-agent --deliver local
+hermes cron create "0 0 * * *"   --name "MAA 日常·早" --script maa_daily.py     --no-agent --deliver local --workdir ~/.hermes/state/maa/am
+hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py     --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
 `--deliver local` 因为脚本自己发卡片（与 `agent_book_daily.py` 一致）。cron 是 UTC（`config.yaml: timezone: Etc/UTC`，现有 `0 0 * * 1-5` 那条即京 8 点，已验证）。
@@ -237,7 +257,7 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 
 1. Discord UI 手建频道 `🌱maa长草助手`（`discord_admin` 没有 `create_channel`，手建 30 秒最快），ID 写进 `config.json`；确认 bot 有 **Manage Threads**（删子区要用）
 2. `.env` 的 `DISCORD_FREE_RESPONSE_CHANNELS` 追加该 ID（原有值为另外两个频道，见本机 `.env`）
-3. 打白名单补丁（adapter.py:60 加 `"maa_action.py"`）+ 写进 `LOCAL_PATCHES.md`
+3. 打白名单补丁（`adapter.py` 的 `_HERMES_BUTTON_SCRIPTS` 加 `"maa_action.py"`）+ 写进 `LOCAL_PATCHES.md`
 4. `maa_plan_card.py` 发卡片 + **merge** 写按钮登记（共享 agent-book 那把锁）+ 清理过期子区
 5. 写 `maa-operator` 技能（抄 `agent-book-tutor/SKILL.md` 的 frontmatter 结构）+ `config.yaml` 绑定
 6. `hermes gateway restart` 让补丁与配置生效
@@ -247,6 +267,7 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 | 行 | 按钮 |
 |---|---|
 | 关卡 | `🎯 选择今天要刷的关卡` 下拉菜单（常用关卡 + 当前开放活动关） |
+| 抄作业 | `🤖 选择要匹配作业的关卡` 下拉菜单（手动按需搜索） |
 | 操作 | `⏭️ 今天跳过/▶️ 恢复自动场次` `📋 最近结果` `🤖 请 Hermes 解释` |
 
 战报默认是**确定性卡片，不过 LLM**（零成本、不会瞎编）；想要自然语言解读就点「🤖 让 Hermes 讲讲」，走 `kind:"prompt"` 按钮起会话——保留旧方案「LLM 润色」的体验但不强制。
@@ -261,13 +282,15 @@ hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py 
 
 ## 端到端验收
 
-1. 清空 `plan.json`，`hermes cron run <计划卡 id>` → 频道出现计划卡，显示「今天刷：上次的本」
+1. 清空 `plan.json`，`hermes cron run <计划卡 id>` → 频道出现计划卡，显示「今天刷：1-7」
 2. 频道里发「今天刷 CE-6，其他不变」→ 收到确认；`cat ~/.hermes/state/maa/plan.json` 见 `stage:"CE-6"` 且 `date` 是今天
 3. `hermes cron run <早场 id>` → 模拟器自动起、频道出现开跑消息、**子区标题为 `MAA日常·早 · MM-DD HH:MM`**、子区内步骤每 5 秒滚动更新
 4. 跑的过程中**在子区里**发「改成 1-7」→ 回复明确说不打断早场、晚场生效（验证子区继承）
 5. 跑完 → 频道出现战报卡片**且内嵌一张游戏截图**；`ps aux | grep -i bluestacks` 为空
 6. `hermes gateway restart` 后使用最新卡片下拉菜单 → 仍然有效；更旧卡片控件已被收起
-7. 次日 07:50 计划卡跑完 → 昨天的子区被删掉；覆盖失效，回到「上次的本」
+7. 次日 07:50 计划卡跑完 → 昨天的子区被删掉；覆盖失效，回到「1-7」
+8. 模拟一个新活动轮换 → watcher 只发一张完全满足练度的普通作业确认卡；单次空观察不撤卡，
+   连续两次空观察或新轮换才让旧卡失效
 
 ---
 

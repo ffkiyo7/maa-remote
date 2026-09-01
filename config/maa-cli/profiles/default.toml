@@ -2,6 +2,9 @@
 adb_path = "/Applications/BlueStacks.app/Contents/MacOS/hd-adb"
 address = "127.0.0.1:5555"
 
+[resource]
+user_resource = true
+
 [instance_options]
 touch_mode = "MaaTouch"
 deployment_with_pause = false

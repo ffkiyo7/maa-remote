@@ -1,5 +1,5 @@
-# Diagnostic task for validating the in-game preset queue rotation without
-# traversing all production facility maintenance.
+# Diagnostic task for validating MaaCore's real-time automatic base scheduling
+# across every shiftable facility without running the rest of the daily chain.
 [[tasks]]
 name = "启动国服"
 type = "StartUp"
@@ -8,11 +8,11 @@ client_type = "Official"
 start_game_enabled = true
 
 [[tasks]]
-name = "预设队列轮换验证"
+name = "自动排班验证"
 type = "Infrast"
 [tasks.params]
-mode = 20000
-facility = []
+mode = 0
+facility = ["Mfg", "Trade", "Power", "Control", "Reception", "Office", "Dorm"]
 drones = "_NotUse"
 threshold = 0.3
 replenish = false

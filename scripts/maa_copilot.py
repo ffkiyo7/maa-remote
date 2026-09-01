@@ -20,12 +20,15 @@ from pathlib import Path
 from typing import Any
 
 from maa_common import (
+    BUTTONS_PATH,
     STATE_DIR,
     atomic_write_json,
     http_get_json as _common_http_get_json,
+    is_run_locked,
     load_json,
     now_beijing,
     prune_button_registry,
+    state_lock,
 )
 
 # ---------------------------------------------------------------------------
@@ -47,8 +50,13 @@ SEARCH_TTL = timedelta(hours=25)
 SEARCH_TOKEN_RE = re.compile(r"^[0-9a-f]{12}$")
 DEFAULT_CORE_VERSION = "v6.16.0"
 DEFAULT_RESOURCE_DIR = Path.home() / "Library/Application Support/com.loong.maa/resource"
+SANITY_RECOVERY_SECONDS = 6 * 60
 
 _battle_data_cache: dict[str, Any] | None = None
+
+
+class StaleActivityError(RuntimeError):
+    """A prepared automatic card no longer belongs to the live rotation."""
 
 
 # ---------------------------------------------------------------------------
@@ -57,18 +65,19 @@ _battle_data_cache: dict[str, Any] | None = None
 
 def resource_signature(config: dict[str, Any]) -> str:
     """Signature of the local Maa resource tree (version.json + dir mtime)."""
-    res_dir = Path(str(config.get("maa_resource_dir", DEFAULT_RESOURCE_DIR)))
-    version = load_json(res_dir / "version.json", {})
-    last_updated = (
-        str(version.get("last_updated", "")) if isinstance(version, dict) else ""
-    )
-    tile_dir = res_dir / "Arknights-Tile-Pos"
-    mtime = ""
-    try:
-        mtime = str(int(tile_dir.stat().st_mtime))
-    except OSError:
-        pass
-    return f"{last_updated}|{mtime}"
+    parts: list[str] = []
+    for res_dir in _resource_dirs(config):
+        version = load_json(res_dir / "version.json", {})
+        last_updated = (
+            str(version.get("last_updated", "")) if isinstance(version, dict) else ""
+        )
+        tile_dir = res_dir / "Arknights-Tile-Pos"
+        try:
+            mtime = str(int(tile_dir.stat().st_mtime))
+        except OSError:
+            mtime = ""
+        parts.append(f"{res_dir}:{last_updated}|{mtime}")
+    return "||".join(parts)
 
 
 def build_stage_index(config: dict[str, Any]) -> dict[str, Any]:
@@ -77,25 +86,27 @@ def build_stage_index(config: dict[str, Any]) -> dict[str, Any]:
     #f# variant files (686 of them) are raid-unrelated duplicates; skip them.
     Code collisions across events resolve to the newest (last-seen) stage.
     """
-    res_dir = Path(str(config.get("maa_resource_dir", DEFAULT_RESOURCE_DIR)))
-    tile_dir = res_dir / "Arknights-Tile-Pos"
     codes: dict[str, str] = {}
     stages: dict[str, str] = {}
-    for path in tile_dir.glob("*.json"):
-        if "#f#" in path.name:
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        stage_id = str(data.get("stageId") or "")
-        code = str(data.get("code") or "")
-        if not stage_id or not code:
-            continue
-        codes[code] = stage_id  # last wins -> newest event on collision
-        stages.setdefault(stage_id, code)
+    # Base first, hot-update overlay last: the overlay is authoritative when a
+    # new event reuses a code or has not reached the bundled resource yet.
+    for res_dir in reversed(_resource_dirs(config)):
+        tile_dir = res_dir / "Arknights-Tile-Pos"
+        for path in tile_dir.glob("*.json"):
+            if "#f#" in path.name:
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            stage_id = str(data.get("stageId") or "")
+            code = str(data.get("code") or "")
+            if not stage_id or not code:
+                continue
+            codes[code] = stage_id
+            stages.setdefault(stage_id, code)
     index = {
         "built_at": now_beijing().isoformat(),
         "resource_signature": resource_signature(config),
@@ -116,6 +127,64 @@ def load_stage_index(config: dict[str, Any]) -> dict[str, Any]:
     ):
         return index
     return build_stage_index(config)
+
+
+def _resource_dirs(config: dict[str, Any]) -> list[Path]:
+    """MaaResource hot-update overlay first, bundled resource second."""
+    configured = config.get("maa_resource_dir")
+    base = Path(str(configured or DEFAULT_RESOURCE_DIR))
+    candidates = [base]
+    if configured is None:
+        candidates.insert(0, base.parent / "MaaResource" / "resource")
+    result: list[Path] = []
+    for path in candidates:
+        if path not in result:
+            result.append(path)
+    return result
+
+
+def _one_cost(values: list[Any]) -> int | None:
+    costs: set[int] = set()
+    for value in values:
+        try:
+            cost = int(value)
+        except (TypeError, ValueError):
+            continue
+        if cost > 0:
+            costs.add(cost)
+    return next(iter(costs)) if len(costs) == 1 else None
+
+
+def stage_sanity_cost(
+    stage_id: str,
+    code: str,
+    config: dict[str, Any],
+) -> int | None:
+    """Resolve one battle's AP cost from MaaResource ``stages.json``.
+
+    Reruns can map Tile-Pos ``actXX_08`` to a stages entry named
+    ``actXX_08_rep``.  Prefer an exact internal id, then fall back to an exact
+    display code.  Ambiguous costs fail closed instead of guessing.
+    """
+    for resource_dir in _resource_dirs(config):
+        stages = load_json(resource_dir / "stages.json", [])
+        if not isinstance(stages, list):
+            continue
+        exact = [
+            item.get("apCost")
+            for item in stages
+            if isinstance(item, dict) and str(item.get("stageId") or "") == stage_id
+        ]
+        if exact:
+            return _one_cost(exact)
+        by_code = [
+            item.get("apCost")
+            for item in stages
+            if isinstance(item, dict) and str(item.get("code") or "") == code
+        ]
+        if by_code:
+            return _one_cost(by_code)
+    return None
 
 
 def resolve_copilot_stage(
@@ -143,10 +212,13 @@ def battle_data(config: dict[str, Any]) -> dict[str, Any]:
     global _battle_data_cache
     if _battle_data_cache is not None:
         return _battle_data_cache
-    res_dir = Path(str(config.get("maa_resource_dir", DEFAULT_RESOURCE_DIR)))
-    raw = load_json(res_dir / "battle_data.json", {})
-    chars = raw.get("chars", {}) if isinstance(raw, dict) else {}
-    _battle_data_cache = chars if isinstance(chars, dict) else {}
+    chars: dict[str, Any] = {}
+    for res_dir in reversed(_resource_dirs(config)):
+        raw = load_json(res_dir / "battle_data.json", {})
+        current = raw.get("chars", {}) if isinstance(raw, dict) else {}
+        if isinstance(current, dict):
+            chars.update(current)
+    _battle_data_cache = chars
     return _battle_data_cache
 
 
@@ -389,15 +461,19 @@ def evaluate_candidate(
         best_score = 0.0
         best_hard: list[str] = []
         best_soft: list[str] = []
+        any_satisfied = False
         for member in members:
             if not isinstance(member, dict):
                 continue
             ok, score, hard, soft = check_op_requirements(member, roster, config)
             if ok:
+                any_satisfied = True
                 if score > best_score:
                     best_score = score
                     best_hard, best_soft = [], soft
-            elif not best_hard or len(hard) < len(best_hard):
+            elif not any_satisfied and (
+                not best_hard or len(hard) < len(best_hard)
+            ):
                 best_hard, best_soft = hard, soft
         total_score += best_score
         hard_gaps.extend(best_hard)
@@ -639,6 +715,80 @@ def prune_search_buttons(token: str, registry: dict[str, Any] | None = None) -> 
     prune_button_registry(prefix)
 
 
+def supersede_search(token: str) -> tuple[bool, Any]:
+    """Atomically invalidate one search that has not entered battle execution."""
+    if not SEARCH_TOKEN_RE.fullmatch(token or ""):
+        return False, None
+    path = SEARCHES_DIR / f"{token}.json"
+    with state_lock():
+        state = load_json(path, None)
+        if not isinstance(state, dict) or state.get("status") not in {
+            "pending",
+            "running",
+            "failed",
+            "done",
+            "queued",
+            "preparing",
+        }:
+            return False, None
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        prune_search_buttons(token, registry)
+        atomic_write_json(BUTTONS_PATH, registry)
+        state["status"] = "superseded"
+        state["superseded_at"] = now_beijing().isoformat()
+        atomic_write_json(path, state)
+        return True, state.get("message_id")
+
+
+def recover_stale_prebattle_dispatch(
+    token: str, state: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Restore a confirmation card when its worker died before battle start."""
+    if state.get("status") not in {"queued", "preparing"}:
+        return None
+    started = state.get("preparation_started_at") or state.get(
+        "execution_requested_at"
+    )
+    try:
+        age = now_beijing() - datetime.fromisoformat(str(started))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("作业派发时间格式错误") from exc
+    if age <= timedelta(minutes=20) or is_run_locked():
+        return None
+
+    path = SEARCHES_DIR / f"{token}.json"
+    with state_lock():
+        fresh = load_json(path, None)
+        fresh_started = (
+            fresh.get("preparation_started_at")
+            or fresh.get("execution_requested_at")
+            if isinstance(fresh, dict)
+            else None
+        )
+        if (
+            not isinstance(fresh, dict)
+            or fresh.get("status") not in {"queued", "preparing"}
+            or fresh_started != started
+        ):
+            return None
+        fresh["status"] = "done"
+        fresh["last_prepare_error"] = (
+            "执行进程在启动模拟器前失联；已恢复确认按钮，可再次执行。"
+        )
+        fresh["last_prepare_failed_at"] = now_beijing().isoformat()
+        for key in (
+            "requested_index",
+            "requested_mode",
+            "execution_requested_at",
+            "preparation_started_at",
+        ):
+            fresh.pop(key, None)
+        atomic_write_json(path, fresh)
+        return fresh
+
+
 def prune_expired_searches(registry: dict[str, Any] | None = None) -> int:
     """Remove expired search state files and their buttons; returns count.
 
@@ -750,23 +900,59 @@ def build_candidate_card(
     roster_hint: str = "",
     stage_id: str = "",
     roster: dict[str, Any] | None = None,
+    auto_confirm: bool = False,
+    activity_title: str = "",
+    sanity_text: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Embed + components + registry entries for a candidate card."""
-    description = search_summary(stage_label, candidates, roster_ok)
+    shown_candidates = candidates[:1] if auto_confirm else candidates
+    description = search_summary(stage_label, shown_candidates, roster_ok)
     if roster_hint:
         description += f"\n{roster_hint}"
+    if sanity_text:
+        description += f"\n{sanity_text}"
     if stage_id:
         zone_warning = zone_progress_warning(stage_label, stage_id, roster)
         if zone_warning:
             description += f"\n{zone_warning}"
     embed = {
-        "title": f"🤖 {stage_label} 抄作业候选",
+        "title": (
+            f"🆕 {activity_title or '新活动'}：确认执行 {stage_label}"
+            if auto_confirm
+            else f"🤖 {stage_label} 抄作业候选"
+        )[:256],
         "description": description[:4000],
         "color": 0x5865F2,
         "timestamp": now_beijing().isoformat(),
     }
     buttons: list[dict[str, Any]] = []
     registry: dict[str, dict[str, Any]] = {}
+    if auto_confirm:
+        confirm_id = f"{BUTTON_PREFIX}{token}:confirm"
+        buttons.append(
+            {
+                "type": 2,
+                "style": 3,
+                "label": "✅ 确认执行（普通）",
+                "custom_id": confirm_id,
+            }
+        )
+        registry[confirm_id] = {
+            "kind": "exec",
+            "script": "maa_action.py",
+            "args": ["copilot", "pick", token, "1", "normal"],
+        }
+        cancel_id = f"{BUTTON_PREFIX}{token}:cancel"
+        buttons.append(
+            {"type": 2, "style": 2, "label": "❌ 取消", "custom_id": cancel_id}
+        )
+        registry[cancel_id] = {
+            "kind": "exec",
+            "script": "maa_action.py",
+            "args": ["copilot", "cancel", token],
+        }
+        embed["footer"] = {"text": "普通模式 · 不使用理智药或源石"}
+        return embed, [{"type": 1, "components": buttons}], registry
     for index, _candidate in enumerate(candidates[:3], start=1):
         custom_id = f"{BUTTON_PREFIX}{token}:{index}"
         buttons.append(
@@ -847,6 +1033,86 @@ def load_roster() -> dict[str, Any] | None:
     if isinstance(roster, dict) and isinstance(roster.get("chars"), dict):
         return roster
     return None
+
+
+def estimated_sanity(snapshot: dict[str, Any], at: datetime | None = None) -> int | None:
+    """Estimate regenerated sanity from a Skland snapshot without overstating cap."""
+    try:
+        current = int(snapshot["current"])
+        maximum = int(snapshot["max"])
+        observed = int(snapshot["server_current_at"])
+        last_add = int(snapshot["last_ap_add_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if current < 0 or maximum <= 0 or observed <= 0 or last_add <= 0:
+        return None
+    if current >= maximum:
+        return current
+    now_epoch = int((at or now_beijing()).timestamp())
+    observed_bucket = max(0, (observed - last_add) // SANITY_RECOVERY_SECONDS)
+    current_bucket = max(0, (now_epoch - last_add) // SANITY_RECOVERY_SECONDS)
+    regenerated = max(0, current_bucket - observed_bucket)
+    return min(maximum, current + regenerated)
+
+
+def sanity_preflight(
+    roster: dict[str, Any] | None,
+    cost: int | None,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a fail-closed, user-facing AP preflight result."""
+    try:
+        required = int(cost or 0)
+    except (TypeError, ValueError):
+        required = 0
+    if required <= 0:
+        return {"known": False, "reason": "关卡理智消耗未知"}
+    snapshot = roster.get("sanity") if isinstance(roster, dict) else None
+    if not isinstance(snapshot, dict):
+        return {"known": False, "cost": required, "reason": "森空岛理智尚未读取"}
+    current = estimated_sanity(snapshot, at)
+    try:
+        maximum = int(snapshot["max"])
+        last_add = int(snapshot["last_ap_add_at"])
+    except (KeyError, TypeError, ValueError):
+        return {"known": False, "cost": required, "reason": "森空岛理智数据格式异常"}
+    if current is None:
+        return {"known": False, "cost": required, "reason": "森空岛理智数据格式异常"}
+    result: dict[str, Any] = {
+        "known": True,
+        "enough": current >= required,
+        "current": current,
+        "max": maximum,
+        "cost": required,
+    }
+    if current < required and required <= maximum:
+        now = at or now_beijing()
+        now_epoch = int(now.timestamp())
+        bucket = max(0, (now_epoch - last_add) // SANITY_RECOVERY_SECONDS)
+        needed = required - current
+        ready_epoch = last_add + (bucket + needed) * SANITY_RECOVERY_SECONDS
+        result["ready_at"] = datetime.fromtimestamp(
+            ready_epoch, tz=now.tzinfo or timezone.utc
+        ).isoformat()
+    return result
+
+
+def sanity_status_text(result: dict[str, Any]) -> str:
+    if not result.get("known"):
+        reason = str(result.get("reason") or "暂时无法读取")
+        return f"🧠 理智：{reason}；确认后会实时核验，失败不会启动模拟器。"
+    current = int(result["current"])
+    maximum = int(result["max"])
+    cost = int(result["cost"])
+    if result.get("enough"):
+        return f"🧠 理智：{current}/{maximum}，本次需要 {cost}，当前够用。"
+    ready = str(result.get("ready_at") or "")
+    ready_hint = ""
+    try:
+        ready_hint = f"，预计 {datetime.fromisoformat(ready):%H:%M} 足够"
+    except (TypeError, ValueError):
+        pass
+    return f"🧠 理智：{current}/{maximum}，本次需要 {cost}，当前不足{ready_hint}。"
 
 
 def roster_age_days(roster: dict[str, Any]) -> int | None:

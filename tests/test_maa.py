@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -176,10 +177,14 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("CloseDown", rendered)
         self.assertIn("stone = 0", rendered)
         self.assertIn("series = 0", rendered)
-        self.assertIn("mode = 20000", rendered)
-        self.assertNotIn("mode = 0", rendered)
-        self.assertIn('facility = ["Mfg", "Trade", "Reception"]', rendered)
-        self.assertNotIn('"Dorm"', rendered)
+        self.assertIn("mode = 0", rendered)
+        self.assertNotIn("mode = 20000", rendered)
+        self.assertIn(
+            'facility = ["Mfg", "Trade", "Power", "Control", "Reception", "Office", "Dorm"]',
+            rendered,
+        )
+        self.assertIn('drones = "_NotUse"', rendered)
+        self.assertIn("replenish = false", rendered)
         self.assertIn("dorm_trust_enabled = false", rendered)
         self.assertIn("medicine = 0", rendered)
         self.assertIn("medicine_expire_days = 2", rendered)
@@ -295,6 +300,11 @@ class RenderingTests(unittest.TestCase):
             "Infrast Start",
             "EnterFacility Mfg #0",
             "EnterFacility Trade #0",
+            "EnterFacility Power #0",
+            "EnterFacility Control #0",
+            "EnterFacility Reception #0",
+            "EnterFacility Office #0",
+            "EnterFacility Dorm #0",
             "Infrast Completed",
             "Recruit Start",
             "Recruit Completed",
@@ -319,6 +329,9 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("固源岩 ×8", summary)
         self.assertNotIn("固源岩 ×16", summary)
         self.assertIn("制造站 ×1", summary)
+        self.assertIn("发电站 ×1", summary)
+        self.assertIn("控制中枢 ×1", summary)
+        self.assertIn("宿舍 ×1", summary)
         self.assertIn("招募 4 次", summary)
         self.assertIn("🏠 返回主界面：✅ 完成", summary)
         self.assertNotIn("Completed", summary)
@@ -570,7 +583,7 @@ class EmulatorBootDiagnosticTests(unittest.TestCase):
 
 
 class DiscordCardTests(unittest.TestCase):
-    def test_activity_output_parser(self) -> None:
+    def test_activity_events_parser(self) -> None:
         output = """Opening side story stages:
 - SideStory「直到大地变成一颗酸橙」
   - TO-9: 晶体元件
@@ -580,11 +593,25 @@ Opening mini games:
 - 黑流树海刷钱
 """
         self.assertEqual(
-            maa_plan_card.parse_activity_stages(output),
-            ["TO-9", "TO-8", "TO-7"],
+            maa_plan_card.parse_activity_events(output),
+            [
+                {
+                    "title": "SideStory「直到大地变成一颗酸橙」",
+                    "stages": ["TO-9", "TO-8", "TO-7"],
+                }
+            ],
         )
         self.assertFalse(maa_plan_card.all_supply_stages_open(output))
         self.assertTrue(maa_plan_card.all_supply_stages_open("资源收集\n"))
+
+    def test_activity_snapshot_ignores_stage_shaped_minigame_bullets(self) -> None:
+        output = """Opening side story stages:
+- SideStory「活动」
+  - NEW-8: 材料
+Opening mini games:
+- XX-1: 这不是活动作战关
+"""
+        self.assertEqual(maa_plan_card.activity_snapshot(output)["stages"], ["NEW-8"])
 
     def test_buttons_fit_limits_and_registry_is_deterministic(self) -> None:
         plan = maa_common.normalize_plan({"stage": "CE-6", "medicine": "none"})
@@ -1663,6 +1690,53 @@ class HomeScreenshotTests(unittest.TestCase):
         # every executable line before those comments must exactly match what
         # the runtime renderer will overwrite it with.
         self.assertTrue(toml.startswith(rendered), "daily.toml drifted from runtime renderer")
+
+    def test_infrast_smoke_uses_the_same_safe_automatic_scheduling_policy(self) -> None:
+        toml = (ROOT / "config" / "maa-cli" / "tasks" / "infrast-smoke.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("mode = 0", toml)
+        self.assertIn(
+            'facility = ["Mfg", "Trade", "Power", "Control", "Reception", "Office", "Dorm"]',
+            toml,
+        )
+        self.assertIn('drones = "_NotUse"', toml)
+        self.assertIn("replenish = false", toml)
+        self.assertIn("dorm_trust_enabled = false", toml)
+        profile = (
+            ROOT / "config" / "maa-cli" / "profiles" / "default.toml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[resource]", profile)
+        self.assertIn("user_resource = true", profile)
+        override = json.loads(
+            (
+                ROOT
+                / "config"
+                / "maa-cli"
+                / "resource"
+                / "tasks"
+                / "tasks.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            override["InfrastDormDoubleConfirmButton"]["roi"],
+            [620, 430, 660, 150],
+        )
+        self.assertEqual(
+            override["InfrastDormDoubleConfirmButton"],
+            {
+                "template": "PopupConfirm.png",
+                "roi": [620, 430, 660, 150],
+                "action": "ClickRect",
+                "specificRect": [800, 450, 90, 90],
+                "postDelay": 1000,
+                "next": [
+                    "InfrastDormConfirmButtonWait",
+                    "InfrastDormDoubleConfirmButton",
+                    "Stop",
+                ],
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ BUTTON_PREFIX = "hermes:btn:maa:"
 ACTIVITY_LINE_RE = re.compile(
     r"^\s*-\s+([A-Za-z0-9][A-Za-z0-9_-]{0,30}-\d{1,2})(?::|\s|$)"
 )
+SIDE_STORY_SECTION = "Opening side story stages:"
 SUPPLY_STAGES: tuple[tuple[str, str, str, frozenset[int]], ...] = (
     ("AP-5 · 红票", "AP-5", "采购凭证（红票）关卡", frozenset({0, 3, 5, 6})),
     ("CA-5 · 技能书", "CA-5", "技能概要关卡", frozenset({1, 2, 4, 6})),
@@ -47,13 +48,133 @@ DEFAULT_MAA_CLI_FORMULA = "MaaAssistantArknights/tap/maa-cli"
 _VERSION_RE = re.compile(r"(?im)^(maa-cli|MaaCore|maa)\s+(v?\d+\.\d+\.\d+\S*)")
 
 
-def parse_activity_stages(output: str) -> list[str]:
-    stages: list[str] = []
-    for line in output.splitlines():
+def parse_activity_events(output: str) -> list[dict[str, Any]]:
+    """Return the currently open side stories and their recommended stages.
+
+    ``maa activity`` prints one unindented bullet per activity and indented
+    bullets for its navigation aliases and recommended farming stages.  Keep
+    the human title as part of the observation identity: an original run and
+    a rerun can reuse the same stage prefix but are different rotations.
+    """
+    events: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    in_side_stories = False
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        if line == SIDE_STORY_SECTION:
+            in_side_stories = True
+            current = None
+            continue
+        if in_side_stories and line.startswith("Opening "):
+            break
+        if not in_side_stories:
+            continue
+        if line.startswith("- "):
+            current = {"title": line[2:].strip()[:120], "stages": []}
+            events.append(current)
+            continue
+        if current is None:
+            continue
         match = ACTIVITY_LINE_RE.match(line)
-        if match and match.group(1) not in stages:
-            stages.append(match.group(1))
-    return stages
+        if match and match.group(1) not in current["stages"]:
+            current["stages"].append(match.group(1))
+    return [event for event in events if event["stages"]]
+
+
+def activity_snapshot(output: str) -> dict[str, Any]:
+    if SIDE_STORY_SECTION not in output:
+        raise RuntimeError("maa activity 输出格式已变化：找不到活动关分区")
+    events = parse_activity_events(output)
+    stages: list[str] = []
+    for event in events:
+        for stage in event["stages"]:
+            if stage not in stages:
+                stages.append(stage)
+    return {
+        "stages": stages,
+        "events": events,
+        "all_supply_stages_open": all_supply_stages_open(output),
+    }
+
+
+def activity_target(snapshot: dict[str, Any]) -> dict[str, str] | None:
+    """Return MaaCore's first recommended stage and its rotation identity."""
+    stages = snapshot.get("stages")
+    if not isinstance(stages, list) or not stages:
+        return None
+    stage = str(stages[0])
+    title = "当前活动"
+    events = snapshot.get("events")
+    if isinstance(events, list):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_stages = event.get("stages")
+            if isinstance(event_stages, list) and stage in event_stages:
+                title = str(event.get("title") or title)[:120]
+                break
+    head, separator, tail = stage.rpartition("-")
+    family = head if separator and tail.isdigit() else stage
+    return {"title": title, "stage": stage, "key": f"{title}|{family}"}
+
+
+def activity_target_is_current(
+    snapshot: dict[str, Any], stage: str, observation_key: str
+) -> bool:
+    """Whether a prepared stage still belongs to the observed rotation.
+
+    MaaCore may reorder the recommended farming stages without the activity
+    itself changing.  Keep an existing card valid while its exact stage is
+    still open and the title/family identity remains the same.
+    """
+    target = activity_target(snapshot)
+    stages = snapshot.get("stages")
+    return bool(
+        target is not None
+        and target["key"] == observation_key
+        and isinstance(stages, list)
+        and stage in stages
+    )
+
+
+def query_activity_snapshot(
+    config: dict[str, Any],
+    *,
+    timeout: float = 30,
+) -> dict[str, Any]:
+    """Read the live activity view from MaaCore or raise with its real error."""
+    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    result = subprocess.run(
+        [maa, "activity", "Official"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+        env=maa_subprocess_env(config),
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"活动关读取失败：{detail or result.returncode}")
+    return activity_snapshot(f"{result.stdout}\n{result.stderr}")
+
+
+def persist_activity_snapshot(
+    config: dict[str, Any], snapshot: dict[str, Any]
+) -> None:
+    updated = dict(config)
+    updated["activity_stages"] = list(snapshot.get("stages", []))
+    updated["activity_events"] = list(snapshot.get("events", []))
+    updated["all_supply_stages_open"] = bool(
+        snapshot.get("all_supply_stages_open", False)
+    )
+    atomic_write_json(CONFIG_PATH, updated)
+    config.update(
+        {
+            "activity_stages": updated["activity_stages"],
+            "activity_events": updated["activity_events"],
+            "all_supply_stages_open": updated["all_supply_stages_open"],
+        }
+    )
 
 
 def all_supply_stages_open(output: str) -> bool:
@@ -76,30 +197,12 @@ def current_supply_choices(
 
 
 def refresh_activity_stages(config: dict[str, Any]) -> tuple[bool, str]:
-    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     try:
-        result = subprocess.run(
-            [maa, "activity", "Official"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-            env=maa_subprocess_env(config),
-        )
+        snapshot = query_activity_snapshot(config)
     except Exception as exc:
         return False, f"活动关读取异常：{type(exc).__name__}: {exc}"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        return False, f"活动关读取失败：{detail or result.returncode}"
-
-    output = f"{result.stdout}\n{result.stderr}"
-    stages = parse_activity_stages(output)
-    updated = dict(config)
-    updated["activity_stages"] = stages
-    updated["all_supply_stages_open"] = all_supply_stages_open(output)
-    atomic_write_json(CONFIG_PATH, updated)
-    config["activity_stages"] = stages
-    config["all_supply_stages_open"] = updated["all_supply_stages_open"]
+    stages = list(snapshot.get("stages", []))
+    persist_activity_snapshot(config, snapshot)
     return True, "、".join(stages) if stages else "当前无开放活动关"
 
 
@@ -620,7 +723,25 @@ def main() -> int:
     update = check_and_update_upstream(token, channel_id, config)
     # Availability changes daily at the game reset and independently of the
     # MaaCore package update, so probe it for every plan card.
-    refresh_activity_stages(config)
+    activity_ok, activity_detail = refresh_activity_stages(config)
+    if not activity_ok:
+        discord_request(
+            token,
+            "POST",
+            f"/channels/{channel_id}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": "❌ MAA 活动关探测失败",
+                        "description": activity_detail[:1500],
+                        "color": 0xED4245,
+                        "timestamp": now_beijing().isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+        raise RuntimeError(activity_detail)
     # A successful refresh rewrites config.json and mutates this copy; reload
     # so the card is always derived from the just-persisted source of truth.
     config = load_config()

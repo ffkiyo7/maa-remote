@@ -58,12 +58,12 @@ maa activity : ['TO-9', 'TO-8', 'TO-7', 'TO-5']      ← 逐字吻合
 | 热更新里有另一份 TO.json | ✗ `MaaResource/resource/tasks/Stages/TO.json` 不存在 |
 
 **唯一与实测吻合的数据源就是 `maa activity Official` 的输出**，也就是
-`maa_plan_card.parse_activity_stages()` 解析出来、存在 `config["activity_stages"]`
-里的那份清单。
+`maa_plan_card.activity_snapshot()` 通过 `parse_activity_events()` 解析出来、存在
+`config["activity_stages"]` 里的那份清单。
 
-> 附带发现：`config["activity_stages"]` 目前是 `["TO-9","TO-8","TO-7"]`（8/1 22:02 存的），
-> **已经过期**，少了 TO-5。`parse_activity_stages()` 本身没问题——拿当前真实输出测过，
-> 能正确解析出 4 个。只是没人重新刷过。这直接影响闸门，见 A-3。
+> 当时附带发现：`config["activity_stages"]` 是 `["TO-9","TO-8","TO-7"]`（8/1 22:02 存的），
+> **已经过期**，少了 TO-5。`parse_activity_events()` 拿当时真实输出能正确解析出 4 个；
+> 问题是没有及时刷新。这直接促成了 A-3。
 
 ## 结论 3：失败清理会杀掉用户正在玩的模拟器
 
@@ -130,7 +130,7 @@ def stage_is_navigable(
     if not activity:
         return False, (
             f"当期活动关清单未知，无法确认 {stage_label} 能否导航，先不执行。"
-            "（等 07:50 计划卡刷新，或手动跑 maa activity Official）"
+            "（等最多 15 分钟让活动 watcher 刷新，或手动跑 maa activity Official）"
         )
     if stage_label in activity:
         return True, ""
@@ -148,35 +148,18 @@ def stage_is_navigable(
    写 `searches/<token>.json` 之前拒掉，直接回一句话，**不派 worker、不发候选卡片**。
    这是决策 1 要的效果——省掉整条链路。
 2. **`maa_action.py` 的 `copilot pick`**：兜底。候选卡片 TTL 有 25 小时，活动可能在这
-   期间轮换（`activity_stages` 每天 07:50 刷新）。这里再查一次，几乎零成本。
+   期间轮换（活动 watcher 每 15 分钟刷新，07:50 计划卡也会刷新）。这里再查一次，几乎零成本。
 
 **不要**挂在 worker 的 `cmd_search` 里当唯一闸门——那时候卡片已经要发出去了。
 
 ## A-3 顺带修掉 `activity_stages` 过期
 
-闸门建立在这份清单上，它过期就会**误拒**合法关卡（现在就少了 TO-5）。
-现状：只有 `maa_plan_card.refresh_activity_stages()` 在 07:50 刷。
-
-在 `maa_copilot_worker.cmd_search` 里加一次机会性刷新，**照抄现有 roster 懒刷新那段的
-写法**（`maa_copilot_worker.py:135` 附近，P1-5 的成果）：
-
-```python
-        try:
-            import maa_plan_card
-            ok, detail = maa_plan_card.refresh_activity_stages(config)
-            if not ok:
-                print(f"activity refresh skipped: {detail}", flush=True)
-        except Exception as exc:
-            print(f"activity refresh skipped: {type(exc).__name__}: {exc}", flush=True)
-```
-
-`maa activity Official` 实测约 1 秒，在 worker 里（已脱离 20s 预算）完全够。
-失败必须降级继续，不能中断搜索。
-
-> ⚠️ 这里有个顺序陷阱：闸门在 `copilot find`（快路径）读的是**刷新前**的
-> `config["activity_stages"]`。所以第一次搜 TO-5 仍会被误拒，刷新后第二次才通过。
-> 可接受（一天最多错一次），但**必须在拒绝文案里说清楚**，别让用户以为是永久结论：
-> 「若你确认该关当期开放，等一次 07:50 刷新或重试一次。」
+闸门建立在这份清单上，它过期就会**误拒**合法关卡（当时就漏了 TO-5）。
+现状：`maa_activity_watch.py` 每 15 分钟调用 `query_activity_snapshot()`，成功后通过
+`persist_activity_snapshot()` 写回活动清单；07:50 计划卡也通过 `refresh_activity_stages()`
+刷新同一份数据。两条入口共用 `activity_snapshot()` / `parse_activity_events()`，不会出现两套
+解析规则。watcher 最坏只会让新活动等待一个轮询周期，查询或格式解析失败会明确告警，不能把
+空结果当成成功继续。
 
 ## A-4 SKILL.md
 

@@ -107,6 +107,7 @@ def deploy_scripts() -> None:
     for name in (
         "maa_common.py",
         "maa_plan_card.py",
+        "maa_activity_watch.py",
         "maa_daily.py",
         "maa_action.py",
         "maa_copilot.py",
@@ -220,6 +221,11 @@ def deploy_maa_config() -> None:
             0o600,
         )
     copy_file(ROOT / "config" / "maa-cli" / "cli.toml", MAA_CONFIG_HOME / "cli.toml", 0o600)
+    copy_file(
+        ROOT / "config" / "maa-cli" / "resource" / "tasks" / "tasks.json",
+        MAA_CONFIG_HOME / "resource" / "tasks" / "tasks.json",
+        0o600,
+    )
 
 
 def deploy_skill() -> None:
@@ -404,6 +410,7 @@ def main() -> int:
             for name in (
                 "maa_common.py",
                 "maa_plan_card.py",
+                "maa_activity_watch.py",
                 "maa_daily.py",
                 "maa_action.py",
                 "maa_copilot.py",
@@ -412,6 +419,14 @@ def main() -> int:
                 "ocrbox",
             )
         ]
+        checks.extend(
+            [
+                MAA_CONFIG_HOME / "profiles" / "default.toml",
+                MAA_CONFIG_HOME / "tasks" / "daily.toml",
+                MAA_CONFIG_HOME / "tasks" / "infrast-smoke.toml",
+                MAA_CONFIG_HOME / "resource" / "tasks" / "tasks.json",
+            ]
+        )
         missing = [str(path) for path in checks if not path.is_file()]
         print(json.dumps({"ok": not missing, "missing": missing}, ensure_ascii=False))
         return 0 if not missing else 1

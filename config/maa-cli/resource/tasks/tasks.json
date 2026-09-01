@@ -1,0 +1,14 @@
+{
+  "InfrastDormDoubleConfirmButton": {
+    "template": "PopupConfirm.png",
+    "roi": [620, 430, 660, 150],
+    "action": "ClickRect",
+    "specificRect": [800, 450, 90, 90],
+    "postDelay": 1000,
+    "next": [
+      "InfrastDormConfirmButtonWait",
+      "InfrastDormDoubleConfirmButton",
+      "Stop"
+    ]
+  }
+}

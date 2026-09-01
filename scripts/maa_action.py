@@ -32,6 +32,7 @@ from maa_common import (
     now_beijing,
     plan_stage_label,
     require_executable,
+    retire_discord_components,
     state_lock,
 )
 
@@ -255,6 +256,28 @@ def _load_search(token: str) -> dict[str, Any] | None:
     return state if isinstance(state, dict) else None
 
 
+def _mark_search_dispatch_failed(token: str, message: str) -> None:
+    with state_lock():
+        state = _load_search(token)
+        if state is None or state.get("status") != "pending":
+            return
+        state["status"] = "failed"
+        state["error"] = message[:400]
+        state["finished_at"] = now_beijing().isoformat()
+        atomic_write_json(_search_path(token), state)
+
+
+def _invalidate_search_card(token: str, config: dict[str, Any]) -> str:
+    changed, message_id = maa_copilot.supersede_search(token)
+    if not changed:
+        return ""
+    try:
+        retire_discord_components(config, message_id)
+    except Exception as exc:
+        return f"；旧卡按钮收起失败但已不能执行：{type(exc).__name__}: {exc}"
+    return ""
+
+
 def _copilot_blackout_reason(config: dict[str, Any]) -> str | None:
     """Refuse to start a copilot run close to the 08:00/22:00 daily runs."""
     minutes = max(0, int(config.get("copilot_blackout_minutes", 25)))
@@ -274,12 +297,25 @@ def _copilot_blackout_reason(config: dict[str, Any]) -> str | None:
     return None
 
 
-def copilot_find(stage: str) -> tuple[bool, str]:
+def start_copilot_search(
+    stage: str,
+    *,
+    auto_confirm: bool = False,
+    activity_title: str = "",
+    activity_key: str = "",
+) -> tuple[bool, str, str | None]:
     config = load_config()
     resolved = valid_copilot_stage(stage, config)
     if resolved is None:
-        return False, f"关卡 {stage[:40]} 不在本地关卡索引里；只接受当期活动关、主线或资源关。"
+        return (
+            False,
+            f"关卡 {stage[:40]} 不在本地关卡索引里；只接受当期活动关、主线或资源关。",
+            None,
+        )
     stage_id, code = resolved
+    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+    if not worker.is_file():
+        return False, "maa_copilot_worker.py 尚未部署。", None
     token = _new_search_token()
     maa_copilot.ensure_private_dirs()
     state = {
@@ -291,57 +327,115 @@ def copilot_find(stage: str) -> tuple[bool, str]:
         "message_id": None,
         "created_at": now_beijing().isoformat(),
         "expires_at": (now_beijing() + maa_copilot.SEARCH_TTL).isoformat(),
+        "source": "activity-watch" if auto_confirm else "discord",
+        "auto_confirm": auto_confirm,
+        "activity_title": activity_title[:120],
+        "activity_key": activity_key[:200],
     }
     atomic_write_json(_search_path(token), state)
-    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
-    if not worker.is_file():
-        return False, "maa_copilot_worker.py 尚未部署。"
-    subprocess.Popen(
-        [sys.executable, str(worker), "search", token],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    return True, f"🔍 正在为 {code} 匹配作业，结果稍后发到频道。"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(worker), "search", token],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:
+        detail = f"搜索进程派发失败：{type(exc).__name__}: {exc}"
+        _mark_search_dispatch_failed(token, detail)
+        return False, detail, None
+    return True, f"🔍 正在为 {code} 匹配作业，结果稍后发到频道。", token
+
+
+def copilot_find(stage: str) -> tuple[bool, str]:
+    ok, message, _token = start_copilot_search(stage)
+    return ok, message
 
 
 def copilot_again(token: str) -> tuple[bool, str]:
-    state = _load_search(token)
-    if state is None:
-        return False, "找不到这次搜索（可能已过期）。"
-    state["status"] = "pending"
-    state["candidates"] = []
-    state["message_id"] = None
-    state["created_at"] = now_beijing().isoformat()
-    state["expires_at"] = (now_beijing() + maa_copilot.SEARCH_TTL).isoformat()
-    atomic_write_json(_search_path(token), state)
     worker = SCRIPTS_DIR / "maa_copilot_worker.py"
     if not worker.is_file():
         return False, "maa_copilot_worker.py 尚未部署。"
-    subprocess.Popen(
-        [sys.executable, str(worker), "search", token],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    config = load_config()
+    state = _load_search(token)
+    if state is None:
+        return False, "找不到这次搜索（可能已过期）。"
+    if state.get("auto_confirm") or state.get("status") != "done":
+        return False, "这张作业卡当前不能重新匹配。"
+    try:
+        retired = retire_discord_components(config, state.get("message_id"))
+    except Exception as exc:
+        return False, f"旧作业卡收起失败，未重新匹配：{type(exc).__name__}: {exc}"
+    if not retired:
+        return False, "旧作业卡缺少消息编号，未重新匹配。"
+    with state_lock():
+        state = _load_search(token)
+        if state is None:
+            return False, "找不到这次搜索（可能已过期）。"
+        if state.get("auto_confirm") or state.get("status") != "done":
+            return False, "这张作业卡当前不能重新匹配。"
+        state["status"] = "pending"
+        state["candidates"] = []
+        state["message_id"] = None
+        state["created_at"] = now_beijing().isoformat()
+        state["expires_at"] = (now_beijing() + maa_copilot.SEARCH_TTL).isoformat()
+        atomic_write_json(_search_path(token), state)
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        maa_copilot.prune_search_buttons(token, registry)
+        atomic_write_json(BUTTONS_PATH, registry)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(worker), "search", token],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:
+        detail = f"搜索进程派发失败：{type(exc).__name__}: {exc}"
+        _mark_search_dispatch_failed(token, detail)
+        return False, detail
     return True, f"🔄 正在重新为 {state.get('stage', '')} 匹配作业。"
 
 
 def copilot_cancel(token: str) -> tuple[bool, str]:
-    state = _load_search(token)
-    if state is None:
-        return False, "找不到这次搜索。"
-    state["status"] = "canceled"
-    atomic_write_json(_search_path(token), state)
+    config = load_config()
+    message_id: Any = None
     with state_lock():
+        state = _load_search(token)
+        if state is None:
+            return False, "找不到这次搜索。"
+        if state.get("status") not in {
+            "pending",
+            "running",
+            "failed",
+            "done",
+            "queued",
+            "preparing",
+        }:
+            return False, "本次作业已经失效、开始或结束，不能再取消。"
+        state["status"] = "canceled"
+        state["canceled_at"] = now_beijing().isoformat()
+        message_id = state.get("message_id")
+        atomic_write_json(_search_path(token), state)
         registry = load_json(BUTTONS_PATH, {})
-        if isinstance(registry, dict):
-            maa_copilot.prune_search_buttons(token, registry)
-            atomic_write_json(BUTTONS_PATH, registry)
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        maa_copilot.prune_search_buttons(token, registry)
+        atomic_write_json(BUTTONS_PATH, registry)
+    try:
+        retire_discord_components(config, message_id)
+    except Exception as exc:
+        return (
+            True,
+            "❌ 已取消；旧卡按钮收起失败但已经不能执行："
+            f"{type(exc).__name__}: {exc}",
+        )
     return True, "❌ 已取消，相关按钮已清理。"
 
 
@@ -358,6 +452,16 @@ def copilot_status(token: str) -> tuple[bool, str]:
         return True, "⏳ 还在匹配中，稍等片刻。"
     if status == "failed":
         return True, f"❌ 匹配失败：{state.get('error', '未知原因')}"
+    if status in {"queued", "preparing"}:
+        return True, "⏳ 已确认，正在做活动、理智和运行环境复核。"
+    if status == "executing":
+        return True, "▶️ 作业正在执行。"
+    if status == "executed":
+        return True, "✅ 作业已经执行完成。"
+    if status == "execution_failed":
+        return True, "❌ 作业已执行但未成功，不会自动重跑。"
+    if status in {"canceled", "superseded"}:
+        return True, "⛔ 这张作业卡已经失效。"
     return True, "⏳ 等待匹配……"
 
 
@@ -368,6 +472,11 @@ def copilot_pick(token: str, number: str, mode: str) -> tuple[bool, str]:
     state = _load_search(token)
     if state is None:
         return False, "找不到这次搜索（可能已过期）。"
+    if state.get("status") != "done":
+        recovered = maa_copilot.recover_stale_prebattle_dispatch(token, state)
+        if recovered is None:
+            return False, "这张作业卡已取消、过期、执行中或已经执行，不能重复启动。"
+        state = recovered
     candidates = state.get("candidates", []) or []
     if not isinstance(candidates, list):
         candidates = []
@@ -388,6 +497,27 @@ def copilot_pick(token: str, number: str, mode: str) -> tuple[bool, str]:
     if not 0 < cand_id < 1_000_000_000:
         return False, "候选项 id 超出安全范围。"
 
+    if state.get("auto_confirm"):
+        stage = str(state.get("stage") or "")
+        try:
+            from maa_plan_card import activity_target_is_current, query_activity_snapshot
+
+            live = query_activity_snapshot(config, timeout=3)
+        except Exception as exc:
+            return False, f"活动开放状态核验失败，未启动：{type(exc).__name__}: {exc}"
+        if not activity_target_is_current(
+            live, stage, str(state.get("activity_key") or "")
+        ):
+            warning = _invalidate_search_card(token, config)
+            return False, f"{stage} 已不属于当前自动活动目标，旧确认按钮已失效{warning}。"
+        preflight = maa_copilot.sanity_preflight(
+            maa_copilot.load_roster(), state.get("sanity_cost"), now_beijing()
+        )
+        if not preflight.get("known"):
+            return False, f"{preflight.get('reason', '无法确认当前理智')}，未启动。"
+        if preflight.get("known") and not preflight.get("enough"):
+            return False, maa_copilot.sanity_status_text(preflight)
+
     reason = _copilot_blackout_reason(config)
     if reason:
         return False, reason
@@ -397,14 +527,40 @@ def copilot_pick(token: str, number: str, mode: str) -> tuple[bool, str]:
     worker = SCRIPTS_DIR / "maa_copilot_worker.py"
     if not worker.is_file():
         return False, "maa_copilot_worker.py 尚未部署。"
-    subprocess.Popen(
-        [sys.executable, str(worker), "run", token, str(index), mode],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
+    with state_lock():
+        fresh = _load_search(token)
+        if fresh is None or fresh.get("status") != "done":
+            return False, "这张作业卡已取消、过期、执行中或已经执行，不能重复启动。"
+        fresh_candidates = fresh.get("candidates", []) or []
+        if not isinstance(fresh_candidates, list) or not 1 <= index <= len(fresh_candidates):
+            return False, "作业候选已经变化，请使用最新卡片。"
+        fresh_candidate = fresh_candidates[index - 1]
+        if not isinstance(fresh_candidate, dict) or fresh_candidate.get("id") != candidate.get("id"):
+            return False, "作业候选已经变化，请使用最新卡片。"
+        fresh["status"] = "queued"
+        fresh["requested_index"] = index
+        fresh["requested_mode"] = mode
+        fresh["execution_requested_at"] = now_beijing().isoformat()
+        fresh["expires_at"] = (now_beijing() + maa_copilot.SEARCH_TTL).isoformat()
+        atomic_write_json(_search_path(token), fresh)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(worker), "run", token, str(index), mode],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        with state_lock():
+            fresh = _load_search(token)
+            if fresh is not None and fresh.get("status") == "queued":
+                fresh["status"] = "done"
+                fresh.pop("requested_index", None)
+                fresh.pop("requested_mode", None)
+                atomic_write_json(_search_path(token), fresh)
+        raise
     mode_label = "突袭" if mode == "raid" else "普通"
     return True, f"▶️ 已派发 {state.get('stage', '')}（{mode_label}）的抄作业场次，后台开跑消息稍后出现。"
 
