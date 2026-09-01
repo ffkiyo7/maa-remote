@@ -1361,6 +1361,51 @@ def should_skip(plan: dict[str, Any], phase: str) -> bool:
     return bool(plan.get("skip")) and phase != "now"
 
 
+def report_lock_conflict(
+    config: dict[str, Any],
+    token: str,
+    channel_id: str,
+    phase: str,
+    attempted_at: datetime,
+) -> None:
+    """Make a rejected daily run visible without clobbering the active run."""
+    reason = "run.lock 被另一场 MAA 占用，本场没有启动模拟器或执行任何任务"
+    # Another runner may currently own last_run.status=running. Keep its state
+    # intact and append conflict-specific observation fields instead.
+    errors: list[str] = []
+    try:
+        merge_last_run(
+            {
+                "last_lock_conflict_at": attempted_at.isoformat(),
+                "last_lock_conflict_phase": phase,
+                "last_lock_conflict_reason": reason,
+            }
+        )
+    except Exception as exc:
+        errors.append(f"冲突状态写入失败：{type(exc).__name__}: {exc}")
+    try:
+        discord_request(
+            token,
+            "POST",
+            f"/channels/{channel_id}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": f"❌ MAA 日常·{PHASE_LABELS[phase]}未启动",
+                        "description": reason,
+                        "color": 0xED4245,
+                        "timestamp": attempted_at.isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+    except Exception as exc:
+        errors.append(f"冲突告警发送失败：{type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError("；".join(errors))
+
+
 def execute(phase: str) -> int:
     started = now_beijing()
     config = load_config()
@@ -1379,7 +1424,8 @@ def execute(phase: str) -> int:
 
     with run_lock(blocking=False) as acquired:
         if not acquired:
-            return 0
+            report_lock_conflict(config, token, channel_id, phase, started)
+            return 1
         cleanup_run_files(int(config.get("retention_days", 14)), started)
         snapshot = {
             "date": started.date().isoformat(),

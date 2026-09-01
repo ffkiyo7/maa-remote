@@ -51,7 +51,7 @@
 ## 它是怎么工作的
 
 核心简化是：**不新增任何常驻进程**。Discord 网关和 cron 调度由已经常驻的
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) 提供，本项目只贡献 4 个 cron 脚本
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 提供，本项目只贡献 5 个 cron 脚本
 和 1 个动作脚本，全部是「跑完就退」的短命进程，状态落盘在 `~/.hermes/state/maa/`。
 
 ```
@@ -60,6 +60,7 @@
         │                                          │
    ┌────┴────────────────────────────┐      ┌──────┴───────────────────────┐
    │ 每 15 分  maa_activity_watch.py │      │                              │
+   │ 京 04:30  maa_depot.py          │      │                              │
    │ 京 07:50  maa_plan_card.py      │      │ 组件交互 hermes:btn:maa:*    │
    │ 京 08:00  maa_daily.py  （早）  │      │   → 按钮登记表 → exec 白名单 │
    │ 京 22:00  maa_daily.py  （晚）  │      │ 自然语言（免 @ 频道）        │
@@ -240,10 +241,15 @@ SKLAND_HG_TOKEN=<token> MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py
 
 也可以事后单独在本机终端跑 `python3 ~/.hermes/scripts/maa_skland.py link`，从 stdin 粘贴。
 
-然后建四条 cron。早晚场用**不同工作目录**传递场次标记，因为 Hermes 的 `--script` 不支持 argv：
+然后建五条 cron。Depot 每天 04:30 只检查是否满 7 天，未到期不会启动模拟器；早晚场用
+**不同工作目录**传递场次标记，因为 Hermes 的 `--script` 不支持 argv：
 
 ```bash
 hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
+```
+
+```bash
+hermes cron create "30 20 * * *" --name "MAA 仓库对表" --script maa_depot.py --no-agent --deliver local
 ```
 
 ```bash
@@ -257,6 +263,8 @@ hermes cron create "0 0 * * *" --name "MAA 日常·早" --script maa_daily.py --
 ```bash
 hermes cron create "0 14 * * *" --name "MAA 日常·晚" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
+
+这些 cron 表达式按 UTC 解释；Depot 的 `20:30 UTC` 对应北京时间次日 `04:30`。
 
 检查部署是否完整：
 

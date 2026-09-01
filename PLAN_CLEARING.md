@@ -732,9 +732,16 @@ python3 deploy.py && python3 deploy.py --check
 - 掉落增量与战报里的数字**一致**（抽查一场，逐项对）
 - 人为让对表失败一次 → 已有快照**未被污染**
 
-### 交付后发现的问题（未修，不阻塞其它步骤）
+### 交付后发现的问题（已修）
 
 **D-1｜Depot 与 08:00 日常抢 `run.lock`，而抢输的一方是静默的。**
+
+**修复**：Depot 已从 07:50 计划卡拆出，改由独立 cron 每日北京时间 04:30 调用；
+`maa_depot.main()` 先按 7 天间隔判断，未到期不开模拟器，到期失败由自身写状态并发告警。
+日常抢锁失败也改为写独立的 `last_lock_conflict_*`、发 Discord 并返回失败，不覆盖当前
+持锁任务的顶层 `last_run.status`。
+
+**原问题（留档）**：
 
 `maa_plan_card.main()` 在 07:50 **同步**调 `maa_depot.run_if_due()`，它开模拟器、跑
 `maa run depot`（`depot_timeout` 默认 **480s**）、再 `close_everything()`，全程持有
@@ -755,6 +762,11 @@ python3 deploy.py && python3 deploy.py --check
 - 无论哪种，`maa_daily.py:1380` 那个静默 `return 0` 都该顺手补上告警
 
 **D-2｜Depot 失败会把整张计划卡也带走。**
+
+**修复**：计划卡不再 import 或调用 Depot。库存采集失败只影响独立 Depot cron，计划卡
+照常生成，库存真值继续沿用上次成功快照。
+
+**原问题（留档）**：
 
 失败分支发完告警后 `raise RuntimeError(...)`，`main()` 就此终止——后面的
 `effective_plan()` / `build_components()` / 按钮登记 / 发卡**全部不执行**。于是一次

@@ -33,6 +33,7 @@ DEFAULTS_PATH = STATE_DIR / "defaults.json"
 PLAN_PATH = STATE_DIR / "plan.json"
 LAST_RUN_PATH = STATE_DIR / "last_run.json"
 RUN_LOCK_PATH = STATE_DIR / "run.lock"
+LAST_RUN_LOCK_PATH = STATE_DIR / "last_run.lock"
 
 # Hermes' persistent-button patch intentionally has one global registry. MAA
 # must merge its keys under the same lock used by agent-book.
@@ -118,6 +119,19 @@ def run_lock(*, blocking: bool = False) -> Iterator[bool]:
 def is_run_locked() -> bool:
     with run_lock(blocking=False) as acquired:
         return not acquired
+
+
+@contextmanager
+def last_run_lock() -> Iterator[None]:
+    """Serialize last_run.json read-modify-write cycles across MAA processes."""
+    ensure_private_dir(STATE_DIR)
+    with LAST_RUN_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        os.chmod(LAST_RUN_LOCK_PATH, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -491,23 +505,24 @@ def cleanup_run_files(retention_days: int = 14, at: datetime | None = None) -> l
 
 
 def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
-    current = load_json(LAST_RUN_PATH, {})
-    if not isinstance(current, dict):
-        current = {}
-    threads = current.get("threads", [])
-    if not isinstance(threads, list):
-        threads = []
-    safe_update = dict(update)
-    update_threads = safe_update.pop("threads", None)
-    current.update(safe_update)
-    if isinstance(update_threads, list):
-        known = {str(item.get("thread_id")) for item in threads if isinstance(item, dict)}
-        for item in update_threads:
-            if isinstance(item, dict) and str(item.get("thread_id")) not in known:
-                threads.append(item)
-    current["threads"] = threads
-    atomic_write_json(LAST_RUN_PATH, current)
-    return current
+    with last_run_lock():
+        current = load_json(LAST_RUN_PATH, {})
+        if not isinstance(current, dict):
+            current = {}
+        threads = current.get("threads", [])
+        if not isinstance(threads, list):
+            threads = []
+        safe_update = dict(update)
+        update_threads = safe_update.pop("threads", None)
+        current.update(safe_update)
+        if isinstance(update_threads, list):
+            known = {str(item.get("thread_id")) for item in threads if isinstance(item, dict)}
+            for item in update_threads:
+                if isinstance(item, dict) and str(item.get("thread_id")) not in known:
+                    threads.append(item)
+        current["threads"] = threads
+        atomic_write_json(LAST_RUN_PATH, current)
+        return current
 
 
 def cleanup_old_threads(token: str, at: datetime | None = None) -> dict[str, int]:

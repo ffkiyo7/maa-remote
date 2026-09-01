@@ -34,6 +34,8 @@
         │                                          │
    ┌────┴──────────────────────────────┐      ┌────┴─────────────────────────┐
    │ */15 * * * * maa_activity_watch  │      │                              │
+   │ 30 20 * * *  maa_depot.py         │      │                              │
+   │ (京 04:30；到期才开模拟器)       │      │                              │
    │ 50 23 * * *  maa_plan_card.py     │      │ 组件交互 hermes:btn:maa:*    │
    │ (京 07:50)                        │      │   → buttons.json 查登记      │
    │  0  0 * * *  maa_daily.py  am     │      │   → exec 白名单校验          │
@@ -54,7 +56,7 @@
                                  └─ 截图 ─ closedown/退出/断 ADB ─ 战报 embed
 ```
 
-四条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
+五条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
 stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）。
 
 ---
@@ -63,9 +65,9 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 | 文件 | 角色 | 触发方式 | 典型耗时 |
 |---|---|---|---|
-| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、两把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
+| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 每日计划卡；每次先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50 | 数秒～5 分钟（含 `maa update` / `brew`） |
-| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率 | 由计划卡按 7 天间隔触发 | 首次/到期时数分钟；未到期不启动模拟器 |
+| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率 | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；活动切换时派发 Top-1 作业搜索，维护重试/取消/完成状态 | cron 每 15 分钟 | 通常 <1s；需要搜索时后台 5~20s |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
@@ -205,8 +207,8 @@ worker 写执行终态，watcher 统一记 completed。
    --workdir ~/.hermes/state/maa/pm  →  phase=pm
    ```
 
-2. **抢锁** — `run_lock(blocking=False)`。**抢不到就直接 `return 0`，静默退出，不发任何消息。**
-   调试时看不到任何反应，先怀疑上一场还没退干净。
+2. **抢锁** — `run_lock(blocking=False)`。抢不到时不碰当前持锁任务的顶层状态，只追加
+   `last_lock_conflict_*`，发 Discord 红色告警并返回失败；不得把整场日常静默吃掉。
 3. 清理 >14 天产物；把**本场实际使用的计划**快照到 `runs/<date>-<phase>.json`；
    `last_run.json` 置 `status=running` 并把上一场的终态字段清空（避免运行中读到旧结果）。
    > 快照是「跑起来之后再改计划不影响本场」的实现基础——后续对 `plan.json` 的写入
@@ -367,7 +369,7 @@ worker 写执行终态，watcher 统一记 completed。
        ├─ 校验 token/index/mode/candidate id + blackout + run.lock 预检
        └─ Popen(worker run <token> <n> <mode>) 后立即返回
                     worker run（8~15 分钟）
-       ├─ run_lock(blocking=False) 抢锁，抢不到静默退出
+       ├─ run_lock(blocking=False) 抢锁，抢不到恢复确认卡并发「未启动」通知
        ├─ 渲染 tasks/copilot-nav.toml（StartUp + Fight times=0 导航）——单作业
        │   copilot 不会自己从主界面导航，必须先停在编队界面（C3 实测结论）
        ├─ 模拟器 → maa run copilot-nav（导航失败=关卡未解锁/不可达，直接报错）
@@ -436,6 +438,7 @@ worker 写执行终态，watcher 统一记 completed。
                       preparing/executing/dismissed/completed 状态
   depot.json      最近完整 Depot 真值 + 期间掉落增量 + 历次消耗与日均消耗率
   run.lock        flock 独占锁（执行）
+  last_run.lock   flock 独占锁（保护 last_run.json 的跨进程 read-modify-write）
   am/ pm/         空目录，仅用于给 cron 传场次
   runs/<date>-<phase>.{json,log,png}   本场快照 / 完整日志 / 截图（保留 14 天）
 
@@ -456,11 +459,12 @@ result = normalize_plan(result)             ← 再规范化一次
 即使磁盘上被人手工塞了别的值也没用（对应测试
 `test_persisted_medicine_choice_cannot_disable_fixed_expiry_policy`）。
 
-**两把锁，别搞混**：
+**三把锁，别搞混**：
 
 | 锁 | 作用域 | 用法 |
 |---|---|---|
-| `run.lock` | 「同一时刻只有一场 MAA」 | runner 用非阻塞抢，抢不到就退；`maa_action` 只用它做只读探测 |
+| `run.lock` | 「同一时刻只有一场 MAA」 | runner 用非阻塞抢并显式处理冲突；`maa_action` 只用它做只读探测 |
+| `last_run.lock` | `last_run.json` 跨进程合并不丢字段 | `merge_last_run()` 内部阻塞持有，调用方不用手动加锁 |
 | `agent-book/state.lock` | 按钮登记表 + `plan.json` 写入 | 阻塞式，跨功能共享 |
 
 `merge_last_run()` 语义特殊：普通字段覆盖，`threads` 数组**按 thread_id 去重后追加**——
@@ -531,14 +535,17 @@ cron 本身只在首次创建时需要注册：
 
 ```bash
 hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
+hermes cron create "30 20 * * *"  --name "MAA 仓库对表"     --script maa_depot.py --no-agent --deliver local
 hermes cron create "50 23 * * *" --name "MAA 计划卡"  --script maa_plan_card.py --no-agent --deliver local
 hermes cron create "0 0 * * *"   --name "MAA 日常·早" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/am
 hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
-cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部一律用 `Asia/Shanghai`。
+cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot 的 `20:30 UTC` 是
+次日北京时间 `04:30`；脚本内部一律用 `Asia/Shanghai`。
 改时间时两边都要想清楚。当前在册：`3ba48fb85d0b`（活动作业监控）、
-`03d5e98ce8d4`（计划卡）、`50cd1fb095f2`（早）、`4f48cf619d9f`（晚），可用
+`b2f15f13589f`（仓库对表）、`03d5e98ce8d4`（计划卡）、`50cd1fb095f2`（早）、
+`4f48cf619d9f`（晚），可用
 `hermes cron list` 复核。
 
 ---
@@ -574,6 +581,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 20 | 收掉用户手里的作业卡必须连续 2 次空快照才发生，且发生时必发 Discord 通知 | `run_once()` 的 `EMPTY_OBSERVATIONS_BEFORE_IDLE` + `test_watcher_enters_idle_on_recognized_empty_snapshot` |
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 | 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |
+| 23 | Depot 不得在计划卡链路内运行；独立 cron 每日只做 7 天到期检查。任何日常抢锁失败都必须写 `last_lock_conflict_*`、发 Discord 并返回失败；`merge_last_run()` 必须持专用锁，不能用陈旧整份文件覆盖持锁任务的新状态 | `maa_depot.main()` / `maa_daily.report_lock_conflict()` / `maa_common.last_run_lock()` + 调度与锁冲突回归测试 |
 
 ---
 

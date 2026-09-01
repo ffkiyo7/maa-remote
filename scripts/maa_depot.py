@@ -14,9 +14,12 @@ import maa_copilot
 from maa_common import (
     STATE_DIR,
     atomic_write_json,
+    discord_request,
+    discord_token,
     load_config,
     load_json,
     maa_subprocess_env,
+    merge_last_run,
     now_beijing,
     run_lock,
 )
@@ -347,13 +350,71 @@ def run_if_due(config: dict[str, Any], *, at: datetime | None = None) -> dict[st
 
 
 def main() -> int:
-    result = run_depot(load_config())
-    print(
-        json.dumps(
-            {"ok": True, "snapshot_at": result["snapshot_at"], "items": len(result["items"])},
-            ensure_ascii=False,
+    config = load_config()
+    attempted_at = now_beijing()
+    try:
+        result = run_if_due(config, at=attempted_at)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        state_error = ""
+        try:
+            merge_last_run(
+                {
+                    "depot_status": "failed",
+                    "depot_attempted_at": attempted_at.isoformat(),
+                    "depot_error": detail,
+                }
+            )
+        except Exception as state_exc:
+            state_error = f"；Depot 失败状态写入也失败：{type(state_exc).__name__}: {state_exc}"
+        channel_id = str(config.get("channel_id", "")).strip()
+        if not channel_id.isdigit():
+            raise RuntimeError(
+                f"{detail}{state_error}；Depot 失败告警未发送：config.json 缺少 channel_id"
+            ) from exc
+        try:
+            discord_request(
+                discord_token(),
+                "POST",
+                f"/channels/{channel_id}/messages",
+                {
+                    "embeds": [
+                        {
+                            "title": "❌ MAA Depot 对表失败",
+                            "description": detail[:1500],
+                            "color": 0xED4245,
+                            "timestamp": attempted_at.isoformat(),
+                        }
+                    ],
+                    "allowed_mentions": {"parse": []},
+                },
+            )
+        except Exception as notify_exc:
+            raise RuntimeError(
+                f"{detail}{state_error}；Depot 失败告警也发送失败："
+                f"{type(notify_exc).__name__}: {notify_exc}"
+            ) from exc
+        raise RuntimeError(detail + state_error) from exc
+
+    record = {
+        "depot_status": result["status"],
+        "depot_snapshot_at": result.get("snapshot_at"),
+        "depot_error": None,
+    }
+    if result.get("item_count") is not None:
+        record["depot_item_count"] = result["item_count"]
+    merge_last_run(record)
+    if result["status"] == "updated":
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "snapshot_at": result["snapshot_at"],
+                    "items": result["item_count"],
+                },
+                ensure_ascii=False,
+            )
         )
-    )
     return 0
 
 

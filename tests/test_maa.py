@@ -28,6 +28,21 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 
 
 class PlanTests(unittest.TestCase):
+    def test_last_run_merge_holds_its_dedicated_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "last_run.json"
+            maa_common.atomic_write_json(path, {"status": "running"})
+            context = unittest.mock.MagicMock()
+            context.__enter__.return_value = None
+            context.__exit__.return_value = False
+            with patch.object(maa_common, "LAST_RUN_PATH", path), patch.object(
+                maa_common, "last_run_lock", return_value=context
+            ) as lock:
+                result = maa_common.merge_last_run({"last_lock_conflict_phase": "am"})
+        lock.assert_called_once_with()
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["last_lock_conflict_phase"], "am")
+
     def test_maa_environment_is_deterministic_and_scoped(self) -> None:
         with patch.dict(
             os.environ,
@@ -1962,6 +1977,72 @@ class DepotTests(unittest.TestCase):
         self.assertFalse(maa_depot.is_due(state, at))
         state["snapshot_at"] = (at - timedelta(days=7)).isoformat()
         self.assertTrue(maa_depot.is_due(state, at))
+
+    def test_cron_entry_checks_due_without_starting_depot_early(self) -> None:
+        at = datetime(2026, 8, 8, 4, 30, tzinfo=BEIJING)
+        with patch.object(maa_depot, "load_config", return_value={}), patch.object(
+            maa_depot, "now_beijing", return_value=at
+        ), patch.object(
+            maa_depot,
+            "run_if_due",
+            return_value={"status": "not_due", "snapshot_at": "2026-08-02T04:30:00+08:00"},
+        ) as due, patch.object(maa_depot, "run_depot") as real_scan, patch.object(
+            maa_depot, "merge_last_run"
+        ) as merge, patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.assertEqual(maa_depot.main(), 0)
+        due.assert_called_once_with({}, at=at)
+        real_scan.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(merge.call_args.args[0]["depot_status"], "not_due")
+
+    def test_cron_entry_alerts_on_failure_and_keeps_it_out_of_plan_card(self) -> None:
+        at = datetime(2026, 8, 8, 4, 30, tzinfo=BEIJING)
+        with patch.object(
+            maa_depot, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(maa_depot, "now_beijing", return_value=at), patch.object(
+            maa_depot, "run_if_due", side_effect=RuntimeError("recognition failed")
+        ), patch.object(maa_depot, "merge_last_run") as merge, patch.object(
+            maa_depot, "discord_token", return_value="token"
+        ), patch.object(maa_depot, "discord_request") as request:
+            with self.assertRaisesRegex(RuntimeError, "recognition failed"):
+                maa_depot.main()
+        self.assertEqual(merge.call_args.args[0]["depot_status"], "failed")
+        self.assertEqual(request.call_args.args[1:3], ("POST", "/channels/123/messages"))
+        self.assertNotIn("maa_depot", maa_plan_card.__dict__)
+
+
+class LockConflictTests(unittest.TestCase):
+    def test_conflict_is_recorded_without_overwriting_the_active_status(self) -> None:
+        at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
+        with patch.object(maa_daily, "merge_last_run") as merge, patch.object(
+            maa_daily, "discord_request"
+        ) as request:
+            maa_daily.report_lock_conflict({}, "token", "123", "am", at)
+        record = merge.call_args.args[0]
+        self.assertNotIn("status", record)
+        self.assertEqual(record["last_lock_conflict_phase"], "am")
+        self.assertIn("run.lock", record["last_lock_conflict_reason"])
+        payload = request.call_args.args[3]
+        self.assertIn("未启动", payload["embeds"][0]["title"])
+
+    def test_daily_lock_loss_reports_and_returns_failure(self) -> None:
+        at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = False
+        context.__exit__.return_value = False
+        with patch.object(maa_daily, "now_beijing", return_value=at), patch.object(
+            maa_daily, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(maa_daily, "discord_token", return_value="token"), patch.object(
+            maa_daily, "load_json", return_value={}
+        ), patch.object(
+            maa_daily, "effective_plan", return_value=maa_common.normalize_plan({})
+        ), patch.object(maa_daily, "run_lock", return_value=context), patch.object(
+            maa_daily, "report_lock_conflict"
+        ) as report:
+            self.assertEqual(maa_daily.execute("am"), 1)
+        report.assert_called_once_with(
+            {"channel_id": "123"}, "token", "123", "am", at
+        )
 
 
 if __name__ == "__main__":
