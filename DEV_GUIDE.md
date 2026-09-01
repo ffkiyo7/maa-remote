@@ -65,6 +65,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 |---|---|---|---|
 | `scripts/maa_common.py` | 无第三方依赖的公共层：时区、两把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 每日计划卡；每次先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50 | 数秒～5 分钟（含 `maa update` / `brew`） |
+| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率 | 由计划卡按 7 天间隔触发 | 首次/到期时数分钟；未到期不启动模拟器 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；活动切换时派发 Top-1 作业搜索，维护重试/取消/完成状态 | cron 每 15 分钟 | 通常 <1s；需要搜索时后台 5~20s |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
@@ -433,6 +434,7 @@ worker 写执行终态，watcher 统一记 completed。
   last_run.json   最近一次运行状态 + threads[] + 资源更新时间戳
   activity_watch.json 当前活动观察 + 搜索 token + idle/searching/waiting/ready/
                       preparing/executing/dismissed/completed 状态
+  depot.json      最近完整 Depot 真值 + 期间掉落增量 + 历次消耗与日均消耗率
   run.lock        flock 独占锁（执行）
   am/ pm/         空目录，仅用于给 cron 传场次
   runs/<date>-<phase>.{json,log,png}   本场快照 / 完整日志 / 截图（保留 14 天）
@@ -483,7 +485,7 @@ python3 deploy.py --check                  # 检查脚本/ocrbox 是否存在，
    `~/.hermes/backups/maa-setup/<YYYYMMDDTHHMMSS>/`。
 2. **幂等写** — `write_bytes()` 内容一致就跳过（不写、不记 changed、不备份），
    否则 `mkstemp + fsync + os.replace` 原子替换，权限 0600/0700。
-   `--check` 对仓库管理的 5 个 `config/maa-cli/**` 文件逐字节比对仓库与运行时；文件存在但
+   `--check` 对仓库管理的 6 个 `config/maa-cli/**` 文件逐字节比对仓库与运行时；文件存在但
    内容漂移会列入 `mismatched` 并返回失败，不再把“存在”误报成“部署干净”。
 3. **状态的部署策略不同**（`deploy_state()`，`deploy.py`）：
    - `config.json`：**逐键合并**，仓库的键覆盖同名键，本地新增键保留。
@@ -571,6 +573,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 19 | 只有「查询成功且确实无活动」才允许清空活动关；格式不可辨认一律抛异常。闸门与解析器必须共用 `is_side_story_heading()`，不许各判各的 | `activity_snapshot()` + `test_snapshot_gate_and_parser_agree_on_what_a_heading_is` |
 | 20 | 收掉用户手里的作业卡必须连续 2 次空快照才发生，且发生时必发 Discord 通知 | `run_once()` 的 `EMPTY_OBSERVATIONS_BEFORE_IDLE` + `test_watcher_enters_idle_on_recognized_empty_snapshot` |
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
+| 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |
 
 ---
 

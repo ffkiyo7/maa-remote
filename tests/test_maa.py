@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import maa_action  # noqa: E402
 import maa_common  # noqa: E402
+import maa_depot  # noqa: E402
 import maa_daily  # noqa: E402
 import maa_plan_card  # noqa: E402
 import deploy  # noqa: E402
@@ -1843,6 +1844,124 @@ class HomeScreenshotTests(unittest.TestCase):
                 ],
             },
         )
+
+
+class DepotTests(unittest.TestCase):
+    def _resource(self, root: Path) -> dict[str, object]:
+        maa_common.atomic_write_json(
+            root / "item_index.json",
+            {
+                "30012": {"name": "固源岩组"},
+                "30022": {"name": "糖组"},
+            },
+        )
+        return {"maa_resource_dir": str(root)}
+
+    def test_parser_accepts_only_the_final_complete_depot_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = self._resource(root)
+            partial = {
+                "taskchain": "Depot",
+                "what": "DepotInfo",
+                "details": {"done": False, "data": '{"30012": 1}'},
+            }
+            complete = {
+                "taskchain": "Depot",
+                "what": "DepotInfo",
+                "details": {"done": True, "data": '{"30012": 40, "30022": 9}'},
+            }
+            output = "\n".join(
+                [
+                    "Depot: " + json.dumps(partial, ensure_ascii=False, indent=2),
+                    "Depot: " + json.dumps(complete, ensure_ascii=False, indent=2),
+                ]
+            )
+            items = maa_depot.parse_depot_output(output, config)
+        self.assertEqual(items["30012"], {"name": "固源岩组", "quantity": 40})
+        self.assertEqual(items["30022"]["quantity"], 9)
+
+    def test_partial_or_empty_depot_result_is_a_visible_error(self) -> None:
+        partial = {
+            "taskchain": "Depot",
+            "what": "DepotInfo",
+            "details": {"done": False, "data": '{"30012": 1}'},
+        }
+        with self.assertRaisesRegex(RuntimeError, "done=true"):
+            maa_depot.parse_depot_output("Depot: " + json.dumps(partial), {})
+
+    def test_drop_delta_and_second_snapshot_produce_consumption_rate(self) -> None:
+        first_at = datetime(2026, 8, 1, 7, 50, tzinfo=BEIJING)
+        second_at = first_at + timedelta(days=7)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            path = root / "depot.json"
+            config = self._resource(root)
+            maa_depot.reconcile(
+                {
+                    "30012": {"name": "固源岩组", "quantity": 100},
+                    "30022": {"name": "糖组", "quantity": 50},
+                },
+                at=first_at,
+                path=path,
+            )
+            parsed_drops = maa_daily._drop_pairs(
+                ["total drops: 固源岩组 ×30, 糖组 ×5, furni ×1"]
+            )
+            after_drop = maa_depot.record_drops(
+                parsed_drops,
+                config,
+                at=first_at + timedelta(days=1),
+                path=path,
+            )
+            self.assertEqual(after_drop["items"]["30012"]["quantity"], 130)
+            self.assertEqual(after_drop["drops_since_snapshot"]["30012"]["quantity"], 30)
+            self.assertNotIn("furni", after_drop["drops_since_snapshot"])
+            result = maa_depot.reconcile(
+                {
+                    "30012": {"name": "固源岩组", "quantity": 90},
+                    "30022": {"name": "糖组", "quantity": 60},
+                },
+                at=second_at,
+                path=path,
+            )
+        interval = result["consumption_history"][0]["items"]
+        self.assertEqual(interval["30012"]["calculated"], 40)
+        self.assertEqual(interval["30012"]["consumed"], 40)
+        # 50 + 5 - 60 = -5: an untracked gain is retained for audit, not
+        # misrepresented as negative consumption.
+        self.assertEqual(interval["30022"]["calculated"], -5)
+        self.assertEqual(interval["30022"]["consumed"], 0)
+        self.assertAlmostEqual(
+            result["consumption_rates"]["30012"]["per_day"], 40 / 7, places=6
+        )
+        self.assertEqual(result["drops_since_snapshot"], {})
+
+    def test_failed_real_scan_never_calls_the_snapshot_writer(self) -> None:
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = True
+        context.__exit__.return_value = False
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="recognition failed")
+        config = {"maa_bin": "/maa", "adb_path": "/adb"}
+        with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
+            maa_daily, "require_executable"
+        ), patch.object(maa_daily, "open_emulator"), patch.object(
+            maa_daily, "wait_for_android"
+        ), patch.object(maa_daily, "verify_game_installed"), patch.object(
+            maa_daily, "settle_android_runtime"
+        ), patch.object(maa_daily, "close_everything", return_value=[]), patch.object(
+            maa_depot.subprocess, "run", return_value=failed
+        ), patch.object(maa_depot, "reconcile") as writer:
+            with self.assertRaisesRegex(RuntimeError, "recognition failed"):
+                maa_depot.run_depot(config)
+        writer.assert_not_called()
+
+    def test_weekly_gate_is_due_only_after_seven_days(self) -> None:
+        at = datetime(2026, 8, 8, 7, 50, tzinfo=BEIJING)
+        state = {"snapshot_at": (at - timedelta(days=6, hours=23)).isoformat()}
+        self.assertFalse(maa_depot.is_due(state, at))
+        state["snapshot_at"] = (at - timedelta(days=7)).isoformat()
+        self.assertTrue(maa_depot.is_due(state, at))
 
 
 if __name__ == "__main__":

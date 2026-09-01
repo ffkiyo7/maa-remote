@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
+import maa_depot
 from maa_common import (
     BEIJING,
     LAST_RUN_PATH,
@@ -1233,6 +1234,7 @@ def report_payload(
     proxy_batches: int = 0,
     proxy_refunded: int = 0,
     connect_retries: int = 0,
+    inventory_error: str = "",
 ) -> dict[str, Any]:
     label = PHASE_LABELS[phase]
     notes: list[str] = []
@@ -1253,6 +1255,8 @@ def report_payload(
         notes.append(f"截图不是游戏主页：{home_verify_detail}")
     if cleanup_errors:
         notes.append("清理异常：" + "；".join(cleanup_errors))
+    if inventory_error:
+        notes.append(f"库存增量记录失败：{inventory_error}")
     embed: dict[str, Any] = {
         "title": f"{'✅' if ok else '❌'} MAA 日常·{label}{'完成' if ok else '失败'}",
         "color": 0x57F287 if ok else 0xED4245,
@@ -1440,6 +1444,7 @@ def execute(phase: str) -> int:
         home_verified: bool | None = None
         home_verify_detail = ""
         cleanup_errors: list[str] = []
+        inventory_error = ""
         salvage_log_path: Path | None = None
         connect_retries = 0
         startup_error = ""
@@ -1550,6 +1555,14 @@ def execute(phase: str) -> int:
                 except Exception as exc:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
+        fight_lines = _named_task_section(stdout_lines + stderr_lines, "刷理智")
+        drops = _drop_pairs(fight_lines) if fight_lines else []
+        if drops:
+            try:
+                maa_depot.record_drops(drops, config, at=now_beijing())
+            except Exception as exc:
+                inventory_error = f"{type(exc).__name__}: {exc}"
+
         duration = (now_beijing() - started).total_seconds()
         # 代理指挥失误到一关没打成，就算后面的链条都补回来了也不算成功——得让人
         # 看见红色去修作战录像，否则理智白挂在那儿谁也不知道。
@@ -1559,6 +1572,7 @@ def execute(phase: str) -> int:
             and not cleanup_errors
             and home_verified is not False
             and not proxy_batches
+            and not inventory_error
         )
         summary = extract_summary(
             stdout_lines,
@@ -1603,6 +1617,7 @@ def execute(phase: str) -> int:
                 proxy_batches=proxy_batches,
                 proxy_refunded=proxy_refunded,
                 connect_retries=connect_retries,
+                inventory_error=inventory_error,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
         finished: dict[str, Any] = {
@@ -1622,6 +1637,7 @@ def execute(phase: str) -> int:
             "proxy_failure_batches": proxy_batches,
             "proxy_failure_sanity_refunded": proxy_refunded,
             "connect_retries": connect_retries,
+            "inventory_error": inventory_error or None,
         }
         if plan.get("annihilation") and annihilation_consumed(stdout_lines + stderr_lines):
             finished["annihilation_game_day"] = cn_game_day(started)

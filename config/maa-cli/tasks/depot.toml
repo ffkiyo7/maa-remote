@@ -1,0 +1,15 @@
+[[tasks]]
+name = "启动国服"
+type = "StartUp"
+[tasks.params]
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+name = "仓库对表"
+type = "Depot"
+[tasks.params]
+enable = true
+
+# CloseDown is deliberately kept out of the task chain. maa_depot.py always
+# closes the game and emulator in its cleanup path, including recognition errors.

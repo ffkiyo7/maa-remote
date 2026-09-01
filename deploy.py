@@ -76,6 +76,7 @@ def maa_config_file_pairs() -> list[tuple[Path, Path]]:
     relative_paths = (
         Path("profiles/default.toml"),
         Path("tasks/daily.toml"),
+        Path("tasks/depot.toml"),
         Path("tasks/infrast-smoke.toml"),
         Path("cli.toml"),
         Path("resource/tasks/tasks.json"),
@@ -130,6 +131,7 @@ def deploy_scripts() -> None:
         "maa_common.py",
         "maa_plan_card.py",
         "maa_activity_watch.py",
+        "maa_depot.py",
         "maa_daily.py",
         "maa_action.py",
         "maa_copilot.py",

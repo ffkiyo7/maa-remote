@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import maa_copilot
+import maa_depot
 from maa_common import (
     BUTTONS_PATH,
     CONFIG_PATH,
@@ -781,6 +782,42 @@ def main() -> int:
     # A successful refresh rewrites config.json and mutates this copy; reload
     # so the card is always derived from the just-persisted source of truth.
     config = load_config()
+    try:
+        depot = maa_depot.run_if_due(config)
+        depot_record = {
+            "depot_status": depot["status"],
+            "depot_snapshot_at": depot.get("snapshot_at"),
+            "depot_error": None,
+        }
+        if depot.get("item_count") is not None:
+            depot_record["depot_item_count"] = depot["item_count"]
+        merge_last_run(depot_record)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        merge_last_run(
+            {
+                "depot_status": "failed",
+                "depot_attempted_at": now_beijing().isoformat(),
+                "depot_error": detail,
+            }
+        )
+        discord_request(
+            token,
+            "POST",
+            f"/channels/{channel_id}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": "❌ MAA Depot 对表失败",
+                        "description": detail[:1500],
+                        "color": 0xED4245,
+                        "timestamp": now_beijing().isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+        raise RuntimeError(f"Depot 对表失败：{detail}") from exc
     plan = effective_plan()
     components, entries = build_components(plan, config)
 
