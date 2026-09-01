@@ -837,6 +837,21 @@ Opening mini games:
             with self.assertRaises(RuntimeError):
                 deploy.resolve_channel_id()
 
+    def test_deploy_check_detects_maa_config_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "repo.toml"
+            target = root / "runtime.toml"
+            source.write_bytes(b"same\n")
+            target.write_bytes(b"same\n")
+            self.assertEqual(deploy.content_mismatches([(source, target)]), [])
+
+            target.write_bytes(b"drifted\n")
+            self.assertEqual(
+                deploy.content_mismatches([(source, target)]),
+                [str(target)],
+            )
+
     def test_parse_maa_versions_from_cli_output(self) -> None:
         cli, core = maa_plan_card.parse_maa_versions(
             "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n"

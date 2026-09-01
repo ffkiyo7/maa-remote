@@ -71,6 +71,28 @@ def copy_file(source: Path, target: Path, mode: int) -> None:
     write_bytes(target, source.read_bytes(), mode)
 
 
+def maa_config_file_pairs() -> list[tuple[Path, Path]]:
+    """Return every repository-managed maa-cli config and its runtime target."""
+    relative_paths = (
+        Path("profiles/default.toml"),
+        Path("tasks/daily.toml"),
+        Path("tasks/infrast-smoke.toml"),
+        Path("cli.toml"),
+        Path("resource/tasks/tasks.json"),
+    )
+    source_root = ROOT / "config" / "maa-cli"
+    return [(source_root / path, MAA_CONFIG_HOME / path) for path in relative_paths]
+
+
+def content_mismatches(file_pairs: list[tuple[Path, Path]]) -> list[str]:
+    """Report deployed files whose bytes differ; missing targets are reported separately."""
+    return [
+        str(target)
+        for source, target in file_pairs
+        if target.is_file() and target.read_bytes() != source.read_bytes()
+    ]
+
+
 def load_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -210,22 +232,8 @@ def deploy_state(channel_id: str) -> None:
 
 
 def deploy_maa_config() -> None:
-    for kind, name in (
-        ("profiles", "default.toml"),
-        ("tasks", "daily.toml"),
-        ("tasks", "infrast-smoke.toml"),
-    ):
-        copy_file(
-            ROOT / "config" / "maa-cli" / kind / name,
-            MAA_CONFIG_HOME / kind / name,
-            0o600,
-        )
-    copy_file(ROOT / "config" / "maa-cli" / "cli.toml", MAA_CONFIG_HOME / "cli.toml", 0o600)
-    copy_file(
-        ROOT / "config" / "maa-cli" / "resource" / "tasks" / "tasks.json",
-        MAA_CONFIG_HOME / "resource" / "tasks" / "tasks.json",
-        0o600,
-    )
+    for source, target in maa_config_file_pairs():
+        copy_file(source, target, 0o600)
 
 
 def deploy_skill() -> None:
@@ -419,17 +427,18 @@ def main() -> int:
                 "ocrbox",
             )
         ]
-        checks.extend(
-            [
-                MAA_CONFIG_HOME / "profiles" / "default.toml",
-                MAA_CONFIG_HOME / "tasks" / "daily.toml",
-                MAA_CONFIG_HOME / "tasks" / "infrast-smoke.toml",
-                MAA_CONFIG_HOME / "resource" / "tasks" / "tasks.json",
-            ]
-        )
+        maa_config_pairs = maa_config_file_pairs()
+        checks.extend(target for _source, target in maa_config_pairs)
         missing = [str(path) for path in checks if not path.is_file()]
-        print(json.dumps({"ok": not missing, "missing": missing}, ensure_ascii=False))
-        return 0 if not missing else 1
+        mismatched = content_mismatches(maa_config_pairs)
+        ok = not missing and not mismatched
+        print(
+            json.dumps(
+                {"ok": ok, "missing": missing, "mismatched": mismatched},
+                ensure_ascii=False,
+            )
+        )
+        return 0 if ok else 1
 
     channel_id = resolve_channel_id()
     deploy_scripts()

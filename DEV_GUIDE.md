@@ -248,8 +248,10 @@ worker 写执行终态，watcher 统一记 completed。
    `Infrast` 固定 `mode = 0`，让 MaaCore 从游戏内实时识别的干员、基建技能和心情计算
    七类设施的排班；不使用无人机、不补源石碎片订单、宿舍不刷信赖。**链里没有 CloseDown**——
    它被拆出去在截图之后单独跑。`profiles/default.toml` 开启 maa-cli 用户资源层，
-   `resource/tasks/tasks.json` 只覆盖 `InfrastDormDoubleConfirmButton`：上游旧蓝色确认模板已经
-   不符合国服当前红色确认条，因此复用现成 `PopupConfirm.png` 识别后点击右侧对勾。
+   `resource/tasks/tasks.json` 完整覆盖 `InfrastDormDoubleConfirmButton`：用现成
+   `PopupConfirm.png` 识别国服当前红色确认条，并点击右侧对勾。2026-09-01 22:00 的完整日常
+   四次通过该确认条并到达 `Infrast Completed`；同日 23:01 实测只覆盖
+   `roi = [630, 430, 650, 290]` 会卡在确认条，因此不能改回极简覆盖。
 8. **`run_maa()`** — `maa run daily -v --batch`，注入 `MAA_CONFIG_DIR` /
    `MAA_LOG_PREFIX=Never` /（可选）剔除代理变量。两个 reader 线程把 stdout+stderr
    同时 tee 到 `runs/<date>-<phase>.log`；主循环每 5 秒把**解析后的中文状态** PATCH 进
@@ -462,7 +464,7 @@ result = normalize_plan(result)             ← 再规范化一次
 ```bash
 python3 -m unittest discover -s tests -v   # 必须在仓库根目录跑（测试要 import 根目录的 deploy.py）
 python3 deploy.py                          # 幂等；输出 {"ok":true,"changed":[…],"backup":"…"}
-python3 deploy.py --check                  # 检查 8 个 Python 脚本、ocrbox 与 4 个关键基建配置
+python3 deploy.py --check                  # 检查脚本/ocrbox 是否存在，并逐字节核对 5 个 maa-cli 配置
 ```
 
 做的事：
@@ -471,6 +473,8 @@ python3 deploy.py --check                  # 检查 8 个 Python 脚本、ocrbox
    `~/.hermes/backups/maa-setup/<YYYYMMDDTHHMMSS>/`。
 2. **幂等写** — `write_bytes()` 内容一致就跳过（不写、不记 changed、不备份），
    否则 `mkstemp + fsync + os.replace` 原子替换，权限 0600/0700。
+   `--check` 对仓库管理的 5 个 `config/maa-cli/**` 文件逐字节比对仓库与运行时；文件存在但
+   内容漂移会列入 `mismatched` 并返回失败，不再把“存在”误报成“部署干净”。
 3. **状态的部署策略不同**（`deploy_state()`，`deploy.py`）：
    - `config.json`：**逐键合并**，仓库的键覆盖同名键，本地新增键保留。
      注意仓库里的 `activity_stages` 会盖掉线上缓存，下一次计划卡会重新刷。
@@ -536,7 +540,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 1 | `stone = 0`，永不提供任何入口 | `render_daily_toml` 字面量 + `normalize_plan` 强制 + 技能第 3 条 |
 | 2 | `medicine = 0`，只用 `medicine_expire_days` 吃临期药 | 同上；`set_medicine()` 直接返回 `ok:false` |
 | 3 | `series = 0`（由 MaaCore 选当前理智支持的最大连战） | `render_daily_toml` 字面量 |
-| 4 | 基建用 `mode = 0` 实时自动排班，facility 覆盖七类设施；不使用无人机、不补源石碎片订单、宿舍不刷信赖；新版红色锁定位置确认条必须能自动通过 | `render_daily_toml` + `infrast-smoke.toml` + 用户资源 `InfrastDormDoubleConfirmButton` |
+| 4 | 基建用 `mode = 0` 实时自动排班，facility 覆盖七类设施；不使用无人机、不补源石碎片订单、宿舍不刷信赖；新版红色锁定位置确认条必须由已实机验证的 `InfrastDormDoubleConfirmButton` 完整覆盖自动通过 | `render_daily_toml` + `infrast-smoke.toml` + 用户资源 `InfrastDormDoubleConfirmButton` |
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
 | 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
 | 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |
