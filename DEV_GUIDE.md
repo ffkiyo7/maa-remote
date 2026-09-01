@@ -249,9 +249,19 @@ worker 写执行终态，watcher 统一记 completed。
    七类设施的排班；不使用无人机、不补源石碎片订单、宿舍不刷信赖。**链里没有 CloseDown**——
    它被拆出去在截图之后单独跑。`profiles/default.toml` 开启 maa-cli 用户资源层，
    `resource/tasks/tasks.json` 完整覆盖 `InfrastDormDoubleConfirmButton`：用现成
-   `PopupConfirm.png` 识别国服当前红色确认条，并点击右侧对勾。2026-09-01 22:00 的完整日常
-   四次通过该确认条并到达 `Infrast Completed`；同日 23:01 实测只覆盖
-   `roi = [630, 430, 650, 290]` 会卡在确认条，因此不能改回极简覆盖。
+   `PopupConfirm.png` 识别国服当前红色确认条，并点击右侧对勾。
+
+   **这一条目前没有 run 级实测数据，别当它已验证。** MaaCore 在**进程启动时一次性载入
+   `resource/`**，所以要判断某场用的是哪一版，看的是那场**启动时刻**磁盘上的内容，不是
+   基建段开始时的。2026-09-01 三场的实际情况：08:00 与 22:00 都是在极简覆盖
+   （`roi = [630,430,650,290]`，其余继承上游）下 `Infrast Completed`——22:00 那场虽然
+   22:05 磁盘已被换成完整覆盖，但它 22:00:49 就载入完了；23:01 那场读到的仍是极简覆盖，
+   `Infrast Error`，0 次确认。完整覆盖是 23:09 才落定的，此后还没跑过一场。
+
+   即：**同一份极简覆盖两成一败，宿舍确认这步会飘**。而且 23:01 那场是当天第二次基建
+   （22:15 刚排完班，宿舍本就没有"撤下干员"弹窗），其后 Recruit/Mall/Award/Custom 全部
+   在 13~30 秒内 Error，更像界面卡死而非确认条点不掉——归因还没坐实。再遇到卡确认条，
+   **先抓卡住时的截图比对模板与实际位置，不要靠改 `roi` 猜**。
 8. **`run_maa()`** — `maa run daily -v --batch`，注入 `MAA_CONFIG_DIR` /
    `MAA_LOG_PREFIX=Never` /（可选）剔除代理变量。两个 reader 线程把 stdout+stderr
    同时 tee 到 `runs/<date>-<phase>.log`；主循环每 5 秒把**解析后的中文状态** PATCH 进
@@ -540,7 +550,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），脚本内部�
 | 1 | `stone = 0`，永不提供任何入口 | `render_daily_toml` 字面量 + `normalize_plan` 强制 + 技能第 3 条 |
 | 2 | `medicine = 0`，只用 `medicine_expire_days` 吃临期药 | 同上；`set_medicine()` 直接返回 `ok:false` |
 | 3 | `series = 0`（由 MaaCore 选当前理智支持的最大连战） | `render_daily_toml` 字面量 |
-| 4 | 基建用 `mode = 0` 实时自动排班，facility 覆盖七类设施；不使用无人机、不补源石碎片订单、宿舍不刷信赖；新版红色锁定位置确认条必须由已实机验证的 `InfrastDormDoubleConfirmButton` 完整覆盖自动通过 | `render_daily_toml` + `infrast-smoke.toml` + 用户资源 `InfrastDormDoubleConfirmButton` |
+| 4 | 基建用 `mode = 0` 实时自动排班，facility 覆盖七类设施；不使用无人机、不补源石碎片订单、宿舍不刷信赖；新版红色锁定位置确认条由用户资源层的 `InfrastDormDoubleConfirmButton` 完整覆盖接管（该覆盖尚无 run 级实测，见 §4 步骤 7） | `render_daily_toml` + `infrast-smoke.toml` + 用户资源 `InfrastDormDoubleConfirmButton` |
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
 | 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
 | 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |

@@ -5,6 +5,11 @@
 >
 > **本文不含实现代码。** 只描述做什么、改哪里、怎么算做完。bash 验收命令和表格形式的
 > 数据结构描述是验收边界的一部分，不算实现代码。写代码是执行 agent 的事。
+>
+> **本文的线上快照会过期。** 每步开工第一件事是按全局护栏 9 对一遍现场；对不上就以
+> 现场为准并回报，不要照着旧快照动手。
+
+**进度**：步骤 0 ✅（`a983ccb`）· 步骤 1 ✅（`49da169`，含一条遗留观测项）· 步骤 2~6 未开工
 
 ---
 
@@ -107,33 +112,53 @@ CF.json = CF-8
 这个问题的答案就变了），所以先做第 2 步，再回头决定 A-1 怎么写。
 **B 与本计划完全正交，可以随时插队做。**
 
-### F. 线上运行实证（2026-09-01 早场）
+### F. 基建覆盖层的实测记录（2026-09-01 全天，已随步骤 1 收敛）
 
-今天 08:00 的自动日常**跑成功了**，这是第 1 步的关键背景：
+> ⚠️ **本节是历史，不是现场。** 派发任何一步之前先自己跑一遍「开工前先对现场」
+> （见全局护栏 9），不要拿这里的快照当线上真值——这一节本身就是被这么坑过一次
+> 才写成现在这样的。
 
-```text
-993s (16m33s)   rc=0    主页截图确认 7/8 标识
-日志: Infrast Start → EnterFacility Dorm #0 → InfrastDormDoubleConfirmed
-      → Dorm #1…#3 → Infrast Completed        (基建段 8m3s)
-排班: 制造×4 贸易×2 发电×3 控制×1 会客×1 办公×1 宿舍×8
-```
-
-**但线上跑的不是仓库工作区那一版**：
+两版覆盖层：
 
 ```text
-线上 ~/.config/maa-cli/resource/tasks/tasks.json
-  InfrastDormDoubleConfirmButton = { roi: [630, 430, 650, 290] }        ← 只覆盖 roi
+极简版   InfrastDormDoubleConfirmButton = { roi: [630, 430, 650, 290] }
+         只覆盖 roi，template/action/next 全部继承上游
 
-仓库 config/maa-cli/resource/tasks/tasks.json（未部署，git 里还是 untracked）
-  InfrastDormDoubleConfirmButton = { template, roi: [620,430,660,150],
-                                     action, specificRect, postDelay, next }
+完整版   InfrastDormDoubleConfirmButton = { template: PopupConfirm.png,
+           roi: [620,430,660,150], action: ClickRect,
+           specificRect: [800,450,90,90], postDelay, next }
 ```
 
-线上那个极简版**只覆盖 `roi`、其余字段继承上游**，并且已经实机验证能工作。仓库那版是
-完整重定义，从未部署过，roi 也不同。
+**当天时间线**（`~/.hermes/state/maa/runs/*.log` 的 Summary 段 + `~/.hermes/backups/maa-setup/`
+各次部署前备份，两边可交叉核对）：
 
-**另外**：`deploy.py --check` 只检查文件**存不存在**、不比内容，所以它现在报"干净"，
-这道防线在这里是失效的。
+| 时刻 | 事件 | 进程内生效的覆盖层 | 结果 |
+|---|---|---|---|
+| 08:00:58 | am 场启动 | 极简 | 基建 08:05:54–08:13:57 **Completed**，逐个宿舍确认 |
+| 22:00:49 | pm 场启动 | 极简 | 基建 22:06:45–22:15:16 **Completed**，4× `InfrastDormDoubleConfirmed` |
+| 22:05:23 | 步骤 0 跑 `deploy.py` **顺手**把线上改成完整版 | — | 文件变了，但 pm 场进程已在 22:00:49 载入完毕 |
+| 23:00:56 | 按本步骤原文部署极简版 | — | — |
+| 23:01:43 | now 场启动 | 极简 | 基建 23:04:56–23:06:27 **Error**，0 次确认 |
+| 23:09:37 | 恢复完整版（当前仓库与线上都是它） | — | 尚无 run 带着它启动过 |
+
+**能得出的结论只有这些：**
+
+1. **同一份极简配置，两成一败。** 三场读的都是极简版——22:00 那场虽然基建段发生在
+   22:05 改写之后，但 MaaCore 在**进程启动时一次性载入 `resource/`**，内存里仍是
+   22:00:49 载入的极简版。所以它不能作为完整版的证据。
+2. **完整版至今零实测。** 它现在在仓库、在线上，但没有任何一场 run 是带着它启动的。
+   下一场自动日常（08:00/22:00）才是它的第一次真实数据。
+3. **23:01 那场有未排除的干扰**，不能直接归因给覆盖层：它是当天**第二次**基建，22:15
+   刚排完班，四个宿舍本就没有"撤下干员"弹窗要确认（22:00 那场第二轮扫宿舍同样 0 次
+   确认、照样 Completed）；而且它之后 Recruit / Mall / Award / Custom **全部 Error**，
+   都是 13–30 秒的快速失败，更像界面卡死或连接退化，不像"红色确认条点不掉"。
+
+**因此：宿舍确认这一步当前状态是「会飘」，两版都没有被证明是稳的。** 谁也别把
+「换成 X 版就好了」当成已知结论——这是第 1 步交付后仍然敞着的一个观测项。
+
+**已经修掉的**：`deploy.py --check` 当时只检查文件**存不存在**、不比内容，所以仓库与
+线上不一致时它报"干净"，22:05 那次静默覆盖就是这么发生的。现在它会比对内容，
+不一致列入 `mismatched` 并返回失败（commit `49da169`）。
 
 ### G. 两个现存 bug（第 0 步要修的）
 
@@ -173,15 +198,31 @@ last_notified_error : "RuntimeError: 森空岛练度与理智刷新失败：
 
 1. **仓库 ≠ 运行时**（DEV_GUIDE §0）。改完必须 `python3 deploy.py`；只改仓库不部署等于没做。
 2. 测试必须**在仓库根目录**跑：`python3 -m unittest discover -s tests -v`，**全绿才算完**。
-3. `DEV_GUIDE.md §8` 那 18 条不变量**一条都不许破**。新增行为若产生新不变量，
-   **同步补进 §8 并配单测**。
+3. `DEV_GUIDE.md §8` 不变量表里的**全部条目一条都不许破**（表在长，不要在这里记条数）。
+   新增行为若产生新不变量，**同步补进 §8 并配单测**。
 4. **不许新增静默 `return`。** 这是 `PLAN_NAV_GATE.md` B-3 的教训：任何跳过都必须发
    Discord 并写 `last_run.json`，否则会永久停摆且无人知情。
 5. 按钮脚本 **< 20s 返回**（不变量 #6）；长任务一律 `Popen` 甩给 worker。
 6. Discord 下拉值必须经 `select_args` **查表**（不变量 #8），不能直通 argv。
 7. `stone = 0` / `medicine = 0` **永不松动**（不变量 #1、#2）。
 8. **每步做完各自提交**，不要攒成一个大 commit。
-9. 遇到与本文描述**不符**的现实（尤其是第 2 步 spike），**停下来回报，不要自己改设计**。
+9. **开工前先对现场，本文的线上快照一律当过期处理。** 本文写于 2026-09-01，其中任何
+   「线上现在是 X」「某文件还是 untracked」「某次实测证明 Y」都是**当时**的观测，
+   随时可能被后续步骤自己改掉——步骤 0 跑一次 `deploy.py` 就顺手改写了步骤 1 的前提，
+   而步骤 1 照着过期前提操作，把一版正在用的配置换掉了。所以每步第一件事是：
+
+   ```bash
+   git log --oneline -8
+   git status --short
+   python3 deploy.py --check                     # 仓库与线上是否已漂移
+   diff <(python3 -m json.tool config/maa-cli/resource/tasks/tasks.json) \
+        <(python3 -m json.tool ~/.config/maa-cli/resource/tasks/tasks.json)
+   ```
+
+   对不上就**以现场为准并回报差异**，不要照着本文的旧快照动手。
+10. 遇到与本文描述**不符**的现实（尤其是第 2 步 spike），**停下来回报，不要自己改设计**。
+11. **区分「实测证明」和「推断」。** 写进本文的实测结论必须能指到日志或备份文件；
+    推断要显式标成推断。同一份配置在不同场次结果不同时，先找干扰项，不要急着归因。
 
 ---
 
@@ -267,7 +308,7 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser( \
 
 ---
 
-## 步骤 1 — 基建覆盖层以线上为准，回灌仓库
+## 步骤 1 — 挡住部署漂移 ✅ 已交付（commit `49da169`，2026-09-01 23:10）
 
 ### 前置
 
@@ -275,23 +316,39 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser( \
 
 ### 目标
 
-消除「仓库版本从未部署、线上版本从未入库」这个隐患，让仓库反映**实际在工作的**配置。
-做完之后 `deploy.py` 是安全的——现在跑它会用一版没验过的配置换掉一版正在工作的。
+原目标是「消除仓库与线上不一致的隐患」。**交付时目标只完成了一半，另一半被证明是伪命题**：
 
-### 做法
+- ✅ **已达成**：`deploy.py --check` 现在**比对内容**，漂移列入 `mismatched` 并返回失败，
+  并做了反向漂移验证（手工改一个字节 → `--check` 必须红）。`config/maa-cli/resource/`
+  已纳入版本管理。这条防线成立了——22:05 那次静默覆盖以后不会再无声发生。
+- ❌ **不成立**：原文让"以线上为准、回灌极简版"。执行时这么做了，结果 23:01 实机
+  **失败**，随即恢复完整版。见地基事实 F。
 
-**用户已拍板：以线上为准。**
+### 做法（已完成，留档）
 
-- 把线上 `~/.config/maa-cli/resource/tasks/tasks.json` 的内容**回灌**到
-  `config/maa-cli/resource/tasks/tasks.json`，即 `InfrastDormDoubleConfirmButton`
-  **只覆盖 `roi`**（`[630, 430, 650, 290]`），其余字段继承上游。
-- 仓库里那版完整重定义（带 `template`/`action`/`specificRect`/`postDelay`/`next`）
-  **丢弃**——它从未部署、从未验证，而线上极简版今早刚实机跑通（见地基事实 F）。
-- **在文件里留一句注释**说明为什么是"只覆盖 roi"而不是完整重定义：上游模板本身没问题，
-  变的只是国服当前红色确认条的位置。
-- 顺手补上 `deploy.py --check` 的能力缺口：它现在**只查文件存在、不比内容**，
-  所以仓库与线上不一致时它报"干净"。让它对 `config/maa-cli/**` 这几个文件**比对内容**。
-- `config/maa-cli/resource/` 目前是 git untracked，这一步要把它**纳入版本管理并提交**。
+1. `deploy.py --check` 从「只查文件存在」改为**逐文件比对内容**，输出加 `mismatched`
+   字段，不一致即失败。
+2. 反向漂移验证：手工改一个字节 → `--check` 报不一致 → 改回 → 干净。
+3. `config/maa-cli/resource/` 纳入版本管理。
+4. 仓库与线上**统一为完整重定义**（`template`/`roi:[620,430,660,150]`/`action`/
+   `specificRect`/`postDelay`/`next`），二者内容一致。
+5. 为什么用完整重定义、极简版为何被放弃，写进 **`DEV_GUIDE.md`**——
+   **不要写进 `tasks.json`**：那是严格 JSON，`//` 或 `/* */` 会让 `json.tool` 和
+   MaaCore 双双解析失败，也和本步骤的验收命令直接冲突。
+
+### 遗留的观测项（不阻塞后续步骤）
+
+宿舍确认目前**会飘**，两版覆盖层都没有被证明是稳的（地基事实 F）。完整重定义
+**尚无任何一场 run 带着它启动过**，下一场自动日常（08:00 / 22:00）是它的第一次真实数据。
+观测方式，不需要专门跑一场：
+
+```bash
+grep -cE "InfrastDormDoubleConfirmed" ~/.hermes/state/maa/runs/$(date +%F)-am.log
+grep -E "Infrast (Completed|Error)"   ~/.hermes/state/maa/runs/$(date +%F)-am.log
+```
+
+再失败一次就**不要再换 roi 猜位置**——那是在没有观测手段的情况下瞎调。该做的是抓一张
+卡住时的截图，确认红色确认条的实际位置与上游模板的匹配度，把结论补进地基事实 F。
 
 ### 允许改动的文件
 
@@ -310,18 +367,22 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser( \
 ### 验收边界
 
 ```bash
-python3 -m unittest discover -s tests -v      # 全绿
+python3 -m unittest discover -s tests -v      # 全绿（交付时 192 项）
 
-# 回灌后仓库与线上应完全一致
+# 仓库与线上应完全一致
 diff <(python3 -m json.tool config/maa-cli/resource/tasks/tasks.json) \
      <(python3 -m json.tool ~/.config/maa-cli/resource/tasks/tasks.json)
-# 期望：无输出
+# 期望：无输出（顺带证明它仍是合法 JSON——所以不许在里面写注释）
 
-python3 deploy.py                              # 期望：changed 里不含 tasks.json（内容已一致）
-python3 deploy.py --check                      # 期望：干净
+python3 deploy.py --check
+# 期望：{"ok": true, "missing": [], "mismatched": []}
 
-# 改坏 --check 的反向验证：手工改一个字节，--check 必须报不一致，改回来
+# 反向漂移验证：手工改一个字节 → --check 必须报 mismatched 且失败 → 改回 → 干净
 ```
+
+**关于 `python3 deploy.py` 的 `changed`**：不要预期它「不含 tasks.json」。`changed`
+取决于**部署前线上的实际内容**，而线上可能已被别的步骤改过（22:05 就是这么发生的）。
+判据用上面的 `--check`，不要用 `changed` 的成员。
 
 真机回归（**必须做**，因为动的是正在工作的配置）：
 
