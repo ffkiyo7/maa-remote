@@ -51,7 +51,13 @@ def op_item(item_id: int, stage_name: str, *, opers=None, groups=None,
     }
 
 
-def prts_http_stub(items: list[dict], *, full_total: int = 39409):
+def prts_http_stub(
+    items: list[dict],
+    *,
+    full_total: int = 39409,
+    level_filtered: bool = True,
+    scan_pages: list[list[dict]] | None = None,
+):
     """Offline stand-in for prts.plus ``/copilot/query``.
 
     Patch this over ``maa_copilot.http_get_json`` — the lowest network entry —
@@ -63,9 +69,20 @@ def prts_http_stub(items: list[dict], *, full_total: int = 39409):
     The envelope (``{"status_code", "message", "data": {"total", "has_next",
     "page", "data": [...]}}``) is the shape of a real response; only the item
     count is trimmed. ``total`` for the unfiltered probe is a real observed
-    value, and ``level_keyword`` deliberately reports a smaller total so
-    ``fetch_stage_copilots`` takes its "the server index really filtered"
-    branch instead of the degraded newest-pages scan.
+    value.
+
+    ``level_filtered`` picks which branch `fetch_stage_copilots` takes:
+
+    * ``True``  — ``level_keyword`` reports a smaller total, i.e. the server
+      index really filtered, so the paged ``level_keyword`` walk runs.
+    * ``False`` — ``level_keyword`` reports the *full* total, i.e. the server
+      ignored the filter. That is the degraded case, and the fetcher falls back
+      to scanning the newest pages by id.
+
+    ``scan_pages`` feeds that degraded scan one item-list per page (page 1
+    first). ``has_next`` stays true while further pages remain, so the loop's
+    own stop conditions — the 8-page cap and the 4-consecutive-empty-pages
+    bail-out — are what actually end it.
     """
     seen_params: list[dict[str, str]] = []
 
@@ -74,6 +91,22 @@ def prts_http_stub(items: list[dict], *, full_total: int = 39409):
         seen_params.append(params)
         if params.keys() == {"limit"} and params["limit"] == "1":
             body = {"total": full_total, "has_next": False, "page": 1, "data": []}
+        elif "level_keyword" in params:
+            body = {
+                "total": len(items) if level_filtered else full_total,
+                "has_next": False,
+                "page": int(params.get("page", 1)),
+                "data": items,
+            }
+        elif "order_by" in params and scan_pages is not None:
+            page = int(params.get("page", 1))
+            page_items = scan_pages[page - 1] if page <= len(scan_pages) else []
+            body = {
+                "total": full_total,
+                "has_next": page < len(scan_pages),
+                "page": page,
+                "data": page_items,
+            }
         else:
             body = {
                 "total": len(items),
@@ -541,6 +574,122 @@ class SearchTests(unittest.TestCase):
                 candidates = maa_copilot.search_copilots("act53side_09", "TO-9", config, None, use_cache=True)
             self.assertEqual(len(fetched), 1)  # fresh cache -> no refetch
             self.assertEqual(candidates[0]["id"], 8)
+
+
+class DegradedScanTests(unittest.TestCase):
+    """`fetch_stage_copilots`'s fallback when the server index stops filtering.
+
+    When `level_keyword` comes back with the *full* total the server clearly
+    ignored the filter, so the fetcher scans the newest pages by id instead.
+    That branch covers the current event — the case this whole feature exists
+    for — and was previously untested because the old networked test only ever
+    exercised the filtered path.
+    """
+
+    CONFIG = {"maa_resource_dir": "/nonexistent"}
+
+    @staticmethod
+    def _scan_params(wire) -> list[dict]:
+        return [p for p in wire.seen_params if "order_by" in p]
+
+    def _fetch(self, wire) -> list[dict]:
+        with patch.object(maa_copilot, "http_get_json", side_effect=wire):
+            return maa_copilot.fetch_stage_copilots(
+                "act53side_09", "TO-9", self.CONFIG
+            )
+
+    def test_degraded_index_falls_back_to_scanning_newest_pages(self) -> None:
+        wire = prts_http_stub(
+            [],
+            level_filtered=False,
+            scan_pages=[
+                # page 1: one for this stage, one for another stage
+                [
+                    op_item(11, "act53side_09", opers=[{"name": "x", "skill": 1}]),
+                    op_item(12, "act51side_01", opers=[{"name": "y", "skill": 1}]),
+                ],
+                # page 2: matches by display code, which _absorb also accepts
+                [op_item(13, "TO-9", opers=[{"name": "z", "skill": 1}])],
+            ],
+        )
+        items = self._fetch(wire)
+
+        # The degraded branch really ran...
+        scans = self._scan_params(wire)
+        self.assertTrue(scans, "没有走降级扫页分支")
+        self.assertEqual(scans[0]["order_by"], "id")
+        self.assertEqual(scans[0]["desc"], "true")
+        self.assertEqual(scans[0]["limit"], "100")
+        # ...and the paged level_keyword walk did not.
+        self.assertEqual(
+            [p for p in wire.seen_params if "level_keyword" in p and "page" in p], []
+        )
+
+        # Client-side stage_name filter still applies: 12 belongs to another
+        # stage and must be dropped even though the server returned it.
+        self.assertEqual(sorted(item["id"] for item in items), [11, 13])
+
+    def test_degraded_scan_dedupes_ids_seen_on_more_than_one_page(self) -> None:
+        repeated = op_item(21, "act53side_09", opers=[{"name": "x", "skill": 1}])
+        wire = prts_http_stub(
+            [],
+            level_filtered=False,
+            scan_pages=[
+                [repeated],
+                [repeated, op_item(22, "act53side_09", opers=[{"name": "y", "skill": 1}])],
+            ],
+        )
+        items = self._fetch(wire)
+        self.assertEqual(sorted(item["id"] for item in items), [21, 22])
+        self.assertEqual(len(items), 2)
+
+    def test_degraded_scan_stops_at_the_eight_page_cap(self) -> None:
+        # Every page yields a new match, so the empty-page bail-out never fires
+        # and has_next stays true — only the hard cap can stop this.
+        wire = prts_http_stub(
+            [],
+            level_filtered=False,
+            scan_pages=[
+                [op_item(100 + n, "act53side_09", opers=[{"name": "x", "skill": 1}])]
+                for n in range(12)
+            ],
+        )
+        items = self._fetch(wire)
+        self.assertEqual(len(self._scan_params(wire)), 8)
+        self.assertEqual(len(items), 8)
+
+    def test_degraded_scan_gives_up_after_four_consecutive_empty_pages(self) -> None:
+        other = "act51side_01"
+        wire = prts_http_stub(
+            [],
+            level_filtered=False,
+            scan_pages=[
+                [op_item(30, "act53side_09", opers=[{"name": "x", "skill": 1}])],
+                [op_item(31, other)],  # empty #1 (nothing for our stage)
+                [op_item(32, other)],  # empty #2
+                [op_item(33, other)],  # empty #3
+                [op_item(34, other)],  # empty #4 -> bail out here
+                # never fetched, so this match must not show up:
+                [op_item(35, "act53side_09", opers=[{"name": "y", "skill": 1}])],
+            ],
+        )
+        items = self._fetch(wire)
+        self.assertEqual(len(self._scan_params(wire)), 5)
+        self.assertEqual([item["id"] for item in items], [30])
+
+    def test_degraded_scan_stops_when_the_server_says_no_more_pages(self) -> None:
+        wire = prts_http_stub(
+            [],
+            level_filtered=False,
+            scan_pages=[
+                [op_item(40, "act53side_09", opers=[{"name": "x", "skill": 1}])],
+                [op_item(41, "act53side_09", opers=[{"name": "y", "skill": 1}])],
+            ],
+        )
+        items = self._fetch(wire)
+        # has_next is false on page 2, well before the cap.
+        self.assertEqual(len(self._scan_params(wire)), 2)
+        self.assertEqual(sorted(item["id"] for item in items), [40, 41])
 
 
 @unittest.skipUnless(
