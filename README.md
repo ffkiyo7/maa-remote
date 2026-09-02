@@ -114,6 +114,15 @@
   `LS-6` 作战记录、`SK-5` 基建材料），公告里出现「资源收集」时全部放开。
 - 下拉选项的 `value` 是**不透明的 `choice:N`**，真实 argv 只存在按钮登记表的 `select_args` 里，
   Discord 侧无法注入任意关卡名。
+- **材料缺口下拉（第三个）**：按「**可用天数 = 当前库存 / 该材料日均消耗**」升序推荐今天
+  刷哪个关，选中写的是**同一个 `plan.stage`**（`daily.toml` 只有一个刷理智 Fight 块，
+  两个字段会立刻产生「谁赢」的歧义）。它与第一个下拉的区别只在**怎么排选项**。
+  - 消耗率取 **≥4 周滚动窗口**（养成消耗是突发的：一次精二吃 20 个，平时是 0；
+    只看最近一周会把几乎所有材料算成零消耗）。
+  - **降级会明说**：`depot.json` 的 `consumption_history` 不足 2 次对表时按
+    `config.farming_manual_weights` 的手工权重排，卡片上标「降级」。
+    窗口内消耗为 0 的材料可用天数是**未知**而不是 ∞，退回手工权重排在实测材料之后。
+  - `farming_stage_table` 里查不到关卡的材料**不推荐**、卡片明说原因——**不猜关**。
 - **上游更新**：每天先 `brew` 跟随 maa-cli，再 `maa update` / `maa hot-update` 跟随 Beta MaaCore
   与资源热更新层，结果写进卡片的「上游更新」字段；失败发红色告警并让 cron 记为失败。
 - 发新卡时把旧卡片的组件 `PATCH` 成空，避免同时存在多张可点的卡。
@@ -312,6 +321,30 @@ maa_action.py copilot pick <token> <n> <mode>   # 只由候选卡片按钮触发
 | `retention_days` | `14` | `runs/` 产物保留天数（子区固定 24h） |
 | `copilot_blackout_minutes` | `25` | 自动场次前多久禁止派发抄作业 |
 | `activity_search_retry_minutes` | `30` | 新活动暂时无作业、搜索冲突或上游未就绪时的重试间隔 |
+| `clearing_enabled` | `false` | 活动通关队列总开关。**默认关着**：它依赖导航定义生成器（PLAN_CLEARING 步骤 2b）与 Q3 实测，两者都还没有 |
+| `clearing_manual_after_days` | `2` | 某关失败过几个**不同日期**后转「需要你手动打一次」（按天计，不按次数计） |
+| `clearing_annihilation_sanity` | `25` | 排队列理智预算时为每日剿灭预留的理智 |
+| `farming_stage_table` | 见下 | 材料 → 关卡的手工映射 |
+| `farming_manual_weights` | 见下 | 冷启动/零消耗时的手工权重，数值越大越优先 |
+
+### 怎么改材料关卡表
+
+两张表都在 `state/config.json`，改完 `python3 deploy.py` 生效（它们是**仓库拥有的
+配置**，不是运行时缓存，所以部署时仓库的值会覆盖线上同名键）：
+
+```jsonc
+"farming_stage_table":   { "固源岩组": "1-7", "碳素": "SK-5" },   // 材料 → 去哪刷
+"farming_manual_weights": { "固源岩组": 100,  "碳素": 60 }        // 越大越优先
+```
+
+- 材料名必须与 `depot.json` 里的 `items[].name` **逐字一致**（那是 MaaCore
+  `item_index.json` 的中文名）；对不上的名字只是不出现在推荐里，不会报错。
+- 表里没配关卡的材料**不会被推荐**，卡片上会列出来提醒你补表——**不要让代码去猜**，
+  猜错就是每天几百理智刷错东西，而且从卡片上看不出来。
+- 种子里只放了确定的关：`1-7` 与五个资源本（`AP-5`/`CA-5`/`CE-6`/`LS-6`/`SK-5`）。
+  资源本按星期开放，当天没开的会被自动排除。
+- 想要全材料覆盖 + 随版本更新的掉率，得接企鹅物流 API（PLAN_CLEARING 步骤 6 里
+  记为备选方案，代价是新增一个会 401/超时的外部依赖）。
 
 `defaults.json` 是持久默认（关卡、任务开关），`plan.json` 是**带日期戳的今日覆盖**，
 过期自动失效。`medicine` / `stone` 已从可变状态里移除，改由 runner 硬编码策略。

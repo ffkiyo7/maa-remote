@@ -2767,5 +2767,289 @@ class ClearingActionTests(unittest.TestCase):
                 )
                 self.assertEqual(bool(reason), blocked)
 
+
+class FarmingRecommendationTests(unittest.TestCase):
+    """PLAN_CLEARING 步骤 6：可用天数排序、冷启动降级、零消耗与短窗口。"""
+
+    def setUp(self) -> None:
+        self.config = {
+            "farming_stage_table": {"固源岩组": "1-7", "碳素": "SK-5", "扭转醇": "9-9"},
+            "farming_manual_weights": {"固源岩组": 100, "碳素": 60, "扭转醇": 10},
+        }
+        self.available = {"1-7", "SK-5", "CE-6"}
+        self.at = datetime(2026, 10, 1, 8, 0, tzinfo=BEIJING)
+
+    @staticmethod
+    def _interval(to: datetime, days: float, items: dict) -> dict:
+        return {
+            "from": (to - timedelta(days=days)).isoformat(),
+            "to": to.isoformat(),
+            "days": days,
+            "items": items,
+        }
+
+    def _depot(self, intervals, stock) -> dict:
+        return {
+            "consumption_history": list(intervals),
+            "items": {
+                f"id{index}": {"name": name, "quantity": quantity}
+                for index, (name, quantity) in enumerate(stock.items())
+            },
+        }
+
+    # --- 冷启动降级 ------------------------------------------------------
+    def test_cold_start_falls_back_to_manual_weights_and_says_so(self) -> None:
+        # 现在正是这个状态：depot.json 只有 1 份快照、consumption_history 为空。
+        result = maa_plan_card.farming_recommendations(
+            self.config, self._depot([], {"固源岩组": 5}), self.available, self.at
+        )
+        self.assertTrue(result["degraded"])
+        self.assertIn("consumption_history", result["reason"])
+        self.assertEqual(
+            [item["material"] for item in result["items"]], ["固源岩组", "碳素"]
+        )
+        self.assertTrue(all(item["basis"] == "manual" for item in result["items"]))
+        note = maa_plan_card.farming_note(result)
+        self.assertIn("降级模式", note)
+
+    def test_one_reconcile_is_still_cold_start(self) -> None:
+        # 「≥2 次成功对表」= consumption_history 里 ≥1 条区间；1 次对表只有
+        # 库存快照，算不出消耗。
+        self.assertFalse(maa_depot.has_measured_consumption({}))
+        self.assertFalse(maa_depot.has_measured_consumption({"consumption_history": []}))
+        self.assertTrue(
+            maa_depot.has_measured_consumption({"consumption_history": [{"days": 7}]})
+        )
+
+    # --- 可用天数排序 ----------------------------------------------------
+    def test_ranking_is_days_left_ascending(self) -> None:
+        history = [
+            self._interval(
+                self.at - timedelta(days=3), 7.0,
+                {
+                    "a": {"name": "固源岩组", "consumed": 7},   # 1/day
+                    "b": {"name": "碳素", "consumed": 70},      # 10/day
+                },
+            )
+        ]
+        depot = self._depot(history, {"固源岩组": 100, "碳素": 20})
+        result = maa_plan_card.farming_recommendations(
+            self.config, depot, self.available, self.at
+        )
+        self.assertFalse(result["degraded"])
+        # 碳素 20/10 = 2 天 < 固源岩组 100/1 = 100 天
+        self.assertEqual(
+            [item["material"] for item in result["items"]], ["碳素", "固源岩组"]
+        )
+        self.assertEqual(result["items"][0]["days_left"], 2.0)
+        self.assertEqual(result["items"][1]["days_left"], 100.0)
+        self.assertIn("最缺：碳素", maa_plan_card.farming_note(result))
+
+    def test_low_stock_needs_no_extra_rule(self) -> None:
+        # 「库存特别少」天然就是「可用天数特别小」，不需要再叠一层例外规则。
+        history = [
+            self._interval(
+                self.at - timedelta(days=1), 7.0,
+                {"a": {"name": "固源岩组", "consumed": 7},
+                 "b": {"name": "碳素", "consumed": 7}},
+            )
+        ]
+        depot = self._depot(history, {"固源岩组": 1, "碳素": 500})
+        result = maa_plan_card.farming_recommendations(
+            self.config, depot, self.available, self.at
+        )
+        self.assertEqual(result["items"][0]["material"], "固源岩组")
+
+    # --- 零消耗与短窗口 --------------------------------------------------
+    def test_zero_consumption_is_never_first_and_never_raises(self) -> None:
+        # 养成消耗是突发的：一次精二吃 20 个，平时是 0。可用天数不是 ∞ 而是
+        # 「未知」——退回手工权重，排在有实测数据的材料之后。当成 0 天会把
+        # 没消耗的材料顶到第一位，正好反了。
+        history = [
+            self._interval(
+                self.at - timedelta(days=1), 7.0,
+                {"a": {"name": "固源岩组", "consumed": 0},   # 零消耗
+                 "b": {"name": "碳素", "consumed": 7}},      # 1/day
+            )
+        ]
+        depot = self._depot(history, {"固源岩组": 3, "碳素": 300})
+        result = maa_plan_card.farming_recommendations(
+            self.config, depot, self.available, self.at
+        )
+        self.assertEqual(result["items"][0]["material"], "碳素")
+        self.assertEqual(result["items"][0]["basis"], "measured")
+        self.assertEqual(result["items"][1]["material"], "固源岩组")
+        self.assertEqual(result["items"][1]["basis"], "manual")
+        self.assertIsNone(result["items"][1]["days_left"])
+        self.assertIn("可用天数**未知**", maa_plan_card.farming_note(result))
+
+    def test_rate_window_sums_at_least_four_weeks_not_just_the_last_reconcile(self) -> None:
+        history = [
+            self._interval(self.at - timedelta(days=25), 7.0,
+                           {"a": {"name": "固源岩组", "consumed": 14}}),
+            self._interval(self.at - timedelta(days=4), 7.0,
+                           {"a": {"name": "固源岩组", "consumed": 0}}),
+        ]
+        rates = maa_depot.consumption_rates_window({"consumption_history": history}, at=self.at)
+        # 只看最近一次对表会得到 0；4 周窗口把 14 摊到 14 天 = 1/day。
+        self.assertEqual(rates["a"]["per_day"], 1.0)
+        self.assertEqual(rates["a"]["days"], 14.0)
+
+    def test_rate_window_drops_intervals_older_than_the_window(self) -> None:
+        history = [
+            self._interval(self.at - timedelta(days=200), 7.0,
+                           {"a": {"name": "固源岩组", "consumed": 700}}),
+            self._interval(self.at - timedelta(days=2), 7.0,
+                           {"a": {"name": "固源岩组", "consumed": 7}}),
+        ]
+        rates = maa_depot.consumption_rates_window({"consumption_history": history}, at=self.at)
+        self.assertEqual(rates["a"]["per_day"], 1.0)
+
+    def test_window_helpers_never_divide_by_zero(self) -> None:
+        for history in ([], [{"to": "bad", "days": 0, "items": {}}],
+                        [{"to": None}], [{"days": 0.0, "items": {"a": {}}}]):
+            with self.subTest(history=history):
+                self.assertEqual(
+                    maa_depot.consumption_rates_window(
+                        {"consumption_history": history}, at=self.at
+                    ),
+                    {},
+                )
+
+    # --- 查不到关卡 / 关卡未开放 ------------------------------------------
+    def test_material_without_a_stage_is_reported_not_guessed(self) -> None:
+        # 不许猜关——猜错就是每天几百理智刷错东西，而且用户看不出来。
+        history = [
+            self._interval(self.at - timedelta(days=1), 7.0,
+                           {"z": {"name": "聚合剂", "consumed": 7}})
+        ]
+        result = maa_plan_card.farming_recommendations(
+            self.config, self._depot(history, {"聚合剂": 2}), self.available, self.at
+        )
+        self.assertNotIn("聚合剂", [item["material"] for item in result["items"]])
+        self.assertIn("聚合剂", result["skipped_no_stage"])
+        self.assertIn("聚合剂", maa_plan_card.farming_note(result))
+
+    def test_a_stage_that_is_not_open_today_is_not_recommended(self) -> None:
+        result = maa_plan_card.farming_recommendations(
+            self.config, self._depot([], {}), self.available, self.at
+        )
+        self.assertNotIn("扭转醇", [item["material"] for item in result["items"]])
+        self.assertIn("扭转醇→9-9", result["skipped_closed"])
+
+
+class FarmingSelectTests(unittest.TestCase):
+    """第三个下拉：查表派发、前缀清扫后仍在、不碰既有两个下拉。"""
+
+    def setUp(self) -> None:
+        self.plan = maa_common.normalize_plan({"stage": "1-7"})
+        self.config = {
+            "channel_id": "1",
+            "activity_stages": [],
+            "farming_stage_table": {"固源岩组": "1-7"},
+            "farming_manual_weights": {"固源岩组": 100},
+        }
+
+    def _components(self):
+        with patch.object(maa_plan_card, "load_depot_state", return_value={}):
+            return maa_plan_card.build_components(self.plan, self.config)
+
+    def test_the_new_select_dispatches_only_through_select_args(self) -> None:
+        _rows, registry = self._components()
+        entry = registry["hermes:btn:maa:farming-select"]
+        self.assertEqual(entry["kind"], "exec")
+        self.assertEqual(entry["script"], "maa_action.py")
+        self.assertNotIn("args", entry)
+        self.assertEqual(
+            list(entry["select_args"].values()), [["plan", "set-stage", "1-7"]]
+        )
+        # 值是不透明的，绝不是关卡名本身（不变量 #8）。
+        for value in entry["select_args"]:
+            self.assertTrue(value.startswith("farming-choice:"))
+
+    def test_the_new_select_writes_the_same_plan_stage_field(self) -> None:
+        # 与既有「刷理智」选关**覆盖同一个字段**：daily.toml 只有一个刷理智
+        # Fight 块，两个字段会立刻产生「谁赢」的歧义。
+        _rows, registry = self._components()
+        stage_args = list(
+            registry["hermes:btn:maa:stage-select"]["select_args"].values()
+        )
+        farming_args = list(
+            registry["hermes:btn:maa:farming-select"]["select_args"].values()
+        )
+        self.assertIn(["plan", "set-stage", "1-7"], stage_args)
+        self.assertEqual(farming_args[0][:2], ["plan", "set-stage"])
+
+    def test_the_new_select_survives_the_0750_prefix_sweep(self) -> None:
+        # 07:50 先删所有 hermes:btn:maa: 前缀再 merge 写回；新下拉在 merge 的
+        # 那一批里，所以清扫之后仍在（不变量 #7、#14）。
+        _rows, registry = self._components()
+        custom_id = "hermes:btn:maa:farming-select"
+        self.assertTrue(custom_id.startswith(maa_plan_card.BUTTON_PREFIX))
+        live = {custom_id: {"stale": True}, "hermes:btn:agent-book:x": {"keep": True}}
+        for key in [k for k in live if k.startswith(maa_plan_card.BUTTON_PREFIX)]:
+            live.pop(key)
+        live.update(registry)
+        self.assertIn(custom_id, live)
+        self.assertIn("hermes:btn:agent-book:x", live)
+
+    def test_the_existing_two_selects_are_untouched(self) -> None:
+        rows, registry = self._components()
+        self.assertIn("hermes:btn:maa:stage-select", registry)
+        self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+        custom_ids = [
+            component["custom_id"]
+            for row in rows
+            for component in row["components"]
+            if component.get("type") == 3
+        ]
+        self.assertEqual(len(custom_ids), len(set(custom_ids)))
+        self.assertIn("hermes:btn:maa:farming-select", custom_ids)
+        self.assertLessEqual(len(rows), 5)
+
+    def test_no_recommendation_means_no_row_and_no_registry_entry(self) -> None:
+        self.config["farming_stage_table"] = {}
+        rows, registry = self._components()
+        self.assertNotIn("hermes:btn:maa:farming-select", registry)
+        self.assertNotIn(
+            "hermes:btn:maa:farming-select",
+            [
+                component["custom_id"]
+                for row in rows
+                for component in row["components"]
+            ],
+        )
+
+    def test_the_card_says_when_the_recommendation_is_a_guess(self) -> None:
+        result = maa_plan_card.farming_recommendations(
+            self.config, {}, {"1-7"}, None
+        )
+        embed = maa_plan_card.build_embed(self.plan, self.config, None, result)
+        names = [field["name"] for field in embed["fields"]]
+        self.assertIn("📦 材料缺口推荐（降级）", names)
+        value = next(
+            field["value"] for field in embed["fields"] if field["name"].startswith("📦")
+        )
+        self.assertIn("降级模式", value)
+
+    def test_the_seeded_table_only_names_stages_the_card_can_offer(self) -> None:
+        # 种子里不许出现猜的关：每一个都必须是 1-7 或 SUPPLY_STAGES 里的资源本。
+        seed = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
+        known = {"1-7"} | {stage for _l, stage, _d, _w in maa_plan_card.SUPPLY_STAGES}
+        for material, stage in seed["farming_stage_table"].items():
+            self.assertIn(stage, known, f"{material} 配了一个来路不明的关卡 {stage}")
+        # 权重表覆盖关卡表里的每一个材料，否则降级模式下它排序全靠 0。
+        self.assertEqual(
+            set(seed["farming_stage_table"]) - set(seed["farming_manual_weights"]),
+            set(),
+        )
+
+    def test_farming_config_keys_are_repo_owned_not_runtime_caches(self) -> None:
+        # 它们是配置，仓库说了算；混进 PRESERVED_RUNTIME_CACHE_KEYS 会让用户
+        # 改了仓库种子却永远不生效（不变量 #25 的反面）。
+        for key in ("farming_stage_table", "farming_manual_weights",
+                    "clearing_manual_after_days", "clearing_enabled"):
+            self.assertNotIn(key, deploy.PRESERVED_RUNTIME_CACHE_KEYS)
+
 if __name__ == "__main__":
     unittest.main()

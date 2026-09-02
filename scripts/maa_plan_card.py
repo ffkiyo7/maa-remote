@@ -618,6 +618,228 @@ def _copilot_stage_select(
     }
 
 
+# ---------------------------------------------------------------------------
+# 材料驱动选关（PLAN_CLEARING 步骤 6）
+# ---------------------------------------------------------------------------
+
+def _manual_weight(config: dict[str, Any], material: str) -> float:
+    weights = config.get("farming_manual_weights")
+    if not isinstance(weights, dict):
+        return 0.0
+    try:
+        return float(weights.get(material, 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def farming_recommendations(
+    config: dict[str, Any],
+    depot_state: dict[str, Any],
+    available_stages: set[str],
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """按「可用天数 = 当前库存 / 该材料日均消耗」升序推荐关卡。
+
+    **排序指标只用这一个。**「库存特别少」天然就是「可用天数特别小」，会自动排到
+    最前，不需要额外的例外规则，也不许再叠一层「库存低于 N 就优先」。
+
+    三条降级路径，都不抛异常（异常会带走整张计划卡，D-2 的教训）：
+
+    1. **冷启动**：`consumption_history` 不足 2 次对表 → 全部按手工权重排，
+       卡片上明说是降级；
+    2. **零消耗**：≥4 周滚动窗口内该材料消耗为 0 → 它的可用天数不是 ∞ 而是
+       **未知**，退回该材料的手工权重排序，排在有实测数据的材料**之后**
+       （当成 0 天会把没消耗的材料顶到第一位，正好反了）；
+    3. **查不到关卡**：`farming_stage_table` 里没有这个材料 → 不推荐、卡片明说。
+       **不许猜关**——猜错就是每天几百理智刷错东西，而且用户看不出来。
+    """
+    import maa_depot
+
+    table = config.get("farming_stage_table")
+    table = table if isinstance(table, dict) else {}
+    measured = maa_depot.has_measured_consumption(depot_state)
+    rates = (
+        maa_depot.consumption_rates_window(depot_state, at=at) if measured else {}
+    )
+    stock = maa_depot.stock_by_name(depot_state)
+    per_day = {
+        str(detail.get("name") or item_id): float(detail.get("per_day") or 0.0)
+        for item_id, detail in rates.items()
+        if isinstance(detail, dict)
+    }
+
+    universe = set(table) | {name for name, rate in per_day.items() if rate > 0}
+    ranked: list[dict[str, Any]] = []
+    no_stage: list[str] = []
+    closed: list[str] = []
+    for material in sorted(universe):
+        stage = str(table.get(material) or "").strip()
+        if not stage:
+            no_stage.append(material)
+            continue
+        if stage not in available_stages:
+            closed.append(f"{material}→{stage}")
+            continue
+        rate = per_day.get(material, 0.0)
+        days_left = (
+            round(stock.get(material, 0) / rate, 2) if measured and rate > 0 else None
+        )
+        ranked.append(
+            {
+                "material": material,
+                "stage": stage,
+                "stock": stock.get(material, 0),
+                "per_day": rate,
+                "days_left": days_left,
+                "weight": _manual_weight(config, material),
+                # measured = 实测推荐；manual = 猜的（冷启动或零消耗）
+                "basis": "measured" if days_left is not None else "manual",
+            }
+        )
+    # 有实测可用天数的排前面（升序）；其余按手工权重降序垫后。
+    ranked.sort(
+        key=lambda item: (
+            0 if item["days_left"] is not None else 1,
+            item["days_left"] if item["days_left"] is not None else 0.0,
+            -item["weight"],
+            item["material"],
+        )
+    )
+    return {
+        "degraded": not measured,
+        "reason": (
+            "尚无跨区间消耗数据（`depot.json` 的 `consumption_history` 不足 2 次对表），"
+            "当前按 `config.farming_manual_weights` 的手工权重推荐"
+            if not measured
+            else ""
+        ),
+        "items": ranked,
+        "skipped_no_stage": no_stage,
+        "skipped_closed": closed,
+    }
+
+
+def farming_note(result: dict[str, Any]) -> str:
+    """计划卡上的一句话说明：用户要能分辨「实测推荐」还是「这是猜的」。"""
+    lines: list[str] = []
+    if result.get("degraded"):
+        lines.append(f"⚠️ **降级模式**：{result['reason']}。")
+    items = result.get("items") or []
+    if not items:
+        lines.append("暂无可推荐的材料关卡。")
+    else:
+        measured = [item for item in items if item["basis"] == "measured"]
+        if measured:
+            head = measured[0]
+            lines.append(
+                f"最缺：{head['material']}（库存 {head['stock']}，"
+                f"日均 {head['per_day']:.2f}，约可用 {head['days_left']} 天）"
+            )
+        manual = [item for item in items if item["basis"] == "manual"]
+        if manual and not result.get("degraded"):
+            lines.append(
+                "（"
+                + "、".join(item["material"] for item in manual[:4])
+                + " 在近 4 周窗口里没有消耗，可用天数**未知**，按手工权重垫后）"
+            )
+    if result.get("skipped_no_stage"):
+        lines.append(
+            "未纳入推荐（`farming_stage_table` 里没有配关卡）："
+            + "、".join(result["skipped_no_stage"][:6])
+        )
+    if result.get("skipped_closed"):
+        lines.append(
+            "今日关卡未开放，暂不推荐：" + "、".join(result["skipped_closed"][:6])
+        )
+    return "\n".join(lines)[:1024]
+
+
+def _farming_stage_select(
+    plan: dict[str, Any],
+    config: dict[str, Any],
+    registry: dict[str, dict[str, Any]],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """第三个下拉：按材料缺口推荐今天刷哪个关。
+
+    范式照抄 `_stage_select()`：值是不透明的 `farming-choice:N`，真正的 argv
+    存在登记项的 `select_args` 里（不变量 #8）。写的是**同一个 `plan.stage`
+    字段**，不是新字段——`daily.toml` 只有一个「刷理智」Fight 块，两个字段会
+    立刻产生「谁赢」的歧义，而且卡片上的「刷什么」也只反映得了一个。
+    这个下拉与第一个下拉的区别只在**怎么排选项**（按材料缺口，不是按分类），
+    选中的语义完全一样。
+    """
+    custom_id = f"{BUTTON_PREFIX}farming-select"
+    selected = str(plan.get("stage", ""))
+    select_args: dict[str, list[str]] = {}
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(result.get("items") or []):
+        stage = item["stage"]
+        if stage in seen:
+            continue
+        seen.add(stage)
+        value = f"farming-choice:{index}"
+        if item["days_left"] is not None:
+            description = (
+                f"{item['material']}：库存 {item['stock']}，约 {item['days_left']} 天"
+            )
+        else:
+            description = f"{item['material']}：无实测消耗，按手工权重"
+        options.append(
+            {
+                "label": f"{stage} · {item['material']}"[:100],
+                "value": value,
+                "description": description[:100],
+                "default": selected == stage,
+                "emoji": {"name": "📦"},
+            }
+        )
+        select_args[value] = ["plan", "set-stage", stage]
+        if len(options) >= 25:
+            break
+    registry[custom_id] = {
+        "kind": "exec",
+        "script": "maa_action.py",
+        "select_args": select_args,
+    }
+    placeholder = (
+        "📦 按材料缺口选关（降级：手工权重）"
+        if result.get("degraded")
+        else "📦 按材料缺口选关（可用天数升序）"
+    )
+    return {
+        "type": 3,
+        "custom_id": custom_id,
+        "placeholder": placeholder[:150],
+        "min_values": 1,
+        "max_values": 1,
+        "options": options,
+    }
+
+
+def load_depot_state() -> dict[str, Any]:
+    """读库存快照；读不出来就当空的——计划卡不因旁路数据失败而消失（D-2）。"""
+    try:
+        import maa_depot
+
+        state = load_json(maa_depot.DEPOT_PATH, {})
+    except Exception:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def current_farming_result(
+    plan: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    """今天的材料推荐。只推**今天真的选得到**的关（与第一个下拉同一个可选集）。"""
+    return farming_recommendations(
+        config,
+        load_depot_state(),
+        {stage for _label, stage, _desc in _stage_choices(plan, config) if stage},
+    )
+
+
 def build_components(
     plan: dict[str, Any],
     config: dict[str, Any],
@@ -625,6 +847,9 @@ def build_components(
     registry: dict[str, dict[str, Any]] = {}
     stage_select = _stage_select(plan, config, registry)
     copilot_select = _copilot_stage_select(plan, config, registry)
+    farming_select = _farming_stage_select(
+        plan, config, registry, current_farming_result(plan, config)
+    )
 
     skip_spec = (
         ("▶️ 恢复自动场次", "unskip", 3, ["plan", "skip-today", "off"])
@@ -663,6 +888,11 @@ def build_components(
         # Discord rejects selects with zero options; skip the row entirely
         # when there is nothing to offer (e.g. no known stages at all).
         rows.insert(1, {"type": 1, "components": [copilot_select]})
+    if farming_select.get("options"):
+        rows.insert(len(rows) - 1, {"type": 1, "components": [farming_select]})
+    else:
+        # 没有可推荐的关就不发这个下拉，但登记项也别留着（点了会指向空表）。
+        registry.pop(farming_select["custom_id"], None)
     return (rows, registry)
 
 
@@ -670,6 +900,7 @@ def build_embed(
     plan: dict[str, Any],
     config: dict[str, Any],
     update: dict[str, Any] | None = None,
+    farming: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     activity_stages = config.get("activity_stages", [])
     activity_note = "、".join(str(item) for item in activity_stages) or "未配置"
@@ -695,6 +926,17 @@ def build_embed(
             "inline": False,
         },
     ]
+    if farming is not None:
+        note = farming_note(farming)
+        if note:
+            fields.append(
+                {
+                    "name": "📦 材料缺口推荐"
+                    + ("（降级）" if farming.get("degraded") else ""),
+                    "value": note,
+                    "inline": False,
+                }
+            )
     if update:
         fields.append(
             {
@@ -804,7 +1046,7 @@ def main() -> int:
     cleanup_result = cleanup_old_threads(token)
     cleanup_run_files(int(config.get("retention_days", 14)))
     retired = retire_old_plan_cards(token, channel_id)
-    embed = build_embed(plan, config, update)
+    embed = build_embed(plan, config, update, current_farming_result(plan, config))
     if cleanup_result["failed"]:
         embed["footer"]["text"] += f" · {cleanup_result['failed']} 个旧子区删除失败"
     if retired["failed"]:

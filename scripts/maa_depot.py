@@ -229,6 +229,95 @@ def reconcile(
     return updated
 
 
+# ---------------------------------------------------------------------------
+# 消耗率取数口径（PLAN_CLEARING 步骤 6 用）
+# ---------------------------------------------------------------------------
+
+# ≥4 周滚动窗口。养成消耗是**突发的**：一次精二吃掉 20 个，平时是 0。
+# 用一周窗口看，几乎所有材料在多数周里都是 0，「可用天数」会全变成 ∞。
+CONSUMPTION_WINDOW = timedelta(weeks=4)
+
+
+def has_measured_consumption(state: dict[str, Any]) -> bool:
+    """是否已经有实测消耗数据，可以离开手工权重的冷启动降级。
+
+    判据写死为「`consumption_history` 里有 ≥2 次成功对表」——**每两次对表之间
+    产生一条区间记录**，所以等价于 `len(consumption_history) >= 1`。
+    1 次对表只有库存快照、算不出消耗。不留「看情况」。
+    """
+    history = state.get("consumption_history")
+    return isinstance(history, list) and len([
+        entry for entry in history if isinstance(entry, dict)
+    ]) >= 1
+
+
+def consumption_rates_window(
+    state: dict[str, Any],
+    *,
+    at: datetime | None = None,
+    window: timedelta = CONSUMPTION_WINDOW,
+) -> dict[str, dict[str, Any]]:
+    """滚动窗口内的日均消耗：取 `to` 落在窗口内的区间，`sum(consumed)/sum(days)`。
+
+    不是「只看最近一次对表」——那正是把突发消耗看成 0 的原因。
+    返回 `{item_id: {"name", "consumed", "days", "per_day"}}`；
+    `per_day == 0` 表示**窗口内确实没消耗**（不是「不知道」，调用方按零消耗降级）。
+    """
+    moment = at or now_beijing()
+    cutoff = moment - window
+    history = state.get("consumption_history")
+    totals: dict[str, dict[str, Any]] = {}
+    if not isinstance(history, list):
+        return totals
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        ended = _parse_time(entry.get("to"))
+        if ended is None or ended.tzinfo is None or ended < cutoff:
+            continue
+        try:
+            days = float(entry.get("days", 0))
+        except (TypeError, ValueError):
+            continue
+        items = entry.get("items")
+        if not isinstance(items, dict) or days <= 0:
+            continue
+        for item_id, detail in items.items():
+            if not isinstance(detail, dict):
+                continue
+            target = totals.setdefault(
+                str(item_id),
+                {"name": str(detail.get("name") or item_id), "consumed": 0, "days": 0.0},
+            )
+            try:
+                target["consumed"] += int(detail.get("consumed", 0))
+            except (TypeError, ValueError):
+                continue
+            target["days"] += days
+    for detail in totals.values():
+        detail["per_day"] = (
+            round(detail["consumed"] / detail["days"], 6) if detail["days"] > 0 else 0.0
+        )
+    return totals
+
+
+def stock_by_name(state: dict[str, Any]) -> dict[str, int]:
+    """材料名 → 当前库存估算（真值快照 + 期间掉落增量，`items` 已经合并好）。"""
+    result: dict[str, int] = {}
+    items = state.get("items")
+    if not isinstance(items, dict):
+        return result
+    for detail in items.values():
+        if not isinstance(detail, dict):
+            continue
+        name = str(detail.get("name") or "").strip()
+        quantity = detail.get("quantity")
+        if not name or not isinstance(quantity, int) or isinstance(quantity, bool):
+            continue
+        result[name] = result.get(name, 0) + max(0, quantity)
+    return result
+
+
 def record_drops(
     pairs: Iterable[tuple[str, int]],
     config: dict[str, Any],

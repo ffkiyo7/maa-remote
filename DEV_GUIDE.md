@@ -132,6 +132,31 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 多值一律拒。改下拉相关代码时必须保持这个性质（对应测试
 `test_adapter_patch_dispatches_only_registered_select_values`）。
 
+### 第三个下拉：材料缺口推荐（三期步骤 6）
+
+`_farming_stage_select()` 与前两个同一个范式（不透明值 + `select_args` 查表），
+`custom_id` 是 `hermes:btn:maa:farming-select`——**故意用 `hermes:btn:maa:` 前缀**：
+它每天 07:50 随卡片重建，清扫之后立刻被同一批 merge 写回，所以「清扫后仍在」。
+（跨天存活的按钮才需要另一个前缀，见 §5.6 的队列。）
+
+**它写的是同一个 `plan.stage` 字段**，不是新字段。理由：`daily.toml` 只有一个
+「刷理智」Fight 块，两个字段会立刻产生「谁赢」的歧义，而卡片上的「刷什么」也只
+反映得了一个。这个下拉和第一个下拉的区别**只在怎么排选项**（按材料缺口，不是按
+分类），选中的语义完全一样，所以复用 `plan set-stage` 的白名单。
+
+排序指标只有一个：`可用天数 = 当前库存 / 该材料日均消耗`，升序。三条降级路径：
+
+| 情况 | 处理 |
+|---|---|
+| `consumption_history` 不足 2 次对表（冷启动） | 全部按 `farming_manual_weights` 排，**卡片上标「降级」** |
+| ≥4 周滚动窗口内消耗为 0 | 可用天数是**未知**不是 ∞ → 退回手工权重，排在实测材料**之后**（当成 0 天会把它顶到第一位，正好反了） |
+| `farming_stage_table` 里没有这个材料 | 不推荐，卡片列出来。**不猜关** |
+
+「≥2 次成功对表」在代码里就是 `len(consumption_history) >= 1`：每两次对表之间产生
+一条区间记录，1 次对表只有库存快照、算不出消耗（`maa_depot.has_measured_consumption()`）。
+取数口径在 `maa_depot.consumption_rates_window()`：取 `to` 落在窗口内的区间，
+`sum(consumed) / sum(days)`——不是只看最近一次对表，那正是把突发消耗看成 0 的原因。
+
 `🤖 请 Hermes 解释` 是唯一 `kind:"prompt"` 的按钮——它起一个只读的 agent 会话，不是 exec。
 
 ---
@@ -667,6 +692,8 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 28 | 队列排关前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的关**不入当轮、不进预算、cursor 不前进**（那不是「打完了」，是「算不出来」，前进会把它永久跳过），提示只发一次 | `maa_clearing.sanity_budget()` / `plan_round()` + `ClearingQueueTests` |
 | 29 | EX 开放闸门是**独立于 `zone_progress_warning()`** 的第二条单向规则，两个模块互不 import；森空岛不可用一律 **fail-closed 不入队 EX**，且必须**可见**：写 `clearing.json` 的 `ex_gate_blocked_reason/_since`，并发一次去重后的 Discord 卡片（同原因不刷屏、原因变了重新发）。⚠️ `totalStage == 0` 这条推论**未实地验证**，下个活动上线当天要核对 | `maa_clearing.ex_gate()` / `apply_ex_gate()` + `test_ex_gate_*`（含 AST 结构断言） |
 | 30 | `needs_manual` 的 N 按**不同日期**计（`Asia/Shanghai` 日界），不按尝试次数计；触发后 cursor **不前进**，只有用户点「已完成」才前进。队列按钮用**第三个前缀** `hermes:btn:maa-clearing:`，不进 `hermes:btn:maa:` 的 07:50 清扫（卡片要跨天存活），也不进 `hermes:btn:maa-copilot:` 的 token TTL 清扫（队列没有 token）——不变量 #7/#14 的边界因此一字未改 | `maa_clearing.record_stage_failure()` / `BUTTON_PREFIX` + `test_manual_threshold_counts_distinct_dates_not_attempts` / `test_manual_card_button_uses_its_own_prefix` |
+| 31 | 材料缺口下拉写的是**同一个 `plan.stage`**（不新增字段：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），值仍经 `select_args` 查表（#8），用 `hermes:btn:maa:` 前缀所以 07:50 清扫后随卡片重建仍在（#7/#14）。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则 | `_farming_stage_select()` + `FarmingSelectTests` |
+| 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；`farming_stage_table` 查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
 
 ---
 
