@@ -13,7 +13,8 @@
 
 - [x] ~~步骤 0 — 修掉 watcher 的两条错（`a983ccb`）~~
 - [x] ~~步骤 1 — 挡住部署漂移（`49da169`；「回灌极简版」被实测否掉，留一条观测项）~~
-- [ ] 步骤 2 — 导航定义生成器（2a spike 的 Q2/Q3 需要有当期活动，空窗期做不干净）
+- [ ] 步骤 2 — 导航定义生成器（2a spike：**Q1/Q2 已实测 ✓**，用已结束的 TO 活动；
+      Q3「真能停在编队界面」需模拟器 + 当期活动，仍待验。2b 生成器等 Q3，未开工）
 - [ ] 步骤 3 — `stage_queue` + 日常让路 + `needs_manual`
 - [ ] 步骤 4 — EX 理智 OCR
 - [x] ~~步骤 5 — Depot 对表 + 掉落增量 + 消耗率（`3aa90a8`；交付后发现的 D-1/D-2 已修，`b8b43b4`）~~
@@ -107,6 +108,13 @@ CF.json = CF-8
 后果：**「补 Stages 定义能否扩大 Fight 的接受集」重新变成开放问题，且倾向于「能」。**
 这正是第 2 步 spike 存在的理由。**但它仍然只是假设**——三个样本证明的是「键集与接受集
 一致」，没有证明「加键能改变接受集」。这两件事之间隔着一个 spike，不要跳过。
+
+> **已由 2a spike 实测证实（2026-09-02，见步骤 2 的「2a 实测结论」）**：
+> 往覆盖层 `resource/tasks/Stages/TO.json` 加一条 `TO-6` 就能让原本被拒的 `TO-6` 被接受，
+> 删掉即恢复被拒。所以判据**就是** `Stages/*.json` 的顶层键集，且覆盖层这条路径会被合并。
+> `PLAN_NAV_GATE.md` 结论 2 的「判据是 `maa activity` 输出」也随之被订正——
+> 活动已结束、`maa activity` 列不出 TO 任何一关时，`TO-5` 照样被接受。
+> **仍未证明的是「接受 ⇒ 真能导航过去」（Q3）。**
 
 ### E. `PLAN_NAV_GATE.md` 的未完成项（交叉引用，不并入本计划）
 
@@ -446,6 +454,92 @@ python3 ~/.hermes/scripts/maa_action.py run now
 
 **🚧 硬闸门**：Q1 或 Q2 为 ✗ → **停下来回报，不要写 2b**。
 clearing 需要整体重新设计，那是另一次立项的事。
+
+### 2a 实测结论（2026-09-02，用已结束的 TO 活动）
+
+**为什么空窗期也能做**：Q1/Q2 问的是「MaaCore 接受 Fight stage 的判据是不是
+`Stages/*.json` 的键」，与活动开不开无关，也不需要模拟器——**接受判定发生在连接设备之前**。
+用已结束的 TO 活动当靶子，正好把「活动开放状态」这个变量固定成"关闭"。
+
+**方法**：临时 `~/.config/maa-cli/tasks/spike-nav.toml`，**只有一个 Fight 块、没有 StartUp**
+（所以全程不会启动模拟器），`times = 1`、`stone = 0`、`medicine = 0`。
+每组跑 `MAA_CONFIG_DIR=~/.config/maa-cli perl -e 'alarm 60; exec @ARGV' maa run spike-nav`
+（本机 `timeout` 不存在，用 `perl alarm` 代替）。
+判据：`Failed to add task` = **拒绝**；走到 `Failed to connect to android device` = **接受**。
+
+#### 对照 1：`TO-5`（上游 `Stages/TO.json` 有键，活动已结束）→ **接受**
+
+```
+[2026-09-02 22:46:59 ERROR] Failed to connect to android device, ...
+[2026-09-02 22:47:02 ERROR] Fight Error
+[导航到关卡] 22:46:59 - 22:47:02 (3s) Error
+```
+
+无 `Failed to add task`，直接推进到连接设备。
+⇒ **接受判据不看活动开放状态。** 这条同时订正了 `PLAN_NAV_GATE.md` 结论 2 的
+「判据是 `maa activity` 输出」——`maa activity` 现在列不出 TO 任何一关，TO-5 照样被接受。
+
+#### 对照 2：`TO-6`（`Stages/TO.json` 与覆盖层都没有这个键）→ **拒绝**
+
+```
+Error: Failed to add task 导航到关卡 with params: {
+  "client_type": "Official", "medicine": 0, "series": 0,
+  "server": "CN", "stage": "TO-6", "stone": 0, "times": 1 }
+Caused by: MaaCore returned an error, ...
+```
+
+符合预期。判据仍是某个键集，不是"任意字符串都收"。
+
+#### Q1 + Q2：把 `TO-6` 写进覆盖层 `~/.config/maa-cli/resource/tasks/Stages/TO.json` → **接受**
+
+写入的内容（照抄 `TO-5` 的三字段形状，只换关卡名；文件里**只有这一条**）：
+
+```json
+{"TO-6": {"algorithm": "JustReturn",
+          "sub": ["TO-6@TO-OpenOpt"],
+          "next": ["TO-6@SideStoryStage", "TO-6@SwipeToStage"]}}
+```
+
+同一条命令的输出：
+
+```
+[2026-09-02 22:47:17 ERROR] Failed to connect to android device, ...
+[2026-09-02 22:47:20 ERROR] Fight Error
+[导航到关卡] 22:47:17 - 22:47:20 (3s) Error
+```
+
+- **Q1 ✓** —— `~/.config/maa-cli/resource/tasks/Stages/<前缀>.json` 这条用户资源路径
+  **会被 MaaCore 合并**（此前只验证过 `tasks/tasks.json` 一条路径）。
+- **Q2 ✓** —— Fight 的接受判据**就是 `Stages/*.json` 的顶层键集**，
+  覆盖层补键能**扩大**接受集。
+
+因为第 3 组通过，**第 4 组（拆分 Q1 与 Q2，往 `tasks.json` 里加同一条定义）没有做**——
+它只在第 3 组被拒时才有意义。
+
+#### 反向验证（证明因果，不是巧合）
+
+删掉刚写的覆盖层文件，`TO-6` **立刻恢复被拒**：
+
+```
+Error: Failed to add task 导航到关卡 with params: { ... "stage": "TO-6" ... }
+```
+
+⇒ 接受确实由那个覆盖层文件造成。
+
+#### 仍然未验
+
+- **Q3（需要模拟器 + 当期活动）**：`Fight(stage=<该关>, times=0)` 能否**真的停在该关的
+  编队界面**。本次全部实测都停在"连接设备失败"这一步，**没有任何一次真的导航过**。
+  ⇒ **Q3 等下一个活动上线实测。**
+- 本次证明的是「**能被接受**」，不是「**能被导航到**」。这两件事之间还隔着一个 Q3，
+  **2b 生成器在 Q3 之前不许写**（硬闸门原文如此，本次实测不放宽它）。
+
+#### 清理
+
+`spike-nav.toml` 与 `resource/tasks/Stages/TO.json` 均已删除，
+`resource/tasks/Stages/` 空目录已 `rmdir`；全程**未改动** `resource/tasks/tasks.json`。
+`python3 deploy.py --check` → `{"ok": true, "missing": [], "mismatched": []}`；
+仓库与线上 `tasks.json` 逐字节一致。
 
 #### 2b 生成器（仅在 2a 三问全过时才做）
 
