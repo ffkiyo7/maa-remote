@@ -216,6 +216,16 @@ worker 写执行终态，watcher 统一记 completed。
 4. `plan.skip` 为真**且 `phase != "now"`** → 发一条灰色「已跳过」Embed，`status=skipped`，
    结束。**不开模拟器。** skip 只关掉 08:00/22:00 两个自动场次；手动场是用户当场下的
    明确指令，本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会提示这一点）。
+4.5. **探模拟器（只对 `am`/`pm`）** — `emulator_is_online()`：`pgrep -f BlueStacks`
+   **或** `adb connect` + `getprop sys.boot_completed == 1`，任一命中即算「用户正在玩」，
+   `report_emulator_busy()` 发灰色「已跳过」Embed、写 `status=skipped` /
+   `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
+   起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把 BlueStacks
+   关掉，等于把正在玩的用户踢出游戏。`now` 不走这条闸门（用户明确要求照跑）。
+   探测预算 5s、失败按离线处理照常执行——**宁可误抢一次设备，也不能因为探测自己坏了
+   就永久停摆**（不变量 #24）。
+   > 别和第 8 步的 `settle_android_runtime()` 搞混：那个在**开机之后**跑，等 `app_process`
+   > 别抖；这个在**开机之前**跑，问的是"设备现在是不是别人的"。
 5. **预检 → 起模拟器** — `require_executable` 校验 maa/adb 可执行（**在开模拟器之前**）→
    `open -a BlueStacks` → 轮询 `adb connect` + `getprop sys.boot_completed`（超时 180s）→
    `pm path com.hypergryph.arknights` 确认国服客户端已装。任一步失败且此时还没建子区，
@@ -589,6 +599,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 | 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |
 | 23 | Depot 不得在计划卡链路内运行；独立 cron 每日只做 7 天到期检查。任何日常抢锁失败都必须写 `last_lock_conflict_*`、发 Discord 并返回失败；`merge_last_run()` 必须持专用锁，不能用陈旧整份文件覆盖持锁任务的新状态 | `maa_depot.main()` / `maa_daily.report_lock_conflict()` / `maa_common.last_run_lock()` + 调度与锁冲突回归测试 |
+| 24 | 自动场次（`am`/`pm`）在 `open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本场，且**必须发 Discord 并写 `last_run.json`**（`status=skipped` + `skip_reason=emulator_busy`），文案要给出「说『现在跑』」这条出路。`now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同） | `maa_daily.AUTO_PHASES` / `emulator_is_online()` / `report_emulator_busy()` + `EmulatorProbeTests` |
 
 ---
 

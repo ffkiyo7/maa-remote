@@ -2081,5 +2081,147 @@ class LockConflictTests(unittest.TestCase):
         )
 
 
+class EmulatorProbeTests(unittest.TestCase):
+    """PLAN_NAV_GATE B: automatic phases must not steal a device in use."""
+
+    @staticmethod
+    def _completed(returncode: int, stdout: str = "") -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    def test_probe_reports_online_from_the_process_signal_alone(self) -> None:
+        # A freshly launched BlueStacks has no Android yet, so the process
+        # signal must be able to answer "online" without asking ADB at all.
+        with patch.object(
+            maa_daily.subprocess, "run", return_value=self._completed(0, "4242\n")
+        ) as run:
+            online, detail = maa_daily.emulator_is_online({})
+        self.assertTrue(online)
+        self.assertIn("进程在跑", detail)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:2], ["pgrep", "-f"])
+
+    def test_probe_reports_online_when_adb_says_boot_completed(self) -> None:
+        # A hung process can outlive its device and vice versa, so ADB is the
+        # second half of the OR.
+        results = [self._completed(1), self._completed(0), self._completed(0, "1\n")]
+        with patch.object(maa_daily.subprocess, "run", side_effect=results):
+            online, detail = maa_daily.emulator_is_online({})
+        self.assertTrue(online)
+        self.assertIn("sys.boot_completed", detail)
+
+    def test_probe_reports_offline_when_both_signals_miss(self) -> None:
+        results = [self._completed(1), self._completed(0), self._completed(0, "\n")]
+        with patch.object(maa_daily.subprocess, "run", side_effect=results):
+            online, detail = maa_daily.emulator_is_online({})
+        self.assertFalse(online)
+        self.assertIn("未连上", detail)
+
+    def test_a_broken_probe_falls_back_to_offline_and_never_raises(self) -> None:
+        # Grabbing the device once by mistake is far cheaper than a daily that
+        # stops forever because the probe itself broke (B-4).
+        for failure in (
+            maa_daily.subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
+            OSError("adb missing"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(maa_daily.subprocess, "run", side_effect=failure):
+                    online, detail = maa_daily.emulator_is_online({})
+                self.assertFalse(online)
+                self.assertTrue(detail)
+
+    def test_probe_never_calls_the_180_second_boot_wait(self) -> None:
+        # `wait_for_android` waits up to 180s for a device we just started;
+        # reusing it here would blow the run budget and 不变量 #6.
+        with patch.object(
+            maa_daily.subprocess, "run", return_value=self._completed(0, "4242\n")
+        ), patch.object(maa_daily, "wait_for_android") as wait, patch.object(
+            maa_daily, "settle_android_runtime"
+        ) as settle:
+            maa_daily.emulator_is_online({})
+        wait.assert_not_called()
+        settle.assert_not_called()
+
+    def test_probe_refuses_an_unvalidated_app_name_without_blocking_the_run(self) -> None:
+        with patch.object(maa_daily.subprocess, "run") as run:
+            online, detail = maa_daily.emulator_is_online({"emulator_app": "evil; rm -rf /"})
+        self.assertFalse(online)
+        self.assertIn("非法字符", detail)
+        run.assert_not_called()
+
+    def _execute(self, phase: str, *, online: bool, probe=None):
+        """Drive execute() far enough to observe the probe branch."""
+        at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
+        lock = unittest.mock.MagicMock()
+        lock.__enter__.return_value = True
+        lock.__exit__.return_value = False
+        probe = probe or unittest.mock.MagicMock(return_value=(online, "探测明细"))
+        with patch.object(maa_daily, "now_beijing", return_value=at), patch.object(
+            maa_daily, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(maa_daily, "discord_token", return_value="token"), patch.object(
+            maa_daily, "load_json", return_value={}
+        ), patch.object(
+            maa_daily, "effective_plan", return_value=maa_common.normalize_plan({})
+        ), patch.object(maa_daily, "run_lock", return_value=lock), patch.object(
+            maa_daily, "cleanup_run_files"
+        ), patch.object(maa_daily, "atomic_write_json"), patch.object(
+            maa_daily, "should_skip", return_value=False
+        ), patch.object(
+            maa_daily, "emulator_is_online", probe
+        ), patch.object(maa_daily, "merge_last_run") as merge, patch.object(
+            maa_daily, "discord_request"
+        ) as request, patch.object(maa_daily, "require_executable"), patch.object(
+            maa_daily, "open_emulator", side_effect=RuntimeError("STOP: probe passed")
+        ) as opened, patch.object(maa_daily, "send_direct_failure"):
+            code = maa_daily.execute(phase)
+        return SimpleNamespace(
+            code=code, merge=merge, request=request, opened=opened, probe=probe
+        )
+
+    def test_automatic_phase_skips_loudly_when_the_emulator_is_busy(self) -> None:
+        for phase in ("am", "pm"):
+            with self.subTest(phase=phase):
+                result = self._execute(phase, online=True)
+                self.assertEqual(result.code, 0)
+                result.opened.assert_not_called()
+
+                # 护栏 4: a skip that nobody can see is a permanent silent stall.
+                records = [call.args[0] for call in result.merge.call_args_list]
+                skipped = [r for r in records if r.get("skip_reason") == "emulator_busy"]
+                self.assertEqual(len(skipped), 1)
+                self.assertEqual(skipped[0]["status"], "skipped")
+                self.assertEqual(skipped[0]["phase"], phase)
+                self.assertEqual(skipped[0]["emulator_probe"], "探测明细")
+                self.assertTrue(skipped[0]["finished_at"])
+
+                payloads = [
+                    call.args[3]
+                    for call in result.request.call_args_list
+                    if call.args[1:3] == ("POST", "/channels/123/messages")
+                ]
+                self.assertEqual(len(payloads), 1)
+                embed = payloads[0]["embeds"][0]
+                self.assertIn("已跳过", embed["title"])
+                self.assertIn("判定你在玩", embed["description"])
+                # The way out matters: otherwise a forgotten emulator means the
+                # daily can never run again.
+                self.assertIn("现在跑", embed["description"])
+
+    def test_automatic_phase_runs_normally_when_the_emulator_is_offline(self) -> None:
+        result = self._execute("am", online=False)
+        result.probe.assert_called_once()
+        result.opened.assert_called_once()
+
+    def test_manual_run_never_defers_to_the_probe(self) -> None:
+        # The single easiest thing to get backwards: "now" is the user saying
+        # "run it anyway", so the probe must not even be consulted.
+        result = self._execute("now", online=True)
+        result.probe.assert_not_called()
+        result.opened.assert_called_once()
+
+    def test_only_the_cron_phases_are_probe_gated(self) -> None:
+        self.assertEqual(maa_daily.AUTO_PHASES, frozenset({"am", "pm"}))
+        self.assertNotIn("now", maa_daily.AUTO_PHASES)
+
+
 if __name__ == "__main__":
     unittest.main()

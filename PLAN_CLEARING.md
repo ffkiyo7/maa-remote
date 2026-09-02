@@ -122,7 +122,12 @@ CF.json = CF-8
 |---|---|
 | A-3 `activity_stages` 过期 | ✅ 已由 `maa_activity_watch.py` 解决 |
 | A-1 / A-2 导航闸门 `stage_is_navigable` | ❌ 未实现（全库无此符号） |
-| B 自动任务执行前探测模拟器 | ❌ 未实现（`maa_daily.py:778` 那个 probe 是**开机稳定性**探测，不是这个） |
+| B 自动任务执行前探测模拟器 | ✅ 已实现（commit `PLACEHOLDER_B_COMMIT`）：`maa_daily.emulator_is_online()` + `report_emulator_busy()`，不变量 #24；真机未验，等下一场自动日常 |
+
+> B 项的那个「不是这个」仍然要记住：`maa_daily.settle_android_runtime()`（原文记的
+> `maa_daily.py:778`）是**开机稳定性**探测，跑在开完模拟器之后、等 `app_process` 别抖；
+> 新加的 `emulator_is_online()` 跑在**开模拟器之前**，问的是"设备是不是用户正在用"。
+> 两者用途不同，**不要合并**。
 
 **A-1 的判据会被第 2 步 spike 的结论直接改写**（如果导航定义能自己补，"哪些关能导航"
 这个问题的答案就变了），所以先做第 2 步，再回头决定 A-1 怎么写。

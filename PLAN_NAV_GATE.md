@@ -35,6 +35,28 @@ subtask 5  ProcessTask  first=[BattleStartAll]    ← cur_retry 0→3 全部失�
 
 ## 结论 2：`Fight` 只接受 `maa activity` 列出的活动关，换成内部 id 也没用
 
+> ⚠️ **订正（2026-09-02）：本节标题与下面"唯一与实测吻合的数据源"那句已被实测推翻。**
+>
+> 真实判据是 **`resource/tasks/Stages/*.json` 的顶层键集**，而且**用户资源覆盖层
+> `~/.config/maa-cli/resource/tasks/Stages/<前缀>.json` 会被 MaaCore 合并，能扩大接受集**。
+>
+> 两条推翻证据：① TO 活动已结束、`maa activity Official` 列不出任何 TO 关，
+> 但 `TO-5` **照样被接受**；② 往覆盖层写一条 `TO-6` 键，原本被拒的 `TO-6` **立刻被接受**，
+> 删掉即恢复被拒。
+>
+> 当时之所以得出"`maa activity` 吻合"，是因为两者当时**恰好逐字相同**——
+> 上游给每个活动只写 4 个推荐关的导航定义，而 `maa activity` 列的也正是那几关。
+> 相关性被当成了因果。下表"判据是 `Stages/TO.json` 的键 ✗"那一行同理：
+> 当时读到的是尚未 `maa update` 的旧资源（`PLAN_CLEARING.md` 地基事实 D 已记）。
+>
+> 完整实测命令与输出见 **`PLAN_CLEARING.md` 步骤 2 的「2a 实测结论（2026-09-02，
+> 用已结束的 TO 活动）」小节**。
+>
+> **仍然成立的部分**：内部 id（`act53side_01`）确实被拒；A 项闸门当时按此判据落地，
+> 行为本身没错。**仍未验证**：接受 ≠ 真能导航过去（`PLAN_CLEARING.md` 的 Q3）。
+>
+> 以下原文保留不动（可能有锚点指过来），阅读时以本订正为准。
+
 这是本次修复的**核心依据**。逐关实测（`Failed to add task` = 被拒）：
 
 ```
@@ -191,7 +213,16 @@ def stage_is_navigable(
 
 ---
 
-# B. 自动任务执行前探测模拟器
+# B. 自动任务执行前探测模拟器 ✅ 已交付（commit `PLACEHOLDER_B_COMMIT`，2026-09-02）
+
+**交付实况**：按 B-1/B-2/B-3 原样落地，行为无偏离。
+`maa_daily.emulator_is_online()`（两信号取或、预算 5s、永不抛异常）+
+`report_emulator_busy()`（发 Discord + 写 `last_run.json`）+ `AUTO_PHASES`，
+接在 `execute()` 里 `should_skip` 之后、`open_emulator()` 之前。
+写进 **DEV_GUIDE §8 不变量 #24**，10 条单测（`EmulatorProbeTests`）覆盖 B-4 全部要求。
+
+**真机未验**：探测「在线」这条路径需要开着模拟器才能触发，本次**未开模拟器**。
+下一场自动日常（08:00 / 22:00）是它的第一次真实数据。观测命令见本节末尾。
 
 ## B-1 行为
 
@@ -259,6 +290,25 @@ def stage_is_navigable(
 - 探测里 adb 超时/抛异常 → **不得让整场挂掉**；按「离线」处理并照常执行
   （宁可抢一次设备，也不要因为探测本身出错就永久停摆）
 - 断言探测没有调用 `wait_for_android`
+
+**已交付**（`tests/test_maa.py::EmulatorProbeTests`，10 条，上述 5 条全覆盖）。
+额外补了：进程信号单独命中即在线（不问 ADB）、两信号都落空即离线、
+`emulator_app` 含非法字符时拒绝探测但**不阻断本场**、`AUTO_PHASES` 不含 `now`。
+
+**真机观测（下一场自动日常之后跑，不需要专门开模拟器）**：
+
+```bash
+# 1) 模拟器没开的正常场：last_run 不该出现 emulator_busy
+python3 -c "import json,os; d=json.load(open(os.path.expanduser( \
+  '~/.hermes/state/maa/last_run.json'))); \
+  print(d.get('status'), d.get('skip_reason'), d.get('emulator_probe'))"
+# 期望：success/failed，skip_reason 为 None
+
+# 2) 想主动验「在线跳过」：在 08:00 或 22:00 前开着 BlueStacks 等那一场
+#    期望：频道里出现「⏭️ MAA 日常·早场已跳过 / 判定你在玩」，
+#    且 status=skipped、skip_reason=emulator_busy、emulator_probe 有探测明细
+#    然后说「现在跑」必须照跑（phase=now 不走闸门）
+```
 
 ---
 
