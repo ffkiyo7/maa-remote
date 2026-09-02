@@ -157,6 +157,34 @@ def attach_annihilation(
     return {**plan, "annihilation": should_run_annihilation(plan, at, last_run)}
 
 
+def attach_clearing_yield(
+    plan: dict[str, Any],
+    config: dict[str, Any],
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """队列活跃时把「刷理智」让出来，保留剿灭（PLAN_CLEARING 步骤 3）。
+
+    「活跃」的三条件定义在 `maa_clearing.queue_is_active()`：冻结日与
+    `needs_manual` 等待日都**不算活跃**，那两天日常照常刷理智——否则那天既不打
+    队列、也不刷理智，一整天的理智白白溢出。
+    """
+    active = False
+    try:
+        import maa_clearing
+
+        if bool(config.get("clearing_enabled", False)):
+            active = maa_clearing.queue_is_active(maa_clearing.load_state(), at)
+    except Exception as exc:
+        # 探测自己坏了不能顺手把理智也停掉：按「不活跃」处理，日常照常刷。
+        # 宁可多刷一场，也不要因为读状态失败就一整天什么都不打。
+        print(
+            f"clearing 队列状态读取失败，按不活跃处理：{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        active = False
+    return {**plan, "farming": not active}
+
+
 def annihilation_consumed(lines: list[str]) -> bool:
     """True when today's annihilation slot was used and must not run again today.
 
@@ -176,7 +204,17 @@ def _toml_string(value: str) -> str:
 
 
 def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
-    """Render the exact immutable plan used for this run; no CloseDown task."""
+    """Render the exact immutable plan used for this run; no CloseDown task.
+
+    `tasks.fight` is the master switch for both Fight blocks. Below it the two
+    blocks have **independent** switches, because the clearing queue
+    (PLAN_CLEARING 步骤 3) needs to take the farming sanity away while keeping
+    annihilation:
+
+      plan["annihilation"] — 每日剿灭（游戏日一次，由 attach_annihilation 记帐）
+      plan["farming"]      — 刷理智（队列活跃时摘掉；周上限 1800 合成玉的剿灭
+                             是代理卡驱动的，摘掉纯亏，所以它不跟着走）
+    """
     tasks = plan.get("tasks", {})
     blocks = [
         "[[tasks]]\n"
@@ -210,23 +248,26 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
                 'server = "CN"\n'
                 'client_type = "Official"\n'
             )
-        blocks.append(
-            "[[tasks]]\n"
-            'name = "刷理智"\n'
-            'type = "Fight"\n'
-            "[tasks.params]\n"
-            f"stage = {_toml_string(str(plan.get('stage', '')))}\n"
-            "medicine = 0\n"
-            f"medicine_expire_days = {max(0, medicine_days)}\n"
-            # This literal is not derived from any state or user input.
-            "stone = 0\n"
-            # Let MaaCore select the largest series currently affordable in
-            # the connected client instead of forcing a fixed multiplier.
-            "series = 0\n"
-            f"times = {int(config.get('fight_times', 2147483647))}\n"
-            'server = "CN"\n'
-            'client_type = "Official"\n'
-        )
+        # Independent switch: the clearing queue removes ONLY this block.
+        # Default True so the deploy seed and isolated renderer tests keep it.
+        if plan.get("farming", True):
+            blocks.append(
+                "[[tasks]]\n"
+                'name = "刷理智"\n'
+                'type = "Fight"\n'
+                "[tasks.params]\n"
+                f"stage = {_toml_string(str(plan.get('stage', '')))}\n"
+                "medicine = 0\n"
+                f"medicine_expire_days = {max(0, medicine_days)}\n"
+                # This literal is not derived from any state or user input.
+                "stone = 0\n"
+                # Let MaaCore select the largest series currently affordable in
+                # the connected client instead of forcing a fixed multiplier.
+                "series = 0\n"
+                f"times = {int(config.get('fight_times', 2147483647))}\n"
+                'server = "CN"\n'
+                'client_type = "Official"\n'
+            )
     if tasks.get("infrast", True):
         blocks.append(
             "[[tasks]]\n"
@@ -1566,7 +1607,11 @@ def execute(phase: str) -> int:
     last_run_state = load_json(LAST_RUN_PATH, {})
     if not isinstance(last_run_state, dict):
         last_run_state = {}
-    plan = attach_annihilation(effective_plan(started), started, last_run_state)
+    plan = attach_clearing_yield(
+        attach_annihilation(effective_plan(started), started, last_run_state),
+        config,
+        started,
+    )
     run_stem = f"{started.date().isoformat()}-{phase}"
     snapshot_path = RUNS_DIR / f"{run_stem}.json"
     log_path = RUNS_DIR / f"{run_stem}.log"
@@ -1670,6 +1715,7 @@ def execute(phase: str) -> int:
                     "content": (
                         f"🌱 MAA 日常·{PHASE_LABELS[phase]}场开始\n"
                         f"🎯 {plan_stage_label(plan)}"
+                        + ("" if plan.get("farming", True) else "（已让路给通关队列，本场不刷理智）")
                         + (" · ☄️ 今日剿灭" if plan.get("annihilation") else " · ☄️ 剿灭今日已刷")
                         + f" · 🧪 {medicine_label(plan['medicine'])}"
                     ),
@@ -1853,9 +1899,47 @@ def execute(phase: str) -> int:
         return 0 if ok else 1
 
 
+def dispatch_clearing_round() -> str:
+    """日常收尾后派发一轮通关队列（PLAN_CLEARING 步骤 3 的调度点）。
+
+    为什么挂在这里：队列必须避开 08:00/22:00 的 `copilot_blackout_minutes` 与
+    Depot 的 04:30 窗口，而「日常刚跑完」正好是一天里最确定安全的两个时刻——
+    锁刚放、blackout 刚过、而且让路的那份理智就攒在那里。派发发生在
+    `run_lock` 释放之后，worker 自己去抢锁。
+    """
+    try:
+        import maa_clearing
+
+        config = load_config()
+        if not bool(config.get("clearing_enabled", False)):
+            return ""
+        if not maa_clearing.queue_is_active(maa_clearing.load_state()):
+            return ""
+        worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+        if not worker.is_file():
+            return "maa_copilot_worker.py 尚未部署，通关队列未派发"
+        subprocess.Popen(
+            [sys.executable, str(worker), "clearing"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return "dispatched"
+    except Exception as exc:
+        return f"通关队列派发失败：{type(exc).__name__}: {exc}"
+
+
 def main(argv: list[str]) -> int:
     phase = select_phase(argv)
-    return execute(phase)
+    code = execute(phase)
+    detail = dispatch_clearing_round()
+    if detail and detail != "dispatched":
+        # 派发失败不改变本场结论，但绝不静默（护栏 4）。
+        print(detail, flush=True)
+        merge_last_run({"clearing_dispatch_error": detail})
+    return code
 
 
 if __name__ == "__main__":

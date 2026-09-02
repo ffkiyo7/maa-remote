@@ -72,7 +72,8 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、缺口文案、候选卡片 | 被 action/worker import | — |
-| `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 搜索发卡；`run <token> <n> <mode>` 真执行 | 仅由 `maa_action.py` 派发 | 搜索 5~20s；执行 8~15 分钟 |
+| `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 搜索发卡；`run <token> <n> <mode>` 真执行；`clearing` 跑一轮通关队列 | 仅由 `maa_action.py` / `maa_daily.py` 派发 | 搜索 5~20s；执行 8~15 分钟 |
+| `scripts/maa_clearing.py` | 通关队列领域层（近纯函数）：队列形态、EX 闸门、理智预算、失败记账、needs_manual 卡片 | 被 action/daily/worker import | — |
 | `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度与理智拉取、`link`（stdin 收 token） | 本机终端；worker 懒刷新或执行前强制刷新 | 秒级 |
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
@@ -337,6 +338,8 @@ worker 写执行终态，watcher 统一记 completed。
 | `plan show` | 只读 |
 | `run now` | 抢锁探测 → 预检 → `Popen` 派发 `maa_daily.py now` 后立即返回 |
 | `log tail` | 读 `last_run.summary`；若是旧版格式则回读 log 用 `extract_summary` 重建 |
+| `clearing status/start/stop/run` | 通关队列（§5.6）；`run` 只 `Popen` 派发 worker |
+| `clearing manual-done <关卡>` | `needs_manual` 卡片的「已完成」按钮，cursor++ |
 
 关卡白名单 `valid_stage()`：空串 ✔ / `^[A-Za-z0-9]{1,8}-\d{1,2}$` ✔ /
 在 `config.activity_stages` 里 ✔ / 否则**现场跑 `maa activity Official` 并按词边界精确匹配**
@@ -436,6 +439,56 @@ worker 写执行终态，watcher 统一记 completed。
 
 ---
 
+## 5.6 链路五：通关队列（`maa_clearing.py` + worker 的 `clearing` 子命令）
+
+三期步骤 3。**默认关闭**（`config.clearing_enabled = false`）：它依赖步骤 2 的
+Q3「`Fight(times=0)` 真能停在补出来的那一关的编队界面」，而 Q3 至今**未验**，
+2b 导航定义生成器也还没写。打开之前队列会去打一堆根本没有导航定义的关。
+
+```
+maa_action.py clearing start        从 config.activity_stages 推出 AT-1..AT-max 建队列
+maa_action.py clearing run   ──┐
+maa_daily.main() 日常收尾    ──┴→ Popen(maa_copilot_worker.py clearing)
+                                   ├─ blackout（08:00/22:00 前 25 分钟）拒绝
+                                   ├─ Depot 窗口（京 04:20–05:00）拒绝
+                                   ├─ EX 闸门（森空岛 zone）→ 放行才把 EX 段接队尾
+                                   ├─ 理智预算 = 估算理智 − 剿灭那份
+                                   ├─ plan_round() 从 cursor 起排出打得起的关
+                                   └─ run.lock → 开模拟器 → 每关 nav + copilot
+                                       成功 cursor++；失败记账后停在这里
+```
+
+**为什么调度点挂在日常收尾**：队列要同时避开 `copilot_blackout_minutes` 和 Depot
+的 04:30 窗口，而「日常刚跑完」是一天里唯一确定安全的两个时刻——锁刚放、blackout
+刚过，而且让路省下的那份理智正好攒在那里。派发发生在 `run_lock` 释放**之后**，
+worker 自己去抢锁。07:50 的计划卡不行：它距 08:00 只有 10 分钟，永远在 blackout 里。
+
+**「队列活跃」的三条件**（`queue_is_active()`，日常让路只看它）：
+
+1. `clearing.json` 存在且 cursor 未到末尾；2. 今日不处于 nav 失败冻结；
+3. 不在 `needs_manual` 等待用户点击。
+
+只有活跃时 `render_daily_toml()` 才摘掉「刷理智」（保留每日剿灭）。
+**冻结日和等待日照常刷理智**——否则那天既不打队列也不刷理智，一整天的理智白白
+溢出，而日常判绿、卡片正常，是最难被发现的一种损失。
+
+**`needs_manual` 的 N 按不同日期计**，不按尝试次数计（`clearing_manual_after_days`，
+默认 2）。活动首日 prts.plus 上作业本来就少，按次数计会让每一关当天就触发，
+把「永不卡死的出口」变成「每关都要用户手打」。
+
+**第三个按钮前缀 `hermes:btn:maa-clearing:`**：`hermes:btn:maa:` 每天 07:50 被整段
+清扫（needs_manual 卡片要跨天存活，用它就死），`hermes:btn:maa-copilot:` 由
+`prune_expired_searches()` 按 token 的 25h TTL 清理（队列没有 token）。用第三个前缀
+让不变量 #7/#14 的两条清扫边界一个字节都不用改；队列自己在用户点掉「已完成」或
+`clearing stop` 时摘按钮。
+
+**EX 开放闸门与 `zone_progress_warning()` 不是一回事，永远不许合并**：后者是
+「只在能证明未解锁时才开口」的单向启发（沉默 ≠ 已解锁），前者是另一条独立的
+单向规则（存在 `totalStage == 0` 的 zone ⇒ 未全开）。合并会把「沉默不代表已解锁」
+这条性质弄丢。两个模块互不 import，有结构性单测守着。
+
+---
+
 ## 6. 状态模型
 
 ```
@@ -447,6 +500,8 @@ worker 写执行终态，watcher 统一记 completed。
   activity_watch.json 当前活动观察 + 搜索 token + idle/searching/waiting/ready/
                       preparing/executing/dismissed/completed 状态
   depot.json      最近完整 Depot 真值 + 期间掉落增量 + 历次消耗与日均消耗率
+  clearing.json   通关队列：stages[] / cursor / 每关失败日期与冻结 / needs_manual
+                  / EX 闸门阻塞原因 / 去重通知（0600，atomic_write_json）
   run.lock        flock 独占锁（执行）
   last_run.lock   flock 独占锁（保护 last_run.json 的跨进程 read-modify-write）
   am/ pm/         空目录，仅用于给 cron 传场次
@@ -607,6 +662,11 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 23 | Depot 不得在计划卡链路内运行；独立 cron 每日只做 7 天到期检查。任何日常抢锁失败都必须写 `last_lock_conflict_*`、发 Discord 并返回失败；`merge_last_run()` 必须持专用锁，不能用陈旧整份文件覆盖持锁任务的新状态 | `maa_depot.main()` / `maa_daily.report_lock_conflict()` / `maa_common.last_run_lock()` + 调度与锁冲突回归测试 |
 | 24 | 自动场次（`am`/`pm`）在 `open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本场，且**必须发 Discord 并写 `last_run.json`**（`status=skipped` + `skip_reason=emulator_busy`），文案要给出「说『现在跑』」这条出路。`now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同） | `maa_daily.AUTO_PHASES` / `emulator_is_online()` / `report_emulator_busy()` + `EmulatorProbeTests` |
 | 25 | `state/config.json` 里**由线上进程写回的运行时缓存键**（当前 `maa_core_version`、`maa_cli_version`、`activity_stages`）必须列入 `deploy.PRESERVED_RUNTIME_CACHE_KEYS`：线上已有值一律保留，仓库种子**只在首次部署时兜底**。**新增此类键时必须同步加进这个元组**，否则每次 `deploy.py` 都会用种子盖掉线上真值（2026-09-02 已实际发生过一次） | `deploy.PRESERVED_RUNTIME_CACHE_KEYS` / `deploy_state()` + `test_every_known_runtime_cache_key_is_preserved_on_deploy`（手工清单比对，漏加即红）、`test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent` |
+| 26 | 「刷理智」与「每日剿灭」是 `render_daily_toml()` 里**两个独立开关**（`plan["farming"]` / `plan["annihilation"]`，`tasks.fight` 仍是二者的总开关）。通关队列**只摘刷理智、永远保留剿灭**（周上限 1800 合成玉、代理卡驱动，摘掉纯亏）。队列状态读不出来时**按不活跃处理**——宁可多刷一场，也不能因为读状态失败就一整天什么都不打 | `render_daily_toml` 的两个 `if` + `attach_clearing_yield()` + `ClearingDailyYieldTests` |
+| 27 | 「队列活跃」= cursor 未到末尾 **且** 今日无 nav 冻结 **且** 不在 `needs_manual` 等待，三条件缺一不可。**冻结日与等待日日常照常刷理智**：只判「`clearing.json` 存在」会把这两天也算成活跃，那天既不打队列也不刷理智，理智白白溢出且日常判绿无人察觉 | `maa_clearing.queue_is_active()` + `test_queue_is_active_requires_all_three_conditions` / `test_frozen_day_still_farms` / `test_needs_manual_waiting_day_still_farms` |
+| 28 | 队列排关前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的关**不入当轮、不进预算、cursor 不前进**（那不是「打完了」，是「算不出来」，前进会把它永久跳过），提示只发一次 | `maa_clearing.sanity_budget()` / `plan_round()` + `ClearingQueueTests` |
+| 29 | EX 开放闸门是**独立于 `zone_progress_warning()`** 的第二条单向规则，两个模块互不 import；森空岛不可用一律 **fail-closed 不入队 EX**，且必须**可见**：写 `clearing.json` 的 `ex_gate_blocked_reason/_since`，并发一次去重后的 Discord 卡片（同原因不刷屏、原因变了重新发）。⚠️ `totalStage == 0` 这条推论**未实地验证**，下个活动上线当天要核对 | `maa_clearing.ex_gate()` / `apply_ex_gate()` + `test_ex_gate_*`（含 AST 结构断言） |
+| 30 | `needs_manual` 的 N 按**不同日期**计（`Asia/Shanghai` 日界），不按尝试次数计；触发后 cursor **不前进**，只有用户点「已完成」才前进。队列按钮用**第三个前缀** `hermes:btn:maa-clearing:`，不进 `hermes:btn:maa:` 的 07:50 清扫（卡片要跨天存活），也不进 `hermes:btn:maa-copilot:` 的 token TTL 清扫（队列没有 token）——不变量 #7/#14 的边界因此一字未改 | `maa_clearing.record_stage_failure()` / `BUTTON_PREFIX` + `test_manual_threshold_counts_distinct_dates_not_attempts` / `test_manual_card_button_uses_its_own_prefix` |
 
 ---
 

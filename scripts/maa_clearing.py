@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""活动通关队列的领域层（PLAN_CLEARING 步骤 3）。
+
+角色对齐 ``maa_copilot.py``：这里只有近纯函数——排队、闸门、理智预算、失败记账、
+卡片构造。真正开模拟器执行的是 ``maa_copilot_worker.py``（**不新建第二个 worker**）。
+
+状态落在 ``~/.hermes/state/maa/clearing.json``（0600，`atomic_write_json`），
+**不塞进 `config.json`**：config.json 是环境与阈值，队列是会话状态。
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from maa_common import (
+    BEIJING,
+    STATE_DIR,
+    atomic_write_json,
+    load_json,
+    now_beijing,
+)
+
+CLEARING_PATH = STATE_DIR / "clearing.json"
+SCHEMA_VERSION = 1
+
+# 第三个按钮前缀。故意既不是 `hermes:btn:maa:`（每天 07:50 被计划卡整段清扫，
+# 而 needs_manual 卡片必须跨天存活），也不是 `hermes:btn:maa-copilot:`
+# （由 `prune_expired_searches()` 按 searches/<token>.json 的 expires_at 清理，
+# 队列没有 token 也没有 25 小时 TTL）。独立前缀让两条既有清扫边界
+# （不变量 #7、#14）**一个字节都不用改**，队列自己负责自己的生命周期：
+# 卡片发出时登记，用户点掉或队列前进时由 `prune_manual_buttons()` 摘掉。
+BUTTON_PREFIX = "hermes:btn:maa-clearing:"
+
+DEFAULT_MANUAL_AFTER_DAYS = 2
+# 剿灭同样吃理智（地基事实 H）。国服剿灭作战单次 25 理智；写成可配是因为
+# 这个数字属于游戏侧常量，改版时不该改代码。
+DEFAULT_ANNIHILATION_SANITY = 25
+
+# 普通数字关：AT-1 … AT-8。EX 段形如 AT-EX-3。
+NORMAL_STAGE_RE = re.compile(r"^([A-Za-z0-9]{1,8})-(\d{1,2})$")
+EX_STAGE_RE = re.compile(r"^([A-Za-z0-9]{1,8})-EX-(\d{1,2})$")
+
+
+# ---------------------------------------------------------------------------
+# 状态读写
+# ---------------------------------------------------------------------------
+
+def load_state(path: Path = CLEARING_PATH) -> dict[str, Any] | None:
+    """读队列状态；文件不存在、坏掉或结构不对都返回 None（= 队列不存在）。
+
+    坏文件不抛异常是刻意的：`queue_is_active()` 挂在日常渲染路径上，
+    一个坏掉的状态文件绝不能把整场日常带走（D-2 的教训）。返回 None 的后果是
+    「队列不活跃」→ 日常照常刷理智，理智不会白丢。
+    """
+    try:
+        state = load_json(path, None)
+    except (ValueError, OSError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    if not isinstance(state.get("stages"), list):
+        return None
+    return state
+
+
+def save_state(state: dict[str, Any], path: Path = CLEARING_PATH) -> dict[str, Any]:
+    state["schema_version"] = SCHEMA_VERSION
+    state["updated_at"] = now_beijing().isoformat()
+    atomic_write_json(path, state)
+    return state
+
+
+def new_state(
+    activity_key: str,
+    activity_title: str,
+    prefix: str,
+    stages: Iterable[str],
+    *,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    moment = at or now_beijing()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "activity_key": str(activity_key)[:200],
+        "activity_title": str(activity_title)[:120],
+        "prefix": str(prefix)[:8],
+        "stages": [str(stage) for stage in stages],
+        "cursor": 0,
+        "created_at": moment.isoformat(),
+        "updated_at": moment.isoformat(),
+        "stage_state": {},
+        "needs_manual": None,
+        "ex_appended": False,
+        "notified": {},
+    }
+
+
+def today_key(at: datetime | None = None) -> str:
+    """`Asia/Shanghai` 自然日。`needs_manual` 的 N 按它计（不是游戏日 04:00）。"""
+    moment = at or now_beijing()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=BEIJING)
+    return moment.astimezone(BEIJING).date().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# 队列形态
+# ---------------------------------------------------------------------------
+
+def build_queue(prefix: str, stages: Iterable[str]) -> list[str]:
+    """普通数字关按序号升序；EX 段不在这里加（等闸门开）。"""
+    numbered: list[tuple[int, str]] = []
+    for raw in stages:
+        stage = str(raw).strip()
+        match = NORMAL_STAGE_RE.match(stage)
+        if not match or match.group(1) != prefix:
+            continue
+        numbered.append((int(match.group(2)), stage))
+    numbered.sort()
+    seen: set[str] = set()
+    result: list[str] = []
+    for _seq, stage in numbered:
+        if stage not in seen:
+            seen.add(stage)
+            result.append(stage)
+    return result
+
+
+def queue_from_activity_stages(stages: Iterable[str]) -> tuple[str, list[str]]:
+    """从 `config.activity_stages` 推出完整队列。
+
+    `activity_stages` 只有 MAA 推荐的那 4 关（例如 `AT-8/AT-7/AT-6/AT-4`），
+    而队列要 `AT-1 → … → AT-8`：取同一前缀里的最大序号，补齐 1..max。
+    多个前缀并存（复刻 + 新活动）时取关卡数最多的那个前缀，其余忽略。
+    """
+    buckets: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    for raw in stages:
+        match = NORMAL_STAGE_RE.match(str(raw).strip())
+        if not match:
+            continue
+        prefix, seq = match.group(1), int(match.group(2))
+        buckets[prefix] = max(buckets.get(prefix, 0), seq)
+        counts[prefix] = counts.get(prefix, 0) + 1
+    if not buckets:
+        return "", []
+    prefix = max(counts, key=lambda key: (counts[key], buckets[key]))
+    return prefix, [f"{prefix}-{index}" for index in range(1, buckets[prefix] + 1)]
+
+
+def ex_segment(prefix: str, count: int) -> list[str]:
+    """EX 段：普通 → 突袭紧跟对应普通关。突袭用同名关卡、mode=raid 区分。"""
+    return [f"{prefix}-EX-{index}" for index in range(1, max(0, count) + 1)]
+
+
+def current_stage(state: dict[str, Any]) -> str:
+    stages = state.get("stages") or []
+    cursor = int(state.get("cursor", 0))
+    if not isinstance(stages, list) or not 0 <= cursor < len(stages):
+        return ""
+    return str(stages[cursor])
+
+
+def is_finished(state: dict[str, Any]) -> bool:
+    stages = state.get("stages") or []
+    return int(state.get("cursor", 0)) >= len(stages)
+
+
+def advance_cursor(state: dict[str, Any]) -> dict[str, Any]:
+    """只在「这关确实过了 / 用户说手打完了」时调用。"""
+    stage = current_stage(state)
+    state["cursor"] = int(state.get("cursor", 0)) + 1
+    if stage:
+        stage_state = state.setdefault("stage_state", {})
+        if isinstance(stage_state, dict):
+            stage_state.pop(stage, None)
+    state["needs_manual"] = None
+    return state
+
+
+# ---------------------------------------------------------------------------
+# EX 开放闸门（与 `zone_progress_warning()` 是两条独立的单向规则，**不许合并**）
+# ---------------------------------------------------------------------------
+
+def ex_gate(roster: dict[str, Any] | None) -> tuple[bool, str]:
+    """(是否放行 EX 段, 被挡住的原因)。**fail-closed**。
+
+    规则：只要 `roster["activity_progress"]` 里还存在 `totalStage == 0` 的 zone，
+    活动就尚未全开 → EX / S 段不入队；全部 zone 都 > 0 才放行。
+
+    ⚠️ **此推论未实地验证**（PLAN_CLEARING 步骤 3）。依据是四个活动的缓存比对：
+    唯一出现 `totalStage == 0` 的就是当时正在进行、尚未全开的那个活动，且
+    act51side 的 zone2 `total = 8` 恰好等于它的 EX 关数。
+    **下个活动上线当天必须核对一次**：把当天的 `activity_progress` 与游戏里
+    EX 是否真的开放对一遍，对不上就回来改这里，不要让队列继续按它排。
+
+    森空岛不可用（401 / 无数据）一律返回不放行，绝不当成「全开」——
+    多等一天没有代价，误判成全开会让队列去打一个根本没开的段。
+    """
+    if not isinstance(roster, dict):
+        return False, "森空岛数据不可用（roster 缺失），EX 段按未全开处理"
+    progress = roster.get("activity_progress")
+    if not isinstance(progress, dict) or not progress:
+        return False, "森空岛未返回活动进度（activity_progress 为空），EX 段按未全开处理"
+    for act_id, zones in progress.items():
+        if not isinstance(zones, list):
+            return False, f"活动 {act_id} 的 zone 进度格式异常，EX 段按未全开处理"
+        for zone in zones:
+            if not isinstance(zone, dict):
+                return False, f"活动 {act_id} 的 zone 进度格式异常，EX 段按未全开处理"
+            try:
+                total = int(zone.get("totalStage") or 0)
+            except (TypeError, ValueError):
+                return False, f"活动 {act_id} 的 totalStage 不是整数，EX 段按未全开处理"
+            if total == 0:
+                zone_id = str(zone.get("zoneId") or act_id)
+                return False, f"{zone_id} 的 totalStage 仍为 0，活动尚未全开，EX 段暂不入队"
+    return True, ""
+
+
+def apply_ex_gate(
+    state: dict[str, Any],
+    roster: dict[str, Any] | None,
+    ex_count: int,
+    *,
+    at: datetime | None = None,
+) -> tuple[dict[str, Any], bool, str]:
+    """闸门放行就把 EX 段接到队尾；被挡住就把原因写进状态（fail-closed 可见）。
+
+    返回 `(state, 是否需要发 Discord 卡片, 原因文案)`。护栏 4：不许只是安静地不入队。
+    """
+    moment = at or now_beijing()
+    if state.get("ex_appended"):
+        return state, False, ""
+    allowed, reason = ex_gate(roster)
+    if allowed:
+        prefix = str(state.get("prefix") or "")
+        stages = list(state.get("stages") or [])
+        for stage in ex_segment(prefix, ex_count):
+            if stage not in stages:
+                stages.append(stage)
+        state["stages"] = stages
+        state["ex_appended"] = True
+        state.pop("ex_gate_blocked_reason", None)
+        state.pop("ex_gate_blocked_since", None)
+        return state, False, ""
+    previous = str(state.get("ex_gate_blocked_reason") or "")
+    state["ex_gate_blocked_reason"] = reason
+    if previous != reason:
+        # 原因变了要重新发；同一原因不刷屏（沿用步骤 0 的 last_notified_error 范式）。
+        state["ex_gate_blocked_since"] = moment.isoformat()
+        return state, True, reason
+    state.setdefault("ex_gate_blocked_since", moment.isoformat())
+    return state, False, reason
+
+
+# ---------------------------------------------------------------------------
+# 理智预算
+# ---------------------------------------------------------------------------
+
+def annihilation_reserve(plan: dict[str, Any], config: dict[str, Any]) -> int:
+    """今天还要打的剿灭要预留多少理智（地基事实 H）。
+
+    剿灭是 `daily.toml` 里的第二个 `Fight(stage=Annihilation)`，**它同样消耗理智**。
+    队列排关前必须先扣掉这份，否则会把可用理智算多、排出打不完的一轮。
+    `plan["annihilation"]` 由 `maa_daily.attach_annihilation()` 按游戏日记帐；
+    今天已经刷过就是 0。
+    """
+    if not isinstance(plan, dict) or not plan.get("annihilation"):
+        return 0
+    if not bool((plan.get("tasks") or {}).get("fight", True)):
+        return 0
+    try:
+        cost = int(config.get("clearing_annihilation_sanity", DEFAULT_ANNIHILATION_SANITY))
+    except (TypeError, ValueError):
+        cost = DEFAULT_ANNIHILATION_SANITY
+    return max(0, cost)
+
+
+def sanity_budget(
+    available: int | None,
+    plan: dict[str, Any],
+    config: dict[str, Any],
+) -> int:
+    """队列这一轮能花的理智 = 当前理智 − 剿灭那份。理智未知一律 0（fail-closed）。"""
+    if available is None:
+        return 0
+    try:
+        current = int(available)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, current - annihilation_reserve(plan, config))
+
+
+# ---------------------------------------------------------------------------
+# 失败记账 / 冻结 / needs_manual
+# ---------------------------------------------------------------------------
+
+def _stage_entry(state: dict[str, Any], stage: str) -> dict[str, Any]:
+    stage_state = state.setdefault("stage_state", {})
+    if not isinstance(stage_state, dict):
+        stage_state = {}
+        state["stage_state"] = stage_state
+    entry = stage_state.get(stage)
+    if not isinstance(entry, dict):
+        entry = {"failed_dates": [], "nav_frozen_date": "", "last_error": ""}
+        stage_state[stage] = entry
+    if not isinstance(entry.get("failed_dates"), list):
+        entry["failed_dates"] = []
+    return entry
+
+
+def is_nav_frozen(state: dict[str, Any], stage: str, at: datetime | None = None) -> bool:
+    """nav 失败后冻结该段，**同一天不再重试**（每天最多撞一次）。"""
+    stage_state = state.get("stage_state")
+    if not isinstance(stage_state, dict):
+        return False
+    entry = stage_state.get(stage)
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("nav_frozen_date") or "") == today_key(at)
+
+
+def manual_after_days(config: dict[str, Any]) -> int:
+    try:
+        value = int(config.get("clearing_manual_after_days", DEFAULT_MANUAL_AFTER_DAYS))
+    except (TypeError, ValueError):
+        return DEFAULT_MANUAL_AFTER_DAYS
+    return max(1, value)
+
+
+def record_stage_failure(
+    state: dict[str, Any],
+    stage: str,
+    *,
+    kind: str,
+    detail: str = "",
+    config: dict[str, Any] | None = None,
+    at: datetime | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """记一次失败，返回 `(state, 是否刚刚转入 needs_manual)`。
+
+    **N 按「不同日期」计，不按尝试次数计**：记的是该关失败过的日期集合
+    （`Asia/Shanghai` 日界），同一天失败 5 次只算 1。理由是活动首日 prts.plus 上
+    作业本来就少，按次数计会让每一关当天就触发 needs_manual，把「永不卡死的出口」
+    变成「每关都要用户手打」。按天计也与 nav 失败冻结的「每天重试一次」处在
+    同一时间尺度上，两者不会互相打架。
+
+    `kind == "nav"` 额外冻结该段到明天。
+    """
+    entry = _stage_entry(state, stage)
+    day = today_key(at)
+    if day not in entry["failed_dates"]:
+        entry["failed_dates"].append(day)
+    entry["last_error"] = str(detail)[:400]
+    entry["last_failed_at"] = (at or now_beijing()).isoformat()
+    if kind == "nav":
+        entry["nav_frozen_date"] = day
+    threshold = manual_after_days(config or {})
+    if len(entry["failed_dates"]) < threshold:
+        return state, False
+    if isinstance(state.get("needs_manual"), dict) and state["needs_manual"].get(
+        "stage"
+    ) == stage:
+        return state, False
+    state["needs_manual"] = {
+        "stage": stage,
+        "since": (at or now_beijing()).isoformat(),
+        "days": list(entry["failed_dates"]),
+        "reason": str(detail)[:400],
+        "message_id": None,
+    }
+    return state, True
+
+
+def awaiting_manual(state: dict[str, Any]) -> str:
+    manual = state.get("needs_manual")
+    if isinstance(manual, dict):
+        return str(manual.get("stage") or "")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 「队列活跃」的精确定义（日常让路只看它）
+# ---------------------------------------------------------------------------
+
+def queue_is_active(state: dict[str, Any] | None, at: datetime | None = None) -> bool:
+    """三个条件全部成立才算活跃：
+
+    1. `clearing.json` 存在，且 cursor **未到末尾**；
+    2. 今日**不处于 nav 失败冻结**；
+    3. **不在 `needs_manual` 等待用户点击**。
+
+    只有活跃时日常才摘掉「刷理智」。**队列因冻结或等待而无法消耗理智的那天，
+    日常照常刷理智**——否则那天既不打队列、也不刷理智，一整天的理智白白溢出，
+    这是最难被发现的一种损失（日常判绿、卡片正常，只是什么都没打）。
+    注意「活跃」不等于「clearing.json 存在」：只判存在会把冻结日和等待日一起算进去。
+    """
+    if not isinstance(state, dict):
+        return False
+    if is_finished(state):
+        return False
+    if awaiting_manual(state):
+        return False
+    stage = current_stage(state)
+    if stage and is_nav_frozen(state, stage, at):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 排一轮
+# ---------------------------------------------------------------------------
+
+def plan_round(
+    state: dict[str, Any],
+    budget: int,
+    cost_of: Callable[[str], int | None],
+    *,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """从 cursor 起按序排出这一轮打得起的关；**不动 cursor**。
+
+    返回 `{"stages": [...], "spent": int, "unknown_cost": [...], "stop_reason": str}`。
+
+    理智成本未知的关（`stage_sanity_cost()` 对 EX 返回 `None`，步骤 4 才解）：
+    **不排入当轮、不计入理智预算**，也**不前进 cursor**——那不是「这关打完了」，
+    是「现在算不出来」，前进会把这关永久跳过。不许拿 0 顶替、不许拿同活动普通关
+    的值猜：理智算错会直接导致队列空跑。
+    """
+    stages = state.get("stages") or []
+    cursor = int(state.get("cursor", 0))
+    remaining = max(0, int(budget))
+    picked: list[str] = []
+    unknown: list[str] = []
+    stop_reason = "queue_end"
+    for index in range(cursor, len(stages)):
+        stage = str(stages[index])
+        if is_nav_frozen(state, stage, at):
+            stop_reason = "nav_frozen"
+            break
+        cost = cost_of(stage)
+        if cost is None:
+            unknown.append(stage)
+            stop_reason = "unknown_cost"
+            break
+        try:
+            cost = int(cost)
+        except (TypeError, ValueError):
+            unknown.append(stage)
+            stop_reason = "unknown_cost"
+            break
+        if cost <= 0 or cost > remaining:
+            stop_reason = "sanity"
+            break
+        picked.append(stage)
+        remaining -= cost
+    return {
+        "stages": picked,
+        "spent": max(0, int(budget)) - remaining,
+        "unknown_cost": unknown,
+        "stop_reason": stop_reason,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 去重通知
+# ---------------------------------------------------------------------------
+
+def should_notify(state: dict[str, Any], key: str, reason: str) -> bool:
+    """同一原因不刷屏；原因变了要重新发。沿用步骤 0 的 `last_notified_error` 范式。"""
+    notified = state.setdefault("notified", {})
+    if not isinstance(notified, dict):
+        notified = {}
+        state["notified"] = notified
+    if notified.get(key) == reason:
+        return False
+    notified[key] = reason
+    return True
+
+
+def clear_notification(state: dict[str, Any], key: str) -> None:
+    notified = state.get("notified")
+    if isinstance(notified, dict):
+        notified.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# Discord 卡片（构造在这里，发送在 worker / 计划卡）
+# ---------------------------------------------------------------------------
+
+def manual_button_id(stage: str) -> str:
+    return f"{BUTTON_PREFIX}manual-done:{stage}"
+
+
+def build_manual_card(
+    state: dict[str, Any], stage: str
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """`needs_manual` 出口卡片：用户手打一次，点「已完成」后 cursor 才前进。
+
+    这不是为教学关特设的补丁——任何一关卡住都走它，队列就永远卡不死。
+    """
+    manual = state.get("needs_manual") or {}
+    days = manual.get("days") if isinstance(manual, dict) else []
+    day_text = "、".join(str(day) for day in days if day) or "—"
+    reason = str(manual.get("reason") or "") if isinstance(manual, dict) else ""
+    custom_id = manual_button_id(stage)
+    embed = {
+        "title": f"🙋 {stage} 需要你手动打一次",
+        "description": (
+            f"通关队列在 {stage} 卡住了，自动路径拿不到作业或导航不过去。\n"
+            "请在游戏里手动把这一关打过，然后点下面的「已完成」，队列会从下一关继续。\n"
+            "在你点掉之前，队列停在这里，日常会照常刷理智（不会白白溢出）。"
+        ),
+        "color": 0xFEE75C,
+        "fields": [
+            {"name": "失败日期", "value": day_text[:1024], "inline": False},
+            {"name": "最后一次原因", "value": (reason or "—")[:1024], "inline": False},
+        ],
+        "timestamp": now_beijing().isoformat(),
+    }
+    components = [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 3,
+                    "label": f"✅ {stage} 已完成"[:80],
+                    "custom_id": custom_id,
+                }
+            ],
+        }
+    ]
+    entries = {
+        custom_id: {
+            "kind": "exec",
+            "script": "maa_action.py",
+            "args": ["clearing", "manual-done", stage],
+        }
+    }
+    return embed, components, entries
+
+
+def ex_gate_embed(reason: str) -> dict[str, Any]:
+    return {
+        "title": "⛔ EX 段未入队（等森空岛）",
+        "description": (
+            f"{reason}\n\n"
+            "如果这是因为森空岛凭据过期，请在**本机终端**重跑：\n"
+            "`python3 ~/.hermes/scripts/maa_skland.py link`\n"
+            "（token 绝不要发到 Discord。）\n"
+            "队列的普通关段不受影响；EX 是被闸门挡住的，不是打完了。"
+        )[:3500],
+        "color": 0xED4245,
+        "timestamp": now_beijing().isoformat(),
+    }
+
+
+def unknown_sanity_embed(stages: list[str]) -> dict[str, Any]:
+    listed = "、".join(stages[:8]) or "—"
+    return {
+        "title": "⏸️ 有关卡的理智消耗未知，队列暂停在这里",
+        "description": (
+            f"{listed} 的理智消耗当前算不出来（`stages.json` 没有 EX 关条目），"
+            "等 PLAN_CLEARING 步骤 4 的 EX 理智 OCR 落地后自动恢复。\n"
+            "**这不需要你做任何事**：cursor 没有前进，这关不会被跳过；"
+            "也没有按钮要点。"
+        )[:3500],
+        "color": 0x99AAB5,
+        "timestamp": now_beijing().isoformat(),
+    }
+
+
+def status_text(state: dict[str, Any] | None) -> str:
+    if not isinstance(state, dict):
+        return "通关队列：未建立（当前没有活动队列）。"
+    stages = state.get("stages") or []
+    cursor = int(state.get("cursor", 0))
+    lines = [
+        f"通关队列：{state.get('activity_title') or state.get('prefix') or '当前活动'}",
+        f"进度：{min(cursor, len(stages))}/{len(stages)}",
+    ]
+    stage = current_stage(state)
+    if stage:
+        lines.append(f"当前关：{stage}")
+    else:
+        lines.append("当前关：已到队尾")
+    manual = awaiting_manual(state)
+    if manual:
+        lines.append(f"⏳ 等你手动打完 {manual} 并点「已完成」")
+    if stage and is_nav_frozen(state, stage):
+        lines.append("❄️ 今日 nav 失败已冻结，明天再试")
+    blocked = state.get("ex_gate_blocked_reason")
+    if blocked:
+        lines.append(f"⛔ EX 段被闸门挡住：{blocked}")
+    lines.append(f"活跃（日常让路）：{'是' if queue_is_active(state) else '否'}")
+    return "\n".join(lines)

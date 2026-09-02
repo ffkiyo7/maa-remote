@@ -17,7 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import maa_action  # noqa: E402
+import maa_clearing  # noqa: E402
 import maa_common  # noqa: E402
+import maa_copilot  # noqa: E402
 import maa_depot  # noqa: E402
 import maa_daily  # noqa: E402
 import maa_plan_card  # noqa: E402
@@ -25,6 +27,7 @@ import deploy  # noqa: E402
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+
 
 
 class PlanTests(unittest.TestCase):
@@ -2322,6 +2325,447 @@ class EmulatorProbeTests(unittest.TestCase):
         self.assertEqual(maa_daily.AUTO_PHASES, frozenset({"am", "pm"}))
         self.assertNotIn("now", maa_daily.AUTO_PHASES)
 
+
+
+class ClearingQueueTests(unittest.TestCase):
+    """PLAN_CLEARING 步骤 3：队列、闸门、理智预算、needs_manual 出口。"""
+
+    def setUp(self) -> None:
+        self.config = {"clearing_manual_after_days": 2}
+        self.state = maa_clearing.new_state(
+            "标题|AT", "标题", "AT", ["AT-1", "AT-2", "AT-3"],
+            at=datetime(2026, 9, 2, 12, 0, tzinfo=BEIJING),
+        )
+
+    # --- 队列形态 -------------------------------------------------------
+    def test_queue_is_derived_from_the_recommended_stages_max_index(self) -> None:
+        # config.activity_stages 只有 MAA 推荐的 4 关，队列要 AT-1..AT-8。
+        prefix, queue = maa_clearing.queue_from_activity_stages(
+            ["AT-8", "AT-7", "AT-6", "AT-4"]
+        )
+        self.assertEqual(prefix, "AT")
+        self.assertEqual(queue, [f"AT-{index}" for index in range(1, 9)])
+
+    def test_queue_ignores_non_numeric_and_empty_input(self) -> None:
+        self.assertEqual(maa_clearing.queue_from_activity_stages([]), ("", []))
+        self.assertEqual(
+            maa_clearing.queue_from_activity_stages(["AT-EX-3", "垃圾"]), ("", [])
+        )
+
+    # --- EX 闸门 --------------------------------------------------------
+    def test_ex_gate_blocks_while_any_zone_has_zero_total_stage(self) -> None:
+        roster = {
+            "activity_progress": {
+                "act99side": [
+                    {"zoneId": "z1", "clearedStage": 8, "totalStage": 8},
+                    {"zoneId": "z2", "clearedStage": 0, "totalStage": 0},
+                ]
+            }
+        }
+        allowed, reason = maa_clearing.ex_gate(roster)
+        self.assertFalse(allowed)
+        self.assertIn("z2", reason)
+        state, notify, blocked = maa_clearing.apply_ex_gate(self.state, roster, 8)
+        self.assertTrue(notify)
+        self.assertEqual(state["stages"], ["AT-1", "AT-2", "AT-3"])
+        self.assertEqual(state["ex_gate_blocked_reason"], blocked)
+        self.assertTrue(state["ex_gate_blocked_since"])
+
+    def test_ex_gate_opens_only_when_every_zone_is_positive(self) -> None:
+        roster = {
+            "activity_progress": {
+                "act99side": [
+                    {"zoneId": "z1", "clearedStage": 8, "totalStage": 8},
+                    {"zoneId": "z2", "clearedStage": 1, "totalStage": 8},
+                ]
+            }
+        }
+        allowed, _reason = maa_clearing.ex_gate(roster)
+        self.assertTrue(allowed)
+        state, notify, blocked = maa_clearing.apply_ex_gate(self.state, roster, 3)
+        self.assertFalse(notify)
+        self.assertEqual(blocked, "")
+        self.assertEqual(
+            state["stages"],
+            ["AT-1", "AT-2", "AT-3", "AT-EX-1", "AT-EX-2", "AT-EX-3"],
+        )
+        self.assertTrue(state["ex_appended"])
+
+    def test_ex_gate_fails_closed_when_skland_is_unavailable(self) -> None:
+        # 401 / 无数据绝不能当成「全开」：多等一天没有代价，误判会让队列
+        # 去打一个根本没开的段。
+        for roster in (None, {}, {"activity_progress": {}}, {"activity_progress": []}):
+            with self.subTest(roster=roster):
+                allowed, reason = maa_clearing.ex_gate(roster)
+                self.assertFalse(allowed)
+                self.assertTrue(reason)
+
+    def test_ex_gate_fail_closed_is_visible_and_deduplicated(self) -> None:
+        # 护栏 4：不许只是安静地不入队——状态里要能自证，卡片发且只发一次，
+        # 原因变了要重新发。
+        first = {"activity_progress": {"a": [{"zoneId": "z2", "totalStage": 0}]}}
+        state, notify, reason = maa_clearing.apply_ex_gate(self.state, first, 8)
+        self.assertTrue(notify)
+        self.assertTrue(maa_clearing.should_notify(state, "ex_gate", reason))
+        # 同一原因再来一轮：状态还在，但不再发第二张卡。
+        state, notify, reason2 = maa_clearing.apply_ex_gate(state, first, 8)
+        self.assertFalse(notify)
+        self.assertFalse(maa_clearing.should_notify(state, "ex_gate", reason2))
+        self.assertEqual(state["ex_gate_blocked_reason"], reason)
+        # 原因变了（森空岛整个不可用）→ 重新发。
+        state, notify, reason3 = maa_clearing.apply_ex_gate(state, None, 8)
+        self.assertTrue(notify)
+        self.assertNotEqual(reason3, reason)
+        self.assertTrue(maa_clearing.should_notify(state, "ex_gate", reason3))
+
+    def test_ex_gate_is_not_wired_to_zone_progress_warning(self) -> None:
+        # 两条独立的单向规则，合并会把「沉默不代表已解锁」这条性质弄丢。
+        # 结构断言而不是字符串搜索（注释里正当地提到对方）：领域层不 import
+        # maa_copilot，所以它调不到那个启发式；反过来 maa_copilot 也不 import
+        # 队列，所以两条单向规则不可能互相依赖。
+        import ast
+
+        for module in ("maa_clearing", "maa_copilot"):
+            tree = ast.parse(
+                (ROOT / "scripts" / f"{module}.py").read_text(encoding="utf-8")
+            )
+            imported: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module)
+            other = "maa_copilot" if module == "maa_clearing" else "maa_clearing"
+            self.assertNotIn(other, imported, f"{module} 不该 import {other}")
+        self.assertFalse(
+            [
+                node
+                for node in ast.walk(
+                    ast.parse(
+                        (ROOT / "scripts" / "maa_clearing.py").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                )
+                if isinstance(node, ast.Call)
+                and "zone_progress_warning" in ast.dump(node.func)
+            ]
+        )
+
+    # --- 理智预算 -------------------------------------------------------
+    def test_sanity_budget_deducts_todays_annihilation_first(self) -> None:
+        # 地基事实 H：剿灭同样吃理智，不先扣就会把可用理智算多。
+        plan = {"annihilation": True, "tasks": {"fight": True}}
+        self.assertEqual(maa_clearing.annihilation_reserve(plan, {}), 25)
+        self.assertEqual(maa_clearing.sanity_budget(100, plan, {}), 75)
+        self.assertEqual(
+            maa_clearing.sanity_budget(100, plan, {"clearing_annihilation_sanity": 40}),
+            60,
+        )
+
+    def test_sanity_budget_reserves_nothing_once_annihilation_is_done(self) -> None:
+        plan = {"annihilation": False, "tasks": {"fight": True}}
+        self.assertEqual(maa_clearing.annihilation_reserve(plan, {}), 0)
+        self.assertEqual(maa_clearing.sanity_budget(100, plan, {}), 100)
+        off = {"annihilation": True, "tasks": {"fight": False}}
+        self.assertEqual(maa_clearing.annihilation_reserve(off, {}), 0)
+
+    def test_sanity_budget_never_goes_negative_or_guesses(self) -> None:
+        plan = {"annihilation": True, "tasks": {"fight": True}}
+        self.assertEqual(maa_clearing.sanity_budget(10, plan, {}), 0)
+        self.assertEqual(maa_clearing.sanity_budget(None, plan, {}), 0)
+
+    # --- 排一轮 ---------------------------------------------------------
+    def test_round_stops_at_the_budget_without_moving_the_cursor(self) -> None:
+        result = maa_clearing.plan_round(self.state, 45, lambda _stage: 20)
+        self.assertEqual(result["stages"], ["AT-1", "AT-2"])
+        self.assertEqual(result["spent"], 40)
+        self.assertEqual(result["stop_reason"], "sanity")
+        self.assertEqual(self.state["cursor"], 0)
+
+    def test_unknown_sanity_cost_stops_the_round_and_freezes_the_cursor(self) -> None:
+        # stage_sanity_cost() 对 EX 返回 None（步骤 4 才解）：不入当轮、
+        # 不进理智预算、cursor 不变——前进会把这关永久跳过。
+        costs = {"AT-1": 18, "AT-2": None, "AT-3": 18}
+        result = maa_clearing.plan_round(self.state, 200, costs.get)
+        self.assertEqual(result["stages"], ["AT-1"])
+        self.assertEqual(result["spent"], 18)
+        self.assertEqual(result["unknown_cost"], ["AT-2"])
+        self.assertEqual(result["stop_reason"], "unknown_cost")
+        self.assertEqual(self.state["cursor"], 0)
+
+    def test_unknown_sanity_cost_notice_is_sent_only_once(self) -> None:
+        self.assertTrue(maa_clearing.should_notify(self.state, "unknown_cost", "AT-2"))
+        self.assertFalse(maa_clearing.should_notify(self.state, "unknown_cost", "AT-2"))
+        self.assertTrue(maa_clearing.should_notify(self.state, "unknown_cost", "AT-3"))
+
+    # --- needs_manual ---------------------------------------------------
+    def test_manual_threshold_counts_distinct_dates_not_attempts(self) -> None:
+        # 活动首日 prts.plus 上作业本来就少；按次数计会让每一关当天就触发
+        # needs_manual，把「永不卡死的出口」变成「每关都要用户手打」。
+        day1 = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        for hour in (9, 13, 18, 23):
+            state, turned = maa_clearing.record_stage_failure(
+                self.state, "AT-1", kind="op", detail="没作业",
+                config=self.config, at=day1.replace(hour=hour),
+            )
+            self.assertFalse(turned, f"同一天第 {hour} 小时就触发了")
+        self.assertEqual(state["stage_state"]["AT-1"]["failed_dates"], ["2026-09-02"])
+        self.assertEqual(maa_clearing.awaiting_manual(state), "")
+
+        day2 = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        state, turned = maa_clearing.record_stage_failure(
+            self.state, "AT-1", kind="op", detail="还是没作业",
+            config=self.config, at=day2,
+        )
+        self.assertTrue(turned)
+        self.assertEqual(maa_clearing.awaiting_manual(state), "AT-1")
+        self.assertEqual(
+            state["stage_state"]["AT-1"]["failed_dates"], ["2026-09-02", "2026-09-03"]
+        )
+        # 已经在等待了就不重复翻牌（卡片不刷屏）。
+        state, turned = maa_clearing.record_stage_failure(
+            self.state, "AT-1", kind="op", detail="x",
+            config=self.config, at=datetime(2026, 9, 4, 9, 0, tzinfo=BEIJING),
+        )
+        self.assertFalse(turned)
+
+    def test_manual_threshold_is_configurable(self) -> None:
+        self.assertEqual(maa_clearing.manual_after_days({}), 2)
+        self.assertEqual(
+            maa_clearing.manual_after_days({"clearing_manual_after_days": 5}), 5
+        )
+        self.assertEqual(
+            maa_clearing.manual_after_days({"clearing_manual_after_days": "x"}), 2
+        )
+
+    def test_needs_manual_holds_the_cursor_until_the_user_clicks(self) -> None:
+        for day in (2, 3):
+            state, _turned = maa_clearing.record_stage_failure(
+                self.state, "AT-1", kind="op", detail="没作业", config=self.config,
+                at=datetime(2026, 9, day, 9, 0, tzinfo=BEIJING),
+            )
+        self.assertEqual(state["cursor"], 0)
+        self.assertEqual(maa_clearing.current_stage(state), "AT-1")
+        maa_clearing.advance_cursor(state)
+        self.assertEqual(state["cursor"], 1)
+        self.assertEqual(maa_clearing.awaiting_manual(state), "")
+        self.assertEqual(maa_clearing.current_stage(state), "AT-2")
+
+    def test_manual_card_button_uses_its_own_prefix(self) -> None:
+        # 不变量 #7/#14 的清扫边界一个字节都不用改：`hermes:btn:maa:` 每天
+        # 07:50 被整段清扫（卡片要跨天存活，用它就死），
+        # `hermes:btn:maa-copilot:` 由 prune_expired_searches 按 token 清理
+        # （队列没有 token）。所以队列用第三个独立前缀。
+        state, _turned = maa_clearing.record_stage_failure(
+            self.state, "AT-1", kind="nav", detail="导航失败", config={"clearing_manual_after_days": 1},
+        )
+        _embed, components, entries = maa_clearing.build_manual_card(state, "AT-1")
+        custom_id = components[0]["components"][0]["custom_id"]
+        self.assertEqual(list(entries), [custom_id])
+        self.assertTrue(custom_id.startswith("hermes:btn:maa-clearing:"))
+        self.assertFalse(custom_id.startswith(maa_plan_card.BUTTON_PREFIX))
+        self.assertFalse(custom_id.startswith(maa_copilot.BUTTON_PREFIX))
+        self.assertEqual(entries[custom_id]["script"], "maa_action.py")
+        self.assertEqual(entries[custom_id]["args"], ["clearing", "manual-done", "AT-1"])
+
+    # --- nav 失败冻结 ---------------------------------------------------
+    def test_nav_failure_freezes_the_stage_for_the_rest_of_the_day(self) -> None:
+        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        state, _turned = maa_clearing.record_stage_failure(
+            self.state, "AT-1", kind="nav", detail="导航失败", config=self.config, at=at
+        )
+        self.assertTrue(maa_clearing.is_nav_frozen(state, "AT-1", at))
+        self.assertEqual(
+            maa_clearing.plan_round(state, 200, lambda _s: 18, at=at)["stages"], []
+        )
+        tomorrow = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        self.assertFalse(maa_clearing.is_nav_frozen(state, "AT-1", tomorrow))
+        self.assertEqual(
+            maa_clearing.plan_round(state, 200, lambda _s: 18, at=tomorrow)["stages"],
+            ["AT-1", "AT-2", "AT-3"],
+        )
+
+    # --- 「队列活跃」的三条件 -------------------------------------------
+    def test_queue_is_active_requires_all_three_conditions(self) -> None:
+        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        self.assertTrue(maa_clearing.queue_is_active(self.state, at))
+        self.assertFalse(maa_clearing.queue_is_active(None, at))
+
+        finished = dict(self.state, cursor=3)
+        self.assertFalse(maa_clearing.queue_is_active(finished, at))
+
+        frozen = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        maa_clearing.record_stage_failure(
+            frozen, "AT-1", kind="nav", detail="x", config=self.config, at=at
+        )
+        self.assertFalse(maa_clearing.queue_is_active(frozen, at))
+
+        waiting = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        maa_clearing.record_stage_failure(
+            waiting, "AT-1", kind="op", detail="x",
+            config={"clearing_manual_after_days": 1}, at=at,
+        )
+        self.assertEqual(maa_clearing.awaiting_manual(waiting), "AT-1")
+        self.assertFalse(maa_clearing.queue_is_active(waiting, at))
+
+    def test_state_round_trips_through_the_atomic_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "clearing.json"
+            maa_clearing.save_state(self.state, path)
+            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+            loaded = maa_clearing.load_state(path)
+            self.assertEqual(loaded["stages"], ["AT-1", "AT-2", "AT-3"])
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(maa_clearing.load_state(path))
+
+
+class ClearingDailyYieldTests(unittest.TestCase):
+    """日常让路：队列活跃时只摘「刷理智」，剿灭永远保留。"""
+
+    def setUp(self) -> None:
+        self.plan = maa_common.normalize_plan(
+            {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
+        )
+        self.plan["annihilation"] = True
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+
+    def test_active_queue_removes_farming_and_keeps_annihilation(self) -> None:
+        rendered = maa_daily.render_daily_toml({**self.plan, "farming": False}, self.config)
+        self.assertIn('name = "每日剿灭"', rendered)
+        self.assertIn('stage = "Annihilation"', rendered)
+        self.assertNotIn('name = "刷理智"', rendered)
+        self.assertNotIn('stage = "CE-6"', rendered)
+        # 让路只动 Fight 的第二个块，其余任务照常。
+        for name in ('name = "基建换班"', 'name = "公开招募"', 'name = "信用商店"',
+                     'name = "领取奖励"', 'name = "返回主界面"'):
+            self.assertIn(name, rendered)
+        self.assertIn("stone = 0", rendered)
+        self.assertIn("medicine = 0", rendered)
+
+    def test_two_independent_switches_cover_all_four_combinations(self) -> None:
+        for annihilation, farming in ((True, True), (True, False), (False, True), (False, False)):
+            with self.subTest(annihilation=annihilation, farming=farming):
+                rendered = maa_daily.render_daily_toml(
+                    {**self.plan, "annihilation": annihilation, "farming": farming},
+                    self.config,
+                )
+                self.assertEqual('name = "每日剿灭"' in rendered, annihilation)
+                self.assertEqual('name = "刷理智"' in rendered, farming)
+
+    def _yield_for(self, state, *, enabled=True):
+        with patch.object(maa_clearing, "load_state", return_value=state):
+            return maa_daily.attach_clearing_yield(
+                self.plan, {"clearing_enabled": enabled},
+                datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING),
+            )
+
+    def test_frozen_day_still_farms(self) -> None:
+        # 队列因冻结无法消耗理智的那天，日常照常刷理智——否则那天既不打队列
+        # 也不刷理智，一整天的理智白白溢出（日常判绿、卡片正常，什么都没打）。
+        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
+        maa_clearing.record_stage_failure(
+            state, "AT-1", kind="nav", detail="x", config={}, at=at
+        )
+        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
+        self.assertIn('name = "刷理智"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+
+    def test_needs_manual_waiting_day_still_farms(self) -> None:
+        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
+        maa_clearing.record_stage_failure(
+            state, "AT-1", kind="op", detail="x",
+            config={"clearing_manual_after_days": 1}, at=at,
+        )
+        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
+        self.assertIn('name = "刷理智"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+
+    def test_active_queue_day_yields_the_farming_block(self) -> None:
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
+        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
+        self.assertNotIn('name = "刷理智"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+
+    def test_disabled_feature_never_yields(self) -> None:
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        self.assertTrue(self._yield_for(state, enabled=False)["farming"])
+
+    def test_a_broken_queue_read_falls_back_to_farming(self) -> None:
+        # 探测自己坏了不能顺手把理智也停掉：宁可多刷一场。
+        with patch.object(maa_clearing, "load_state", side_effect=OSError("boom")):
+            plan = maa_daily.attach_clearing_yield(self.plan, {"clearing_enabled": True})
+        self.assertTrue(plan["farming"])
+
+
+class ClearingActionTests(unittest.TestCase):
+    """`maa_action.py` 的新子命令必须进白名单并保持 <20s 的派发姿态。"""
+
+    def test_new_subcommands_are_on_the_dispatch_allowlist(self) -> None:
+        with patch.object(maa_action, "clearing_status", return_value=(True, "s")) as status:
+            self.assertEqual(maa_action.dispatch(["clearing", "status"]), (True, "s"))
+        status.assert_called_once_with()
+        with patch.object(
+            maa_action, "clearing_manual_done", return_value=(True, "m")
+        ) as done:
+            self.assertEqual(
+                maa_action.dispatch(["clearing", "manual-done", "AT-1"]), (True, "m")
+            )
+        done.assert_called_once_with("AT-1")
+        for argv in (["clearing"], ["clearing", "nope"], ["clearing", "manual-done"]):
+            ok, message = maa_action.dispatch(argv)
+            self.assertFalse(ok)
+            self.assertIn("不支持的动作", message)
+
+    def test_clearing_is_refused_while_the_feature_is_off(self) -> None:
+        with patch.object(maa_action, "load_config", return_value={}):
+            ok, message = maa_action.clearing_start()
+        self.assertFalse(ok)
+        self.assertIn("clearing_enabled", message)
+
+    def test_clearing_run_dispatches_and_returns_immediately(self) -> None:
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        with patch.object(
+            maa_action, "load_config", return_value={"clearing_enabled": True}
+        ), patch.object(maa_clearing, "load_state", return_value=state), patch.object(
+            maa_action.subprocess, "Popen"
+        ) as popen, patch.object(
+            maa_action, "_copilot_blackout_reason", return_value=None
+        ), patch.object(maa_action.Path, "is_file", return_value=True):
+            ok, message = maa_action.clearing_run()
+        self.assertTrue(ok, message)
+        self.assertEqual(popen.call_args.args[0][-1], "clearing")
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_clearing_run_respects_the_daily_blackout(self) -> None:
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        with patch.object(
+            maa_action, "load_config", return_value={"clearing_enabled": True}
+        ), patch.object(maa_clearing, "load_state", return_value=state), patch.object(
+            maa_action, "_copilot_blackout_reason", return_value="太靠近 08:00"
+        ), patch.object(maa_action.subprocess, "Popen") as popen:
+            ok, message = maa_action.clearing_run()
+        self.assertFalse(ok)
+        self.assertEqual(message, "太靠近 08:00")
+        popen.assert_not_called()
+
+    def test_the_depot_window_is_kept_clear_of_the_queue(self) -> None:
+        import maa_copilot_worker
+
+        for hour, minute, blocked in (
+            (4, 19, False), (4, 20, True), (4, 30, True), (4, 59, True), (5, 0, False)
+        ):
+            with self.subTest(hour=hour, minute=minute):
+                reason = maa_copilot_worker._depot_window_reason(
+                    datetime(2026, 9, 2, hour, minute, tzinfo=BEIJING)
+                )
+                self.assertEqual(bool(reason), blocked)
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,15 @@ python3 ~/.hermes/scripts/maa_action.py log tail
 python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
 python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
+python3 ~/.hermes/scripts/maa_action.py clearing status
+python3 ~/.hermes/scripts/maa_action.py clearing start
+python3 ~/.hermes/scripts/maa_action.py clearing stop
+python3 ~/.hermes/scripts/maa_action.py clearing run
 ```
+
+`clearing manual-done <关卡>` **只**通过 needs_manual 卡片上的「已完成」按钮触发，
+聊天里不要替用户点——那句话的含义是「我已经在游戏里手动打过这一关了」，
+只有用户本人能确认。
 
 `copilot pick <token> <n> <mode>` 只通过候选卡片上的按钮触发，聊天里不要手拼；
 token 形如 12 位十六进制，来自搜索确认消息，不要猜测。
@@ -74,6 +82,15 @@ token 形如 12 位十六进制，来自搜索确认消息，不要猜测。
 - “作业结果呢 / 匹配到哪了” → 让用户直接看频道里的候选卡片；也可 `copilot status <token>`
 - “换一批 / 重找” → 候选卡片上的 🔄 按钮（`copilot again`），不用手拼
 - “不抄了 / 取消” → 候选卡片上的 ❌ 按钮（`copilot cancel`）
+- “通关队列到哪了 / 活动打到第几关” → `clearing status`
+- “开始自动通关这个活动” → `clearing start`（队列默认关闭，`config.clearing_enabled`
+  为 false 时脚本会直接拒绝并说明原因，原样转述即可）
+- “不打了 / 停掉队列” → `clearing stop`
+- “现在推一轮队列” → `clearing run`（后台派发；08:00/22:00 前 25 分钟与北京时间
+  04:20–05:00 的仓库对表窗口会被拒绝，原样转述）
+- 队列卡在某关发出「需要你手动打一次」卡片 → 只提示用户去游戏里打，然后**由用户**
+  点卡片上的「已完成」。**队列活跃时日常会摘掉「刷理智」但保留每日剿灭**，
+  冻结日和等待手动完成的那天照常刷理智。
 - 新活动自动确认卡 → 用户只需点“确认执行（普通）”或“取消”；不能把“已派发”说成“已完成”，
   最终状态只认 worker 随后发出的战报卡。
 - 自动卡回报“未启动，可重试” → 表示尚未进战且安全清理已完成，原确认卡仍可再点；回报普通

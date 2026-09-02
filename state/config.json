@@ -33,5 +33,9 @@
   "maa_core_version": "v6.17.0-beta.1",
   "copilot_blackout_minutes": 25,
   "activity_search_retry_minutes": 30,
-  "skland_roster_refresh_days": 7
+  "skland_roster_refresh_days": 7,
+  "clearing_enabled": false,
+  "clearing_manual_after_days": 2,
+  "clearing_annihilation_sanity": 25,
+  "clearing_ex_stage_count": 8
 }

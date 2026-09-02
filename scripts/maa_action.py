@@ -565,6 +565,137 @@ def copilot_pick(token: str, number: str, mode: str) -> tuple[bool, str]:
     return True, f"▶️ 已派发 {state.get('stage', '')}（{mode_label}）的抄作业场次，后台开跑消息稍后出现。"
 
 
+# ---------------------------------------------------------------------------
+# 通关队列（PLAN_CLEARING 步骤 3）
+# ---------------------------------------------------------------------------
+
+def _clearing_guard(config: dict[str, Any]) -> str | None:
+    if not bool(config.get("clearing_enabled", False)):
+        return (
+            "通关队列当前是关闭的（`config.clearing_enabled = false`）。"
+            "它要等 PLAN_CLEARING 步骤 2 的 Q3「真能停在编队界面」实测通过、"
+            "并且导航定义生成器（2b）落地之后才允许打开。"
+        )
+    return None
+
+
+def clearing_status() -> tuple[bool, str]:
+    import maa_clearing
+
+    config = load_config()
+    guard = _clearing_guard(config)
+    prefix = f"{guard}\n\n" if guard else ""
+    return True, prefix + maa_clearing.status_text(maa_clearing.load_state())
+
+
+def clearing_start() -> tuple[bool, str]:
+    """按当前活动建队列。关卡表取 `config.activity_stages` 这份运行时缓存，
+    不现场跑 `maa activity`——按钮脚本必须 <20s（不变量 #6）。"""
+    import maa_clearing
+
+    config = load_config()
+    guard = _clearing_guard(config)
+    if guard:
+        return False, guard
+    existing = maa_clearing.load_state()
+    if existing is not None and not maa_clearing.is_finished(existing):
+        return False, "已有一个未完成的队列；先 `clearing stop` 再重建。"
+    stages = config.get("activity_stages", [])
+    prefix, queue = maa_clearing.queue_from_activity_stages(
+        stages if isinstance(stages, list) else []
+    )
+    if not queue:
+        return False, "当前没有可用的活动关（`config.activity_stages` 为空或不是数字关）。"
+    state = maa_clearing.new_state(
+        activity_key=prefix,
+        activity_title=str(config.get("activity_title") or prefix),
+        prefix=prefix,
+        stages=queue,
+    )
+    maa_clearing.save_state(state)
+    return True, f"🗂️ 通关队列已建立：{queue[0]} → {queue[-1]}（共 {len(queue)} 关）。"
+
+
+def clearing_stop() -> tuple[bool, str]:
+    import maa_clearing
+
+    state = maa_clearing.load_state()
+    if state is None:
+        return False, "当前没有通关队列。"
+    stage = maa_clearing.awaiting_manual(state)
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        for custom_id in [
+            key for key in registry if key.startswith(maa_clearing.BUTTON_PREFIX)
+        ]:
+            registry.pop(custom_id)
+        atomic_write_json(BUTTONS_PATH, registry)
+    try:
+        maa_clearing.CLEARING_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    suffix = f"（原本在等 {stage} 的手动完成）" if stage else ""
+    return True, f"🗑️ 通关队列已删除{suffix}；日常恢复照常刷理智。"
+
+
+def clearing_manual_done(stage: str) -> tuple[bool, str]:
+    """`needs_manual` 出口：用户手打完点这个按钮，cursor 才前进。"""
+    import maa_clearing
+
+    stage = str(stage or "").strip()[:40]
+    with state_lock():
+        state = maa_clearing.load_state()
+        if state is None:
+            return False, "当前没有通关队列。"
+        awaiting = maa_clearing.awaiting_manual(state)
+        if not awaiting:
+            return False, "队列当前没有在等待手动完成。"
+        if awaiting != stage:
+            return False, f"队列在等的是 {awaiting}，不是 {stage}。"
+        maa_clearing.advance_cursor(state)
+        maa_clearing.save_state(state)
+        registry = load_json(BUTTONS_PATH, {})
+        if isinstance(registry, dict):
+            registry.pop(maa_clearing.manual_button_id(stage), None)
+            atomic_write_json(BUTTONS_PATH, registry)
+    nxt = maa_clearing.current_stage(state)
+    return True, (
+        f"✅ 已记下 {stage} 手动完成；队列继续到 {nxt or '队尾（全部完成）'}。"
+    )
+
+
+def clearing_run() -> tuple[bool, str]:
+    """派发一轮队列执行给 worker 后立即返回（不变量 #6：按钮脚本 <20s）。"""
+    import maa_clearing
+
+    config = load_config()
+    guard = _clearing_guard(config)
+    if guard:
+        return False, guard
+    state = maa_clearing.load_state()
+    if state is None:
+        return False, "当前没有通关队列；先 `clearing start`。"
+    if not maa_clearing.queue_is_active(state):
+        return False, "队列当前不活跃（已到队尾 / nav 冻结中 / 在等手动完成）。"
+    blackout = _copilot_blackout_reason(config)
+    if blackout:
+        return False, blackout
+    worker = SCRIPTS_DIR / "maa_copilot_worker.py"
+    if not worker.is_file():
+        return False, "maa_copilot_worker.py 尚未部署。"
+    subprocess.Popen(
+        [sys.executable, str(worker), "clearing"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return True, "▶️ 已派发一轮通关队列，进展稍后发到频道。"
+
+
 def dispatch(argv: list[str]) -> tuple[bool, str]:
     if argv[:2] == ["plan", "set-stage"] and len(argv) == 3:
         return set_stage(argv[2])
@@ -586,9 +717,20 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return copilot_status(argv[2])
     if argv[:2] == ["copilot", "pick"] and len(argv) == 5:
         return copilot_pick(argv[2], argv[3], argv[4])
+    if argv == ["clearing", "status"]:
+        return clearing_status()
+    if argv == ["clearing", "start"]:
+        return clearing_start()
+    if argv == ["clearing", "stop"]:
+        return clearing_stop()
+    if argv == ["clearing", "run"]:
+        return clearing_run()
+    if argv[:2] == ["clearing", "manual-done"] and len(argv) == 3:
+        return clearing_manual_done(argv[2])
     return False, (
         "不支持的动作；只允许 plan set-stage/skip-today/show、run now、log tail、"
-        "copilot find/again/cancel/status/pick。"
+        "copilot find/again/cancel/status/pick、"
+        "clearing status/start/stop/run/manual-done。"
     )
 
 
