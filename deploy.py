@@ -221,7 +221,7 @@ def deploy_state(channel_id: str) -> None:
     # configuration the repository owns. A seed value is only a first-boot
     # fallback; once the host has its own value, the seed must never clobber it.
     #   maa_core_version / maa_cli_version — written by the plan card's version probe
-    #   activity_stages                    — written by the活动 watcher / plan card
+    #   activity_stages                    — written by the activity watcher / plan card
     # Letting the seed win here re-creates the staleness PLAN_NAV_GATE A-3 fixed:
     # on 2026-09-02 a deploy replaced a correct empty list with a month-old TO
     # event's stages, and only the next watcher tick cleaned it up.
