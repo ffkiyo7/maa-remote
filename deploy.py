@@ -71,18 +71,41 @@ def copy_file(source: Path, target: Path, mode: int) -> None:
     write_bytes(target, source.read_bytes(), mode)
 
 
+MAA_CONFIG_RELATIVE_PATHS = (
+    Path("profiles/default.toml"),
+    Path("tasks/daily.toml"),
+    Path("tasks/depot.toml"),
+    Path("tasks/infrast-smoke.toml"),
+    Path("cli.toml"),
+    Path("resource/tasks/tasks.json"),
+)
+
+# `maa_daily.render_daily_toml()` rewrites the deployed `tasks/daily.toml` in
+# full before every run (DEV_GUIDE §0), so the runtime copy legitimately differs
+# from the repository seed the moment a run happens. Comparing its bytes would
+# make `--check` permanently red and train us to ignore it, so it is checked for
+# existence only. Every other maa-cli config — `resource/tasks/tasks.json`
+# above all, which nothing rewrites at runtime — is still compared byte for byte.
+RUNTIME_REWRITTEN_MAA_CONFIGS = frozenset({Path("tasks/daily.toml")})
+
+
 def maa_config_file_pairs() -> list[tuple[Path, Path]]:
     """Return every repository-managed maa-cli config and its runtime target."""
-    relative_paths = (
-        Path("profiles/default.toml"),
-        Path("tasks/daily.toml"),
-        Path("tasks/depot.toml"),
-        Path("tasks/infrast-smoke.toml"),
-        Path("cli.toml"),
-        Path("resource/tasks/tasks.json"),
-    )
     source_root = ROOT / "config" / "maa-cli"
-    return [(source_root / path, MAA_CONFIG_HOME / path) for path in relative_paths]
+    return [
+        (source_root / path, MAA_CONFIG_HOME / path)
+        for path in MAA_CONFIG_RELATIVE_PATHS
+    ]
+
+
+def maa_config_content_checked_pairs() -> list[tuple[Path, Path]]:
+    """The subset of `maa_config_file_pairs()` whose bytes must match the repo."""
+    source_root = ROOT / "config" / "maa-cli"
+    return [
+        (source_root / path, MAA_CONFIG_HOME / path)
+        for path in MAA_CONFIG_RELATIVE_PATHS
+        if path not in RUNTIME_REWRITTEN_MAA_CONFIGS
+    ]
 
 
 def content_mismatches(file_pairs: list[tuple[Path, Path]]) -> list[str]:
@@ -429,10 +452,9 @@ def main() -> int:
                 "ocrbox",
             )
         ]
-        maa_config_pairs = maa_config_file_pairs()
-        checks.extend(target for _source, target in maa_config_pairs)
+        checks.extend(target for _source, target in maa_config_file_pairs())
         missing = [str(path) for path in checks if not path.is_file()]
-        mismatched = content_mismatches(maa_config_pairs)
+        mismatched = content_mismatches(maa_config_content_checked_pairs())
         ok = not missing and not mismatched
         print(
             json.dumps(

@@ -388,6 +388,11 @@ python3 deploy.py --check
 # 反向漂移验证：手工改一个字节 → --check 必须报 mismatched 且失败 → 改回 → 干净
 ```
 
+**`tasks/daily.toml` 不在内容比对范围内**（后补，见 `deploy.RUNTIME_REWRITTEN_MAA_CONFIGS`）：
+它每场执行前被 `render_daily_toml()` 整份重写，比内容会让 `--check` 每场日常之后都红、
+永远清不干净。它仍照常部署、照常查存在。`resource/tasks/tasks.json` **必须仍比内容**——
+本步的防线就在那里，豁免它等于把 `49da169` 白做。
+
 **关于 `python3 deploy.py` 的 `changed`**：不要预期它「不含 tasks.json」。`changed`
 取决于**部署前线上的实际内容**，而线上可能已被别的步骤改过（22:05 就是这么发生的）。
 判据用上面的 `--check`，不要用 `changed` 的成员。

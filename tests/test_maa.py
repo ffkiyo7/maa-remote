@@ -868,6 +868,42 @@ Opening mini games:
                 [str(target)],
             )
 
+    def test_deploy_check_skips_daily_toml_but_still_guards_tasks_json(self) -> None:
+        # `maa_daily.render_daily_toml()` rewrites the deployed daily.toml before
+        # every run, so `--check` must not read that into deployment drift; the
+        # user-resource overlay has no such excuse and must stay byte-compared.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            runtime = root / "runtime"
+            for relative in deploy.MAA_CONFIG_RELATIVE_PATHS:
+                for base in (repo / "config" / "maa-cli", runtime):
+                    (base / relative).parent.mkdir(parents=True, exist_ok=True)
+                    (base / relative).write_bytes(b"seed\n")
+
+            with patch.object(deploy, "ROOT", repo), patch.object(
+                deploy, "MAA_CONFIG_HOME", runtime
+            ):
+                checked = deploy.maa_config_content_checked_pairs()
+                self.assertEqual(deploy.content_mismatches(checked), [])
+                # Every config is still deployed and existence-checked.
+                self.assertEqual(len(deploy.maa_config_file_pairs()), 6)
+                self.assertEqual(len(checked), 5)
+
+                daily = runtime / "tasks" / "daily.toml"
+                daily.write_bytes(b"rewritten by render_daily_toml\n")
+                self.assertEqual(
+                    deploy.content_mismatches(deploy.maa_config_content_checked_pairs()),
+                    [],
+                )
+
+                overlay = runtime / "resource" / "tasks" / "tasks.json"
+                overlay.write_bytes(b"drifted\n")
+                self.assertEqual(
+                    deploy.content_mismatches(deploy.maa_config_content_checked_pairs()),
+                    [str(overlay)],
+                )
+
     def test_parse_maa_versions_from_cli_output(self) -> None:
         cli, core = maa_plan_card.parse_maa_versions(
             "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n"
