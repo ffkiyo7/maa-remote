@@ -122,7 +122,7 @@ CF.json = CF-8
 |---|---|
 | A-3 `activity_stages` 过期 | ✅ 已由 `maa_activity_watch.py` 解决 |
 | A-1 / A-2 导航闸门 `stage_is_navigable` | ❌ 未实现（全库无此符号） |
-| B 自动任务执行前探测模拟器 | ✅ 已实现（commit `PLACEHOLDER_B_COMMIT`）：`maa_daily.emulator_is_online()` + `report_emulator_busy()`，不变量 #24；真机未验，等下一场自动日常 |
+| B 自动任务执行前探测模拟器 | ✅ 已实现（commit `f3b98de`）：`maa_daily.emulator_is_online()` + `report_emulator_busy()`，不变量 #24；真机未验，等下一场自动日常 |
 
 > B 项的那个「不是这个」仍然要记住：`maa_daily.settle_android_runtime()`（原文记的
 > `maa_daily.py:778`）是**开机稳定性**探测，跑在开完模拟器之后、等 `app_process` 别抖；

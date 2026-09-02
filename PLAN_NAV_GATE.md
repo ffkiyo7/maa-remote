@@ -213,7 +213,7 @@ def stage_is_navigable(
 
 ---
 
-# B. 自动任务执行前探测模拟器 ✅ 已交付（commit `PLACEHOLDER_B_COMMIT`，2026-09-02）
+# B. 自动任务执行前探测模拟器 ✅ 已交付（commit `f3b98de`，2026-09-02）
 
 **交付实况**：按 B-1/B-2/B-3 原样落地，行为无偏离。
 `maa_daily.emulator_is_online()`（两信号取或、预算 5s、永不抛异常）+
