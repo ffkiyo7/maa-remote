@@ -2385,9 +2385,13 @@ class ClearingQueueTests(unittest.TestCase):
         state, notify, blocked = maa_clearing.apply_ex_gate(self.state, roster, 3)
         self.assertFalse(notify)
         self.assertEqual(blocked, "")
+        # 突袭紧跟对应普通关（PLAN_CLEARING 步骤 3 的队列形态）。
         self.assertEqual(
             state["stages"],
-            ["AT-1", "AT-2", "AT-3", "AT-EX-1", "AT-EX-2", "AT-EX-3"],
+            ["AT-1", "AT-2", "AT-3",
+             "AT-EX-1", "AT-EX-1#raid",
+             "AT-EX-2", "AT-EX-2#raid",
+             "AT-EX-3", "AT-EX-3#raid"],
         )
         self.assertTrue(state["ex_appended"])
 
@@ -3050,6 +3054,309 @@ class FarmingSelectTests(unittest.TestCase):
         for key in ("farming_stage_table", "farming_manual_weights",
                     "clearing_manual_after_days", "clearing_enabled"):
             self.assertNotIn(key, deploy.PRESERVED_RUNTIME_CACHE_KEYS)
+
+
+class ClearingUnknownCostBlockTests(unittest.TestCase):
+    """返工 1：理智未知堵死队列时，日常必须把刷理智收回来。"""
+
+    def setUp(self) -> None:
+        self.at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
+        self.state = maa_clearing.new_state(
+            "k", "t", "AT", ["AT-EX-1"], at=self.at
+        )
+        self.plan = maa_common.normalize_plan(
+            {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
+        )
+        self.plan["annihilation"] = True
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+
+    def test_blocked_day_is_not_active_so_the_daily_still_farms(self) -> None:
+        # 队列一进 EX 段就排不出关（stage_sanity_cost 对 EX 返回 None）。
+        # 不记这一笔的话 queue_is_active 只看得到「cursor 没到末尾」→ 日常每场
+        # 都摘掉刷理智，而队列一关都打不了，理智整天白白溢出。
+        result = maa_clearing.plan_round(self.state, 200, lambda _s: None, at=self.at)
+        self.assertEqual(result["stages"], [])
+        self.assertEqual(result["stop_reason"], "unknown_cost")
+        self.assertTrue(maa_clearing.queue_is_active(self.state, self.at))
+
+        maa_clearing.mark_blocked(
+            self.state, "unknown_cost", result["unknown_cost"], at=self.at
+        )
+        self.assertFalse(maa_clearing.queue_is_active(self.state, self.at))
+        self.assertEqual(
+            maa_clearing.blocked_today(self.state, self.at), "unknown_cost"
+        )
+
+        with patch.object(maa_clearing, "load_state", return_value=self.state):
+            plan = maa_daily.attach_clearing_yield(
+                self.plan, {"clearing_enabled": True}, self.at
+            )
+        rendered = maa_daily.render_daily_toml(plan, self.config)
+        self.assertIn('name = "刷理智"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+
+    def test_the_block_expires_the_next_day_like_the_nav_freeze(self) -> None:
+        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"], at=self.at)
+        tomorrow = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        self.assertEqual(maa_clearing.blocked_today(self.state, tomorrow), "")
+        self.assertTrue(maa_clearing.queue_is_active(self.state, tomorrow))
+
+    def test_clear_blocked_reopens_the_queue_same_day(self) -> None:
+        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"], at=self.at)
+        maa_clearing.clear_blocked(self.state)
+        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
+        self.assertTrue(maa_clearing.queue_is_active(self.state, self.at))
+
+    def test_status_text_says_why_the_queue_is_parked(self) -> None:
+        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"])
+        text = maa_clearing.status_text(self.state)
+        self.assertIn("理智消耗算不出来", text)
+        self.assertIn("活跃（日常让路）：否", text)
+
+    def test_a_sanity_shortage_does_not_park_the_queue(self) -> None:
+        # 理智不够是暂时的（等一会儿就有了），不该让日常把刷理智让回去。
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"], at=self.at)
+        result = maa_clearing.plan_round(state, 5, lambda _s: 18, at=self.at)
+        self.assertEqual(result["stop_reason"], "sanity")
+        self.assertEqual(maa_clearing.blocked_today(state, self.at), "")
+        self.assertTrue(maa_clearing.queue_is_active(state, self.at))
+
+
+class ClearingRaidTests(unittest.TestCase):
+    """返工 2：EX 段的突袭要真的排进队列并真的以 raid 模式执行。"""
+
+    def test_ex_segment_alternates_normal_then_raid(self) -> None:
+        self.assertEqual(
+            maa_clearing.ex_segment("AT", 3),
+            [
+                "AT-EX-1", "AT-EX-1#raid",
+                "AT-EX-2", "AT-EX-2#raid",
+                "AT-EX-3", "AT-EX-3#raid",
+            ],
+        )
+        self.assertEqual(maa_clearing.ex_segment("AT", 0), [])
+
+    def test_split_entry_and_label(self) -> None:
+        self.assertEqual(maa_clearing.split_entry("AT-EX-1"), ("AT-EX-1", "normal"))
+        self.assertEqual(
+            maa_clearing.split_entry("AT-EX-1#raid"), ("AT-EX-1", "raid")
+        )
+        self.assertEqual(maa_clearing.entry_label("AT-EX-1"), "AT-EX-1")
+        self.assertEqual(maa_clearing.entry_label("AT-EX-1#raid"), "AT-EX-1（突袭）")
+
+    def test_the_gate_appends_the_full_alternating_segment(self) -> None:
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
+        roster = {"activity_progress": {"a": [{"zoneId": "z", "totalStage": 8,
+                                              "clearedStage": 8}]}}
+        state, _notify, _reason = maa_clearing.apply_ex_gate(state, roster, 2)
+        self.assertEqual(
+            state["stages"],
+            ["AT-1", "AT-EX-1", "AT-EX-1#raid", "AT-EX-2", "AT-EX-2#raid"],
+        )
+
+    def test_cost_lookup_and_navigation_use_the_plain_stage_name(self) -> None:
+        # 突袭是同一个关卡再打一遍：理智查表、导航、作业匹配全按普通关名走，
+        # 只有 --raid 取值不同。
+        seen: list[str] = []
+
+        def cost_of(entry: str) -> int:
+            stage, _mode = maa_clearing.split_entry(entry)
+            seen.append(stage)
+            return 18
+
+        state = maa_clearing.new_state(
+            "k", "t", "AT", ["AT-EX-1", "AT-EX-1#raid"]
+        )
+        result = maa_clearing.plan_round(state, 100, cost_of)
+        self.assertEqual(result["stages"], ["AT-EX-1", "AT-EX-1#raid"])
+        self.assertEqual(seen, ["AT-EX-1", "AT-EX-1"])
+
+    def test_raid_entries_run_with_raid_mode(self) -> None:
+        # maa copilot --help 的取值：normal / raid / both。
+        import maa_copilot_worker
+
+        calls: list[list[str]] = []
+
+        def fake_watchdog(config, command, handle, log_path, env):
+            calls.append(command)
+            return 0, 0
+
+        with patch.object(
+            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
+        ), patch.object(
+            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
+        ), patch.object(
+            maa_copilot_worker, "_run_copilot_with_watchdog", side_effect=fake_watchdog
+        ), patch.object(
+            maa_copilot_worker.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+        ), patch.object(
+            maa_copilot_worker, "atomic_write_text"
+        ), tempfile.TemporaryDirectory() as raw:
+            log_path = Path(raw) / "clearing.log"
+            log_path.write_text("", encoding="utf-8")
+            for mode in ("normal", "raid"):
+                with self.subTest(mode=mode):
+                    calls.clear()
+                    # 让胜利标记出现，否则判据（返工 3）会判失败。真实情况下
+                    # 子进程写的就是这个 handle，所以桩也必须写它——从别的
+                    # 文件句柄追加会和缓冲区打架，顺序反过来。
+                    def watchdog_with_victory(config, command, handle, log_path_, env):
+                        calls.append(command)
+                        handle.write("Copilot Completed\n")
+                        return 0, 0
+
+                    with patch.object(
+                        maa_copilot_worker,
+                        "_run_copilot_with_watchdog",
+                        side_effect=watchdog_with_victory,
+                    ):
+                        ok, kind, _detail = maa_copilot_worker._clearing_fight_stage(
+                            {}, "AT-EX-1", "act_ex_1", None, {}, log_path, mode
+                        )
+                    self.assertTrue(ok, kind)
+                    self.assertEqual(calls[0][calls[0].index("--raid") + 1], mode)
+
+
+class ClearingVictoryJudgementTests(unittest.TestCase):
+    """返工 3：cursor 一前进就永久跳过该关，所以退出码 0 不够。"""
+
+    def test_a_failure_marker_beats_a_zero_exit_code(self) -> None:
+        for marker in maa_clearing.COPILOT_FAILURE_MARKERS:
+            with self.subTest(marker=marker):
+                outcome, detail = maa_clearing.copilot_outcome(
+                    f"MissionStart\n{marker}\n", 0
+                )
+                self.assertEqual(outcome, "failed")
+                self.assertIn(marker, detail)
+
+    def test_a_victory_marker_with_a_zero_exit_code_is_a_win(self) -> None:
+        outcome, detail = maa_clearing.copilot_outcome(
+            "MissionStart\nCopilot Completed\n", 0
+        )
+        self.assertEqual(outcome, "won")
+        self.assertEqual(detail, "")
+
+    def test_no_marker_at_all_is_unknown_not_a_win(self) -> None:
+        # 判据未经真实 copilot 日志核对（runs/ 的 14 天保留期已把 2026-08 那批
+        # 抄作业日志清掉），所以故意 fail-closed：宁可停下来问，也不静默跳关。
+        outcome, detail = maa_clearing.copilot_outcome("MissionStart\n", 0)
+        self.assertEqual(outcome, "unknown")
+        self.assertIn("COPILOT_VICTORY_MARKERS", detail)
+
+    def test_a_nonzero_exit_code_is_always_a_failure(self) -> None:
+        self.assertEqual(
+            maa_clearing.copilot_outcome("Copilot Completed", 1)[0], "failed"
+        )
+
+    def test_zero_exit_with_a_failure_marker_does_not_advance_the_cursor(self) -> None:
+        import maa_copilot_worker
+
+        def watchdog_with_error(config, command, handle, log_path_, env):
+            handle.write("Copilot Error\n")
+            return 0, 0
+
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
+        ), patch.object(
+            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
+        ), patch.object(
+            maa_copilot_worker, "_run_copilot_with_watchdog",
+            side_effect=watchdog_with_error,
+        ), patch.object(
+            maa_copilot_worker.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+        ), patch.object(maa_copilot_worker, "atomic_write_text"):
+            log_path = Path(raw) / "clearing.log"
+            log_path.write_text("", encoding="utf-8")
+            ok, kind, detail = maa_copilot_worker._clearing_fight_stage(
+                {}, "AT-1", "act_1", None, {}, log_path, "normal"
+            )
+        self.assertFalse(ok)
+        self.assertEqual(kind, "op")
+        self.assertIn("Copilot Error", detail)
+
+        # 按 op 失败记账，cursor 不动。
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
+        state, _turned = maa_clearing.record_stage_failure(
+            state, "AT-1", kind=kind, detail=detail, config={}
+        )
+        self.assertEqual(state["cursor"], 0)
+        self.assertEqual(maa_clearing.current_stage(state), "AT-1")
+        self.assertFalse(maa_clearing.is_nav_frozen(state, "AT-1"))
+
+    def test_an_earlier_run_in_the_same_log_cannot_fake_a_win(self) -> None:
+        # 日志是追加的：上一趟的 `Copilot Completed` 不能把这一趟算成通关。
+        import maa_copilot_worker
+
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
+        ), patch.object(
+            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
+        ), patch.object(
+            maa_copilot_worker, "_run_copilot_with_watchdog", return_value=(0, 0)
+        ), patch.object(
+            maa_copilot_worker.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+        ), patch.object(maa_copilot_worker, "atomic_write_text"):
+            log_path = Path(raw) / "clearing.log"
+            log_path.write_text("Copilot Completed\n", encoding="utf-8")
+            ok, _kind, detail = maa_copilot_worker._clearing_fight_stage(
+                {}, "AT-1", "act_1", None, {}, log_path, "normal"
+            )
+        self.assertFalse(ok, detail)
+
+
+class ClearingDispatchNoticeTests(unittest.TestCase):
+    """返工 4：派发失败也要发 Discord，不能只写 last_run（护栏 4）。"""
+
+    def test_a_dispatch_failure_writes_state_and_posts(self) -> None:
+        with patch.object(maa_daily, "merge_last_run") as merge, patch.object(
+            maa_daily, "load_config", return_value={"channel_id": "42"}
+        ), patch.object(maa_daily, "discord_token", return_value="tok"), patch.object(
+            maa_daily, "discord_request"
+        ) as post:
+            maa_daily.report_clearing_dispatch_failure("通关队列派发失败：OSError: boom")
+        self.assertIn("clearing_dispatch_error", merge.call_args.args[0])
+        self.assertEqual(post.call_args.args[2], "/channels/42/messages")
+        embed = post.call_args.args[3]["embeds"][0]
+        self.assertEqual(embed["title"], "❌ 通关队列未派发")
+        self.assertIn("boom", embed["description"])
+
+    def test_normal_no_ops_stay_quiet(self) -> None:
+        # 「功能没启用」「队列不活跃」是正常无操作，不该刷屏。
+        with patch.object(maa_daily, "load_config", return_value={}):
+            self.assertEqual(maa_daily.dispatch_clearing_round(), "")
+        with patch.object(
+            maa_daily, "load_config", return_value={"clearing_enabled": True}
+        ), patch.object(maa_clearing, "load_state", return_value=None):
+            self.assertEqual(maa_daily.dispatch_clearing_round(), "")
+
+    def test_main_reports_a_dispatch_failure_without_changing_the_verdict(self) -> None:
+        with patch.object(maa_daily, "select_phase", return_value="am"), patch.object(
+            maa_daily, "execute", return_value=0
+        ), patch.object(
+            maa_daily, "dispatch_clearing_round", return_value="worker 未部署"
+        ), patch.object(
+            maa_daily, "report_clearing_dispatch_failure"
+        ) as report:
+            self.assertEqual(maa_daily.main(["maa_daily.py"]), 0)
+        report.assert_called_once_with("worker 未部署")
+
+    def test_a_successful_dispatch_reports_nothing(self) -> None:
+        with patch.object(maa_daily, "select_phase", return_value="am"), patch.object(
+            maa_daily, "execute", return_value=0
+        ), patch.object(
+            maa_daily, "dispatch_clearing_round", return_value="dispatched"
+        ), patch.object(
+            maa_daily, "report_clearing_dispatch_failure"
+        ) as report:
+            maa_daily.main(["maa_daily.py"])
+        report.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

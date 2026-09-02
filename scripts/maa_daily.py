@@ -1931,14 +1931,55 @@ def dispatch_clearing_round() -> str:
         return f"通关队列派发失败：{type(exc).__name__}: {exc}"
 
 
+def report_clearing_dispatch_failure(detail: str) -> None:
+    """派发不出去也必须可见：写状态**并**发 Discord（护栏 4）。
+
+    只有真正的异常路径才走这里；「功能没启用」「队列不活跃」是正常无操作，
+    不发（`dispatch_clearing_round()` 对那两种情况返回空串）。
+    """
+    print(detail, flush=True)
+    try:
+        merge_last_run(
+            {
+                "clearing_dispatch_error": detail,
+                "clearing_dispatch_failed_at": now_beijing().isoformat(),
+            }
+        )
+    except Exception as exc:
+        print(f"派发失败状态写入失败：{type(exc).__name__}: {exc}", flush=True)
+    try:
+        config = load_config()
+        discord_request(
+            discord_token(),
+            "POST",
+            f"/channels/{str(config.get('channel_id', ''))}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": "❌ 通关队列未派发",
+                        "description": (
+                            f"{detail}\n"
+                            "本场日常的结论不受影响；队列这一轮没有跑，"
+                            "可以说「现在推一轮队列」手动补，或等下一场日常。"
+                        )[:1500],
+                        "color": 0xED4245,
+                        "timestamp": now_beijing().isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+    except Exception as exc:
+        print(f"派发失败通知发送失败：{type(exc).__name__}: {exc}", flush=True)
+
+
 def main(argv: list[str]) -> int:
     phase = select_phase(argv)
     code = execute(phase)
     detail = dispatch_clearing_round()
     if detail and detail != "dispatched":
         # 派发失败不改变本场结论，但绝不静默（护栏 4）。
-        print(detail, flush=True)
-        merge_last_run({"clearing_dispatch_error": detail})
+        report_clearing_dispatch_failure(detail)
     return code
 
 

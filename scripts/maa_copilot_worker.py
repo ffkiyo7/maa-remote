@@ -1170,8 +1170,13 @@ def _clearing_fight_stage(
     roster: dict[str, Any] | None,
     env: dict[str, str],
     log_path: Path,
+    mode: str = "normal",
 ) -> tuple[bool, str, str]:
-    """打一关。返回 `(是否成功, 失败种类, 明细)`；失败种类 ∈ {"", "nav", "op"}。"""
+    """打一关。返回 `(是否成功, 失败种类, 明细)`；失败种类 ∈ {"", "nav", "op"}。
+
+    `stage` 已经是**去掉 `#raid` 后缀**的关卡名：理智查表、导航、作业匹配全都按
+    普通关名走，只有最后 `maa copilot --raid` 的取值受 `mode` 影响。
+    """
     maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     candidate = _clearing_pick_op(stage, stage_id, config, roster)
     if candidate is None:
@@ -1197,19 +1202,29 @@ def _clearing_fight_stage(
         # 不一定是关卡未解锁。
         return False, "nav", f"{stage} 导航到编队界面失败：{detail}"
 
+    # `maa copilot --help`：normal / raid / both（另收 legacy 的 0/1/2）。
     command = [maa_bin, "copilot", uri, "--formation", "--batch", "-v",
-               "--raid", "normal"]
+               "--raid", mode]
+    marker = f"# {now_beijing().isoformat()} clearing {stage} mode={mode} "
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            f"# {now_beijing().isoformat()} clearing {stage} "
-            f"id={candidate.get('id')}\n"
-        )
+        handle.write(f"{marker}id={candidate.get('id')}\n")
         return_code, _taps = _run_copilot_with_watchdog(
             config, command, handle, log_path, env
         )
-    if return_code != 0:
-        return False, "op", f"{stage} 作业执行失败（退出码 {return_code}）"
-    return True, "", str(candidate.get("title") or "")
+
+    # 退出码 0 **不等于** 打过了：cursor 一前进就永久跳过这一关，所以要拿
+    # 本趟输出去判胜负（`maa_clearing.copilot_outcome()` 里写了判据与局限）。
+    import maa_clearing
+
+    try:
+        full = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        full = ""
+    this_run = full.rsplit(marker, 1)[-1] if marker in full else full
+    outcome, detail = maa_clearing.copilot_outcome(this_run, return_code)
+    if outcome == "won":
+        return True, "", str(candidate.get("title") or "")
+    return False, "op", f"{stage}（{mode}）作业未判定为通关：{detail}"
 
 
 def cmd_clearing() -> int:
@@ -1286,7 +1301,9 @@ def cmd_clearing() -> int:
     budget = maa_clearing.sanity_budget(sanity, plan, config)
     index = maa_copilot.load_stage_index(config)
 
-    def cost_of(stage: str) -> int | None:
+    def cost_of(entry: str) -> int | None:
+        # 突袭条目按**普通关名**查理智；`#raid` 只影响执行时的 --raid 取值。
+        stage, _mode = maa_clearing.split_entry(entry)
         resolved = maa_copilot.resolve_copilot_stage(stage, index)
         if resolved is None:
             return None
@@ -1298,17 +1315,31 @@ def cmd_clearing() -> int:
         if maa_clearing.should_notify(state, "unknown_cost", "|".join(unknown)):
             embed = maa_clearing.unknown_sanity_embed(unknown)
             _clearing_notice(config, embed["title"], embed["description"], 0x99AAB5)
-        maa_clearing.save_state(state)
     if not plan_result["stages"]:
+        if plan_result["stop_reason"] == "unknown_cost":
+            # 理智算不出来会**一直**排不出来（不像理智不够那样等等就好），
+            # 不记这一笔的话队列会永远「活跃但打不了」，日常每场都白让出刷理智。
+            maa_clearing.mark_blocked(
+                state, "unknown_cost", plan_result["unknown_cost"], at=at
+            )
+        maa_clearing.save_state(state)
         _clearing_notice(
             config,
             "⏸️ 通关队列本轮没有可打的关",
             f"可用理智 {sanity if sanity is not None else '未知（森空岛不可用）'}（已扣剿灭预留 "
             f"{maa_clearing.annihilation_reserve(plan, config)}），"
-            f"停在 `{plan_result['stop_reason']}`。",
+            f"停在 `{plan_result['stop_reason']}`。"
+            + (
+                "\n今天不再重试，日常照常刷理智；明天自动再试一次。"
+                if plan_result["stop_reason"] == "unknown_cost"
+                else ""
+            ),
             0x99AAB5,
         )
         return 0
+    # 排得出关就说明堵塞已经解除（例如步骤 4 落地后理智读得出来了）。
+    maa_clearing.clear_blocked(state)
+    maa_clearing.save_state(state)
 
     with run_lock(blocking=False) as acquired:
         if not acquired:
@@ -1369,34 +1400,35 @@ def _clearing_run_locked(
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
-        for stage in stages:
+        for entry in stages:
+            stage, mode = maa_clearing.split_entry(entry)
             resolved = maa_copilot.resolve_copilot_stage(stage, index)
             if resolved is None:
                 state, turned = maa_clearing.record_stage_failure(
-                    state, stage, kind="nav",
+                    state, entry, kind="nav",
                     detail=f"{stage} 不在本地关卡索引里（多半是 MAA 没写导航定义）",
                     config=config, at=at,
                 )
                 maa_clearing.save_state(state)
                 failure = f"{stage} 不在本地关卡索引里"
                 if turned:
-                    _clearing_post_manual_card(config, state, stage)
+                    _clearing_post_manual_card(config, state, entry)
                 break
             ok, kind, detail = _clearing_fight_stage(
-                config, stage, resolved[0], roster, env, log_path
+                config, stage, resolved[0], roster, env, log_path, mode
             )
             if ok:
                 maa_clearing.advance_cursor(state)
                 maa_clearing.save_state(state)
-                done.append(stage)
+                done.append(maa_clearing.entry_label(entry))
                 continue
             state, turned = maa_clearing.record_stage_failure(
-                state, stage, kind=kind, detail=detail, config=config, at=at
+                state, entry, kind=kind, detail=detail, config=config, at=at
             )
             maa_clearing.save_state(state)
             failure = detail
             if turned:
-                _clearing_post_manual_card(config, state, stage)
+                _clearing_post_manual_card(config, state, entry)
             break
     except Exception as exc:
         failure = f"{type(exc).__name__}: {exc}"

@@ -488,14 +488,41 @@ maa_daily.main() 日常收尾    ──┴→ Popen(maa_copilot_worker.py cleari
 刚过，而且让路省下的那份理智正好攒在那里。派发发生在 `run_lock` 释放**之后**，
 worker 自己去抢锁。07:50 的计划卡不行：它距 08:00 只有 10 分钟，永远在 blackout 里。
 
-**「队列活跃」的三条件**（`queue_is_active()`，日常让路只看它）：
+**「队列活跃」的四条件**（`queue_is_active()`，日常让路只看它）：
 
 1. `clearing.json` 存在且 cursor 未到末尾；2. 今日不处于 nav 失败冻结；
-3. 不在 `needs_manual` 等待用户点击。
+3. 不在 `needs_manual` 等待用户点击；4. 今日未被 `mark_blocked()` 堵住。
 
 只有活跃时 `render_daily_toml()` 才摘掉「刷理智」（保留每日剿灭）。
-**冻结日和等待日照常刷理智**——否则那天既不打队列也不刷理智，一整天的理智白白
-溢出，而日常判绿、卡片正常，是最难被发现的一种损失。
+**冻结日、等待日、被堵日都照常刷理智**——否则那天既不打队列也不刷理智，一整天的
+理智白白溢出，而日常判绿、卡片正常，是最难被发现的一种损失。
+
+第 4 条是为「理智成本算不出来」加的：`plan_round()` 撞上 `unknown_cost` 会停下且
+不前进 cursor（对的），但队列一进 EX 段就会**永远**排不出关（`stage_sanity_cost()`
+对 EX 返回 `None`，步骤 4 才解），于是队列长期「活跃但一关都打不了」。
+`mark_blocked()` 按**日期**记（次日自动过期重试一次，与 nav 冻结同尺度），
+排得出关时由 `clear_blocked()` 解除。**理智不够不记这一笔**——那是暂时的，
+等一会儿就恢复，不该让日常把刷理智让回去。
+
+**EX 段的突袭**用队列条目的 `#raid` 后缀表示（`AT-EX-1` → `AT-EX-1#raid`，突袭紧跟
+对应普通关）。选后缀而不是把 `stages` 改成带 mode 的字典，是为了让 `stages` 保持
+一串纯字符串：已落盘的 `clearing.json` 不用迁移，`current_stage()` / `plan_round()` /
+`stage_state` 的键形状不变，Discord 的 `custom_id` 也直接拼得进去。
+**除了执行时 `maa copilot --raid` 的取值（`normal` / `raid` / `both`，由
+`maa copilot --help` 核实），其余一切——理智查表、导航、作业匹配、状态展示——
+都用 `split_entry()` 去掉后缀之后的关卡名。**
+
+**「这一关打过了没有」的判据**（`copilot_outcome()`）：退出码 0 **且**输出不含
+`Copilot Error` / `Copilot Stopped` / `Error: Some error` **且**含 `Copilot Completed`。
+只看退出码对抄作业够用（用户看得见战报、可以自己再点一次），但队列的 cursor 一旦
+前进就**永久跳过**这一关，撤退、三星未达、进程正常退出的 Fight Error 都会被算成通关。
+判据依据是 maa-cli 把 MaaCore 的 TaskChain 回调打成 `<链名> Completed/Stopped/Error`
+这条约定（worker 导航段的 `"Fight Completed" not in …` 就建立在同一条上，且 C3
+实测跑通过）。**局限**：`Copilot Completed` 这个具体字符串**没有拿真实 copilot 日志
+核对过**——`runs/` 的 14 天保留期已把 2026-08 那批抄作业日志清掉，当前 `asst.log`
+窗口里也没有任何一次真实作战。所以认不出胜利标记时返回 `unknown` 并**按失败处理**
+（fail-closed，宁可停下来问，也不静默跳关）。第一次真机跑完请照
+`runs/<date>-clearing.log` 核对，对不上就改 `COPILOT_VICTORY_MARKERS`。
 
 **`needs_manual` 的 N 按不同日期计**，不按尝试次数计（`clearing_manual_after_days`，
 默认 2）。活动首日 prts.plus 上作业本来就少，按次数计会让每一关当天就触发，
@@ -688,12 +715,15 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 24 | 自动场次（`am`/`pm`）在 `open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本场，且**必须发 Discord 并写 `last_run.json`**（`status=skipped` + `skip_reason=emulator_busy`），文案要给出「说『现在跑』」这条出路。`now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同） | `maa_daily.AUTO_PHASES` / `emulator_is_online()` / `report_emulator_busy()` + `EmulatorProbeTests` |
 | 25 | `state/config.json` 里**由线上进程写回的运行时缓存键**（当前 `maa_core_version`、`maa_cli_version`、`activity_stages`）必须列入 `deploy.PRESERVED_RUNTIME_CACHE_KEYS`：线上已有值一律保留，仓库种子**只在首次部署时兜底**。**新增此类键时必须同步加进这个元组**，否则每次 `deploy.py` 都会用种子盖掉线上真值（2026-09-02 已实际发生过一次） | `deploy.PRESERVED_RUNTIME_CACHE_KEYS` / `deploy_state()` + `test_every_known_runtime_cache_key_is_preserved_on_deploy`（手工清单比对，漏加即红）、`test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent` |
 | 26 | 「刷理智」与「每日剿灭」是 `render_daily_toml()` 里**两个独立开关**（`plan["farming"]` / `plan["annihilation"]`，`tasks.fight` 仍是二者的总开关）。通关队列**只摘刷理智、永远保留剿灭**（周上限 1800 合成玉、代理卡驱动，摘掉纯亏）。队列状态读不出来时**按不活跃处理**——宁可多刷一场，也不能因为读状态失败就一整天什么都不打 | `render_daily_toml` 的两个 `if` + `attach_clearing_yield()` + `ClearingDailyYieldTests` |
-| 27 | 「队列活跃」= cursor 未到末尾 **且** 今日无 nav 冻结 **且** 不在 `needs_manual` 等待，三条件缺一不可。**冻结日与等待日日常照常刷理智**：只判「`clearing.json` 存在」会把这两天也算成活跃，那天既不打队列也不刷理智，理智白白溢出且日常判绿无人察觉 | `maa_clearing.queue_is_active()` + `test_queue_is_active_requires_all_three_conditions` / `test_frozen_day_still_farms` / `test_needs_manual_waiting_day_still_farms` |
+| 27 | 「队列活跃」= cursor 未到末尾 **且** 今日无 nav 冻结 **且** 不在 `needs_manual` 等待 **且** 今日未被 `mark_blocked()` 堵住，**四**条件缺一不可。**冻结日、等待日、被堵日日常都照常刷理智**：少判任何一条都会让那天既不打队列也不刷理智，理智白白溢出且日常判绿无人察觉。第 4 条专治「理智成本算不出来」——它不像理智不够那样等等就好，会让队列永久「活跃但打不了」；按日期记、次日自动重试一次，排得出关时 `clear_blocked()` 解除。**理智不够不记这一笔** | `maa_clearing.queue_is_active()` / `mark_blocked()` + `test_queue_is_active_requires_all_three_conditions` / `test_frozen_day_still_farms` / `test_needs_manual_waiting_day_still_farms` / `ClearingUnknownCostBlockTests` |
 | 28 | 队列排关前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的关**不入当轮、不进预算、cursor 不前进**（那不是「打完了」，是「算不出来」，前进会把它永久跳过），提示只发一次 | `maa_clearing.sanity_budget()` / `plan_round()` + `ClearingQueueTests` |
 | 29 | EX 开放闸门是**独立于 `zone_progress_warning()`** 的第二条单向规则，两个模块互不 import；森空岛不可用一律 **fail-closed 不入队 EX**，且必须**可见**：写 `clearing.json` 的 `ex_gate_blocked_reason/_since`，并发一次去重后的 Discord 卡片（同原因不刷屏、原因变了重新发）。⚠️ `totalStage == 0` 这条推论**未实地验证**，下个活动上线当天要核对 | `maa_clearing.ex_gate()` / `apply_ex_gate()` + `test_ex_gate_*`（含 AST 结构断言） |
 | 30 | `needs_manual` 的 N 按**不同日期**计（`Asia/Shanghai` 日界），不按尝试次数计；触发后 cursor **不前进**，只有用户点「已完成」才前进。队列按钮用**第三个前缀** `hermes:btn:maa-clearing:`，不进 `hermes:btn:maa:` 的 07:50 清扫（卡片要跨天存活），也不进 `hermes:btn:maa-copilot:` 的 token TTL 清扫（队列没有 token）——不变量 #7/#14 的边界因此一字未改 | `maa_clearing.record_stage_failure()` / `BUTTON_PREFIX` + `test_manual_threshold_counts_distinct_dates_not_attempts` / `test_manual_card_button_uses_its_own_prefix` |
 | 31 | 材料缺口下拉写的是**同一个 `plan.stage`**（不新增字段：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），值仍经 `select_args` 查表（#8），用 `hermes:btn:maa:` 前缀所以 07:50 清扫后随卡片重建仍在（#7/#14）。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则 | `_farming_stage_select()` + `FarmingSelectTests` |
 | 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；`farming_stage_table` 查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
+| 33 | 队列 cursor **只在这一关被判定为通关时**才前进：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串尚未用真实 copilot 日志核对（日志已过 14 天保留期），第一次真机跑完要核对 | `maa_clearing.copilot_outcome()` + `ClearingVictoryJudgementTests` |
+| 34 | EX 段的突袭用队列条目的 `#raid` 后缀表示，突袭紧跟对应普通关；**除了 `maa copilot --raid` 的取值，理智查表 / 导航 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.ex_segment()` / `split_entry()` + `ClearingRaidTests` |
+| 35 | 通关队列派发失败（worker 未部署 / `Popen` 抛错）必须**写 `last_run` 并发 Discord**，不能只写状态（护栏 4）。「功能未启用」「队列不活跃」是正常无操作，不发 | `maa_daily.report_clearing_dispatch_failure()` + `ClearingDispatchNoticeTests` |
 
 ---
 

@@ -151,12 +151,46 @@ def queue_from_activity_stages(stages: Iterable[str]) -> tuple[str, list[str]]:
     return prefix, [f"{prefix}-{index}" for index in range(1, buckets[prefix] + 1)]
 
 
+# 队列条目的突袭表示：**关卡名 + `#raid` 后缀**。
+# 选后缀而不是把 stages 改成带 mode 的字典，是因为 stages 保持成一串纯字符串：
+# 已落盘的 clearing.json 不需要迁移，`current_stage()` / `plan_round()` /
+# `stage_state` 的键都不用改形状，Discord 的 custom_id 也直接拼得进去。
+# **除了执行时的 `--raid` 取值，其余一切（理智查表、导航、状态展示）都用
+# `split_entry()` 去掉后缀之后的关卡名。**
+RAID_SUFFIX = "#raid"
+
+
+def split_entry(entry: str) -> tuple[str, str]:
+    """队列条目 → `(关卡名, mode)`，mode ∈ {"normal", "raid"}。"""
+    text = str(entry or "")
+    if text.endswith(RAID_SUFFIX):
+        return text[: -len(RAID_SUFFIX)], "raid"
+    return text, "normal"
+
+
+def entry_label(entry: str) -> str:
+    """给人看的名字：`AT-EX-1（突袭）`。"""
+    stage, mode = split_entry(entry)
+    return f"{stage}（突袭）" if mode == "raid" else stage
+
+
 def ex_segment(prefix: str, count: int) -> list[str]:
-    """EX 段：普通 → 突袭紧跟对应普通关。突袭用同名关卡、mode=raid 区分。"""
-    return [f"{prefix}-EX-{index}" for index in range(1, max(0, count) + 1)]
+    """EX 段：**普通 → 突袭紧跟对应普通关**（AT-EX-1 普通 → AT-EX-1 突袭 → AT-EX-2 …）。
+
+    突袭是同一个关卡再打一遍，靠条目上的 `#raid` 后缀区分，执行时传
+    `maa copilot --raid raid`（取值由 `maa copilot --help` 核实：
+    `normal` / `raid` / `both`）。
+    """
+    entries: list[str] = []
+    for index in range(1, max(0, count) + 1):
+        stage = f"{prefix}-EX-{index}"
+        entries.append(stage)
+        entries.append(f"{stage}{RAID_SUFFIX}")
+    return entries
 
 
 def current_stage(state: dict[str, Any]) -> str:
+    """当前**队列条目**（可能带 `#raid` 后缀）。取关卡名请用 `split_entry()`。"""
     stages = state.get("stages") or []
     cursor = int(state.get("cursor", 0))
     if not isinstance(stages, list) or not 0 <= cursor < len(stages):
@@ -376,6 +410,47 @@ def record_stage_failure(
     return state, True
 
 
+def mark_blocked(
+    state: dict[str, Any],
+    kind: str,
+    stages: list[str],
+    *,
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """记下「今天排不出任何一关，而且不是因为理智不够」。
+
+    理智不够是**暂时的**（等一会儿就恢复了），不该让日常把刷理智让出去继续等；
+    但「理智成本算不出来」（EX 关，步骤 4 才解）会一直排不出来，队列会永久停在
+    那里。不记这一笔的话 `queue_is_active()` 只看得到「cursor 没到末尾」，
+    于是日常每场都摘掉刷理智、队列又一关都打不了，理智整天白白溢出——
+    正是三条件定义要防的那种损失，只是原因不在原来那三条里。
+
+    按**日期**记，次日自动过期重试一次，与 nav 失败冻结同一个时间尺度。
+    """
+    state["blocked"] = {
+        "kind": str(kind),
+        "date": today_key(at),
+        "stages": [str(stage) for stage in stages],
+        "at": (at or now_beijing()).isoformat(),
+    }
+    return state
+
+
+def clear_blocked(state: dict[str, Any]) -> dict[str, Any]:
+    state.pop("blocked", None)
+    return state
+
+
+def blocked_today(state: dict[str, Any], at: datetime | None = None) -> str:
+    """今天被堵住的原因种类；没被堵返回空串。"""
+    blocked = state.get("blocked")
+    if not isinstance(blocked, dict):
+        return ""
+    if str(blocked.get("date") or "") != today_key(at):
+        return ""
+    return str(blocked.get("kind") or "")
+
+
 def awaiting_manual(state: dict[str, Any]) -> str:
     manual = state.get("needs_manual")
     if isinstance(manual, dict):
@@ -388,22 +463,26 @@ def awaiting_manual(state: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def queue_is_active(state: dict[str, Any] | None, at: datetime | None = None) -> bool:
-    """三个条件全部成立才算活跃：
+    """**四个**条件全部成立才算活跃：
 
     1. `clearing.json` 存在，且 cursor **未到末尾**；
     2. 今日**不处于 nav 失败冻结**；
-    3. **不在 `needs_manual` 等待用户点击**。
+    3. **不在 `needs_manual` 等待用户点击**；
+    4. 今日**未被 `mark_blocked()` 堵住**（当前唯一的堵法是「理智成本算不出来」，
+       见 `plan_round()` 的 `unknown_cost`）。
 
-    只有活跃时日常才摘掉「刷理智」。**队列因冻结或等待而无法消耗理智的那天，
-    日常照常刷理智**——否则那天既不打队列、也不刷理智，一整天的理智白白溢出，
-    这是最难被发现的一种损失（日常判绿、卡片正常，只是什么都没打）。
-    注意「活跃」不等于「clearing.json 存在」：只判存在会把冻结日和等待日一起算进去。
+    只有活跃时日常才摘掉「刷理智」。**队列因冻结、等待或被堵而无法消耗理智的
+    那天，日常照常刷理智**——否则那天既不打队列、也不刷理智，一整天的理智白白
+    溢出，这是最难被发现的一种损失（日常判绿、卡片正常，只是什么都没打）。
+    注意「活跃」不等于「clearing.json 存在」：只判存在会把上面三种日子一起算进去。
     """
     if not isinstance(state, dict):
         return False
     if is_finished(state):
         return False
     if awaiting_manual(state):
+        return False
+    if blocked_today(state, at):
         return False
     stage = current_stage(state)
     if stage and is_nav_frozen(state, stage, at):
@@ -492,6 +571,53 @@ def clear_notification(state: dict[str, Any], key: str) -> None:
 # Discord 卡片（构造在这里，发送在 worker / 计划卡）
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 「这一关到底打过了没有」的判据
+# ---------------------------------------------------------------------------
+
+# maa-cli 把 MaaCore 的 TaskChain 回调打成 `<链名> Completed / Stopped / Error`
+# ——`maa_daily._task_state()` 与 worker 导航段的 `"Fight Completed" not in …`
+# 都建立在同一条约定上，后者是 C3 实测跑通过的。
+COPILOT_VICTORY_MARKERS = ("Copilot Completed",)
+COPILOT_FAILURE_MARKERS = (
+    "Copilot Error",
+    "Copilot Stopped",
+    "Error: Some error",
+)
+
+
+def copilot_outcome(output: str, return_code: int) -> tuple[str, str]:
+    """`maa copilot` 这一趟到底算不算打过了：`("won"|"failed"|"unknown", 明细)`。
+
+    **为什么不能只看退出码**：抄作业那条链上退出码 0 就报成功是够用的——用户看得见
+    战报、下次自己再点一次。但队列的 cursor 一旦前进就**永久跳过这一关**，
+    撤退、三星未达、进程正常退出的 Fight Error 全都会被算成通关，队列会带着一串
+    没打过的关一路推到底，而且没有任何人知道。
+
+    **局限（必须知道）**：胜利标记 `Copilot Completed` 是从 maa-cli 的任务链约定
+    推出来的，**没有拿真实的 copilot 日志核对过**——`runs/` 的 14 天保留期已经把
+    2026-08 那批抄作业日志清掉了，当前 `asst.log` 窗口里也没有任何一次真实作战。
+    所以这里**故意 fail-closed**：认不出胜利标记就返回 `unknown`，调用方按失败处理、
+    cursor 不前进。代价是队列可能停下来问用户，好过静默跳关。
+    第一次真机跑完请照着 `runs/<date>-clearing.log` 核对一次这个标记，对不上就改这里。
+    """
+    text = str(output or "")
+    hit = [marker for marker in COPILOT_FAILURE_MARKERS if marker in text]
+    if hit:
+        return "failed", f"输出含失败标记：{'、'.join(hit)}"
+    if return_code != 0:
+        return "failed", f"maa copilot 退出码 {return_code}"
+    if any(marker in text for marker in COPILOT_VICTORY_MARKERS):
+        return "won", ""
+    return (
+        "unknown",
+        "退出码 0 但输出里没有 `Copilot Completed`，无法确认这一关真的打过了；"
+        "cursor 未前进（宁可停下来问，也不静默跳关）。"
+        "请核对 runs/ 下的 clearing 日志，若胜利标记不是这个字符串就改 "
+        "maa_clearing.COPILOT_VICTORY_MARKERS。",
+    )
+
+
 def manual_button_id(stage: str) -> str:
     return f"{BUTTON_PREFIX}manual-done:{stage}"
 
@@ -508,10 +634,11 @@ def build_manual_card(
     day_text = "、".join(str(day) for day in days if day) or "—"
     reason = str(manual.get("reason") or "") if isinstance(manual, dict) else ""
     custom_id = manual_button_id(stage)
+    label = entry_label(stage)
     embed = {
-        "title": f"🙋 {stage} 需要你手动打一次",
+        "title": f"🙋 {label} 需要你手动打一次",
         "description": (
-            f"通关队列在 {stage} 卡住了，自动路径拿不到作业或导航不过去。\n"
+            f"通关队列在 {label} 卡住了，自动路径拿不到作业或导航不过去。\n"
             "请在游戏里手动把这一关打过，然后点下面的「已完成」，队列会从下一关继续。\n"
             "在你点掉之前，队列停在这里，日常会照常刷理智（不会白白溢出）。"
         ),
@@ -529,7 +656,7 @@ def build_manual_card(
                 {
                     "type": 2,
                     "style": 3,
-                    "label": f"✅ {stage} 已完成"[:80],
+                    "label": f"✅ {label} 已完成"[:80],
                     "custom_id": custom_id,
                 }
             ],
@@ -586,14 +713,19 @@ def status_text(state: dict[str, Any] | None) -> str:
     ]
     stage = current_stage(state)
     if stage:
-        lines.append(f"当前关：{stage}")
+        lines.append(f"当前关：{entry_label(stage)}")
     else:
         lines.append("当前关：已到队尾")
     manual = awaiting_manual(state)
     if manual:
-        lines.append(f"⏳ 等你手动打完 {manual} 并点「已完成」")
+        lines.append(f"⏳ 等你手动打完 {entry_label(manual)} 并点「已完成」")
     if stage and is_nav_frozen(state, stage):
         lines.append("❄️ 今日 nav 失败已冻结，明天再试")
+    blocked = blocked_today(state)
+    if blocked == "unknown_cost":
+        lines.append("⏸️ 今日因理智消耗算不出来被堵住（等步骤 4），明天自动重试一次")
+    elif blocked:
+        lines.append(f"⏸️ 今日被堵住：{blocked}")
     blocked = state.get("ex_gate_blocked_reason")
     if blocked:
         lines.append(f"⛔ EX 段被闸门挡住：{blocked}")
