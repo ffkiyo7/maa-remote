@@ -416,6 +416,7 @@ def mark_blocked(
     stages: list[str],
     *,
     at: datetime | None = None,
+    detail: str = "",
 ) -> dict[str, Any]:
     """记下「今天排不出任何一关，而且不是因为理智不够」。
 
@@ -432,6 +433,7 @@ def mark_blocked(
         "date": today_key(at),
         "stages": [str(stage) for stage in stages],
         "at": (at or now_beijing()).isoformat(),
+        "detail": str(detail)[:400],
     }
     return state
 
@@ -731,3 +733,199 @@ def status_text(state: dict[str, Any] | None) -> str:
         lines.append(f"⛔ EX 段被闸门挡住：{blocked}")
     lines.append(f"活跃（日常让路）：{'是' if queue_is_active(state) else '否'}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 步骤 4：编队界面 OCR 读理智（EX 关在 stages.json 里没有条目）
+# ---------------------------------------------------------------------------
+
+# 编队界面右下角「开始行动」旁边那个理智消耗数字（形如 `-21`）。ROI 是归一化的
+# [x, y, w, h]，默认取右下角一块；**真机校准后**把实测值写进
+# `config.clearing_sanity_ocr_roi`。ROI 故意不取整张图：顶部的「78/135」当前理智、
+# 掉落物数量、代理次数都是数字，全图找会歧义。
+DEFAULT_SANITY_OCR_ROI = (0.55, 0.70, 0.45, 0.30)
+# 理智消耗在界面上带负号（`-21`）；Vision 偶尔把负号识成长横或漏掉，所以
+# 无号数字也收，但**有号的优先**——两者同时出现时以带号的为准。
+SANITY_OCR_TOKEN_RE = re.compile(r"^\s*(?P<sign>[-−–—])?\s*(?P<num>\d{1,3})\s*$")
+SANITY_COST_MAX = 200
+
+
+def parse_ocr_lines(text: str) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """ocrbox 每行打 `文本\\t[x,y,w,h]`（左上角像素坐标）；解析成 (文本, 框)。"""
+    parsed: list[tuple[str, tuple[int, int, int, int]]] = []
+    for raw in str(text or "").splitlines():
+        if "\t" not in raw:
+            continue
+        label, _tab, box = raw.rpartition("\t")
+        match = re.fullmatch(r"\s*\[(\d+),(\d+),(\d+),(\d+)\]\s*", box)
+        if not match:
+            continue
+        parsed.append((label, tuple(int(part) for part in match.groups())))  # type: ignore[arg-type]
+    return parsed
+
+
+def sanity_ocr_roi(config: dict[str, Any] | None) -> tuple[float, float, float, float]:
+    raw = (config or {}).get("clearing_sanity_ocr_roi")
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        try:
+            values = tuple(float(part) for part in raw)
+        except (TypeError, ValueError):
+            return DEFAULT_SANITY_OCR_ROI
+        if all(0.0 <= part <= 1.0 for part in values) and values[2] > 0 and values[3] > 0:
+            return values  # type: ignore[return-value]
+    return DEFAULT_SANITY_OCR_ROI
+
+
+def png_size(path: Path) -> tuple[int, int] | None:
+    """读 PNG 的 IHDR 拿宽高；不是 PNG 或读不到返回 None。"""
+    try:
+        with Path(path).open("rb") as handle:
+            head = handle.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(head[16:20], "big")
+    height = int.from_bytes(head[20:24], "big")
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def sanity_cost_from_ocr(
+    lines: list[tuple[str, tuple[int, int, int, int]]],
+    image_size: tuple[int, int],
+    roi: tuple[float, float, float, float] = DEFAULT_SANITY_OCR_ROI,
+) -> tuple[int | None, str]:
+    """从 OCR 结果里取理智消耗。**歧义一律 None**（对齐 `maa_copilot._one_cost()`）。
+
+    返回 `(cost | None, 说明)`。规则：
+    - 只看框中心落在 ROI 里的文本；
+    - 文本必须整体是「可选负号 + 1~3 位数字」（`78/135`、`x1`、`+3` 都不算）；
+    - 有号候选优先；同一优先级里出现**两个不同的数**就放弃；
+    - 0 或超过 `SANITY_COST_MAX` 视为没读到。
+    读不出返回 None，**不许猜一个数**——理智算错会直接导致队列空跑。
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None, "截图尺寸无效"
+    rx, ry, rw, rh = roi
+    x0, y0, x1, y1 = rx * width, ry * height, (rx + rw) * width, (ry + rh) * height
+    signed: set[int] = set()
+    bare: set[int] = set()
+    seen: list[str] = []
+    for label, (bx, by, bw, bh) in lines:
+        cx, cy = bx + bw / 2, by + bh / 2
+        if not (x0 <= cx <= x1 and y0 <= cy <= y1):
+            continue
+        seen.append(label)
+        match = SANITY_OCR_TOKEN_RE.match(label)
+        if not match:
+            continue
+        value = int(match.group("num"))
+        if value <= 0 or value > SANITY_COST_MAX:
+            continue
+        (signed if match.group("sign") else bare).add(value)
+    for bucket, kind in ((signed, "带负号"), (bare, "无号")):
+        if len(bucket) == 1:
+            value = next(iter(bucket))
+            return value, f"ROI 内{kind}数字 {value}"
+        if len(bucket) > 1:
+            return None, f"ROI 内{kind}数字有歧义：{sorted(bucket)}"
+    return None, f"ROI 内没有理智数字（看到：{seen[:6]}）"
+
+
+def ocr_sanity_cost(
+    png_path: Path,
+    config: dict[str, Any] | None,
+    *,
+    ocrbox: Path | None = None,
+    runner: Callable[..., Any] | None = None,
+) -> tuple[int | None, str]:
+    """对一张编队界面截图跑本机 Vision OCR（ocrbox），返回 `(理智 | None, 说明)`。
+
+    任何环节失败（截图不是 PNG、ocrbox 未部署、OCR 崩溃、歧义）都返回 None。
+    这是与不变量 #5b（日常战报截图的主页校验）**不同的一套用途**，不复用那道闸门。
+    """
+    import subprocess
+
+    from maa_common import SCRIPTS_DIR
+
+    run = runner or subprocess.run
+    binary = ocrbox or (SCRIPTS_DIR / "ocrbox")
+    size = png_size(Path(png_path))
+    if size is None:
+        return None, "截图不是可读的 PNG"
+    if not Path(binary).is_file():
+        return None, "ocrbox 未部署，读不出理智"
+    try:
+        result = run(
+            [str(binary), str(png_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except Exception as exc:
+        return None, f"OCR 失败：{type(exc).__name__}: {exc}"
+    if getattr(result, "returncode", 1) != 0:
+        return None, f"OCR 失败：{str(getattr(result, 'stderr', '') or '').strip()[:120]}"
+    cost, detail = sanity_cost_from_ocr(
+        parse_ocr_lines(getattr(result, "stdout", "") or ""), size, sanity_ocr_roi(config)
+    )
+    return cost, detail
+
+
+def cached_sanity_cost(state: dict[str, Any], stage: str) -> int | None:
+    """OCR 读到过的理智（按**普通关名**缓存；突袭与普通关同价）。
+
+    存在独立的 `state["sanity_costs"]` 里而不是 `stage_state`：后者是失败记账，
+    `advance_cursor()` 通关后会把它清掉，而理智缓存要留给紧跟着的突袭条目用。
+    """
+    costs = state.get("sanity_costs")
+    if not isinstance(costs, dict):
+        return None
+    entry = costs.get(stage)
+    if not isinstance(entry, dict):
+        return None
+    try:
+        value = int(entry.get("cost"))
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def remember_sanity_cost(
+    state: dict[str, Any], stage: str, cost: int, *, at: datetime | None = None
+) -> dict[str, Any]:
+    costs = state.setdefault("sanity_costs", {})
+    if not isinstance(costs, dict):
+        costs = {}
+        state["sanity_costs"] = costs
+    costs[stage] = {
+        "cost": int(cost),
+        "source": "ocr",
+        "at": (at or now_beijing()).isoformat(),
+    }
+    return state
+
+
+def resolve_cost(
+    entry: str, state: dict[str, Any], lookup: Callable[[str], int | None]
+) -> int | None:
+    """队列排关用的理智：**`stages.json` 有真值时以它为准**，没有才用 OCR 缓存。
+
+    `lookup` 就是 `stage_sanity_cost()` 那条路；OCR 只是 EX 的补充路径，
+    不改普通关的既有行为。
+    """
+    stage, _mode = split_entry(entry)
+    known = lookup(stage)
+    if known is not None:
+        return known
+    return cached_sanity_cost(state, stage)
+
+
+def probe_candidate(plan_result: dict[str, Any]) -> str:
+    """这一轮该去编队界面 OCR 的关：`plan_round()` 撞上的第一个理智未知关。"""
+    unknown = plan_result.get("unknown_cost") or []
+    return str(unknown[0]) if unknown else ""

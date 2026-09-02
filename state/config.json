@@ -38,6 +38,7 @@
   "clearing_manual_after_days": 2,
   "clearing_annihilation_sanity": 25,
   "clearing_ex_stage_count": 8,
+  "clearing_sanity_ocr_roi": [0.55, 0.70, 0.45, 0.30],
   "farming_stage_table": {
     "固源岩": "1-7",
     "固源岩组": "1-7",

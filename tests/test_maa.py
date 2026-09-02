@@ -3391,5 +3391,306 @@ class ClearingDispatchNoticeTests(unittest.TestCase):
             maa_daily.main(["maa_daily.py"])
         report.assert_not_called()
 
+
+def _png_bytes(width: int = 1920, height: int = 1080) -> bytes:
+    """只带 IHDR 的最小 PNG 头——`png_size()` 只读前 24 字节。"""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
+
+
+class SanityOcrTests(unittest.TestCase):
+    """步骤 4：编队界面 OCR 读理智，歧义/读不出一律 None，绝不猜数。"""
+
+    SIZE = (1920, 1080)
+
+    def lines(self, text: str):
+        return maa_clearing.parse_ocr_lines(text)
+
+    def test_signed_number_inside_roi_is_the_cost(self) -> None:
+        # 右下角 `-21`；顶部的当前理智 `78/135` 与左侧掉落数量都不在 ROI 里。
+        ocr = "78/135\t[1700,30,100,40]\n固源岩组\t[300,600,120,40]\n3\t[330,650,20,30]\n-21\t[1560,980,60,40]\n开始行动\t[1650,970,200,60]"
+        cost, detail = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
+        self.assertEqual(cost, 21)
+        self.assertIn("带负号", detail)
+
+    def test_signed_beats_bare_and_dash_variants_count_as_signed(self) -> None:
+        for dash in ("-", "−", "–", "—"):
+            with self.subTest(dash=dash):
+                ocr = f"{dash}21\t[1560,980,60,40]\n1\t[1500,1000,20,30]"
+                cost, _ = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
+                self.assertEqual(cost, 21)
+
+    def test_a_single_bare_number_is_accepted_when_the_sign_was_dropped(self) -> None:
+        cost, detail = maa_clearing.sanity_cost_from_ocr(
+            self.lines("21\t[1560,980,60,40]\nx1\t[1400,1000,40,30]"), self.SIZE
+        )
+        self.assertEqual(cost, 21)
+        self.assertIn("无号", detail)
+
+    def test_two_different_numbers_in_roi_are_ambiguous(self) -> None:
+        cost, detail = maa_clearing.sanity_cost_from_ocr(
+            self.lines("21\t[1560,980,60,40]\n30\t[1400,1000,60,40]"), self.SIZE
+        )
+        self.assertIsNone(cost)
+        self.assertIn("歧义", detail)
+
+    def test_numbers_outside_roi_and_non_cost_tokens_are_ignored(self) -> None:
+        ocr = "21\t[100,100,60,40]\n78/135\t[1700,30,100,40]\n+3\t[1560,980,40,40]\n0\t[1560,1000,20,20]\n999\t[1600,1000,40,30]"
+        cost, detail = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
+        self.assertIsNone(cost)
+        self.assertIn("没有理智数字", detail)
+
+    def test_roi_comes_from_config_and_falls_back_when_invalid(self) -> None:
+        self.assertEqual(
+            maa_clearing.sanity_ocr_roi({"clearing_sanity_ocr_roi": [0.1, 0.2, 0.3, 0.4]}),
+            (0.1, 0.2, 0.3, 0.4),
+        )
+        for bad in (None, [1, 2], ["a", "b", "c", "d"], [0.5, 0.5, 0.0, 0.5], [2, 0, 1, 1]):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    maa_clearing.sanity_ocr_roi({"clearing_sanity_ocr_roi": bad}),
+                    maa_clearing.DEFAULT_SANITY_OCR_ROI,
+                )
+        # 换 ROI 后，原来在 ROI 里的数字会掉出去。
+        cost, _ = maa_clearing.sanity_cost_from_ocr(
+            self.lines("-21\t[1560,980,60,40]"), self.SIZE, (0.0, 0.0, 0.3, 0.3)
+        )
+        self.assertIsNone(cost)
+
+    def test_png_size_reads_ihdr_and_rejects_non_png(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            good = Path(raw) / "a.png"
+            good.write_bytes(_png_bytes(1280, 720))
+            self.assertEqual(maa_clearing.png_size(good), (1280, 720))
+            bad = Path(raw) / "b.png"
+            bad.write_bytes(b"not a png at all, definitely not")
+            self.assertIsNone(maa_clearing.png_size(bad))
+            self.assertIsNone(maa_clearing.png_size(Path(raw) / "missing.png"))
+
+    def test_ocr_sanity_cost_end_to_end_with_a_stubbed_ocrbox(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            png = Path(raw) / "shot.png"
+            png.write_bytes(_png_bytes())
+            ocrbox = Path(raw) / "ocrbox"
+            ocrbox.write_text("#!/bin/sh\n")
+
+            def runner(cmd, **kwargs):
+                self.assertEqual(cmd, [str(ocrbox), str(png)])
+                return SimpleNamespace(
+                    returncode=0, stdout="-21\t[1560,980,60,40]\n开始行动\t[1650,970,200,60]", stderr=""
+                )
+
+            cost, detail = maa_clearing.ocr_sanity_cost(png, {}, ocrbox=ocrbox, runner=runner)
+            self.assertEqual(cost, 21)
+
+    def test_every_failure_path_returns_none_instead_of_a_guess(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            png = Path(raw) / "shot.png"
+            png.write_bytes(_png_bytes())
+            ocrbox = Path(raw) / "ocrbox"
+            ocrbox.write_text("#!/bin/sh\n")
+            # ocrbox 未部署
+            cost, detail = maa_clearing.ocr_sanity_cost(
+                png, {}, ocrbox=Path(raw) / "nope", runner=lambda *a, **k: None
+            )
+            self.assertIsNone(cost)
+            self.assertIn("ocrbox", detail)
+            # 截图不是 PNG
+            junk = Path(raw) / "junk.png"
+            junk.write_bytes(b"garbage garbage garbage garbage")
+            cost, detail = maa_clearing.ocr_sanity_cost(junk, {}, ocrbox=ocrbox, runner=lambda *a, **k: None)
+            self.assertIsNone(cost)
+            # OCR 崩溃 / 非零退出 / 读不出
+            crashes = [
+                lambda *a, **k: (_ for _ in ()).throw(OSError("boom")),
+                lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="ERR"),
+                lambda *a, **k: SimpleNamespace(returncode=0, stdout="开始行动\t[1650,970,200,60]", stderr=""),
+            ]
+            for runner in crashes:
+                cost, detail = maa_clearing.ocr_sanity_cost(png, {}, ocrbox=ocrbox, runner=runner)
+                self.assertIsNone(cost, detail)
+                self.assertNotEqual(cost, 0)
+
+    def test_stages_json_truth_wins_over_the_ocr_cache(self) -> None:
+        # 不碰 `stage_sanity_cost()` 对普通关的既有行为：有真值时以它为准。
+        at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1", "AT-EX-1#raid"], at=at)
+        self.assertIsNone(maa_clearing.cached_sanity_cost(state, "AT-EX-1"))
+        maa_clearing.remember_sanity_cost(state, "AT-EX-1", 30, at=at)
+        self.assertEqual(maa_clearing.cached_sanity_cost(state, "AT-EX-1"), 30)
+        lookup = {"AT-1": 18}.get
+        self.assertEqual(maa_clearing.resolve_cost("AT-1", state, lookup), 18)
+        self.assertEqual(maa_clearing.resolve_cost("AT-EX-1", state, lookup), 30)
+        # 突袭与普通关同价，按普通关名取缓存。
+        self.assertEqual(maa_clearing.resolve_cost("AT-EX-1#raid", state, lookup), 30)
+        self.assertIsNone(maa_clearing.resolve_cost("AT-EX-2", state, lookup))
+        # 排一轮：EX-1 有缓存能排进去，EX-2 仍是 unknown，probe 指向它。
+        result = maa_clearing.plan_round(
+            state, 100, lambda e: maa_clearing.resolve_cost(e, state, lookup), at=at
+        )
+        self.assertEqual(result["stages"], ["AT-1", "AT-EX-1", "AT-EX-1#raid"])
+        self.assertEqual(maa_clearing.probe_candidate(result), "")
+        state["stages"].append("AT-EX-2")
+        result = maa_clearing.plan_round(
+            state, 100, lambda e: maa_clearing.resolve_cost(e, state, lookup), at=at
+        )
+        self.assertEqual(maa_clearing.probe_candidate(result), "AT-EX-2")
+
+    def test_mark_blocked_keeps_the_ocr_detail(self) -> None:
+        at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        state = maa_clearing.new_state("k", "t", "AT", ["AT-EX-1"], at=at)
+        maa_clearing.mark_blocked(state, "unknown_cost", ["AT-EX-1"], at=at, detail="ROI 内没有理智数字")
+        self.assertEqual(state["blocked"]["detail"], "ROI 内没有理智数字")
+        self.assertEqual(maa_clearing.blocked_today(state, at), "unknown_cost")
+
+
+class ClearingSanityProbeTests(unittest.TestCase):
+    """步骤 4 接进 worker：理智未知的关先去编队界面 OCR，读到就缓存并顺手打，读不出才堵。"""
+
+    def setUp(self) -> None:
+        import maa_copilot_worker
+
+        self.worker = maa_copilot_worker
+        self.at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
+        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-EX-1", "AT-EX-1#raid"], at=self.at)
+        self.saved: list[dict] = []
+        self.notices: list[tuple[str, str]] = []
+        self.fights: list[str] = []
+        self.index = {"codes": {"AT-EX-1": "act_ex_1"}, "stages": {"act_ex_1": "AT-EX-1"}}
+
+    def run_locked(self, probe_result, *, stages=(), remaining=50, fight_ok=True):
+        w = self.worker
+
+        def fake_fight(config, stage, stage_id, roster, env, log_path, mode="normal"):
+            self.fights.append(f"{stage}#{mode}")
+            return (True, "", "t") if fight_ok else (False, "op", "没作业")
+
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            w, "RUNS_DIR", Path(raw)
+        ), patch.object(w, "require_executable"), patch.object(
+            w, "merge_last_run"
+        ), patch.object(w, "open_emulator"), patch.object(
+            w, "wait_for_android"
+        ), patch.object(w, "verify_game_installed"), patch.object(
+            w, "settle_android_runtime"
+        ), patch.object(w, "maa_subprocess_env", return_value={}), patch.object(
+            w, "capture_screenshot", return_value=(True, "")
+        ), patch.object(w, "close_everything", return_value=[]), patch.object(
+            w.maa_copilot, "load_stage_index", return_value=self.index
+        ), patch.object(
+            w, "_clearing_probe_sanity", return_value=probe_result
+        ) as probe, patch.object(
+            w, "_clearing_fight_stage", side_effect=fake_fight
+        ), patch.object(
+            w, "_clearing_notice", side_effect=lambda c, t, b, col: self.notices.append((t, b))
+        ), patch.object(
+            w, "_clearing_post_manual_card"
+        ), patch.object(
+            maa_clearing, "save_state", side_effect=lambda s, path=None: self.saved.append(dict(s)) or s
+        ):
+            code = w._clearing_run_locked(
+                {}, self.state, list(stages), None, self.at, probe="AT-EX-1", remaining=remaining
+            )
+        return code, probe
+
+    def test_a_readable_cost_is_cached_and_the_stage_is_fought_when_affordable(self) -> None:
+        code, probe = self.run_locked((30, "", "ROI 内带负号数字 30"), remaining=50)
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[1], "AT-EX-1")  # 去掉后缀的关名
+        self.assertEqual(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"), 30)
+        self.assertEqual(self.fights, ["AT-EX-1#normal"])
+        self.assertEqual(self.state["cursor"], 1)
+        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
+        self.assertEqual(code, 0)
+        self.assertIn("理智探测", self.notices[-1][1])
+
+    def test_a_readable_cost_above_the_remaining_budget_is_only_cached(self) -> None:
+        code, _ = self.run_locked((30, "", "ok"), remaining=10)
+        self.assertEqual(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"), 30)
+        self.assertEqual(self.fights, [])
+        self.assertEqual(self.state["cursor"], 0)
+        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
+        self.assertEqual(code, 0)
+        self.assertIn("留给下一轮", self.notices[-1][1])
+
+    def test_an_unreadable_cost_blocks_today_without_guessing(self) -> None:
+        code, _ = self.run_locked((None, "ocr", "AT-EX-1 理智 OCR 读不出：ROI 内没有理智数字"))
+        self.assertIsNone(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"))
+        self.assertEqual(self.fights, [])
+        self.assertEqual(self.state["cursor"], 0)
+        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "unknown_cost")
+        self.assertIn("读不出", self.state["blocked"]["detail"])
+        # 被堵的当天日常照常刷理智（四条件的第 4 条）。
+        self.assertFalse(maa_clearing.queue_is_active(self.state, self.at))
+        self.assertEqual(code, 1)
+
+    def test_a_navigation_failure_during_the_probe_is_booked_as_nav(self) -> None:
+        code, _ = self.run_locked((None, "nav", "AT-EX-1 导航到编队界面失败：x"))
+        self.assertTrue(maa_clearing.is_nav_frozen(self.state, "AT-EX-1", self.at))
+        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
+        self.assertEqual(self.state["cursor"], 0)
+        self.assertEqual(code, 1)
+
+    def test_planned_stages_run_before_the_probe_and_a_failure_skips_it(self) -> None:
+        w = self.worker
+        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1"], at=self.at)
+        self.index = {"codes": {"AT-1": "act_1", "AT-EX-1": "act_ex_1"}, "stages": {}}
+        code, probe = self.run_locked((30, "", "ok"), stages=["AT-1"], remaining=50)
+        self.assertEqual(self.fights, ["AT-1#normal", "AT-EX-1#normal"])
+        self.assertEqual(self.state["cursor"], 2)
+        # 排好的关失败了就不再探测。
+        self.fights.clear()
+        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1"], at=self.at)
+        code, probe = self.run_locked((30, "", "ok"), stages=["AT-1"], remaining=50, fight_ok=False)
+        probe.assert_not_called()
+        self.assertEqual(self.state["cursor"], 0)
+        self.assertEqual(code, 1)
+
+    def test_the_cache_survives_clearing_the_normal_stage_for_the_raid_entry(self) -> None:
+        # 通关后 advance_cursor 会清掉该关的失败记账，理智缓存必须留给紧跟的突袭。
+        code, _ = self.run_locked((30, "", "ok"), remaining=50)
+        self.assertEqual(self.state["cursor"], 1)
+        self.assertEqual(maa_clearing.current_stage(self.state), "AT-EX-1#raid")
+        self.assertEqual(
+            maa_clearing.resolve_cost("AT-EX-1#raid", self.state, lambda s: None), 30
+        )
+
+    def test_probe_helper_chains_navigate_screenshot_and_ocr(self) -> None:
+        w = self.worker
+        with tempfile.TemporaryDirectory() as raw:
+            log = Path(raw) / "c.log"
+            png = Path(raw) / "s.png"
+            with patch.object(w, "_clearing_navigate", return_value=(False, "nav 失败")):
+                self.assertEqual(w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)[1], "nav")
+            with patch.object(w, "_clearing_navigate", return_value=(True, "")), patch.object(
+                w, "capture_screenshot", return_value=(False, "adb 挂了")
+            ):
+                cost, kind, detail = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
+                self.assertEqual((cost, kind), (None, "ocr"))
+                self.assertIn("adb", detail)
+            with patch.object(w, "_clearing_navigate", return_value=(True, "")), patch.object(
+                w, "capture_screenshot", return_value=(True, "")
+            ), patch.object(maa_clearing, "ocr_sanity_cost", return_value=(21, "ok")):
+                cost, kind, _ = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
+                self.assertEqual((cost, kind), (21, ""))
+                self.assertIn("sanity-ocr AT-EX-1: 21", log.read_text(encoding="utf-8"))
+
+    def test_sanity_probe_is_a_worker_subcommand_but_not_a_discord_command(self) -> None:
+        w = self.worker
+        with patch.object(w, "cmd_sanity_probe", return_value=0) as cmd:
+            self.assertEqual(w.main(["sanity-probe", "1-7"]), 0)
+        cmd.assert_called_once_with("1-7")
+        self.assertEqual(w.main(["sanity-probe"]), 2)
+        # 校准入口只在本机终端跑，不进 Discord 白名单（不变量 #8 的边界不变）。
+        ok, _ = maa_action.dispatch(["sanity-probe", "1-7"])
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

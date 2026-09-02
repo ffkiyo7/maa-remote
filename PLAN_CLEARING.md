@@ -18,7 +18,8 @@
 - [ ] 步骤 3 — `stage_queue` + 日常让路 + `needs_manual`
       （**代码已交付 `50f1965`**，单测全覆盖；整条队列由 `config.clearing_enabled`
       默认 `false` 关着，等 Q3 + 2b。真机三项待下个活动上线验）
-- [ ] 步骤 4 — EX 理智 OCR
+- [ ] 步骤 4 — EX 理智 OCR（**代码已交付**：编队界面截图 → ocrbox → 歧义即 `None`，
+      接进队列的探测轮；真机校准 `sanity-probe` 待跑，ROI 默认值未校准）
 - [x] ~~步骤 5 — Depot 对表 + 掉落增量 + 消耗率（`3aa90a8`；交付后发现的 D-1/D-2 已修，`b8b43b4`）~~
 - [ ] 步骤 6 — 计划卡加 farming 选关下拉
       （**代码已交付**，单测全覆盖；当前必然走冷启动降级——`depot.json` 只有 1 份快照。
@@ -794,6 +795,22 @@ python3 -m unittest discover -s tests -v      # 全绿
 ---
 
 ## 步骤 4 — EX 理智 OCR 实测
+
+> **2026-09-03 代码已交付**（真机校准待跑）。落地形态：
+> - `maa_clearing.sanity_cost_from_ocr()` / `ocr_sanity_cost()`：只看
+>   `config.clearing_sanity_ocr_roi`（归一化 `[x,y,w,h]`，默认右下角
+>   `[0.55,0.70,0.45,0.30]`，**未校准的估计**）里的文本，带负号的 `-21` 优先，
+>   同级两个不同数字即歧义；ocrbox 缺失 / 崩溃 / 非 PNG / 无数字一律 `None`。
+> - 队列接入：`plan_round()` 撞上的第一个理智未知关成为本轮 `probe`，排好的关打完后
+>   由 worker 的 `_clearing_probe_sanity()` 导航到编队界面截图 OCR；读到写进
+>   `clearing.json` 的 `sanity_costs`（`resolve_cost()` 仍**先查 `stages.json`**），
+>   剩余预算够就顺手打；读不出按「今日堵住」记账，当天不再开模拟器重试。
+> - 校准入口：`python3 ~/.hermes/scripts/maa_copilot_worker.py sanity-probe 1-7`
+>   （本机终端，不进 Discord 白名单），输出 `ocr` 与 `stages_json` 并排、`match`。
+> - 不变量 #36；单测 `SanityOcrTests` / `ClearingSanityProbeTests`。
+>
+> **待验**：① 对普通关跑一次 `sanity-probe`，`match == true`，并按截图把实测 ROI
+> 写进 `clearing_sanity_ocr_roi`；② EX 关要等下个活动上线（已结束活动的 EX 进不去）。
 
 ### 前置
 

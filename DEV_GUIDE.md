@@ -539,6 +539,24 @@ worker 自己去抢锁。07:50 的计划卡不行：它距 08:00 只有 10 分�
 单向规则（存在 `totalStage == 0` 的 zone ⇒ 未全开）。合并会把「沉默不代表已解锁」
 这条性质弄丢。两个模块互不 import，有结构性单测守着。
 
+**EX 关的理智从哪来（步骤 4）**：`stages.json` 没有 EX 条目，`stage_sanity_cost()`
+返回 `None`。队列的做法是**去编队界面 OCR**：`plan_round()` 撞上的第一个理智未知关
+（`probe_candidate()`）在锁内、排好的关打完之后，由 `_clearing_probe_sanity()`
+导航到该关的编队界面 → `capture_screenshot()` → `maa_clearing.ocr_sanity_cost()`
+（本机 Vision OCR `ocrbox`，只看 `config.clearing_sanity_ocr_roi` 那块右下角 ROI，
+带负号的 `-21` 优先，同级出现两个不同数字即歧义）。读到就写进
+`clearing.json` 的 `sanity_costs[<普通关名>]`（独立于 `stage_state`，因为通关后
+`advance_cursor()` 会清掉失败记账，而缓存要留给紧跟着的突袭条目），剩余预算够就
+顺手打了；读不出 → `mark_blocked("unknown_cost", detail=…)`，当天不再开模拟器重试。
+**`resolve_cost()` 永远先查 `stages.json`**，OCR 缓存只在真值缺席时用——普通关的
+既有行为一个字节没变。这套 OCR 与不变量 #5b（日常战报截图的主页校验）是两种用途，
+不共用那道闸门。
+校准入口：`python3 ~/.hermes/scripts/maa_copilot_worker.py sanity-probe 1-7`
+（本机终端；同一条 blackout 闸门、同一把 `run.lock`；不在 Discord 白名单里），
+输出 JSON 里 `ocr` 与 `stages_json` 并排，`match: true` 才有资格拿它去读 EX。
+ROI 默认值是**未校准的估计**，第一次 `sanity-probe` 跑完按截图把实测框写进
+`clearing_sanity_ocr_roi`。
+
 ---
 
 ## 6. 状态模型
@@ -724,6 +742,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 33 | 队列 cursor **只在这一关被判定为通关时**才前进：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串尚未用真实 copilot 日志核对（日志已过 14 天保留期），第一次真机跑完要核对 | `maa_clearing.copilot_outcome()` + `ClearingVictoryJudgementTests` |
 | 34 | EX 段的突袭用队列条目的 `#raid` 后缀表示，突袭紧跟对应普通关；**除了 `maa copilot --raid` 的取值，理智查表 / 导航 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.ex_segment()` / `split_entry()` + `ClearingRaidTests` |
 | 35 | 通关队列派发失败（worker 未部署 / `Popen` 抛错）必须**写 `last_run` 并发 Discord**，不能只写状态（护栏 4）。「功能未启用」「队列不活跃」是正常无操作，不发 | `maa_daily.report_clearing_dispatch_failure()` + `ClearingDispatchNoticeTests` |
+| 36 | EX 关理智只信两处：`stages.json` 真值（优先）与编队界面 OCR 缓存。OCR 读不出（ocrbox 缺失 / 崩溃 / ROI 内无数字 / 两个不同数字）**一律 `None`，不许猜数、不许拿 0 或同活动普通关的值顶替**；`None` 的关不入轮、不进预算、cursor 不动，按「今日堵住」记账。普通关的 `stage_sanity_cost()` 行为不变 | `maa_clearing.sanity_cost_from_ocr()` / `ocr_sanity_cost()` / `resolve_cost()` + `SanityOcrTests` / `ClearingSanityProbeTests` |
 
 ---
 

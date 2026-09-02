@@ -1163,6 +1163,60 @@ def _clearing_pick_op(
     return None
 
 
+def _clearing_navigate(
+    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+) -> tuple[bool, str]:
+    """`Fight(times=0)` 把游戏停在该关的编队界面。返回 `(是否到达, 失败明细)`。"""
+    maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    nav_path = MAA_CONFIG_DIR / "tasks" / "copilot-nav.toml"
+    atomic_write_text(nav_path, NAV_TOML_TEMPLATE.format(stage=stage))
+    nav_result = subprocess.run(
+        [maa_bin, "run", "copilot-nav", "-v", "--batch"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=900,
+        env=env,
+    )
+    nav_output = f"{nav_result.stdout}\n{nav_result.stderr}"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(nav_output)
+    if nav_result.returncode != 0 or "Fight Completed" not in nav_output:
+        detail = " | ".join(nav_output.strip().splitlines()[-3:])[-400:]
+        # 导航失败多半是「MAA 没为该关写导航定义」（步骤 2 的地基），
+        # 不一定是关卡未解锁。
+        return False, f"{stage} 导航到编队界面失败：{detail}"
+    return True, ""
+
+
+def _clearing_probe_sanity(
+    config: dict[str, Any],
+    stage: str,
+    env: dict[str, str],
+    log_path: Path,
+    png_path: Path,
+) -> tuple[int | None, str, str]:
+    """步骤 4：导航到编队界面，截图，OCR 读理智消耗。
+
+    返回 `(理智 | None, 失败种类, 明细)`，失败种类 ∈ {"", "nav", "ocr"}。
+    读不出一律 None——调用方按「今日堵住」记账，不许猜一个数。
+    """
+    import maa_clearing
+
+    nav_ok, nav_detail = _clearing_navigate(config, stage, env, log_path)
+    if not nav_ok:
+        return None, "nav", nav_detail
+    shot_ok, shot_detail = capture_screenshot(config, png_path)
+    if not shot_ok:
+        return None, "ocr", f"{stage} 编队界面截图失败：{shot_detail}"
+    cost, detail = maa_clearing.ocr_sanity_cost(png_path, config)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"# sanity-ocr {stage}: {cost} ({detail}) png={png_path}\n")
+    if cost is None:
+        return None, "ocr", f"{stage} 理智 OCR 读不出：{detail}"
+    return cost, "", detail
+
+
 def _clearing_fight_stage(
     config: dict[str, Any],
     stage: str,
@@ -1183,24 +1237,9 @@ def _clearing_fight_stage(
         return False, "op", f"{stage} 暂时没有完全满足当前干员练度的作业"
     uri, _rewritten = _prepare_op_file(candidate, stage_id, config)
 
-    nav_path = MAA_CONFIG_DIR / "tasks" / "copilot-nav.toml"
-    atomic_write_text(nav_path, NAV_TOML_TEMPLATE.format(stage=stage))
-    nav_result = subprocess.run(
-        [maa_bin, "run", "copilot-nav", "-v", "--batch"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=900,
-        env=env,
-    )
-    nav_output = f"{nav_result.stdout}\n{nav_result.stderr}"
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(nav_output)
-    if nav_result.returncode != 0 or "Fight Completed" not in nav_output:
-        detail = " | ".join(nav_output.strip().splitlines()[-3:])[-400:]
-        # 导航失败多半是「MAA 没为该关写导航定义」（步骤 2 的地基），
-        # 不一定是关卡未解锁。
-        return False, "nav", f"{stage} 导航到编队界面失败：{detail}"
+    nav_ok, nav_detail = _clearing_navigate(config, stage, env, log_path)
+    if not nav_ok:
+        return False, "nav", nav_detail
 
     # `maa copilot --help`：normal / raid / both（另收 legacy 的 0/1/2）。
     command = [maa_bin, "copilot", uri, "--formation", "--batch", "-v",
@@ -1301,27 +1340,25 @@ def cmd_clearing() -> int:
     budget = maa_clearing.sanity_budget(sanity, plan, config)
     index = maa_copilot.load_stage_index(config)
 
-    def cost_of(entry: str) -> int | None:
-        # 突袭条目按**普通关名**查理智；`#raid` 只影响执行时的 --raid 取值。
-        stage, _mode = maa_clearing.split_entry(entry)
+    def lookup(stage: str) -> int | None:
         resolved = maa_copilot.resolve_copilot_stage(stage, index)
         if resolved is None:
             return None
         return maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
 
+    def cost_of(entry: str) -> int | None:
+        # 突袭条目按**普通关名**查理智；`#raid` 只影响执行时的 --raid 取值。
+        # `stages.json` 有真值以它为准；没有（EX 关）才用步骤 4 的 OCR 缓存。
+        return maa_clearing.resolve_cost(entry, state, lookup)
+
     plan_result = maa_clearing.plan_round(state, budget, cost_of, at=at)
-    if plan_result["unknown_cost"]:
-        unknown = plan_result["unknown_cost"]
-        if maa_clearing.should_notify(state, "unknown_cost", "|".join(unknown)):
-            embed = maa_clearing.unknown_sanity_embed(unknown)
-            _clearing_notice(config, embed["title"], embed["description"], 0x99AAB5)
-    if not plan_result["stages"]:
-        if plan_result["stop_reason"] == "unknown_cost":
-            # 理智算不出来会**一直**排不出来（不像理智不够那样等等就好），
-            # 不记这一笔的话队列会永远「活跃但打不了」，日常每场都白让出刷理智。
-            maa_clearing.mark_blocked(
-                state, "unknown_cost", plan_result["unknown_cost"], at=at
-            )
+    # 步骤 4：理智未知的关不再直接堵住——本轮去它的编队界面 OCR 一次，
+    # 读到就缓存（下一轮排得进），读不出才按「今日堵住」记账（在锁内做）。
+    # 当天已经因此堵过就不再开模拟器重试，与 nav 冻结同尺度。
+    probe = maa_clearing.probe_candidate(plan_result)
+    if probe and maa_clearing.blocked_today(state, at) == "unknown_cost":
+        probe = ""
+    if not plan_result["stages"] and not probe:
         maa_clearing.save_state(state)
         _clearing_notice(
             config,
@@ -1330,15 +1367,16 @@ def cmd_clearing() -> int:
             f"{maa_clearing.annihilation_reserve(plan, config)}），"
             f"停在 `{plan_result['stop_reason']}`。"
             + (
-                "\n今天不再重试，日常照常刷理智；明天自动再试一次。"
+                "\n今天已因理智读不出被堵住，日常照常刷理智；明天自动再试一次。"
                 if plan_result["stop_reason"] == "unknown_cost"
                 else ""
             ),
             0x99AAB5,
         )
         return 0
-    # 排得出关就说明堵塞已经解除（例如步骤 4 落地后理智读得出来了）。
-    maa_clearing.clear_blocked(state)
+    if plan_result["stages"]:
+        # 排得出关就说明堵塞已经解除（例如 OCR 读出理智之后）。
+        maa_clearing.clear_blocked(state)
     maa_clearing.save_state(state)
 
     with run_lock(blocking=False) as acquired:
@@ -1350,7 +1388,15 @@ def cmd_clearing() -> int:
                 0xED4245,
             )
             return 1
-        return _clearing_run_locked(config, state, plan_result["stages"], roster, at)
+        return _clearing_run_locked(
+            config,
+            state,
+            plan_result["stages"],
+            roster,
+            at,
+            probe=probe,
+            remaining=max(0, int(budget) - int(plan_result["spent"])),
+        )
 
 
 def maa_daily_attach_annihilation(
@@ -1369,7 +1415,16 @@ def _clearing_run_locked(
     stages: list[str],
     roster: dict[str, Any] | None,
     at: datetime,
+    *,
+    probe: str = "",
+    remaining: int = 0,
 ) -> int:
+    """锁内执行：先打排好的 `stages`，再（若有）对 `probe` 那关做步骤 4 的理智 OCR。
+
+    `probe` 是 `plan_round()` 撞上的第一个理智未知关（EX），`remaining` 是打完
+    `stages` 之后剩下的理智预算：OCR 读到的理智 ≤ remaining 就顺手把它打了，
+    否则只缓存、留给下一轮。读不出 → `mark_blocked()`，今日不再重试。
+    """
     import maa_clearing
 
     stem = f"{at.date().isoformat()}-clearing"
@@ -1377,9 +1432,37 @@ def _clearing_run_locked(
     png_path = RUNS_DIR / f"{stem}.png"
     index = maa_copilot.load_stage_index(config)
     done: list[str] = []
+    probed = ""
     failure = ""
     emulator_touched = False
     cleanup_errors: list[str] = []
+
+    def attempt(entry: str) -> bool:
+        """打一关；成功前进 cursor 并返回 True，失败记账（可能转 needs_manual）返回 False。"""
+        nonlocal failure
+        stage, mode = maa_clearing.split_entry(entry)
+        resolved = maa_copilot.resolve_copilot_stage(stage, index)
+        if resolved is None:
+            kind, detail = "nav", f"{stage} 不在本地关卡索引里（多半是 MAA 没写导航定义）"
+            ok = False
+        else:
+            ok, kind, detail = _clearing_fight_stage(
+                config, stage, resolved[0], roster, env, log_path, mode
+            )
+        if ok:
+            maa_clearing.advance_cursor(state)
+            maa_clearing.save_state(state)
+            done.append(maa_clearing.entry_label(entry))
+            return True
+        _state, turned = maa_clearing.record_stage_failure(
+            state, entry, kind=kind, detail=detail, config=config, at=at
+        )
+        maa_clearing.save_state(state)
+        failure = detail
+        if turned:
+            _clearing_post_manual_card(config, state, entry)
+        return False
+
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
         require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -1387,7 +1470,7 @@ def _clearing_run_locked(
             {
                 "status": "running",
                 "phase": "clearing",
-                "stage": stages[0],
+                "stage": stages[0] if stages else probe,
                 "started_at": at.isoformat(),
                 "log": str(log_path),
             }
@@ -1401,35 +1484,39 @@ def _clearing_run_locked(
         env["MAA_LOG_PREFIX"] = "Never"
 
         for entry in stages:
-            stage, mode = maa_clearing.split_entry(entry)
-            resolved = maa_copilot.resolve_copilot_stage(stage, index)
-            if resolved is None:
-                state, turned = maa_clearing.record_stage_failure(
-                    state, entry, kind="nav",
-                    detail=f"{stage} 不在本地关卡索引里（多半是 MAA 没写导航定义）",
-                    config=config, at=at,
+            if not attempt(entry):
+                break
+
+        if probe and not failure:
+            stage, _mode = maa_clearing.split_entry(probe)
+            cost, kind, detail = _clearing_probe_sanity(
+                config, stage, env, log_path, RUNS_DIR / f"{stem}-sanity.png"
+            )
+            if kind == "nav":
+                _state, turned = maa_clearing.record_stage_failure(
+                    state, probe, kind="nav", detail=detail, config=config, at=at
                 )
                 maa_clearing.save_state(state)
-                failure = f"{stage} 不在本地关卡索引里"
+                failure = detail
                 if turned:
-                    _clearing_post_manual_card(config, state, entry)
-                break
-            ok, kind, detail = _clearing_fight_stage(
-                config, stage, resolved[0], roster, env, log_path, mode
-            )
-            if ok:
-                maa_clearing.advance_cursor(state)
+                    _clearing_post_manual_card(config, state, probe)
+            elif cost is None:
+                # 读不出就按「今日堵住」记账：日常照常刷理智，明天再试一次。
+                # 不许猜一个数——理智算错会直接导致队列空跑。
+                maa_clearing.mark_blocked(
+                    state, "unknown_cost", [probe], at=at, detail=detail
+                )
                 maa_clearing.save_state(state)
-                done.append(maa_clearing.entry_label(entry))
-                continue
-            state, turned = maa_clearing.record_stage_failure(
-                state, entry, kind=kind, detail=detail, config=config, at=at
-            )
-            maa_clearing.save_state(state)
-            failure = detail
-            if turned:
-                _clearing_post_manual_card(config, state, entry)
-            break
+                failure = detail
+            else:
+                maa_clearing.remember_sanity_cost(state, stage, cost, at=at)
+                maa_clearing.clear_blocked(state)
+                maa_clearing.save_state(state)
+                probed = f"{stage} 理智 {cost}（编队界面 OCR）"
+                if cost <= remaining:
+                    attempt(probe)
+                else:
+                    probed += f"，本轮剩余预算 {remaining} 不够，留给下一轮"
     except Exception as exc:
         failure = f"{type(exc).__name__}: {exc}"
     finally:
@@ -1443,12 +1530,14 @@ def _clearing_run_locked(
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
-    ok = bool(done) and not failure and not cleanup_errors
+    ok = (bool(done) or bool(probed)) and not failure and not cleanup_errors
     body = (
         f"本轮推进：{('、'.join(done) or '无')}\n"
         f"队列进度：{min(int(state.get('cursor', 0)), len(state.get('stages') or []))}"
         f"/{len(state.get('stages') or [])}"
     )
+    if probed:
+        body += f"\n理智探测：{probed}"
     if failure:
         body += f"\n停在：{failure[:600]}"
     if cleanup_errors:
@@ -1471,6 +1560,74 @@ def _clearing_run_locked(
     return 0 if ok else 1
 
 
+def cmd_sanity_probe(stage: str) -> int:
+    """步骤 4 的校准入口（本机终端用，不进 Discord 白名单）。
+
+    开模拟器 → 导航到 `stage` 的编队界面 → 截图 → OCR，把读到的理智与
+    `stages.json` 的真值并排打印成 JSON，然后关掉一切。对普通关先跑一遍、
+    `match` 为 true，才有资格拿它去读 EX（PLAN_CLEARING 步骤 4「先校准再用」）。
+    与队列同一条 blackout 闸门、同一把 run.lock。
+    """
+    import maa_clearing
+    from maa_action import _copilot_blackout_reason
+
+    config = load_config()
+    at = now_beijing()
+    stage = str(stage or "").strip()[:40]
+    for reason in (_copilot_blackout_reason(config), _depot_window_reason(at)):
+        if reason:
+            print(json.dumps({"ok": False, "error": reason}, ensure_ascii=False))
+            return 1
+    index = maa_copilot.load_stage_index(config)
+    resolved = maa_copilot.resolve_copilot_stage(stage, index)
+    if resolved is None:
+        print(json.dumps({"ok": False, "error": f"{stage} 不在本地关卡索引里"}, ensure_ascii=False))
+        return 1
+    truth = maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+    stem = f"{at.date().isoformat()}-sanity-probe-{stage}"
+    log_path = RUNS_DIR / f"{stem}.log"
+    png_path = RUNS_DIR / f"{stem}.png"
+    result: dict[str, Any] = {
+        "ok": False,
+        "stage": stage,
+        "stage_id": resolved[0],
+        "stages_json": truth,
+        "ocr": None,
+        "detail": "",
+        "png": str(png_path),
+        "log": str(log_path),
+    }
+    with run_lock(blocking=False) as acquired:
+        if not acquired:
+            result["detail"] = "run.lock 被另一场 MAA 占用"
+            print(json.dumps(result, ensure_ascii=False))
+            return 1
+        cleanup_errors: list[str] = []
+        try:
+            require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
+            require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+            open_emulator(config)
+            wait_for_android(config)
+            verify_game_installed(config)
+            settle_android_runtime(config)
+            env = maa_subprocess_env(config)
+            env["MAA_LOG_PREFIX"] = "Never"
+            cost, kind, detail = _clearing_probe_sanity(config, stage, env, log_path, png_path)
+            result.update({"ocr": cost, "kind": kind, "detail": detail})
+        except Exception as exc:
+            result["detail"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                cleanup_errors = close_everything(config)
+            except Exception as exc:
+                cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
+    result["cleanup_errors"] = cleanup_errors
+    result["match"] = result["ocr"] is not None and result["ocr"] == truth
+    result["ok"] = result["ocr"] is not None and not cleanup_errors
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result["ok"] else 1
+
+
 def main(argv: list[str]) -> int:
     if argv[:1] == ["search"] and len(argv) == 2:
         return cmd_search(argv[1])
@@ -1478,8 +1635,11 @@ def main(argv: list[str]) -> int:
         return cmd_run(argv[1], argv[2], argv[3])
     if argv == ["clearing"]:
         return cmd_clearing()
+    if argv[:1] == ["sanity-probe"] and len(argv) == 2:
+        return cmd_sanity_probe(argv[1])
     print(
-        "用法: maa_copilot_worker.py search <token> | run <token> <n> <mode> | clearing",
+        "用法: maa_copilot_worker.py search <token> | run <token> <n> <mode> | "
+        "clearing | sanity-probe <关卡>",
         file=sys.stderr,
     )
     return 2
