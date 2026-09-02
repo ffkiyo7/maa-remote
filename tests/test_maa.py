@@ -904,6 +904,70 @@ Opening mini games:
                     [str(overlay)],
                 )
 
+    def test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent(self) -> None:
+        # activity_stages / the version probes are runtime caches, not config.
+        # A stale seed clobbering them re-creates PLAN_NAV_GATE A-3 staleness.
+        self.assertEqual(
+            deploy.load_json(deploy.ROOT / "state" / "config.json", {})["activity_stages"],
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            hermes = root / "hermes"
+            live = hermes / "state" / "maa"
+            live.mkdir(parents=True)
+            seed = {
+                "activity_stages": ["SEED-1"],
+                "maa_cli_version": "v0.0.1",
+                "maa_core_version": "v0.0.2",
+                "retention_days": 14,
+                "channel_id": deploy.CHANNEL_PLACEHOLDER,
+            }
+            repo_state = root / "repo" / "state"
+            repo_state.mkdir(parents=True)
+            for name in ("defaults.json", "plan.json", "last_run.json"):
+                (repo_state / name).write_text("{}", encoding="utf-8")
+            (repo_state / "config.json").write_text(
+                json.dumps(seed), encoding="utf-8"
+            )
+
+            def deploy_once() -> dict:
+                with patch.object(deploy, "ROOT", root / "repo"), patch.object(
+                    deploy, "HERMES_HOME", hermes
+                ):
+                    deploy.deploy_state("424242")
+                return json.loads((live / "config.json").read_text(encoding="utf-8"))
+
+            # 1. Live host already has its own values -> deploy must not touch them.
+            (live / "config.json").write_text(
+                json.dumps(
+                    {
+                        "activity_stages": [],
+                        "maa_cli_version": "v0.7.5",
+                        "maa_core_version": "v6.17.0-beta.1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = deploy_once()
+            self.assertEqual(result["activity_stages"], [])
+            self.assertEqual(result["maa_cli_version"], "v0.7.5")
+            self.assertEqual(result["maa_core_version"], "v6.17.0-beta.1")
+            # Non-cache keys still deploy normally.
+            self.assertEqual(result["retention_days"], 14)
+            self.assertEqual(result["channel_id"], "424242")
+
+            # A live non-empty list survives too: "preserve" is not "force empty".
+            (live / "config.json").write_text(
+                json.dumps({"activity_stages": ["AT-8", "AT-7"]}), encoding="utf-8"
+            )
+            self.assertEqual(deploy_once()["activity_stages"], ["AT-8", "AT-7"])
+
+            # 2. First boot: no live value -> the seed is the fallback.
+            (live / "config.json").unlink()
+            self.assertEqual(deploy_once()["activity_stages"], ["SEED-1"])
+
     def test_parse_maa_versions_from_cli_output(self) -> None:
         cli, core = maa_plan_card.parse_maa_versions(
             "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n"

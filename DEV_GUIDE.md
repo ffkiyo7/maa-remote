@@ -510,8 +510,14 @@ python3 deploy.py --check                  # 检查脚本/ocrbox 与 6 个 maa-c
      它漂移就是真事故（`49da169` 的成果）。豁免名单要加项必须同时说明“谁在运行时重写它”。
 3. **状态的部署策略不同**（`deploy_state()`，`deploy.py`）：
    - `config.json`：**逐键合并**，仓库的键覆盖同名键，本地新增键保留。
-     注意仓库里的 `activity_stages` 会盖掉线上缓存，下一次计划卡会重新刷。
-     `maa_core_version` / `maa_cli_version` 以本机已写入的为准，避免种子版本盖掉计划卡刚探测到的真值。
+     **例外是三个运行时缓存键**（`deploy.py` 的 `preserved_runtime_caches`）：
+     `maa_core_version` / `maa_cli_version`（计划卡的版本探测写）和
+     `activity_stages`（活动 watcher / 计划卡写）——**线上已有值就一律保留**，
+     种子只在线上还没有这个键时（首次部署）当兜底。
+     它们是运行时缓存，不是仓库拥有的配置；让种子赢就等于每次部署都把
+     `PLAN_NAV_GATE.md` A-3 修掉的那种过期又造一遍
+     （2026-09-02 实际发生过一次：部署把正确的 `[]` 换成了一个月前 TO 活动的关卡，
+     直到下一次 watcher 才清掉）。
      同时丢掉已废弃的 `resource_update_interval_days`。
    - **`channel_id` 例外**：仓库里存的是占位符 `REPLACE_WITH_DISCORD_CHANNEL_ID`，
      真实频道 ID 不入库。`resolve_channel_id()` 按
@@ -594,7 +600,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 16 | 森空岛/鹰角 token 永不经 Discord、argv、agent 上下文；`copilot/` 下文件 0600 | `maa_skland.py` stdin/环境变量注入 + 测试 |
 | 17 | 抄作业关卡只接受本地 `stage_index` 精确查表，不许猜别名 | `valid_copilot_stage()` |
 | 18 | 活动自动作业只给完全满足练度且无软硬缺口的 Top-1 普通模式；自动搜索绕过 12h 缓存，开模拟器前和进战前都复核活动与实时理智 | watcher 状态机 + `cmd_search()` + `copilot_pick()` + `_require_auto_run_preflight()` |
-| 19 | 只有「查询成功且确实无活动」才允许清空活动关；格式不可辨认一律抛异常。闸门与解析器必须共用 `is_side_story_heading()`，不许各判各的 | `activity_snapshot()` + `test_snapshot_gate_and_parser_agree_on_what_a_heading_is` |
+| 19 | 只有「查询成功且确实无活动」才允许清空活动关；格式不可辨认一律抛异常。闸门与解析器必须共用 `is_side_story_heading()`，不许各判各的。`activity_stages` 是运行时缓存：**`deploy.py` 不得用仓库种子覆盖线上值**，否则等于绕过本闸门写回一份过期活动关 | `activity_snapshot()` + `test_snapshot_gate_and_parser_agree_on_what_a_heading_is`；`deploy.preserved_runtime_caches` + `test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent` |
 | 20 | 收掉用户手里的作业卡必须连续 2 次空快照才发生，且发生时必发 Discord 通知 | `run_once()` 的 `EMPTY_OBSERVATIONS_BEFORE_IDLE` + `test_watcher_enters_idle_on_recognized_empty_snapshot` |
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 | 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |

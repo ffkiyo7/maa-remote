@@ -217,15 +217,21 @@ def deploy_state(channel_id: str) -> None:
     current_config = load_json(target / "config.json", {})
     if not isinstance(current_config, dict):
         raise RuntimeError("existing MAA config.json is not an object")
-    # Plan-card version probes write the live maa-cli / MaaCore versions.
-    # Don't let a stale seed in the repo clobber them on every deploy.
-    preserved_versions = {
+    # These keys are runtime caches that live processes probe and rewrite, not
+    # configuration the repository owns. A seed value is only a first-boot
+    # fallback; once the host has its own value, the seed must never clobber it.
+    #   maa_core_version / maa_cli_version — written by the plan card's version probe
+    #   activity_stages                    — written by the活动 watcher / plan card
+    # Letting the seed win here re-creates the staleness PLAN_NAV_GATE A-3 fixed:
+    # on 2026-09-02 a deploy replaced a correct empty list with a month-old TO
+    # event's stages, and only the next watcher tick cleaned it up.
+    preserved_runtime_caches = {
         key: current_config[key]
-        for key in ("maa_core_version", "maa_cli_version")
+        for key in ("maa_core_version", "maa_cli_version", "activity_stages")
         if key in current_config
     }
     current_config.update(desired_config)
-    current_config.update(preserved_versions)
+    current_config.update(preserved_runtime_caches)
     current_config.pop("resource_update_interval_days", None)
     write_json(target / "config.json", current_config)
 

@@ -28,11 +28,7 @@
   "resource_update_timeout": 300,
   "maa_cli_update_timeout": 180,
   "maa_cli_formula": "MaaAssistantArknights/tap/maa-cli",
-  "activity_stages": [
-    "TO-9",
-    "TO-8",
-    "TO-7"
-  ],
+  "activity_stages": [],
   "maa_cli_version": "v0.7.5",
   "maa_core_version": "v6.17.0-beta.1",
   "copilot_blackout_minutes": 25,
