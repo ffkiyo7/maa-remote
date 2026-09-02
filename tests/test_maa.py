@@ -836,6 +836,39 @@ Opening mini games:
         self.assertIn('(interaction.data or {}).get("values", [])', patched)
         self.assertEqual(deploy.patch_adapter_source(patched), patched)
 
+    def test_adapter_patch_accepts_a_multiline_native_allowlist(self) -> None:
+        # hermes-agent f6b3e394b7（2026-09-03）把 maa_action.py 原生写进多行的
+        # frozenset；只看第一行的检测会把它误判成未知基线并拒绝部署。
+        already_dispatching = deploy.patch_adapter_source(
+            '''_HERMES_BUTTON_SCRIPTS = frozenset({"agent_book_action.py"})
+    async def _run_hermes_button_script(
+        self,
+        entry: dict[str, Any],
+    ) -> tuple[bool, str]:
+        raw_args = entry.get("args", [])
+        if not isinstance(raw_args, list) or len(raw_args) > 10:
+            return False, "按钮动作参数无效。"
+        args = [str(value) for value in raw_args]
+        if any(len(value) > 200 for value in args):
+            return False, "按钮动作参数过长。"
+                ok, message = await self._run_hermes_button_script(entry)
+'''
+        ).split("\n", 1)[1]
+        native = (
+            '_HERMES_BUTTON_SCRIPTS = frozenset({\n'
+            '    "agent_book_action.py",\n'
+            '    "maa_action.py",\n'
+            '    "luxraykit_pr_action.py",\n'
+            '})\n' + already_dispatching
+        )
+        self.assertEqual(deploy.patch_adapter_source(native), native)
+        # 真正未知的基线仍然拒绝。
+        with self.assertRaises(RuntimeError):
+            deploy.patch_adapter_source(
+                '_HERMES_BUTTON_SCRIPTS = frozenset({\n    "agent_book_action.py",\n})\n'
+                + already_dispatching
+            )
+
     def test_channel_id_is_resolved_and_placeholder_never_deploys(self) -> None:
         repo_config = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
         self.assertEqual(repo_config["channel_id"], deploy.CHANNEL_PLACEHOLDER)

@@ -290,7 +290,13 @@ def patch_adapter_source(text: str) -> str:
     """Add the reviewed MAA script and exact-value select-menu dispatch."""
     old = '_HERMES_BUTTON_SCRIPTS = frozenset({"agent_book_action.py"})'
     new = '_HERMES_BUTTON_SCRIPTS = frozenset({"agent_book_action.py", "maa_action.py"})'
-    if '"maa_action.py"' not in text.split("_HERMES_BUTTON_SCRIPTS", 1)[1].split("\n", 2)[0]:
+    # "Already allowed" must be judged on the whole frozenset literal, not on
+    # its first line: hermes-agent f6b3e394b7 (2026-09-03) carries maa_action.py
+    # natively in a multi-line frozenset, and a first-line check misread that
+    # as an unknown baseline and refused to deploy anything.
+    head, _sep, tail = text.partition("_HERMES_BUTTON_SCRIPTS = frozenset({")
+    allowlist_literal = tail.split("})", 1)[0] if _sep else ""
+    if '"maa_action.py"' not in allowlist_literal:
         if text.count(old) != 1:
             raise RuntimeError("Hermes button allowlist no longer matches the reviewed baseline")
         text = text.replace(old, new)
