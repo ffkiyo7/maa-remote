@@ -71,6 +71,24 @@ def copy_file(source: Path, target: Path, mode: int) -> None:
     write_bytes(target, source.read_bytes(), mode)
 
 
+# Keys in `state/config.json` that live processes probe and rewrite. They are
+# runtime caches, not configuration the repository owns, so a seed value is only
+# a first-boot fallback: once the host has its own value, the seed must never
+# clobber it (`deploy_state()`).
+#   maa_core_version / maa_cli_version — written by the plan card's version probe
+#   activity_stages                    — written by the activity watcher / plan card
+# Letting the seed win here re-creates the staleness PLAN_NAV_GATE A-3 fixed:
+# on 2026-09-02 a deploy replaced a correct empty list with a month-old TO
+# event's stages, and only the next watcher tick cleaned it up.
+# **Adding a key of this kind? Add it here too** — DEV_GUIDE §8 不变量 #25, and
+# `test_every_known_runtime_cache_key_is_preserved_on_deploy` will fail until
+# you do.
+PRESERVED_RUNTIME_CACHE_KEYS = (
+    "maa_core_version",
+    "maa_cli_version",
+    "activity_stages",
+)
+
 MAA_CONFIG_RELATIVE_PATHS = (
     Path("profiles/default.toml"),
     Path("tasks/daily.toml"),
@@ -217,17 +235,9 @@ def deploy_state(channel_id: str) -> None:
     current_config = load_json(target / "config.json", {})
     if not isinstance(current_config, dict):
         raise RuntimeError("existing MAA config.json is not an object")
-    # These keys are runtime caches that live processes probe and rewrite, not
-    # configuration the repository owns. A seed value is only a first-boot
-    # fallback; once the host has its own value, the seed must never clobber it.
-    #   maa_core_version / maa_cli_version — written by the plan card's version probe
-    #   activity_stages                    — written by the activity watcher / plan card
-    # Letting the seed win here re-creates the staleness PLAN_NAV_GATE A-3 fixed:
-    # on 2026-09-02 a deploy replaced a correct empty list with a month-old TO
-    # event's stages, and only the next watcher tick cleaned it up.
     preserved_runtime_caches = {
         key: current_config[key]
-        for key in ("maa_core_version", "maa_cli_version", "activity_stages")
+        for key in PRESERVED_RUNTIME_CACHE_KEYS
         if key in current_config
     }
     current_config.update(desired_config)

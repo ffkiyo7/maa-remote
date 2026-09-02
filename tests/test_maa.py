@@ -968,6 +968,42 @@ Opening mini games:
             (live / "config.json").unlink()
             self.assertEqual(deploy_once()["activity_stages"], ["SEED-1"])
 
+    def test_every_known_runtime_cache_key_is_preserved_on_deploy(self) -> None:
+        """DEV_GUIDE §8 不变量 #25 — the checklist that catches a forgotten key.
+
+        This list is maintained by hand on purpose. When you add a config key
+        that a live process writes back, this test fails until you also add it
+        to `deploy.PRESERVED_RUNTIME_CACHE_KEYS` — which is exactly the reminder
+        that was missing when a deploy clobbered `activity_stages` on
+        2026-09-02. If a key here is genuinely repo-owned, delete it from the
+        list and say why in the commit.
+        """
+        known_runtime_caches = {
+            # written by maa_plan_card's version probe
+            "maa_core_version",
+            "maa_cli_version",
+            # written by maa_activity_watch / maa_plan_card's activity snapshot
+            "activity_stages",
+        }
+        preserved = set(deploy.PRESERVED_RUNTIME_CACHE_KEYS)
+        self.assertEqual(
+            known_runtime_caches - preserved,
+            set(),
+            "运行时缓存键漏进 deploy.PRESERVED_RUNTIME_CACHE_KEYS，部署会用种子盖掉线上真值",
+        )
+        # The reverse too: preserving a key the repo really owns would silently
+        # freeze it on every host that already has a value.
+        self.assertEqual(preserved - known_runtime_caches, set())
+        # No duplicates — the tuple is the single source of truth.
+        self.assertEqual(
+            len(deploy.PRESERVED_RUNTIME_CACHE_KEYS), len(preserved)
+        )
+        # Every preserved key must actually exist in the seed, otherwise it is
+        # a typo that would silently never match.
+        seed = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
+        for key in deploy.PRESERVED_RUNTIME_CACHE_KEYS:
+            self.assertIn(key, seed, f"{key} 不在仓库种子里，多半是拼错了")
+
     def test_parse_maa_versions_from_cli_output(self) -> None:
         cli, core = maa_plan_card.parse_maa_versions(
             "maa-cli v0.7.5\nMaaCore v6.17.0-beta.1\n"
