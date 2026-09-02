@@ -625,6 +625,42 @@ python3 ~/.hermes/scripts/maa_action.py plan show
 hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、真的耗理智）
 ```
 
+### 单测必须离线可跑
+
+**整套单测不许碰网络**，一条都不许。曾经有一条 `test_search_copilots_respects_cache_ttl`
+在验缓存 TTL 时顺手调了真实的 prts.plus，结果整套测试既慢（15～59s）又会被对方
+一次 SSL EOF 判红——「全绿」这个验收标准就此不可信。现在网络层由
+`tests/test_copilot.py: prts_http_stub()` 桩掉，整套 2.4s。
+
+改完测试用这条**断网复核**，必须仍然全绿：
+
+```bash
+python3 -c "
+import socket, ssl, unittest
+def blocked(*a, **k):
+    raise RuntimeError('network access attempted during unit tests')
+socket.socket.connect = blocked
+socket.socket.connect_ex = blocked
+socket.create_connection = blocked
+socket.getaddrinfo = blocked
+unittest.main(module=None, argv=['nonet', 'discover', '-s', 'tests'])
+"
+```
+
+> 注意是 patch `socket.socket.connect` 而不是 `socket.socket` 本身——
+> 后者会把 `ssl.SSLSocket` 的继承搞崩，测试还没跑就 ImportError。
+
+**线上契约冒烟**（默认跳过，故意要连真网的那一条）：
+
+```bash
+MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
+```
+
+验的是 prts.plus 仍然返回 `prts_query()` 能解析的信封与字段
+（`id` / `content` / `available` / `rating_ratio` / `views`，以及 `content` 里的
+`stage_name`）。**桩数据改了就该跑一次这个**，确认桩还对得上真实响应。
+不要把它放进 CI 或默认套件。
+
 **单测不能替代真机验收。** 图像识别、连战倍率选择、基建自动排班这些只有实机能验。
 需要跑完整链路又不想耗理智时，把 `config.json` 的 `fight_times` 临时设成 `0`
 （Fight 立即达限但任务链完整），验完**务必**改回 `2147483647`。

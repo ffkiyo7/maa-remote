@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,42 @@ def op_item(item_id: int, stage_name: str, *, opers=None, groups=None,
         "upload_time": upload_time,
         "uploader": "test_uploader",
     }
+
+
+def prts_http_stub(items: list[dict], *, full_total: int = 39409):
+    """Offline stand-in for prts.plus ``/copilot/query``.
+
+    Patch this over ``maa_copilot.http_get_json`` — the lowest network entry —
+    rather than over ``fetch_stage_copilots``. Everything above the wire then
+    still runs for real: ``prts_query()``'s envelope validation, the
+    ``level_keyword`` / ``document=`` query fan-out, ``_absorb()``'s
+    client-side ``content.stage_name`` filter and the id dedup.
+
+    The envelope (``{"status_code", "message", "data": {"total", "has_next",
+    "page", "data": [...]}}``) is the shape of a real response; only the item
+    count is trimmed. ``total`` for the unfiltered probe is a real observed
+    value, and ``level_keyword`` deliberately reports a smaller total so
+    ``fetch_stage_copilots`` takes its "the server index really filtered"
+    branch instead of the degraded newest-pages scan.
+    """
+    seen_params: list[dict[str, str]] = []
+
+    def _get(url: str, timeout: int = 30):
+        params = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        seen_params.append(params)
+        if params.keys() == {"limit"} and params["limit"] == "1":
+            body = {"total": full_total, "has_next": False, "page": 1, "data": []}
+        else:
+            body = {
+                "total": len(items),
+                "has_next": False,
+                "page": int(params.get("page", 1)),
+                "data": items,
+            }
+        return {"status_code": 200, "message": "", "data": body}
+
+    _get.seen_params = seen_params
+    return _get
 
 
 def roster(chars: dict) -> dict:
@@ -462,15 +499,36 @@ class SearchTests(unittest.TestCase):
             cache_path.write_text(json.dumps(stale), encoding="utf-8")
             fetched: list[int] = []
             real_fetch = maa_copilot.fetch_stage_copilots
+            returned: list[list[dict]] = []
 
             def counting_fetch(stage_id, code, config):
                 fetched.append(1)
-                return real_fetch(stage_id, code, config)
+                # The real fetcher, exercised against a stubbed wire — see
+                # prts_http_stub(). Never hits the network, so the suite stays
+                # green offline and cannot go red on a prts.plus hiccup.
+                items = real_fetch(stage_id, code, config)
+                returned.append(items)
+                return items
 
+            # id 99 is for this stage; id 98 belongs to another stage and must
+            # be dropped by the client-side filter, never trusted from the
+            # server. Both come back through the same query.
+            wire = prts_http_stub([
+                op_item(99, "act53side_09", opers=[{"name": "x", "skill": 1}]),
+                op_item(98, "act51side_01", opers=[{"name": "y", "skill": 1}]),
+            ])
             with patch.object(maa_copilot, "fetch_stage_copilots", side_effect=counting_fetch), \
+                 patch.object(maa_copilot, "http_get_json", side_effect=wire), \
                  patch.object(maa_copilot, "CACHE_DIR", cache_dir):
                 maa_copilot.search_copilots("act53side_09", "TO-9", config, None, use_cache=True)
             self.assertEqual(len(fetched), 1)  # stale -> refetch
+            # The refetch really parsed the wire: the matching item survived and
+            # the other stage's item was filtered out.
+            self.assertEqual([item["id"] for item in returned[0]], [99])
+            # And it really went through prts_query's fan-out, not a shortcut.
+            self.assertIn(
+                "act53side_09", [p.get("level_keyword") for p in wire.seen_params]
+            )
 
             fresh = {
                 "fetched_at": (datetime.now().astimezone() - timedelta(hours=1)).isoformat(),
@@ -478,10 +536,41 @@ class SearchTests(unittest.TestCase):
             }
             cache_path.write_text(json.dumps(fresh), encoding="utf-8")
             with patch.object(maa_copilot, "fetch_stage_copilots", side_effect=counting_fetch), \
+                 patch.object(maa_copilot, "http_get_json", side_effect=wire), \
                  patch.object(maa_copilot, "CACHE_DIR", cache_dir):
                 candidates = maa_copilot.search_copilots("act53side_09", "TO-9", config, None, use_cache=True)
             self.assertEqual(len(fetched), 1)  # fresh cache -> no refetch
             self.assertEqual(candidates[0]["id"], 8)
+
+
+@unittest.skipUnless(
+    os.environ.get("MAA_LIVE_TESTS") == "1",
+    "线上契约冒烟，默认跳过；用 MAA_LIVE_TESTS=1 显式开启",
+)
+class LiveContractTests(unittest.TestCase):
+    """The one thing the old networked TTL test covered by accident.
+
+    `test_search_copilots_respects_cache_ttl` used to call the real fetcher
+    over the real wire. That was never its subject — it verifies the 12h cache
+    TTL — but it did incidentally prove prts.plus still speaks the envelope
+    `prts_query()` parses. Keeping that as a hidden side effect made the whole
+    suite flaky (SSL EOF) and slow; asserting it here on purpose, opt-in, is
+    the honest version. Never run by CI or by the default suite.
+    """
+
+    def test_prts_query_envelope_still_matches_the_parser(self) -> None:
+        inner = maa_copilot.prts_query({"limit": 1}, timeout=30)
+        # prts_query already raises "prts 返回格式异常" if these are missing;
+        # assert them explicitly so a failure names the field that moved.
+        self.assertIsInstance(inner.get("data"), list)
+        self.assertIsInstance(int(inner.get("total", 0) or 0), int)
+        self.assertGreater(int(inner.get("total", 0) or 0), 0)
+        item = inner["data"][0]
+        for field in ("id", "content", "available", "rating_ratio", "views"):
+            self.assertIn(field, item, f"prts.plus 的作业条目少了 {field}")
+        # content is a JSON *string* carrying stage_name — the field the
+        # client-side filter in _absorb() trusts instead of the server.
+        self.assertIn("stage_name", maa_copilot.parse_content(item))
 
 
 class ExecutionUriTests(unittest.TestCase):
