@@ -16,7 +16,7 @@
 - [ ] 步骤 2 — 导航定义生成器（2a spike 的 Q2/Q3 需要有当期活动，空窗期做不干净）
 - [ ] 步骤 3 — `stage_queue` + 日常让路 + `needs_manual`
 - [ ] 步骤 4 — EX 理智 OCR
-- [x] ~~步骤 5 — Depot 对表 + 掉落增量 + 消耗率（`3aa90a8`；留 D-1/D-2 两项）~~
+- [x] ~~步骤 5 — Depot 对表 + 掉落增量 + 消耗率（`3aa90a8`；交付后发现的 D-1/D-2 已修，`b8b43b4`）~~
 - [ ] 步骤 6 — 计划卡加 farming 选关下拉
 
 ---
@@ -672,7 +672,8 @@ python3 -m unittest discover -s tests -v      # 全绿
 `furni` 家具明确排除在养成材料之外。**目前只有首份快照，跨周消耗率要等下次对表才产生**，
 计算路径已有回归测试覆盖。
 
-**遗留两项**（见本步末尾「交付后发现的问题」，均不阻塞步骤 2/3/4/6）。
+**交付后发现的 D-1/D-2 已修**（commit `b8b43b4`，见本步末尾「交付后发现的问题」；
+Depot 调度已从计划卡拆出，写入不变量 #23）。
 
 ### 前置
 
@@ -699,16 +700,18 @@ python3 -m unittest discover -s tests -v      # 全绿
 
 跑几周就有了**本账号的真实消耗率**，比任何手工权重表都准。这正是第 6 步要用的输入。
 
-- 触发点接在 `maa_plan_card.py` 的每周节奏上（该脚本已经在跑每周 `maa update`）。
+- 触发点：**独立 cron** `30 20 * * *`（UTC，即北京时间每日 04:30）调 `maa_depot.main()`，
+  每日只做 7 天到期检查，未到期不开模拟器。**不得挂在 `maa_plan_card.py` 链路内**
+  （不变量 #23；原设计挂在 07:50 计划卡上，因 D-1/D-2 改掉）。
 - **对表失败不得污染已有库存快照** —— 宁可这周没数据，也不要写进一份错的。
 
 ### 允许改动的文件
 
 - 新增 `scripts/maa_depot.py`
 - 新增 `config/maa-cli/tasks/depot.toml`
-- `scripts/maa_daily.py`（战报里回写掉落到累计增量）
-- `scripts/maa_plan_card.py`（每周触发）
-- `deploy.py`、`tests/`
+- `scripts/maa_daily.py`（战报里回写掉落到累计增量；抢锁失败的显式上报）
+- `scripts/maa_common.py`（`last_run_lock()` / `merge_last_run()`）
+- `deploy.py`、`tests/`、`README.md`（cron 建法）
 - `DEV_GUIDE.md`（§6 状态模型要加 `depot.json`）
 
 ### 禁止触碰
@@ -748,8 +751,8 @@ python3 deploy.py && python3 deploy.py --check
 `run.lock`。而这之前还排着 `check_and_update_upstream()`（DEV_GUIDE 记的是数秒～5 分钟）。
 最坏情况 07:50 + 5min + 开机 70s + 480s + 清理 ≈ **08:04 才放锁**。
 
-08:00 的日常用的是 `maa_daily.py:1380` 的 `run_lock(blocking=False)`，抢不到就
-`return 0`——**不发 Discord、不写 `last_run.json`**。也就是每 7 天有一次机会整场早场
+08:00 的日常在 `maa_daily.main()` 里用 `run_lock(blocking=False)`，当时抢不到就
+`return 0`——**不发 Discord、不写 `last_run.json`**（现已改为 `report_lock_conflict()`）。也就是每 7 天有一次机会整场早场
 无声消失。这正是全局护栏 4 点名的那种静默 `return`（`PLAN_NAV_GATE.md` B-3 的教训）。
 
 那个 `return 0` 是既有代码、不是本步引入的；但本步**新造了一条定期走到它的路**。
@@ -759,7 +762,7 @@ python3 deploy.py && python3 deploy.py --check
 
 - 挪去自己的 cron，选个远离 08:00/22:00 的时段（`maa_depot.py` 已有独立 `main()`，几乎零成本）
 - 或挂在 22:00 那场**之后**跑，而不是 08:00 之前
-- 无论哪种，`maa_daily.py:1380` 那个静默 `return 0` 都该顺手补上告警
+- 无论哪种，`maa_daily.main()` 那个静默 `return 0` 都该顺手补上告警
 
 **D-2｜Depot 失败会把整张计划卡也带走。**
 
@@ -772,6 +775,10 @@ python3 deploy.py && python3 deploy.py --check
 `effective_plan()` / `build_components()` / 按钮登记 / 发卡**全部不执行**。于是一次
 周度库存扫描失败 = 当天**没有计划卡**，而这天多半正是模拟器不稳的那天，也正是最需要
 卡片的时候。告警是对的，连坐值得商榷：Depot 是旁路数据采集，不是计划卡的前置。
+
+---
+
+## 步骤 6 — 计划卡加 farming 选关下拉
 
 ### 前置
 
