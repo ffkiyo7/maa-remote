@@ -665,6 +665,13 @@ python3 deploy.py --check                  # 检查脚本/ocrbox 与 6 个 maa-c
 | `~/.hermes/.env` | `DISCORD_FREE_RESPONSE_CHANNELS` 追加频道 ID（免 @） |
 | `~/.hermes/config.yaml` | 频道绑定 `maa-operator` 技能 + 频道提示词 |
 
+> `patch_config_yaml_text()` 只认 `channel_prompts:` 这一行做锚点（缩进按块内实际
+> 缩进推导），**不许拿相邻的顶层键（如 `timezone`）当锚点**——键顺序归 Hermes 管，
+> 会变（见 §11.17）。是否需要插入按 `yaml.safe_load` 的**解析值**判断而不是字面量，
+> 这样 Hermes 折行重排过文本也不会重复插入。写盘前后各解析一次，
+> 顶层 `timezone` 丢失/被改、或 `platforms.discord.channel_prompts[<频道>]`
+> 不等于目标文案就 `RuntimeError` 且不落盘；config.yaml 在打补丁前就解析不了也直接拒绝。
+
 > `patch_adapter_source()` 用**精确字符串匹配**，匹配不到就 `RuntimeError`
 > 而不是硬改。因此 **`hermes update` 之后 `deploy.py` 可能直接报错**——这是刻意的：
 > 宁可失败，也不要在改了结构的 adapter 上瞎打补丁。届时需要读新 adapter 源码更新这些 old/new 串。
@@ -972,3 +979,11 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
     引用新包中已经改名的模板，导致 MaaCore 在真正连模拟器前直接退出。
     计划卡因此在 MaaCore 更新成功后紧接着跑 `maa hot-update --batch`；任一步
     失败都会红卡报错，不再把半更新状态当成可用。
+
+17. **拿相邻顶层键当 YAML 锚点会写坏 config.yaml，代价是全部 cron 提前 8 小时**——
+    旧 `patch_config_yaml()` 把频道提示词插在 `timezone: Etc/UTC` 之前，假定它紧跟
+    `channel_prompts:`。2026-09-03 Hermes 重排了键顺序，`timezone` 落到了 `skills:`
+    之后，于是那行 6 空格缩进的提示词插进了 `skills:` 块里，YAML 解析失败。
+    Hermes 静默回退默认配置 → `timezone: Etc/UTC` 失效 → cron 全按本机 `+08:00` 解释，
+    每个 job 都提前 8 小时跑。修法见 §7 的锚点说明；判断线上是否中招：
+    `hermes cron list` 的 `Next run` 带 `+08:00` 而不是 `+00:00`。

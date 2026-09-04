@@ -424,9 +424,78 @@ def patch_env(channel_id: str) -> None:
     write_text(path, "\n".join(lines) + "\n", 0o600)
 
 
-def patch_config_yaml(channel_id: str) -> None:
-    path = HERMES_HOME / "config.yaml"
-    text = path.read_text(encoding="utf-8")
+MAA_CHANNEL_PROMPT = (
+    "你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
+    "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。"
+)
+# Superseded prompt wordings that a previous deploy may have written. Kept so an
+# upgrade rewrites them in place instead of appending a second entry.
+OLD_MAA_CHANNEL_PROMPTS = (
+    "你是 MAA 长草助手。只处理今天的关卡、临期理智药、跳过、立即运行和日志；"
+    "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。",
+)
+HERMES_VENV_PYTHON = HERMES_HOME / "hermes-agent" / "venv" / "bin" / "python"
+
+
+def parse_yaml(text: str) -> Any:
+    """Parse YAML, raising ValueError on malformed input.
+
+    The repository's tests run on the system interpreter, which has no PyYAML.
+    Hermes ships its own, so fall back to its venv rather than adding a
+    third-party dependency to this script.
+    """
+    try:
+        import yaml  # type: ignore
+    except ModuleNotFoundError:
+        pass
+    else:
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError as exc:  # pragma: no cover - depends on host
+            raise ValueError(str(exc)) from exc
+    if not HERMES_VENV_PYTHON.exists():
+        raise RuntimeError(
+            f"need PyYAML to validate config.yaml: neither this interpreter nor {HERMES_VENV_PYTHON} has it"
+        )
+    process = subprocess.run(
+        [
+            str(HERMES_VENV_PYTHON),
+            "-c",
+            "import json,sys,yaml; json.dump(yaml.safe_load(sys.stdin.read()), sys.stdout, default=str)",
+        ],
+        input=text,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode != 0:
+        raise ValueError(process.stderr.strip() or "yaml.safe_load failed")
+    return json.loads(process.stdout)
+
+
+def _discord_section(document: Any) -> dict[str, Any]:
+    platforms = document.get("platforms") if isinstance(document, dict) else None
+    discord = platforms.get("discord") if isinstance(platforms, dict) else None
+    return discord if isinstance(discord, dict) else {}
+
+
+def patch_config_yaml_text(text: str, channel_id: str) -> str:
+    """Return config.yaml with the MAA channel binding and prompt applied.
+
+    The prompt is anchored on the `channel_prompts:` mapping itself, never on a
+    neighbouring top-level key: key order in config.yaml is Hermes' to change,
+    and an anchor that assumes it will eventually splice the entry into the
+    wrong block (see DEV_GUIDE.md §11). The result is re-parsed before the
+    caller is allowed to write it.
+    """
+    try:
+        before = parse_yaml(text)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"config.yaml 当前就无法解析，请先手工修好再部署：{exc}"
+        ) from exc
+    if not isinstance(before, dict):
+        raise RuntimeError("config.yaml 顶层不是映射，请先手工修好再部署")
+
     binding = (
         f"      - id: '{channel_id}'\n"
         "        skills:\n"
@@ -438,22 +507,72 @@ def patch_config_yaml(channel_id: str) -> None:
             raise RuntimeError("Discord channel_prompts marker is ambiguous")
         text = text.replace(marker, binding + marker)
 
-    old_prompt = (
-        f"      '{channel_id}': '你是 MAA 长草助手。只处理今天的关卡、临期理智药、跳过、立即运行和日志；"
-        "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。'\n"
-    )
-    prompt = (
-        f"      '{channel_id}': '你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
-        "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。'\n"
-    )
-    if old_prompt in text:
-        text = text.replace(old_prompt, prompt)
-    elif prompt not in text:
-        marker = "timezone: Etc/UTC"
-        if text.count(marker) != 1:
-            raise RuntimeError("timezone marker is ambiguous")
-        text = text.replace(marker, prompt + marker)
-    write_text(path, text, 0o600)
+    prompts = _discord_section(before).get("channel_prompts")
+    current = prompts.get(channel_id) if isinstance(prompts, dict) else None
+    if current != MAA_CHANNEL_PROMPT:
+        entry = f"'{channel_id}': '{MAA_CHANNEL_PROMPT}'"
+        if current is None:
+            text = _insert_channel_prompt(text, entry)
+        else:
+            replaced = False
+            for old in OLD_MAA_CHANNEL_PROMPTS:
+                old_entry = f"      '{channel_id}': '{old}'\n"
+                if old_entry in text:
+                    text = text.replace(old_entry, f"      {entry}\n")
+                    replaced = True
+                    break
+            if not replaced:
+                raise RuntimeError(
+                    f"channel_prompts['{channel_id}'] 已有非预期文案，请手工确认后再部署：{current!r}"
+                )
+
+    try:
+        after = parse_yaml(text)
+    except ValueError as exc:
+        raise RuntimeError(f"补丁后的 config.yaml 无法解析，已放弃写盘：{exc}") from exc
+    if not isinstance(after, dict):
+        raise RuntimeError("补丁后的 config.yaml 顶层不是映射，已放弃写盘")
+    if "timezone" not in after or after.get("timezone") != before.get("timezone"):
+        raise RuntimeError(
+            "补丁后顶层 timezone 丢失或被改动，已放弃写盘："
+            f"{before.get('timezone')!r} -> {after.get('timezone')!r}"
+        )
+    patched_prompts = _discord_section(after).get("channel_prompts")
+    if not isinstance(patched_prompts, dict) or patched_prompts.get(channel_id) != MAA_CHANNEL_PROMPT:
+        raise RuntimeError(
+            "补丁后 platforms.discord.channel_prompts 未落到预期文案，已放弃写盘"
+        )
+    return text
+
+
+def _insert_channel_prompt(text: str, entry: str) -> str:
+    """Insert `entry` as the first item of the `channel_prompts:` mapping."""
+    lines = text.splitlines(keepends=True)
+    anchors = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip() == "channel_prompts:"
+    ]
+    if len(anchors) != 1:
+        raise RuntimeError("Discord channel_prompts marker is ambiguous")
+    anchor = anchors[0]
+    anchor_indent = len(lines[anchor]) - len(lines[anchor].lstrip(" "))
+    indent = anchor_indent + 2
+    for line in lines[anchor + 1:]:
+        if not line.strip():
+            continue
+        line_indent = len(line) - len(line.lstrip(" "))
+        if line_indent > anchor_indent:
+            indent = line_indent
+        break
+    lines.insert(anchor + 1, " " * indent + entry + "\n")
+    return "".join(lines)
+
+
+def patch_config_yaml(channel_id: str) -> None:
+    path = HERMES_HOME / "config.yaml"
+    text = path.read_text(encoding="utf-8")
+    write_text(path, patch_config_yaml_text(text, channel_id), 0o600)
 
 
 def main() -> int:

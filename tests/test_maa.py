@@ -869,6 +869,103 @@ Opening mini games:
                 + already_dispatching
             )
 
+    # config.yaml 的键顺序归 Hermes 管：timezone 早于 platforms.discord。
+    # 2026-09-04 的事故就是补丁拿 `timezone: Etc/UTC` 当锚点，把 prompt 插进了
+    # 上一块 `skills:` 里。
+    CONFIG_SAMPLE = (
+        "delegation:\n"
+        "  max_iterations: 50\n"
+        "skills:\n"
+        "  creation_nudge_interval: 15\n"
+        "timezone: Etc/UTC\n"
+        "platforms:\n"
+        "  discord:\n"
+        "    channel_skill_bindings:\n"
+        "      - id: '1531685973501542422'\n"
+        "        skills:\n"
+        "          - agent-book-tutor\n"
+        "    channel_prompts:\n"
+        "      '1531685973501542422': '你是领读老师。'\n"
+    )
+
+    def test_channel_prompt_lands_in_channel_prompts_whatever_the_key_order(self) -> None:
+        patched = deploy.patch_config_yaml_text(self.CONFIG_SAMPLE, "1533066727313637457")
+        parsed = deploy.parse_yaml(patched)
+        self.assertEqual(parsed["timezone"], "Etc/UTC")
+        # 事故的直接症状：prompt 落进了 skills 块。
+        self.assertEqual(parsed["skills"], {"creation_nudge_interval": 15})
+        discord = parsed["platforms"]["discord"]
+        self.assertEqual(
+            discord["channel_prompts"]["1533066727313637457"], deploy.MAA_CHANNEL_PROMPT
+        )
+        self.assertIn(
+            {"id": "1533066727313637457", "skills": ["maa-operator"]},
+            discord["channel_skill_bindings"],
+        )
+
+    def test_channel_prompt_is_not_duplicated_and_old_wording_is_rewritten(self) -> None:
+        once = deploy.patch_config_yaml_text(self.CONFIG_SAMPLE, "1533066727313637457")
+        self.assertEqual(deploy.patch_config_yaml_text(once, "1533066727313637457"), once)
+
+        # Hermes 重排/折叠过文本以后，只认字面量的旧实现会再插一遍；按解析值判断不会。
+        head, tail = deploy.MAA_CHANNEL_PROMPT.split(" ", 1)
+        reflowed = once.replace(
+            f"      '1533066727313637457': '{deploy.MAA_CHANNEL_PROMPT}'\n",
+            f"      '1533066727313637457': {head}\n        {tail}\n",
+        )
+        self.assertEqual(
+            deploy.parse_yaml(reflowed)["platforms"]["discord"]["channel_prompts"][
+                "1533066727313637457"
+            ],
+            deploy.MAA_CHANNEL_PROMPT,
+        )
+        self.assertEqual(
+            deploy.patch_config_yaml_text(reflowed, "1533066727313637457"), reflowed
+        )
+
+        stale = self.CONFIG_SAMPLE.replace(
+            "      '1531685973501542422': '你是领读老师。'\n",
+            "      '1531685973501542422': '你是领读老师。'\n"
+            f"      '1533066727313637457': '{deploy.OLD_MAA_CHANNEL_PROMPTS[0]}'\n",
+        )
+        upgraded = deploy.patch_config_yaml_text(stale, "1533066727313637457")
+        self.assertEqual(upgraded.count("'1533066727313637457':"), 1)
+        self.assertEqual(
+            deploy.parse_yaml(upgraded)["platforms"]["discord"]["channel_prompts"][
+                "1533066727313637457"
+            ],
+            deploy.MAA_CHANNEL_PROMPT,
+        )
+
+    def test_unparsable_result_raises_before_the_file_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            home = Path(raw)
+            config = home / "config.yaml"
+            config.write_text(self.CONFIG_SAMPLE, encoding="utf-8")
+            real = deploy.parse_yaml
+            calls = {"n": 0}
+
+            def flaky(text: str):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real(text)
+                raise ValueError("mapping values are not allowed in this context")
+
+            with patch.object(deploy, "HERMES_HOME", home), patch.object(
+                deploy, "parse_yaml", side_effect=flaky
+            ):
+                with self.assertRaises(RuntimeError):
+                    deploy.patch_config_yaml("1533066727313637457")
+            self.assertEqual(config.read_text(encoding="utf-8"), self.CONFIG_SAMPLE)
+
+    def test_an_already_broken_config_is_refused_instead_of_patched(self) -> None:
+        broken = self.CONFIG_SAMPLE.replace(
+            "timezone: Etc/UTC\n",
+            "      '1533066727313637457': '你是 MAA 长草助手。'\ntimezone: Etc/UTC\n",
+        )
+        with self.assertRaises(RuntimeError):
+            deploy.patch_config_yaml_text(broken, "1533066727313637457")
+
     def test_channel_id_is_resolved_and_placeholder_never_deploys(self) -> None:
         repo_config = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
         self.assertEqual(repo_config["channel_id"], deploy.CHANNEL_PLACEHOLDER)
