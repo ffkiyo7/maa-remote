@@ -4412,23 +4412,56 @@ def _zone(cleared: int, total: int, act: str = "act54side") -> dict:
     ]}}
 
 
+RAID_ON = {"copilot_raid_switch_task": "ChangeToRaidDifficulty"}
+RAID_OFF = {"copilot_raid_switch_task": ""}
+
+
 class CopilotModeTests(unittest.TestCase):
-    """D7：活动关一律普通 + 突袭；资源本 / 主线只有普通。"""
+    """D7：活动关普通 + 突袭；资源本 / 主线只有普通。突袭开关为空时活动关也只有普通。"""
 
     def test_activity_stages_need_both_modes(self) -> None:
         for stage in ("SR-1", "SR-8", "SR-EX-1", "SR-S-1"):
             with self.subTest(stage=stage):
                 self.assertEqual(
-                    maa_clearing.required_modes(stage, "SR"), ("normal", "raid")
+                    maa_clearing.required_modes(stage, "SR", RAID_ON),
+                    ("normal", "raid"),
                 )
 
     def test_supplies_and_main_have_no_raid(self) -> None:
         for stage in ("CE-6", "1-7", "AP-5"):
             with self.subTest(stage=stage):
-                self.assertEqual(maa_clearing.required_modes(stage, "SR"), ("normal",))
+                self.assertEqual(
+                    maa_clearing.required_modes(stage, "SR", RAID_ON), ("normal",)
+                )
 
     def test_no_activity_means_normal_only(self) -> None:
-        self.assertEqual(maa_clearing.required_modes("SR-8", ""), ("normal",))
+        self.assertEqual(maa_clearing.required_modes("SR-8", "", RAID_ON), ("normal",))
+
+    def test_an_empty_switch_task_turns_the_whole_raid_feature_off(self) -> None:
+        """空开关 = 突袭功能关闭，不是「跳过切换直接打」（2026-09-09 线上缺陷）。"""
+        for stage in ("SR-1", "SR-8", "SR-EX-1", "SR-S-1"):
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    maa_clearing.required_modes(stage, "SR", RAID_OFF), ("normal",)
+                )
+        self.assertFalse(maa_clearing.raid_enabled(RAID_OFF))
+        self.assertFalse(maa_clearing.raid_enabled({"copilot_raid_switch_task": "   "}))
+        self.assertTrue(maa_clearing.raid_enabled(RAID_ON))
+
+    def test_the_switch_task_defaults_only_when_the_key_is_absent(self) -> None:
+        # 键缺失 → 取默认任务名（与 worker 的取值口径一致）；config 不是字典 → 关闭。
+        self.assertEqual(
+            maa_clearing.raid_switch_task({}), maa_clearing.DEFAULT_RAID_SWITCH_TASK
+        )
+        self.assertEqual(maa_clearing.required_modes("SR-8", "SR", {}),
+                         ("normal", "raid"))
+        for bad in (None, "", []):
+            with self.subTest(config=bad):
+                self.assertEqual(maa_clearing.raid_switch_task(bad), "")
+                self.assertEqual(maa_clearing.required_modes("SR-8", "SR", bad),
+                                 ("normal",))
+        # 不传 config 一律 fail-closed。
+        self.assertEqual(maa_clearing.required_modes("SR-8", "SR"), ("normal",))
 
     def test_entry_round_trip_keeps_the_raid_suffix(self) -> None:
         self.assertEqual(maa_clearing.make_entry("SR-5", "raid"), "SR-5#raid")
@@ -4666,14 +4699,15 @@ class CopilotTargetSetTests(unittest.TestCase):
         self.config = {"activity_search_retry_minutes": 30}
         self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
 
-    def _collect(self, *, ledger=None, roster=None, state=None,
+    def _collect(self, *, ledger=None, roster=None, state=None, config=None,
                  keys=("SR-1", "SR-2", "SR-5", "SR-6", "SR-8", "SR-EX-1", "SR-S-1",
                        "SR-TR-1")):
         import maa_activity_watch as watch
 
         with _nav_patch(set(keys)):
             return watch.collect_targets(
-                self.config, state if state is not None else {}, "SR",
+                {**self.config, **(config or {})},
+                state if state is not None else {}, "SR",
                 SR_INDEX, ledger or {}, roster, self.at,
             )
 
@@ -4687,6 +4721,28 @@ class CopilotTargetSetTests(unittest.TestCase):
         )
         entries = watch._entry_list(targets[:2])
         self.assertEqual(entries, ["SR-1", "SR-1#raid", "SR-2", "SR-2#raid"])
+
+    def test_an_empty_raid_switch_keeps_raid_entries_out_of_the_round(self) -> None:
+        """突袭开关为空 → 排轮里一个 `#raid` 都不许有（2026-09-09 线上缺陷）。"""
+        import maa_activity_watch as watch
+
+        targets, _excluded = self._collect(config=RAID_OFF)
+        self.assertTrue(targets)
+        self.assertEqual({tuple(t["modes"]) for t in targets}, {("normal",)})
+        entries = watch._entry_list(targets)
+        self.assertEqual(entries, [t["stage"] for t in targets])
+        self.assertFalse([e for e in entries if e.endswith(maa_clearing.RAID_SUFFIX)])
+
+    def test_an_activity_stage_with_normal_done_is_cleared_when_raid_is_off(self) -> None:
+        # 普通已通、突袭没打：开关开着要补突袭，开关关掉就算通关，不再排。
+        ledger = {"stages": {"SR-1": {"normal": "2026-09-09T02:00:00+08:00",
+                                      "raid": None, "attempts": []}}}
+        targets, _ = self._collect(ledger=ledger, config=RAID_ON)
+        self.assertEqual([t["modes"] for t in targets if t["stage"] == "SR-1"],
+                         [["raid"]])
+        targets, excluded = self._collect(ledger=ledger, config=RAID_OFF)
+        self.assertNotIn("SR-1", [t["stage"] for t in targets])
+        self.assertIn("SR-1", [e["stage"] for e in excluded if e["reason"] == "cleared"])
 
     def test_a_stage_without_an_upstream_nav_key_never_enters_the_set(self) -> None:
         # 不变量 #37：本地索引里有、上游 `tasks/Stages/SR.json` 里没有 → 不排。
@@ -5096,7 +5152,8 @@ class CopilotBatchExecutionTests(unittest.TestCase):
             "sanity_cost": cost,
         }
 
-    def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None, ledger_dir=None):
+    def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None, ledger_dir=None,
+             config=None):
         import maa_copilot_worker as worker
 
         token = "a" * 12
@@ -5132,7 +5189,10 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 patch.object(maa_copilot, "SEARCHES_DIR", searches),
                 patch.object(worker, "RUNS_DIR", Path(raw)),
                 patch.object(worker, "state_lock", return_value=contextlib.nullcontext()),
-                patch.object(worker, "load_config", return_value={"channel_id": "1"}),
+                patch.object(
+                    worker, "load_config",
+                    return_value={"channel_id": "1", **(config or {})},
+                ),
                 patch.object(worker, "emulator_is_online", return_value=(False, "")),
                 patch.object(worker, "_retire_round_controls"),
                 patch.object(worker, "_notice"),
@@ -5182,6 +5242,45 @@ class CopilotBatchExecutionTests(unittest.TestCase):
         for label in ("SR-5", "SR-5（突袭）", "SR-6"):
             self.assertIn(label, result.results)
         self.assertIn("3/3 通过", result.report["title"])
+
+    def test_a_raid_entry_is_skipped_outright_when_the_switch_is_empty(self) -> None:
+        """最后一道防线：开关为空时 `raid` 条目**绝不**跑 `maa copilot`，也不记账。
+
+        单文件 `maa copilot --raid raid` 不切难度，真跑下去打的是普通难度，
+        却会按突袭记一次通关（2026-09-09 线上缺陷）。
+        """
+        import maa_copilot_worker as worker
+
+        entries = [self._entry("SR-5"), self._entry("SR-5", "raid")]
+        fought: list[str] = []
+
+        def fight(config, entry, env, log_path):
+            fought.append(f"{entry['stage']}#{entry['mode']}")
+            return "won", ""
+
+        result = self._run(entries, fight, config=dict(RAID_OFF))
+        self.assertEqual(fought, ["SR-5#normal"])
+        # 记账里只有普通那一次；`raid` 的时间戳仍是 None。
+        stage = result.ledger["stages"]["SR-5"]
+        self.assertIsNone(stage["raid"])
+        self.assertEqual([a["mode"] for a in stage["attempts"]], ["normal"])
+        self.assertIn("突袭切换未启用", result.results)
+        self.assertIn("⏭️", result.results)
+        # 跳过不算失败：这一轮照样是「成功」，不发红卡也不停整轮。
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.state["status"], "executed")
+        self.assertTrue(hasattr(worker, "RAID_DISABLED_NOTICE"))
+
+    def test_a_raid_entry_still_runs_when_the_switch_is_configured(self) -> None:
+        fought: list[str] = []
+        self._run(
+            [self._entry("SR-5"), self._entry("SR-5", "raid")],
+            lambda config, entry, env, log: (
+                fought.append(f"{entry['stage']}#{entry['mode']}") or ("won", "")
+            ),
+            config=dict(RAID_ON),
+        )
+        self.assertEqual(fought, ["SR-5#normal", "SR-5#raid"])
 
     def test_a_non_activity_round_writes_only_the_standalone_ledger(self) -> None:
         """手动抄资源本：`activity_key` 是空串，当期活动账本一个字节都不许动。"""
@@ -5413,15 +5512,16 @@ class CopilotRaidSwitchTests(unittest.TestCase):
         # 只读上游、只写临时目录（不变量 #37）。
         self.assertNotEqual(run.call_args.kwargs["env"]["MAA_CONFIG_DIR"], str(source))
 
-    def test_an_empty_switch_task_skips_the_step_entirely(self) -> None:
+    def test_an_empty_switch_task_refuses_instead_of_faking_a_raid_clear(self) -> None:
+        """空开关 = 功能关闭。**不许**跳过切换接着打：那打的是普通难度（2026-09-09）。"""
         import maa_copilot_worker as worker
 
         with patch.object(worker.subprocess, "run") as run:
             ok, detail = worker.switch_to_raid(
                 {"copilot_raid_switch_task": ""}, "SR-5", {}, Path("/nonexistent")
             )
-        self.assertTrue(ok)
-        self.assertIn("跳过", detail)
+        self.assertFalse(ok)
+        self.assertIn("突袭切换未启用", detail)
         run.assert_not_called()
 
     def test_a_failed_switch_is_a_navigation_class_failure(self) -> None:
@@ -5559,14 +5659,14 @@ class SanityYieldTests(unittest.TestCase):
 class ManualCopilotPathTests(unittest.TestCase):
     """2e：手动路径——选关即执行，不降级。"""
 
-    def _start(self, stage, watch_state, *, blocker=""):
+    def _start(self, stage, watch_state, *, blocker="", config=None):
         with tempfile.TemporaryDirectory() as raw:
             watch = Path(raw) / "activity_watch.json"
             maa_common.atomic_write_json(watch, watch_state)
             searches = Path(raw) / "searches"
             searches.mkdir()
             with patch.object(maa_action, "WATCH_PATH", watch), \
-                 patch.object(maa_action, "load_config", return_value={}), \
+                 patch.object(maa_action, "load_config", return_value=config or {}), \
                  patch.object(maa_copilot, "SEARCHES_DIR", searches), \
                  patch.object(maa_copilot, "ensure_private_dirs"), \
                  patch.object(maa_action, "dispatch_blocker", return_value=blocker), \
@@ -5595,6 +5695,13 @@ class ManualCopilotPathTests(unittest.TestCase):
         self.assertEqual(result.state["activity_key"], SR_KEY)
         self.assertIn("普通 + 突袭", result.message)
         self.assertEqual(result.popen.call_args.args[0][-2:], ["search", result.state["token"]])
+
+    def test_an_activity_stage_gets_one_entry_when_the_raid_switch_is_empty(self) -> None:
+        """手动路径同样受总开关约束：只写一条普通条目，文案不再写「普通 + 突袭」。"""
+        result = self._start("SR-8", {"activity_key": SR_KEY}, config=dict(RAID_OFF))
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(result.state["modes"], ["normal"])
+        self.assertNotIn("突袭", result.message)
 
     def test_a_supply_stage_only_gets_the_normal_mode(self) -> None:
         result = self._start("CE-6", {"activity_key": SR_KEY})
@@ -5973,6 +6080,23 @@ class CopilotCardTests(unittest.TestCase):
         self.assertIn("⏳ 排程 14:30", listing)
         # 已通的关照样能选——手动路径允许重打（D14）。
         self.assertIn("SR-5", [stage for _l, stage, _d in options])
+
+    def test_with_the_raid_switch_off_a_normal_clear_says_so_on_the_card(self) -> None:
+        """开关关掉时 ✅ 只代表普通难度打过了，卡上必须写明白，不能让人误以为突袭也通了。"""
+        ledger = {"stages": {"SR-5": {"normal": "t", "raid": None}}}
+        embed, _options = self._view(
+            dict(RAID_OFF), watch={"activity_key": SR_KEY}, ledger=ledger
+        )
+        listing = embed["fields"][0]["value"]
+        self.assertIn("`SR-5` · ✅ 已通（突袭功能未启用）", listing)
+        self.assertNotIn("突袭待补", listing)
+        # 非活动关不带这句尾巴（它们本来就没有突袭）。
+        embed, _options = self._view(
+            {**RAID_OFF, "all_supply_stages_open": True}, watch={},
+            ledger={"stages": {"CE-6": {"normal": "t", "raid": None}}},
+            at=datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+        )
+        self.assertNotIn("突袭功能未启用", embed["fields"][0]["value"])
 
     def test_a_stage_at_its_daily_cap_says_so_but_stays_selectable(self) -> None:
         at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)

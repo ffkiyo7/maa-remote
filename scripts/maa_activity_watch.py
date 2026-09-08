@@ -140,7 +140,11 @@ def collect_targets(
             excluded.append({"stage": code, "reason": "zone_unopened", "detail": ""})
             continue
         modes = maa_copilot.ledger_pending_modes(
-            ledger, roster, code, stage_id, maa_clearing.required_modes(code, prefix)
+            ledger,
+            roster,
+            code,
+            stage_id,
+            maa_clearing.required_modes(code, prefix, config),
         )
         if not modes:
             excluded.append({"stage": code, "reason": "cleared", "detail": ""})

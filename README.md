@@ -263,8 +263,11 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 - 已观察到的活动只有连续两次轮询都返回空，才会被视为结束并撤掉未打完的一轮；
   单次空结果只记一次防抖，不会把短暂的上游抖动误判成轮换。
 - 抄作业结束在结算界面，不受返回主页那道闸门约束。
-- ⚠️ **突袭切换（`ChangeToRaidDifficulty`）尚未真机验证**：验不过就把
-  `config.copilot_raid_switch_task` 设成空串，自动路径退回只打普通，突袭留人工。
+- ❌ **突袭当前是关掉的**（`config.copilot_raid_switch_task` 默认空串）：2026-09-09 真机验
+  `ChangeToRaidDifficulty` 失败——关卡详情页上根本没有突袭切换控件（`Custom Error`）。
+  空串 = **突袭功能整体关闭**，不是「跳过切换直接打」：单文件 `maa copilot --raid raid`
+  只挑作业、不切难度，跳过切换打完会把普通难度记成一次突袭通关。所以活动关只排普通，
+  卡上写「✅ 已通（突袭功能未启用）」，突袭留人工。重新启用见下面的配置表。
 
 ### 肉鸽（手动触发）
 
@@ -448,7 +451,7 @@ maa_action.py roguelike status                  # 「肉鸽到哪了」
 | `activity_search_retry_minutes` | `30` | 某关练度不满足 / 暂无作业时的重试间隔 |
 | `auto_copilot_min_lead_minutes` | `40` | 距下一场日常不足这么多分钟就不再开新的一关（比黑名单宽，因为它要覆盖整关） |
 | `auto_copilot_max_attempts_per_day` | `2` | 同一「关 + 模式」当天失败 / 未确认这么多次后，**当天不再自动排它**（卡上写「🚫 今日已尝试 N 次」），次日自动恢复。手动从下拉重打不受限。`0` = 不限制 |
-| `copilot_raid_switch_task` | `ChangeToRaidDifficulty` | 从普通难度切到突袭用的上游任务名。**留空 = 跳过切换**，自动路径退回只打普通 |
+| `copilot_raid_switch_task` | `""`（关闭） | 从普通难度切到突袭用的上游任务名。**留空 = 突袭功能整体关闭**：活动关只排普通，worker 拿到突袭条目一律 `skipped`，绝不跑 `maa copilot`。重新启用见下方 |
 | `roguelike_run_timeout` | `3600`（1 小时） | 肉鸽**单局**子进程的上限。超了走 `terminate()`（SIGTERM），不是 SIGKILL，好让 MaaCore 有机会收手。整轮的长度由 blackout / Depot 窗口约束，不在这里叠加 |
 | `annihilation_sanity` | `25` | 排作业理智预算时为每日剿灭预留的理智 |
 | `farming_stage_table` | 见下 | 材料 → 关卡的手工映射 |
@@ -459,6 +462,30 @@ maa_action.py roguelike status                  # 「肉鸽到哪了」
 | `farming_activity_edge` | `1.3` | 活动关要比最优常驻关便宜多少倍才算「明显更优」，达不到就不给稀缺分 |
 | `farming_rerun_days` | `378` | 预计复刻间隔（天）。42 组 `ACT→ACT_REP` 的历史中位数，p25–p75 是 351–387 |
 | `farming_scarcity_horizon_days` | `400` | 稀缺分的视野：距下次可刷日超过这么多天就按满分 1.0 算 |
+
+### 怎么重新打开突袭
+
+改 `state/config.json` 的 `copilot_raid_switch_task`，`python3 deploy.py` 生效
+（仓库的值会覆盖线上同名键）。两个候选写法：
+
+```jsonc
+"copilot_raid_switch_task": "ChangeToRaidDifficulty"   // 现在的默认任务名（09-09 验失败）
+```
+
+上游 MaaCore 的 `MultiCopilotTaskPlugin` 其实是**两个任务名并列**当候选跑的
+（`RaidConfirm` 先判「已经是突袭」，不是才点 `ChangeToRaidDifficulty`）。想照抄它，
+除了改这个键还要把 `scripts/maa_copilot_worker.py` 的 `RAID_SWITCH_TOML_TEMPLATE`
+改成能接受列表：
+
+```toml
+task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]
+```
+
+**启用前必须真机验一关**（命令级清单在 `docs/PLAN_PHASE4.md` 的
+「突袭切换真机验证（2026-09-09）」）：日志里 `[切换突袭难度] … Completed`、
+收尾截图确实停在突袭详情页、那一趟有 `Copilot Completed`、账本 `stages.<关>.raid`
+出现时间戳——四条缺一条就把开关改回 `""`。另外注意：**突袭只在复刻活动里存在**，
+首次开放的 SideStory 详情页上根本没有这个按钮，拿它验只会一直 `Custom Error`。
 
 ### 怎么改材料关卡表
 

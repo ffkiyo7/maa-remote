@@ -1110,18 +1110,23 @@ def copilot_card_stages(
             # 与其发一个点了必失败的选项，不如在一览里说清楚。
             status, text = "not_indexed", "⛔ 不在本地关卡索引里"
         else:
+            modes = maa_clearing.required_modes(stage, prefix, config)
             pending = maa_copilot.ledger_pending_modes(
-                ledger,
-                roster,
-                stage,
-                resolved[0],
-                maa_clearing.required_modes(stage, prefix),
+                ledger, roster, stage, resolved[0], modes
             )
             failure = stage_state.get(stage) if isinstance(stage_state, dict) else None
             gaps = list((failure or {}).get("gaps") or []) if isinstance(failure, dict) else []
             capped = maa_copilot.daily_capped_modes(ledger, stage, pending, config, at)
             if not pending:
-                status, text = "cleared", "✅ 已通"
+                # 突袭功能关掉时，活动关的「已通」只覆盖普通难度——卡上必须写明白，
+                # 否则看到 ✅ 会以为突袭也打过了（`copilot_raid_switch_task` 为空）。
+                raid_off = (
+                    "raid" not in modes
+                    and bool(prefix)
+                    and maa_clearing.stage_nav_prefix(stage) == prefix
+                )
+                status = "cleared"
+                text = "✅ 已通（突袭功能未启用）" if raid_off else "✅ 已通"
             elif stage in scheduled:
                 status, text = "scheduled", f"⏳ 排程 {scheduled[stage]}"
             elif capped:

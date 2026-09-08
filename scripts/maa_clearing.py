@@ -70,16 +70,46 @@ def stage_nav_prefix(stage: str) -> str:
     return text.split("-", 1)[0] if text else ""
 
 
-def required_modes(stage: str, activity_prefix: str) -> tuple[str, ...]:
+# 突袭切换那一步用的上游任务名。`config.copilot_raid_switch_task`
+# **空串 = 突袭功能整体关闭**（不只是「跳过切换」）：单文件
+# `maa copilot <uri> --raid raid` 根本不会去切难度（`is_raid` 只在 `copilot_list`
+# 的条目里有意义），不切就打等于**拿普通难度冒充突袭通关**。所以开关为空时
+# 突袭条目从排轮起就不产生，worker 那边再兜一道防线。
+DEFAULT_RAID_SWITCH_TASK = "ChangeToRaidDifficulty"
+
+
+def raid_switch_task(config: dict[str, Any] | None) -> str:
+    """配置里的突袭切换任务名；空串 = 功能关闭。
+
+    键**缺失**时取默认值（与 `maa_copilot_worker.switch_to_raid()` 同一套取值口径），
+    键存在但为空串 / 空白才算关闭。`config` 不是字典一律当关闭（fail-closed）。
+    """
+    if not isinstance(config, dict):
+        return ""
+    return str(config.get("copilot_raid_switch_task", DEFAULT_RAID_SWITCH_TASK) or "").strip()
+
+
+def raid_enabled(config: dict[str, Any] | None) -> bool:
+    """突袭功能的总开关。**不传 config = 关闭**：宁可少排一个模式，也不许错记通关。"""
+    return bool(raid_switch_task(config))
+
+
+def required_modes(
+    stage: str, activity_prefix: str, config: dict[str, Any] | None = None
+) -> tuple[str, ...]:
     """这一关要打**哪些模式**才算通关（D7）。
 
-    当期活动关（前缀相同：数字关、EX、S）一律 `normal + raid`——prts 的
+    当期活动关（前缀相同：数字关、EX、S）是 `normal + raid`——prts 的
     `content.difficulty` 全为空（地基事实 F），判不出「这份作业支不支持突袭」，
     所以同一份作业先普通后突袭都打一遍。资源本 / 主线没有突袭，只有 `normal`。
+
+    **突袭功能关掉时（`copilot_raid_switch_task` 为空）活动关也只返回
+    `("normal",)`**：排轮与手动路径都不再产生 `raid` 条目，这一关只要普通模式
+    拿到 `Copilot Completed` 就算通关。
     """
     prefix = str(activity_prefix or "")
     if prefix and stage_nav_prefix(stage) == prefix:
-        return ("normal", "raid")
+        return ("normal", "raid") if raid_enabled(config) else ("normal",)
     return ("normal",)
 
 

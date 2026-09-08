@@ -94,20 +94,25 @@ type = "Custom"
 task_names = ["CopilotNavigationReady"]
 """
 
-# ⚠️ **突袭切换这一段真机未验**（spike A 的 Q3 被塔罗牌弹窗卡死，没走到）。
+# ⚠️ **突袭切换 2026-09-09 真机验证失败，功能默认关闭**（DEV_GUIDE §5.5 第 3 条）。
 # Fight 导航停在的是**普通难度**详情页，要打突袭得先把难度切过去；MaaCore 自己
 # 在 `MultiCopilotTaskPlugin` 里用的就是 `RaidConfirm` / `ChangeToRaidDifficulty`
-# 这两个上游任务名，所以这里照抄后者。
-# **步骤 2 真机验收第一项就是它**：切换后截图能看到突袭标识且 `Copilot Completed`。
-# 验不过就把 `config.copilot_raid_switch_task` 设成空串——自动路径退回只打普通，
-# 突袭留人工，其余一行代码都不用改。
+# 这两个上游任务名，所以这里照抄后者。今晨的实测：SR-5 导航成功，
+# `Custom(ChangeToRaidDifficulty)` 13 秒后 `Custom Error`——同一轮的收尾截图里
+# 那个 ROI 是纯背景，SideStory「月行水上」的详情页上根本没有突袭切换按钮。
+# 现在 `config.copilot_raid_switch_task` 空串 = **突袭功能整体关闭**：排轮不产生
+# `raid` 条目，`_batch_run_locked()` 再兜一道，`switch_to_raid()` 直接拒绝。
 RAID_SWITCH_TOML_TEMPLATE = """[[tasks]]
 name = "切换突袭难度"
 type = "Custom"
 [tasks.params]
 task_names = [{task}]
 """
-DEFAULT_RAID_SWITCH_TASK = "ChangeToRaidDifficulty"
+DEFAULT_RAID_SWITCH_TASK = maa_clearing.DEFAULT_RAID_SWITCH_TASK
+RAID_DISABLED_NOTICE = (
+    "突袭切换未启用（config.copilot_raid_switch_task 为空）；"
+    "单文件 maa copilot --raid raid 不会切难度，跑下去等于拿普通难度冒充突袭"
+)
 
 # The takeover popup appears when the agent-command (代理指挥) switch is on:
 # "接管后，本次行动内将无法回到代理指挥模式 / 确认要接管作战吗？"
@@ -523,15 +528,17 @@ def _navigate_to_stage(
 def switch_to_raid(
     config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
-    """把关卡详情页从普通难度切到突袭（⚠️ **真机未验**，见文件头的注释）。
+    """把关卡详情页从普通难度切到突袭（⚠️ **2026-09-09 真机验失败**，见文件头注释）。
 
-    `config.copilot_raid_switch_task` 是这一步的开关：默认
-    `"ChangeToRaidDifficulty"`（MaaCore 自己切突袭用的上游任务名），
-    **空串表示跳过切换直接打**——真机验不过时改这一个键就能退回只打普通。
+    `config.copilot_raid_switch_task` 是这一步的开关，**空串 = 突袭功能关闭**，
+    此时这里**直接失败**而不是「跳过切换接着打」：单文件
+    `maa copilot <uri> --raid raid` 不会去切难度（`is_raid` 只在 `copilot_list`
+    的条目里有意义），跳过切换打完记的会是一次假的突袭通关。正常路径根本走不到
+    这里——排轮与 `_batch_run_locked()` 早就把 `raid` 条目滤掉了。
     """
-    task = str(config.get("copilot_raid_switch_task", DEFAULT_RAID_SWITCH_TASK)).strip()
+    task = maa_clearing.raid_switch_task(config)
     if not task:
-        return True, "已按配置跳过突袭切换"
+        return False, f"{stage} {RAID_DISABLED_NOTICE}"
     maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     body = RAID_SWITCH_TOML_TEMPLATE.format(task=json.dumps(task, ensure_ascii=False))
     with _isolated_config(env, {"copilot-raid.toml": body}) as raid_env:
@@ -764,9 +771,18 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
+        raid_on = maa_clearing.raid_enabled(config)
         for entry in entries:
             stage = str(entry.get("stage") or "")
             mode = str(entry.get("mode") or "normal")
+            if mode == "raid" and not raid_on:
+                # 最后一道防线：条目可能是开关关掉**之前**排的（轮次落盘后配置改了、
+                # 手动轮排在前面），照跑会打普通难度却记成突袭通关。宁可什么都不做。
+                results.append(
+                    {"stage": stage, "mode": mode, "outcome": "skipped",
+                     "detail": RAID_DISABLED_NOTICE}
+                )
+                continue
             if stage in failed_stages:
                 # 普通没过就别去撞突袭：突袭是同一关再打一遍，普通没通它根本没解锁。
                 results.append(

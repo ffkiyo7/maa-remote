@@ -497,6 +497,7 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
     """手动抄一关：写一份 `pending` 搜索并派后台 worker（<20s，不变量 #6）。
 
     模式按 D7 定：当期活动关普通 + 突袭，资源本 / 主线只有普通。
+    **`config.copilot_raid_switch_task` 为空时突袭功能整体关闭**，活动关也只排普通。
     """
     config = load_config()
     resolved = valid_copilot_stage(stage, config)
@@ -522,7 +523,8 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
         return False, f"{blocker}；请日常 / 对表结束后再点。", None
     activity_key = str(load_json(WATCH_PATH, {}).get("activity_key") or "")
     prefix = maa_copilot._activity_prefix(activity_key)
-    modes = list(maa_clearing.required_modes(code, prefix))
+    # 突袭开关为空时这里只会给出 `["normal"]`——手动路径同样不许排突袭。
+    modes = list(maa_clearing.required_modes(code, prefix, config))
     token = _new_search_token()
     maa_copilot.ensure_private_dirs()
     state = {

@@ -598,7 +598,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    排目标集合 + 现搜作业                  maa_action.py copilot find SR-8   ~10ms
    写 searches/<token>.json               ├─ nav_checker() 先拒掉上游没导航的关
    publish_round() 发「已排程」卡          ├─ dispatch_blocker() 被挡 → 拒绝，不排程
-   到点 dispatch_batch()                  ├─ modes = required_modes()（活动关 both）
+   到点 dispatch_batch()                  ├─ modes = required_modes()（活动关 both；突袭开关空则只 normal）
                                           └─ Popen(worker search <token>)
                                                 worker search（5~20s，flock 防并发）
                                             ├─ refresh_roster() 失败 → **直接失败**（D13）
@@ -618,10 +618,11 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    ├─ emulator_is_online()：在线 → 放回 scheduled + 「模拟器正在使用」，什么都不碰
    ├─ status=executing → 收掉「取消本轮」按钮 → 开机链（StartUp/ADB/settle）
    ├─ 循环每个条目：
+   │    mode == "raid" 且突袭开关为空 → 该条目 skipped，绝不跑 maa copilot（最后一道防线）
    │    maa_action.min_lead_reason()  距下一场日常不足 auto_copilot_min_lead_minutes → 收尾
    │    _recheck_before_stage()  活动 key 还在吗 + refresh_roster() 实时理智够吗
    │    _navigate_to_stage()     临时 MAA_CONFIG_DIR 里 Fight(times=1) + Custom 界面检查
-   │    switch_to_raid()         仅 raid：Custom(ChangeToRaidDifficulty)（⚠️ 真机未验）
+   │    switch_to_raid()         仅 raid：Custom(ChangeToRaidDifficulty)（❌ 真机验失败，默认关闭）
    │    maa copilot <uri> --formation --batch -v --raid <mode>   （watchdog 处理接管弹窗）
    │    copilot_outcome() → record_copilot_attempt() → save_ledger()
    │    一关失败 **继续下一关**；`nav`（导航/切难度）失败 **停止整轮**
@@ -646,11 +647,23 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    ② 它的导航链不处理首通弹窗——SR-6 的「获得了塔罗牌」让它**死循环 9 分钟不报错**，
    直到 900s 超时。Fight 导航链自带 `<前缀>-TarotClose` 这类处理，B 基线因此更稳。
    详见 `docs/spikes/copilot-list-2026-09-08.md`。
-3. **突袭切换 ⚠️ 真机未验**：Fight 导航停在的是普通难度详情页，要打突袭得先切过去。
-   MaaCore 自己在 `MultiCopilotTaskPlugin` 里用 `RaidConfirm` / `ChangeToRaidDifficulty`，
-   这里照抄后者，跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。
-   `config.copilot_raid_switch_task` 是它的开关，**空串 = 跳过切换**——真机验不过就改
-   这一个键，自动路径退回只打普通、突袭留人工，一行代码都不用动。
+3. **突袭切换 ❌ 2026-09-09 真机验证失败，功能默认关闭**（现场与下次验证清单见
+   `docs/PLAN_PHASE4.md` 的「突袭切换真机验证（2026-09-09）」）。
+   Fight 导航停在的是普通难度详情页，要打突袭得先切过去；MaaCore 自己在
+   `MultiCopilotTaskPlugin` 里用 `RaidConfirm` / `ChangeToRaidDifficulty`，这里照抄后者，
+   跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。实测：SR-5 导航两段都 Completed，
+   `Custom(ChangeToRaidDifficulty)` 13 s 后 `Custom Error`
+   （`runs/2026-09-09-copilot-5814e6deb762.log` 第 20–32 行）。收尾截图是
+   SideStory「月行水上」的普通难度关卡详情页，**整屏没有突袭控件**；上游 ROI
+   `[600,610,130,110]`（1280×720，本机 1920×1080 由 MaaCore 自己缩放 ×1.5 →
+   `x 900–1095, y 915–1080`）裁出来是纯背景。最可能的根因是**首次开放的 SideStory
+   本来就没有突袭难度**（突袭只在复刻活动里有；上游 `tasks/Stages/SR.json` 也没有任何
+   突袭变体，`RaidDifficulty-Chapter15.png` / `NormalDifficulty*.png` 是主线章节资产）。
+   **`config.copilot_raid_switch_task` 空串 = 突袭功能整体关闭**（不是「跳过切换直接打」
+   ——单文件 `maa copilot <uri> --raid raid` 根本不切难度，`is_raid` 只对 `copilot_list`
+   的条目有意义，跳过切换打完会把普通难度记成一次突袭通关）。三层落实：
+   `maa_clearing.required_modes()` 不产生 `raid` 条目 → worker `_batch_run_locked()`
+   拿到 `raid` 条目判 `skipped` → `switch_to_raid()` 直接拒绝。仓库种子是 `""`。
 4. **代理指挥开关**：点开始行动时代理开着会弹「确认要接管作战吗？」，MaaCore 的
    copilot 链不处理 → 必失败。worker 内置 watchdog（`ocrbox` OCR + ADB tap）在弹窗
    出现时点确认。正常路径（游戏新会话代理默认关）watchdog 不会触发。
@@ -693,8 +706,10 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
 ```
 
 - **一关「通关」= 所需模式全部拿到 `Copilot Completed`**（`copilot_outcome()`，不变量 #33）。
-  所需模式由 `required_modes()` 定：当期活动前缀的关（数字 / EX / S）是 `normal + raid`，
-  资源本 / 主线只有 `normal`。**突袭失败 → 该关不算通关**，下一轮只排剩下的 `raid`（D7）。
+  所需模式由 `required_modes(stage, prefix, config)` 定：当期活动前缀的关（数字 / EX / S）是
+  `normal + raid`，资源本 / 主线只有 `normal`。**突袭失败 → 该关不算通关**，下一轮只排剩下的
+  `raid`（D7）。**`config.copilot_raid_switch_task` 为空时活动关也只有 `normal`**（突袭功能
+  关闭，现状即如此），卡上写「✅ 已通（突袭功能未启用）」以免 ✅ 被误读成突袭也通了。
 - `record_copilot_attempt()` **只有 `won` 才写模式时间戳**；`unknown`（退出码 0 但没有
   胜利标记）与 `failed` 一样只进 `attempts`。`attempts` 只留最近 40 条。
 - **「已通关」有两条判据，是「或」的关系**（D10，`ledger_pending_modes()`）：
@@ -1131,7 +1146,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 32 | 材料推荐的**每一条降级路径都不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**（进 `degraded_reasons`，卡片上列出来）：外部抓取失败退本地缓存、缓存也没有就当空数据；冷启动（`consumption_history` 不足 2 次对表）缺口项退手工权重；≥4 周窗口内零消耗的材料可用量是**未知**、同样退手工权重；`itemValue == null` 的材料不参与缺口计价；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_farming.load_market_data()` / `farming_result()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingScoreTests` / `FarmingFetchTests`
 | 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在候选关集合里取命中的——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选里有掉率数据时按「理智/件」最便宜的挑，没有数据才退回启发式顺序（手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。**没有主掉落的关也留在表里**（`materials: []`）：`maa_farming` 要靠它把关卡代号对到内部 `stageId` 与 `apCost`。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` / `FarmingScoreTests.test_a_priced_material_picks_the_cheapest_open_stage`
 | 33 | 记账**只在这一关被判定为通关时**才写：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行）。判据的输入是「**这一关自己的那段输出**」：逐关标记必须 `flush()` 之后再把日志句柄交给子进程，切片按 flush 后的**字节偏移**（`_log_since()`）而不是按标记 `rsplit`——不 flush 的话标记排在这一关全部输出之后，切出来是空段、一律判成 `unknown`（2026-09-09 线上现象，§5.5 关键事实 9） | `maa_clearing.copilot_outcome()` + `maa_copilot_worker._fight_one()` / `_log_since()` + `CopilotVictoryJudgementTests` / `CopilotLogMarkerTests`（**用真实子进程**共享 fd，Python 侧写字符串的桩测不出来） |
-| 34 | 一轮条目的突袭用 `#raid` 后缀表示，每关先普通后突袭；**除了 `maa copilot --raid` 的取值，理智查表 / 导航键闸门 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.split_entry()` / `make_entry()` / `required_modes()` + `CopilotModeTests` / `CopilotTargetSetTests.test_a_raid_entry_is_gated_under_its_plain_stage_name` |
+| 34 | 一轮条目的突袭用 `#raid` 后缀表示，每关先普通后突袭；**除了 `maa copilot --raid` 的取值，理智查表 / 导航键闸门 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实）。**`--raid raid` 只挑作业，不切难度**：难度切换是 `switch_to_raid()` 单独一趟，所以 `copilot_raid_switch_task` 为空 = 突袭功能关闭，不是「跳过切换直接打」 | `maa_clearing.split_entry()` / `make_entry()` / `required_modes()` / `raid_enabled()` + `CopilotModeTests` / `CopilotTargetSetTests.test_a_raid_entry_is_gated_under_its_plain_stage_name` / `CopilotBatchExecutionTests.test_a_raid_entry_is_skipped_outright_when_the_switch_is_empty` |
 | 35 | 一轮里**一关失败继续下一关**，只有 `nav`（上游导航 / 切突袭难度）这类环境失败才停止整轮；两种情况战报都必须**逐关列出结果**。普通没过就跳过同一关的突袭（那关根本没解锁） | `maa_copilot_worker._batch_run_locked()` + `CopilotBatchExecutionTests` |
 | 36 | 一轮里每开新的一关前检查距下一场日常是否还够 `auto_copilot_min_lead_minutes`（默认 40，比 `copilot_blackout_minutes` 宽，因为它要覆盖整关而不只是启动），不够就收尾、剩下的留给下一轮。**「能不能开」的三条闸门（blackout / Depot 窗口 / 时间预算）只有一份实现**，都在 `maa_action.py`：watcher 派发前查一次，worker 每关开始前再查一次 | `maa_action.min_lead_reason()` / `_copilot_blackout_reason()` / `depot_window_reason()` + `CopilotTimeBudgetTests` / `CopilotDispatchGateTests` |
 | 39 | **计划的覆盖是按场次的**：`plan.json` 的形状是 `{date, sessions: {am, pm}, updated_at}`，`effective_plan(at, phase)` 只叠 `sessions[phase]`。改早场绝不影响晚场（D3）。**`now` 永远叠不到任何场次**——没有写路径能产生 `sessions.now`（`plan set-stage` / `skip-today` 只接受 `am`/`pm`），所以手动场按定义走缺口默认关（D4）。磁盘上是旧的按天格式（顶层 `stage`/`skip`）时**读成空**、不迁移、不抛 | `maa_common.plan_sessions()` / `effective_plan()` / `maa_action._today_override()` + `PlanTests.test_session_overrides_apply_per_phase_and_expire_next_day` / `test_legacy_day_level_plan_reads_as_empty_and_never_raises` / `SessionDailyTests` |
@@ -1249,7 +1264,8 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 战报里某关 ❓ 未确认 | `copilot_outcome()` 返回 `unknown`：退出码 0 但没有 `Copilot Completed`。**不记通关**，下一轮会重打。日志文件名写在记账 `attempts[].detail` 里。上游改措辞了就改 `maa_clearing.COPILOT_VICTORY_MARKERS` |
 | 战报全 ❓、记账全 `unknown`，日志里却明明有 `Copilot Completed` | **看标记行 `# <时刻> copilot <关> mode=…` 是不是排在这一关的输出之后**。是的话就是逐关标记没 `flush()` 就把句柄交给了子进程（§5.5 关键事实 9 / 不变量 #33），切出来的「本关输出」是空段。2026-09-09 03:30 那轮就是这样，连带触发了 30 分钟退避后的重打 |
 | 某关今天不再被自动排、卡上写「🚫 今日已尝试 N 次」 | 当日上限命中（`auto_copilot_max_attempts_per_day`，默认 2）。次日自动恢复；想现在就重打，从抄作业卡的下拉手动选它（手动路径不受这条限制）。`copilot/ledger.json` 的 `attempts` 是计数依据 |
-| 突袭那次总是失败 | 先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`。切换任务名验不通就把 `config.copilot_raid_switch_task` 设成空串，自动路径退回只打普通 |
+| 突袭那次总是失败 | 现状：`copilot_raid_switch_task` 默认空串 = **突袭功能关闭**，正常不会排突袭。要重新启用先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`；2026-09-09 实测是 `Custom Error`（详情页上根本没有突袭控件），详见 §5.5 第 3 条 |
+| 卡上写「✅ 已通（突袭功能未启用）」 | 不是缺陷：`copilot_raid_switch_task` 为空，这一关只按普通难度判通关。想补突袭要先把开关配好并真机验一关（清单在 `docs/PLAN_PHASE4.md`） |
 | 点了「肉鸽停」还在跑 | 这是设计（不变量 #47）：停止只在**局间**生效，当前这一局会打完。要立刻停就点「⏏️ 立即中止」——那一局作废。看 `roguelike.json` 的 `stop_requested_at` 有没有写进去 |
 | 肉鸽开始被拒「上次 X 主题没有干净结束」 | `roguelike.json` 的 `dirty = true`（不变量 #49）。用**同一个主题**跑一局，上游自己会 `Continue → ExitThenAbandon` 收掉残局，干净结束后 `dirty` 清零，就能换主题了 |
 | 肉鸽一局都没跑就收尾了 | 战报的「停止原因」是答案：blackout（距 08:00 / 22:00 不足 `copilot_blackout_minutes`）、Depot 对表窗口（京 04:20–05:00）、模拟器在用。肉鸽不耗理智，所以**不会**是理智问题 |

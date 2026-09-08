@@ -12,7 +12,7 @@
 
 - [x] ~~步骤 0 — 收尾：提交并部署 09-08 的自动定关改版；排查 07:50 上游更新连续失败~~（09-09 验收通过：修 2 处缺陷补 4 条测试；根因 libgit2 不走代理，`cli.toml` 改 `git` 后端）
 - [x] ~~步骤 1 — 场次级计划 + 早晚两张卡 + 单下拉 + 抄作业卡分离 + 模拟器探测统一~~（09-09 验收通过并部署：372 项单测；打回一次恢复 `log tail`；计划卡 custom_id 带场次；真机四条待看频道）
-- [x] ~~步骤 2 — 作业链统一：静默执行、普通+突袭、已通关跳过、理智调度、串行多关~~（09-09 验收通过并部署：357 项单测，净减约 2000 行；打回一次补手动路径 blackout 闸门；突袭切换 `ChangeToRaidDifficulty` 真机待验，不通就把 `copilot_raid_switch_task` 设空）
+- [x] ~~步骤 2 — 作业链统一：静默执行、普通+突袭、已通关跳过、理智调度、串行多关~~（09-09 验收通过并部署：357 项单测，净减约 2000 行；打回一次补手动路径 blackout 闸门；突袭切换 `ChangeToRaidDifficulty` **09-09 真机验证失败**，`copilot_raid_switch_task` 种子已改空串 = 突袭功能关闭，见「Spike 结论 / 突袭切换真机验证（2026-09-09）」）
 - [x] ~~步骤 3 — 素材权重公式（一图流 / 企鹅物流）+ 活动期间 all-in + Fight drops 上限~~（09-09 验收通过并部署：新模块 `maa_farming.py`，397 项单测；EX 关理智一图流也不收录，仍是缺口）
 - [x] ~~步骤 4 — 肉鸽：手动触发、上游全托管、优雅停止~~（09-09 验收通过并部署：`maa_roguelike.py` + `maa_roguelike_worker.py`，456 项单测；打回一次修测试抢真锁 + 开机前先查闸门；真机首跑待验）
 - [x] ~~步骤 5 — 上游增量（上报掉落、Award 开关、OperBox 后备）~~（09-09 验收通过并部署：掉落匿名上报、Award / Mall 开关、OperBox 练度后备（fail-closed）、非活动关独立账本；494 项单测）
@@ -667,7 +667,7 @@ D19。聊天说「刷肉鸽」→ 一张配置卡（主题等下拉 + 开始按�
 |---|---|---|
 | Q1 Fight 导航停在关卡详情页后，`copilot_list` 能否自己点到另一关 | **✓** | 第 1 项 SR-5 走 `is_stage_detail_opened + confirm_stage_name` 快路径，881 ms 零点击接手；第 2 项 SR-6 在结算退回列表后 `find_stage` 自己点 `(1315, 618)`，2.4 s 内开打；两关都三星（`StageDrops-Stars-3` 0.998 / 0.979）。不必先回列表、不必关详情面板 |
 | Q2 maa-cli stdout 能否区分逐关成败 | **✗** | `Copilot Start / Completed` 是任务级、整趟各一次；`CopilotListLoadTaskFileSuccess` maa-cli 0.7.5 **不打印**（`strings` 无此串），只在 MaaCore `debug/asst.log` 里（带 `file_name` + `stage_name`）。stdout 全文 27 行，逐关只有重复的 `BattleFormation / MissionStart`，无关名无胜负。`maa_clearing.copilot_outcome()` 在 list 模式下退化成整趟一个结论 |
-| Q3 `is_raid=true` 能否同场切突袭 | **未验** | 第 3 项没走到，`RaidConfirm / ChangeToRaidDifficulty` 零次执行（被下面的弹窗卡死） |
+| Q3 `is_raid=true` 能否同场切突袭 | **未验**（B 路线已于 09-09 补验，**失败**，见下一小节） | 第 3 项没走到，`RaidConfirm / ChangeToRaidDifficulty` 零次执行（被下面的弹窗卡死） |
 
 **顺带挖出的坑（比 Q3 重要）**：SR-6 首通弹出全屏「获得了塔罗牌」弹窗，`MultiCopilotTaskPlugin` 的导航路径不处理任何弹窗：
 `find_stage` 只 OCR 到塔罗牌文字，`Copilot@FullStageNavigation` 空滑，**死循环 9 轮 / 9 分钟不报错不退出**，直到 900 s 超时。
@@ -680,10 +680,71 @@ D19。聊天说「刷肉鸽」→ 一张配置卡（主题等下拉 + 开始按�
 - **`copilot_list` 整体挂起，择日再验**（用户当时不在场，塔罗牌弹窗的现场没看到）。不给上游提 issue。
   将来重验的前置条件仍是两个：① 逐关记账改读 `asst.log`（`CopilotListLoadTaskFileSuccess` + `StageDrops-Stars-N`），② 弹窗有解。
 - 突袭切换在两条路都没验过；步骤 2 真机验收第一项就是「B 路线：Fight 导航 → `Custom(ChangeToRaidDifficulty)` → 单文件 copilot」能否切到突袭。
+  **→ 09-09 05:01 补验，B 路线失败**（`Custom Error`，详情页上没有突袭控件）；结论与下一步见下一小节。
 - 记账种子：SR-5 / SR-6 用户此前已自己打过（spike 等于重打了一遍），SR-8 09-08 15:17 由抄作业通关；本地记账上线时把
   **SR-5 / SR-6 / SR-8 的普通模式**写入种子，突袭留空。
 - 约束核对：全程 `medicine = 0 / stone = 0`、无 `use_sanity_potion`、无 `--ignore-requirements`；`close_everything → []`；仓库与线上未改；未发 Discord；
   唯一副作用是 `copilot/cache/act54side_0{5,6}.json` 搜索缓存。
+
+### 突袭切换真机验证（2026-09-09）❌ —— spike A 的 Q3 补验，**失败，功能默认关闭**
+
+**现场**（`runs/2026-09-09-copilot-5814e6deb762.{log,png}`，账本 `copilot/ledger.json` SR-5 `raid` 一次 `failed`）：
+
+| 段 | 结果 |
+|---|---|
+| `[启动国服]` 05:00:58–05:01:29 | Completed |
+| `[导航到关卡]` 05:01:29–05:01:51 | Completed（`Fight Completed`） |
+| `[检查关卡界面]` 05:01:51–05:01:53 | Completed（`Custom Completed`） |
+| `[切换突袭难度]` 05:01:55–05:02:08（13 s） | **Error**（`Custom Error` + `Error: Some error occurred during running task!`） |
+
+**① 画面停在哪**：截图是 SideStory「月行水上」的**关卡选择 / 详情页，普通难度**——SR-5「月斜」标题带**三星**（普通已通）、
+推荐等级「精英1 LV.30」、右下 `演习` / `开始行动 -12`、其上 `代理指挥` 复选框（未勾）、`敌方情报` / `地图` / `报酬`、
+底部 SR-4…SR-7 关卡链、右上理智 86/207。导航本身没问题，卡在切换那一步。
+**整屏没有任何「突袭」切换控件**。上游 ROI `[600,610,130,110]`（1280×720）折算到本机 1920×1080 是 `x 900–1095, y 915–1080`
+（×1.5），裁出来看是**纯背景**（蓝色底图 + 那条横向路径线），最近的控件 `代理指挥`（x≈1565–1870）、
+`演习/开始行动`（x≈1250–1900）都在它右侧几百像素外。所以 `ChangeToRaidDifficulty` 的模板永远匹配不到，
+`maxTimes: 3` 三次点空 → `Custom Error`。
+
+**② 更可能的正确做法**（按可信度排序，**未验证，不要据此直接改默认值**）：
+
+1. **最可能的根因：这个活动压根没有突袭难度。** 突袭只在**复刻**活动里存在，「月行水上」是首次开放的 SideStory。
+   佐证：上游 `tasks/Stages/SR.json` 的顶层键只有 `SR-5…SR-8` + `SR-Open*` / `SRChapterToSR`，**没有任何突袭变体**；
+   `ChangeToRaidDifficulty` 的 `doc` 写的是 `["突袭", "15章险地"]`，`RaidDifficulty-Chapter15.png` 与
+   `NormalDifficulty*.png`（放在 `template/StageNavigation/**Episode/**` 下）都是**主线章节**资产。
+   若成立，则「D7 活动关一律普通 + 突袭」这条前提本身要改：得先判出「这个活动有没有突袭」再决定排不排。
+2. **任务名列表照抄上游插件**：`task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]`。
+   MaaCore 的 `MultiCopilotTaskPlugin` 就是这么并列两个候选的——`RaidConfirm` 是 `DoNothing` + 模板
+   `NormalDifficulty*.png`（"现在能切回普通" = **已经在突袭**），先判「已是突袭」再点切换。
+   这修的是「重复执行 / 已切过」那一类，**修不了「屏幕上没这个按钮」**；但它与上游一致，值得作为启用时的默认值。
+3. 面板遮挡 / 入口不在详情页：`ChangeToRaidDifficulty` 的 ROI 在**屏幕底部中央偏左**，那正好是主线章节页
+   「标准 / 突袭」切换的位置。若复刻 SideStory 的入口在别处（例如活动主页而非关卡详情页），
+   就得先退出详情面板再切、切完重新导航——这条要拿一个**真的有突袭的活动**才能验。
+
+**③ 下次真机验证的清单**（用户在场时做；**先找一个确定有突袭的活动**，如复刻 SideStory 或主线 15 章）：
+
+```bash
+# 0. 前提：不在 blackout / Depot 窗口；模拟器没人用。开关先手动打开：
+#    ~/.hermes/state/maa/config.json 里 copilot_raid_switch_task 改成 "ChangeToRaidDifficulty"
+#    （或按上面第 2 条，先把 worker 的 RAID_SWITCH_TOML_TEMPLATE 改成两个任务名并列）
+# 1. 排一关：手动搜作业 → 自动派 worker（modes 会是 normal + raid）
+python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
+# 2. 盯这一轮的日志，重点看 `# raid-switch <关卡> task=…` 之后那一段
+tail -f ~/.hermes/state/maa/runs/$(date +%F)-copilot-*.log
+# 3. 收尾截图：切换成功的话，关卡详情页应能看到突袭标识 / 理智消耗变高
+open ~/.hermes/state/maa/runs/$(date +%F)-copilot-*.png
+# 4. 记账复核：raid 必须真的拿到 Copilot Completed 才写时间戳
+python3 -c "import json;print(json.load(open('$HOME/.hermes/state/maa/copilot/ledger.json'))['stages'])"
+```
+
+**看什么**：日志里 `[切换突袭难度] … Completed` + `Custom Completed`（不是 `Custom Error`）；
+截图里详情页确实是突袭；`maa copilot … --raid raid` 那一段有 `Copilot Completed`；
+账本 `stages.<关>.raid` 出现时间戳。四条缺一条就算没验过，把开关改回空串。
+
+**已落地的语义修正（不需要再验）**：`copilot_raid_switch_task` 为空**不再是「跳过切换直接打」**，
+而是**突袭功能整体关闭**——单文件 `maa copilot <uri> --raid raid` 根本不切难度（`is_raid` 只对
+`copilot_list` 的条目有意义），跳过切换打完会把**普通难度**记成一次突袭通关。
+现在：`required_modes()` 不再产生 `raid` 条目 → worker `_batch_run_locked()` 再兜一道判 `skipped` →
+`switch_to_raid()` 直接拒绝。仓库种子已改成 `""`（D22：验不过就退回只打普通）。
 
 ### spike B — 一图流活动日历 / 物品价值接口 ✅（2026-09-08 23:35 实测，报告全文在当晚 scratchpad `research_yituliu.md`，要点如下）
 
