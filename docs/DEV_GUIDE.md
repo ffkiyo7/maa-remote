@@ -1,6 +1,6 @@
 # 开发指南（基于当前代码实现）
 
-面向要改这套东西的人。[PLAN.md](./PLAN.md) 是设计意图，[README.md](../README.md) 是功能与落地状态，
+面向要改这套东西的人。[PLAN_PHASE4.md](./PLAN_PHASE4.md) 是当前一期的设计意图与决策（更早的在 [archive/](./archive/)），[README.md](../README.md) 是功能与落地状态，
 本文只讲**现状的自动化链路是怎么串起来的、改哪里会影响什么**。
 
 ---

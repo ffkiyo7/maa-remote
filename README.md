@@ -531,11 +531,13 @@ python3 -m unittest discover -s tests -v
 |---|---|
 | [docs/DISCORD_GUIDE.md](./docs/DISCORD_GUIDE.md) | **面向使用者**：频道里会自动发生什么、能点什么、能说什么 |
 | [docs/DEV_GUIDE.md](./docs/DEV_GUIDE.md) | **现状的链路怎么串起来、改哪里影响什么**。§8 是不可破坏的不变量，§10 是「症状 → 看哪里」，§11 是 18 条踩坑记录 |
-| [docs/PLAN.md](./docs/PLAN.md) | 一期的设计意图与决策表 |
-| [docs/PLAN_PHASE2.md](./docs/PLAN_PHASE2.md) | 二期（prts.plus 抄作业）方案 |
-| [docs/PLAN_NAV_GATE.md](./docs/PLAN_NAV_GATE.md) | 导航闸门 + 自动任务模拟器探测 |
-| [docs/PLAN_CLEARING.md](./docs/PLAN_CLEARING.md) | 三期方案与进度（通关队列已在四期步骤 2 拆除，留作历史记录） |
-| [docs/REVIEW_PHASE2.md](./docs/REVIEW_PHASE2.md) | 二期五轮评审的 29 条问题与修复记录 |
+| [docs/PLAN_PHASE4.md](./docs/PLAN_PHASE4.md) | **四期（当前）**：22 条决策、地基事实、步骤 0~5 交付记录、spike 与真机验证结论 |
+| [docs/spikes/](./docs/spikes) | 三份实测报告：`copilot_list` 真机、一图流 / 企鹅物流数据源、肉鸽上游参数 |
+| [docs/archive/PLAN.md](./docs/archive/PLAN.md) | （归档）一期的设计意图与决策表 |
+| [docs/archive/PLAN_PHASE2.md](./docs/archive/PLAN_PHASE2.md) | （归档）二期（prts.plus 抄作业）方案 |
+| [docs/archive/PLAN_NAV_GATE.md](./docs/archive/PLAN_NAV_GATE.md) | （归档）导航闸门 + 自动任务模拟器探测的实测记录 |
+| [docs/archive/PLAN_CLEARING.md](./docs/archive/PLAN_CLEARING.md) | （归档）三期方案与实测；通关队列已在四期拆除，材料选关已被四期公式取代 |
+| [docs/archive/REVIEW_PHASE2.md](./docs/archive/REVIEW_PHASE2.md) | （归档）二期五轮评审的 29 条问题与修复记录 |
 
 ## 已知限制
 
@@ -551,7 +553,7 @@ python3 -m unittest discover -s tests -v
   `Stages/<前缀>.json` 里没有该关的键）——这是预期行为，不是 bug；原因通常不是"关卡未解锁"。
   **这是一条明确的边界，不是待办**：本项目不自写导航定义，也不为上游没覆盖的关补自动战斗；
   日常、抄作业、自动匹配刷材料关一律只跑上游提供了导航的关（2026-09-08 决策，
-  见 [docs/PLAN_CLEARING.md](./docs/PLAN_CLEARING.md) 步骤 2）。
+  见 [docs/archive/PLAN_CLEARING.md](./docs/archive/PLAN_CLEARING.md) 步骤 2）。
 - **活动监控依赖本机 MAA 热更新资源**。资源还没包含新活动时不会猜活动；07:50 更新资源后，
   watcher 才能按资源内的开放时间识别。自动作业只取上游第一推荐关，不代替前置关卡通关。
 - **动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带的 LaunchDaemon
