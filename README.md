@@ -51,8 +51,8 @@
 ## 它是怎么工作的
 
 核心简化是：**不新增任何常驻进程**。Discord 网关和 cron 调度由已经常驻的
-[Hermes Agent](https://github.com/NousResearch/hermes-agent) 提供，本项目只贡献 5 个 cron 脚本
-和 1 个动作脚本，全部是「跑完就退」的短命进程，状态落盘在 `~/.hermes/state/maa/`。
+[Hermes Agent](https://github.com/NousResearch/hermes-agent) 提供，本项目只贡献 6 条 cron
+（4 个脚本）和 1 个动作脚本，全部是「跑完就退」的短命进程，状态落盘在 `~/.hermes/state/maa/`。
 
 ```
         Hermes gateway（唯一常驻进程）
@@ -61,20 +61,20 @@
    ┌────┴────────────────────────────┐      ┌──────┴───────────────────────┐
    │ 每 15 分  maa_activity_watch.py │      │                              │
    │ 京 04:30  maa_depot.py          │      │                              │
-   │ 京 07:50  maa_plan_card.py      │      │ 组件交互 hermes:btn:maa:*    │
-   │ 京 08:00  maa_daily.py  （早）  │      │   → 按钮登记表 → exec 白名单 │
-   │ 京 22:00  maa_daily.py  （晚）  │      │ 自然语言（免 @ 频道）        │
-   └─────────────────────────────────┘      │   → maa-operator 技能        │
-                                            └──────┬───────────────────────┘
+   │ 京 07:50  maa_plan_card.py（早）│      │ 组件交互 hermes:btn:maa:*    │
+   │ 京 21:50  maa_plan_card.py（晚）│      │   → 按钮登记表 → exec 白名单 │
+   │ 京 08:00  maa_daily.py  （早）  │      │ 自然语言（免 @ 频道）        │
+   │ 京 22:00  maa_daily.py  （晚）  │      │   → maa-operator 技能        │
+   └─────────────────────────────────┘      └──────┬───────────────────────┘
                         ┌──────────────────────────┘
                         ▼   （唯一状态变更入口，< 1s 返回）
                   maa_action.py
                         │
                         ▼
    ~/.hermes/state/maa/{config,defaults,plan,last_run,activity_watch}.json + run.lock + runs/
-                        │   effective_plan() = defaults ⊕ 当天的 plan 覆盖
+                        │   effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次> 的覆盖
                         ▼
-   maa_daily.py ── flock ── 快照本场计划 ── 起 BlueStacks ── 等 ADB
+   maa_daily.py ── flock ── 探模拟器 ── 快照本场计划 ── 起 BlueStacks ── 等 ADB
         └─ 渲染 daily.toml ── maa run ── 每 5s 编辑子区里的同一条进度消息
               └─ 返回主界面 ── Vision OCR 核对 ── 截图 ── closedown ── 战报
 ```
@@ -84,10 +84,11 @@
 | 北京时间 | 发生什么 |
 |---|---|
 | 每 15 分钟 | 读取 MAA 当前活动；轮换变化时取上游第一推荐关，重新查询作业站，只给完全满足练度且无软硬缺口的 Top-1 普通作业发“确认执行 / 取消”卡；失败按 30 分钟退避重试 |
-| 07:50 | 检查并跟随 maa-cli / MaaCore 更新 → 刷新当期活动关 → 频道里发**今日计划卡**（刷图与抄作业两个下拉 + 三个按钮）→ 清理 24h 前的子区和 14 天前的运行产物 |
-| 08:00 | 跑一遍完整日常。频道发「🟡 开跑」，其下开一个子区滚动中文步骤；跑完发战报卡片 + 主界面截图 |
-| 22:00 | 同上，任务链完全一致 |
-| 任意时刻 | 点计划卡改关卡／跳过／立刻跑；或在频道里说人话，也可以说「抄 TO-9」走抄作业流程 |
+| 07:50 | 检查并跟随 maa-cli / MaaCore 更新 → 刷新当期活动关 → 发**早场计划卡**（一个关卡下拉 + 一个「跳过本场」按钮）→ 清理 24h 前的子区和 14 天前的运行产物 |
+| 08:00 | 按**早场**的计划跑一遍完整日常。频道发「🟡 开跑」，其下开一个子区滚动中文步骤；跑完发战报卡片 + 主界面截图 |
+| 21:50 | 刷新当期活动关 → 发**晚场计划卡**（同样两行控件）。**不跟随上游更新**，早上跟过了 |
+| 22:00 | 按**晚场**的计划跑，任务链完全一致 |
+| 任意时刻 | 点计划卡改**那一场**的关卡／跳过，或说「现在跑」立刻开一场手动日常；说「抄作业」拿一览卡，说「抄 TO-9」直接走抄作业流程 |
 
 ## 仓库 ≠ 运行时
 
@@ -107,20 +108,24 @@
 
 ## 功能
 
-### 计划卡（每天 07:50）
+### 计划卡（每天两张：07:50 早场 / 21:50 晚场）
+
+**计划是按场次的**：早场卡管 08:00 那场，晚场卡管 22:00 那场。改一场**不影响另一场**，
+说「现在跑」的手动场两场覆盖都不吃，永远走缺口默认关。
+
+每张卡**恰好两行控件**：一个关卡下拉 + 一个「⏭️ 跳过本场 / ▶️ 恢复本场」按钮。
 
 - **关卡下拉**：`上次作战关卡` / `1-7` / **当天开放的资源本** / 当期活动关，
   每个选项都带**这关掉什么**（`SR-8 · 异铁组`）。材料名从上游 `stages.json` 的
   `dropInfos` 现取（`item_index.json` 翻中文名），所以**新活动上线自动跟随**，不用改配置。
   资源本按国服 04:00 的游戏日刷新过滤（`AP-5` 红票、`CA-5` 技能书、`CE-6` 龙门币、
   `LS-6` 作战记录、`SK-5` 基建材料），公告里出现「资源收集」时全部放开。
-- 下拉选项的 `value` 是**不透明的 `choice:N`**，真实 argv 只存在按钮登记表的 `select_args` 里，
-  Discord 侧无法注入任意关卡名。
-- **材料缺口不是下拉，是后台固定计算**：07:50 按「**可用天数 = 当前库存 / 该材料日均消耗**」
-  升序算出今天该刷哪个关，直接写进当天计划，卡片上写明理由
-  （「异铁组 库存 66、日均 4.00，约只够 16.5 天」）。**你从下拉手动选过，当天就不会再被自动改**。
-  - 曾经这里有第三个「按材料缺口选关」的下拉，2026-09-08 删掉了：缺口天天变，
-    下拉却只能选关、显示不了缺口，和第一个下拉的语义完全重复。
+- 下拉选项的 `value` 是**不透明的 `choice:N`**，真实 argv（含场次）只存在按钮登记表的
+  `select_args` 里，Discord 侧无法注入任意关卡名或场次。
+- **材料缺口不是下拉，是后台固定计算**：每张卡按「**可用天数 = 当前库存 / 该材料日均消耗**」
+  升序算出**这一场**该刷哪个关，直接写进当天该场次的计划，卡片「为什么」字段写明理由
+  （「异铁组 库存 66、日均 4.00，约只够 16.5 天」）。
+  **你在某一场手动选过，当天那一场就不会再被自动改**，另一场照样自动算。
   - 消耗率取 **≥4 周滚动窗口**（养成消耗是突发的：一次精二吃 20 个，平时是 0；
     只看最近一周会把几乎所有材料算成零消耗）。
   - **降级期不自动改关**：`depot.json` 的 `consumption_history` 不足 2 次对表时，
@@ -128,9 +133,13 @@
     所以此时沿用默认关并在卡片上说明在等数据。
     窗口内消耗为 0 的材料可用天数是**未知**而不是 ∞，退回手工权重排在实测材料之后。
   - 上游掉落表和 `farming_stage_table` 都查不到关卡的材料**不推荐**、卡片明说原因——**不猜关**。
-- **上游更新**：每天先 `brew` 跟随 maa-cli，再 `maa update` / `maa hot-update` 跟随 Beta MaaCore
-  与资源热更新层，结果写进卡片的「上游更新」字段；失败发红色告警并让 cron 记为失败。
-- 发新卡时把旧卡片的组件 `PATCH` 成空，避免同时存在多张可点的卡。
+- **活动截止**：从 MaaCore 的 `StageActivityV2.json` 读当期活动的结束时刻（按它自己声明的
+  时区解释），读不出来就整行不显示，不会因此让整张卡失败。
+- **上游更新只在早场卡跑**：`brew` 跟随 maa-cli，再 `maa update` / `maa hot-update` 跟随
+  Beta MaaCore 与资源热更新层，结果写进早场卡的「上游更新」字段；失败发红色告警并让 cron
+  记为失败。晚场卡不跑这一步（早上刚跟过，21:50 再等几分钟网络没有意义）。
+- 发新卡时把标题以 `🌱 MAA 今日计划` 开头的旧卡片组件 `PATCH` 成空，
+  避免同时存在多张可点的卡——21:50 收掉早场卡是预期行为。
 
 ### 日常执行（08:00 / 22:00）
 
@@ -157,8 +166,12 @@
 
 跑完按 bundle ID 请求模拟器正常退出，`pkill` 兜底，再用不会自匹配的进程模式复核，最后断开 ADB。
 
-**「跳过」只关掉 08:00 和 22:00 两个自动场次**；说「现在跑」派发的手动场豁免 skip，照跑。
+**「跳过」只关掉设它的那一场**（早场跳过不影响晚场）；说「现在跑」派发的手动场豁免 skip，照跑。
 启动时快照当场计划，运行中改计划不影响本场。
+
+**开跑前先探模拟器**：08:00 / 22:00、抄作业、通关队列、仓库对表这些自动行为在拿到 `run.lock`
+之后、开模拟器**之前**都会探一次——模拟器已经开着就判定「你在玩」，发一条灰卡说明并退出，
+不会把你踢出游戏。探测预算 5 秒、永不抛异常、失败按离线处理照常执行。手动场「现在跑」豁免。
 
 ### 两条从实战里长出来的容错
 
@@ -203,6 +216,12 @@ API 失败或理智不足都会明确拒绝。作业下载、可执行文件检�
 `ready`（待确认）、`preparing`（确认后、进战前）、`executing`（已进入执行）、`dismissed`
 （本轮取消）和 `completed`（本轮已有终态）。同一活动取消或完成后不再重复打扰；新轮换才重置。
 
+聊天里说「抄作业 / 有什么关能抄」→ 发一张**抄作业卡**：列出当前开放关（关卡 + 主掉落 +
+上游有没有导航 + 活动截止），下拉里只放**上游写了导航定义**的关；没有活动时退化成
+当天开放的资源本 + `1-7`。选中一关即开始搜作业，等价于直接说「抄 TO-9」。
+这张卡有自己的按钮前缀 `hermes:btn:maa-copilot:card:`，发新卡时先把上一张的组件 `PATCH` 空
+并删掉旧登记；它既不进计划卡的 `hermes:btn:maa:` 清扫，也不被搜索的 TTL 清扫误删。
+
 聊天里说「抄 TO-9」→ 从 [prts.plus](https://prts.plus) 匹配作业（prts 客户端过滤 + 森空岛练度校验）
 → 频道发候选卡片（▶️ 普通 / 🔥 突袭 / ❌ 取消 / 🔄 换一批）→ 点按钮后台执行：
 复用上游导航并检查关卡详情界面 → `maa copilot`（接管弹窗靠 ocrbox watchdog 兜底）→ 截图 → 清理 → 战报。
@@ -220,8 +239,9 @@ API 失败或理智不足都会明确拒绝。作业下载、可执行文件检�
 
 - `maa_action.py` 是**唯一**状态变更入口。技能文件（`SKILL.md`）明确禁止 LLM 直接写
   `plan.json` / `defaults.json` / `config.json` / 按钮登记表，也禁止直接调用 runner。
-- LLM 能改的只有**今天的关卡**和**是否跳过**，其余（任务链、次数、吃药、ADB、模拟器、Discord 配置）
-  一律拒绝。碎石**永久关闭**，不提供入口、脚本级硬拒。
+- LLM 能改的只有**今天某一场的关卡**和**那一场是否跳过**，其余（任务链、次数、吃药、ADB、
+  模拟器、Discord 配置）一律拒绝。碎石**永久关闭**，不提供入口、脚本级硬拒。
+- 场次参数只接受 `am` / `pm`，非法值脚本层拒绝；卡片上的场次由按钮登记表写死，不从 Discord 直通。
 - 技能明确要求**绝不索取、接收、复述或写入森空岛 / 鹰角 token**；用户想在聊天里贴，引导去本机终端。
 - Discord 侧永不展示 maa-cli 的原始 stdout/stderr，只展示中文步骤和战报；CLI 原文只写本地日志。
 - `copilot pick` 的 token 校验 `^[0-9a-f]{12}$`、index 限 `1..len(candidates)`、
@@ -264,8 +284,9 @@ SKLAND_HG_TOKEN=<token> MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py
 
 也可以事后单独在本机终端跑 `python3 ~/.hermes/scripts/maa_skland.py link`，从 stdin 粘贴。
 
-然后建五条 cron。Depot 每天 04:30 只检查是否满 7 天，未到期不会启动模拟器；早晚场用
-**不同工作目录**传递场次标记，因为 Hermes 的 `--script` 不支持 argv：
+然后建六条 cron。Depot 每天 04:30 只检查是否满 7 天，未到期不会启动模拟器；
+**计划卡和日常都用不同工作目录传递场次标记**（`…/maa/am`、`…/maa/pm`），
+因为 Hermes 的 `--script` 不支持 argv：
 
 ```bash
 hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
@@ -276,7 +297,11 @@ hermes cron create "30 20 * * *" --name "MAA 仓库对表" --script maa_depot.py
 ```
 
 ```bash
-hermes cron create "50 23 * * *" --name "MAA 计划卡" --script maa_plan_card.py --no-agent --deliver local
+hermes cron create "50 23 * * *" --name "MAA 计划卡·早" --script maa_plan_card.py --no-agent --deliver local --workdir ~/.hermes/state/maa/am
+```
+
+```bash
+hermes cron create "50 13 * * *" --name "MAA 计划卡·晚" --script maa_plan_card.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
 ```bash
@@ -287,7 +312,11 @@ hermes cron create "0 0 * * *" --name "MAA 日常·早" --script maa_daily.py --
 hermes cron create "0 14 * * *" --name "MAA 日常·晚" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
-这些 cron 表达式按 UTC 解释；Depot 的 `20:30 UTC` 对应北京时间次日 `04:30`。
+这些 cron 表达式按 UTC 解释；Depot 的 `20:30 UTC` 对应北京时间次日 `04:30`，
+计划卡的 `50 23` / `50 13 UTC` 对应京 `07:50` / `21:50`。
+
+> **已经建过计划卡 cron 的机器**：原来那条（`03d5e98ce8d4`，无 workdir）要改成带
+> `--workdir ~/.hermes/state/maa/am`，或者删了按上面重建，否则场次只能靠小时兜底判断。
 
 检查部署是否完整：
 
@@ -305,16 +334,19 @@ python3 deploy.py --check
 下面这些命令——**这是 LLM 唯一被允许执行的命令集**：
 
 ```text
-maa_action.py plan set-stage <关卡>     # 「刷 CE-6」「今天 1-7」
-maa_action.py plan set-stage ""         # 「刷上次的本」
-maa_action.py plan skip-today on|off    # 「今天别跑」/「恢复今天」
-maa_action.py plan show                 # 「今天怎么跑」
-maa_action.py run now                   # 「现在跑」（豁免 skip）
-maa_action.py log tail                  # 「最近怎么了」
-maa_action.py copilot find <关卡>       # 「抄 TO-9」
+maa_action.py plan set-stage <关卡> <am|pm>     # 「早上刷 CE-6」「晚上换 1-7」
+maa_action.py plan set-stage "" <am|pm>         # 「这场刷上次的本」
+maa_action.py plan skip-today on|off <am|pm>    # 「早场别跑」/「晚上还是跑吧」
+maa_action.py plan show                         # 「今天怎么跑」（一次念完两场）
+maa_action.py run now                           # 「现在跑」（豁免 skip、不吃场次覆盖）
+maa_action.py log tail                          # 「最近怎么了」「看日志」
+maa_action.py copilot card                      # 「抄作业」「有什么关能抄」
+maa_action.py copilot find <关卡>               # 「抄 TO-9」
 maa_action.py copilot status|cancel|again <token>
 maa_action.py copilot pick <token> <n> <mode>   # 只由候选卡片按钮触发
 ```
+
+**场次参数不能省**：`am` = 早场 08:00，`pm` = 晚场 22:00。你没说是哪一场时它会先问，不会替你挑。
 
 ## 配置
 
@@ -329,6 +361,8 @@ maa_action.py copilot pick <token> <n> <mode>   # 只由候选卡片按钮触发
 | `emulator_settle_quiet_seconds` | `8` | 冷启后等 `app_process` 安静多久再交给 MaaCore |
 | `connect_retry_limit` | `2` | 连接阶段崩溃的重开次数，共用同一个超时预算 |
 | `medicine_expire_days` | `2` | 只吃这个窗口内即将过期的理智药 |
+| `emulator_probe_timeout` | `5`（不在种子里，代码默认） | 开模拟器前那次「你是不是在玩」探测的总预算（秒）；设 `0` 关闭探测 |
+| `maa_activity_cache` | 不在种子里 | 覆盖 `StageActivityV2.json` 的路径（默认 `~/Library/Caches/com.loong.maa/StageActivityV2.json`），只用于卡片上的「活动截止」 |
 | `fight_times` | `2147483647` | 生产值。配合 `series = 0` 一直打到理智不足 |
 | `proxy_failure_limit` | `2` | 连续多少批代理指挥失误触发熔断 |
 | `proxy_failure_salvage` | `true` | 熔断后是否补跑去掉 Fight 的链条 |

@@ -16,11 +16,13 @@ from maa_common import (
     atomic_write_json,
     discord_request,
     discord_token,
+    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
     merge_last_run,
     now_beijing,
+    report_emulator_busy,
     run_lock,
 )
 
@@ -370,7 +372,12 @@ def record_drops(
 
 
 def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str, Any]:
-    """Run one real Depot scan; install it only after the whole flow succeeds."""
+    """Run one real Depot scan; install it only after the whole flow succeeds.
+
+    模拟器已经在用时**什么都不做**（D18）：写一条灰卡与 `depot_status`，
+    `snapshot_at` 原样不动，明天 04:30 那趟自然重试。返回的 dict 带
+    `status = "skipped_busy"`，由 `run_if_due()` 原样传给 `main()`。
+    """
     # Local import avoids a module cycle: maa_daily calls record_drops().
     import maa_daily
 
@@ -378,6 +385,26 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
     with run_lock(blocking=False) as acquired:
         if not acquired:
             raise RuntimeError("另一个 MAA 任务正在运行，Depot 对表未执行")
+        online, probe_detail = emulator_is_online(config)
+        if online:
+            reason = (
+                "检测到模拟器正在使用，本次仓库对表未执行，也没有碰设备；"
+                "明天 04:30 会自然重试。"
+            )
+            report_emulator_busy(
+                config,
+                title="⏭️ MAA 仓库对表已跳过",
+                reason=reason,
+                detail=probe_detail,
+                at=observed_at,
+                state_update={
+                    "depot_status": "skipped_busy",
+                    "depot_attempted_at": observed_at.isoformat(),
+                    "depot_error": None,
+                    "emulator_probe": probe_detail,
+                },
+            )
+            return {"status": "skipped_busy", "probe": probe_detail}
         emulator_opened = False
         error: Exception | None = None
         items: dict[str, dict[str, Any]] | None = None
@@ -431,6 +458,10 @@ def run_if_due(config: dict[str, Any], *, at: datetime | None = None) -> dict[st
     if not is_due(state, moment):
         return {"status": "not_due", "snapshot_at": state.get("snapshot_at")}
     updated = run_depot(config, at=moment)
+    if updated.get("status") == "skipped_busy":
+        # 真值没换，`snapshot_at` 必须保持旧值——否则这次「没跑」会被记成
+        # 一次成功对表，7 天间隔白白往后推一周。
+        return {"status": "skipped_busy", "snapshot_at": state.get("snapshot_at")}
     return {
         "status": "updated",
         "snapshot_at": updated["snapshot_at"],

@@ -688,6 +688,15 @@ def execution_uri(
 # ---------------------------------------------------------------------------
 
 BUTTON_PREFIX = "hermes:btn:maa-copilot:"
+# 抄作业卡（四期 1c）自己的一段前缀。它落在 `hermes:btn:maa-copilot:` 之下，
+# 所以**不会**被计划卡 07:50 那趟 `hermes:btn:maa:` 清扫碰到；又因为 `card` 不是
+# 12 位 hex（`SEARCH_TOKEN_RE`），`prune_expired_searches()` 也永远轮不到它——
+# 那个函数只按 `searches/<token>.json` 里真实存在的 token 清。
+CARD_BUTTON_PREFIX = f"{BUTTON_PREFIX}card:"
+# 上一张抄作业卡的 message_id：发新卡前要把它的组件 PATCH 空。
+# 刻意**不放在 `SEARCHES_DIR`** 下——那个目录里的每个 `*.json` 都会被
+# `prune_expired_searches()` 当成一次搜索删掉。
+CARD_PATH = COPILOT_DIR / "card.json"
 
 
 def ensure_private_dirs() -> None:

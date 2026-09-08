@@ -425,13 +425,15 @@ def patch_env(channel_id: str) -> None:
 
 
 MAA_CHANNEL_PROMPT = (
-    "你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
+    "你是 MAA 长草助手。只处理今天早场 / 晚场各自的关卡与跳过、以及抄作业；"
     "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。"
 )
 # Superseded prompt wordings that a previous deploy may have written. Kept so an
 # upgrade rewrites them in place instead of appending a second entry.
 OLD_MAA_CHANNEL_PROMPTS = (
     "你是 MAA 长草助手。只处理今天的关卡、临期理智药、跳过、立即运行和日志；"
+    "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。",
+    "你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；"
     "所有读取与变更必须遵守 maa-operator 技能并通过 maa_action.py，禁止直接写状态文件，碎石永久关闭。",
 )
 HERMES_VENV_PYTHON = HERMES_HOME / "hermes-agent" / "venv" / "bin" / "python"

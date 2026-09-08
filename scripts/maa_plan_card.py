@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Publish the 07:50 MAA plan card and maintain persistent buttons."""
+"""Publish the two daily MAA plan cards (07:50 早场 / 21:50 晚场) and the
+on-demand 抄作业 card, and maintain their persistent buttons."""
 
 from __future__ import annotations
 
@@ -8,11 +9,13 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import maa_copilot
 from maa_common import (
+    BEIJING,
     BUTTONS_PATH,
     CONFIG_PATH,
     atomic_write_json,
@@ -27,6 +30,7 @@ from maa_common import (
     medicine_label,
     merge_last_run,
     now_beijing,
+    plan_sessions,
     plan_stage_label,
     PLAN_PATH,
     state_lock,
@@ -34,6 +38,13 @@ from maa_common import (
 
 
 BUTTON_PREFIX = "hermes:btn:maa:"
+CARD_TITLE_PREFIX = "🌱 MAA 今日计划"
+# 一天两张卡（D1）：07:50 的早场卡跟随上游更新，21:50 的晚场卡不跟。
+PHASE_TITLES = {"am": "早场 08:00", "pm": "晚场 22:00"}
+# MaaCore 的活动时间缓存（`maa activity` 按 etag 拉取的那份），地基事实 E。
+DEFAULT_STAGE_ACTIVITY_PATH = (
+    Path.home() / "Library" / "Caches" / "com.loong.maa" / "StageActivityV2.json"
+)
 ACTIVITY_LINE_RE = re.compile(
     r"^\s*-\s+([A-Za-z0-9][A-Za-z0-9_-]{0,30}-\d{1,2})(?::|\s|$)"
 )
@@ -48,6 +59,82 @@ SUPPLY_STAGES: tuple[tuple[str, str, str, frozenset[int]], ...] = (
 )
 DEFAULT_MAA_CLI_FORMULA = "MaaAssistantArknights/tap/maa-cli"
 _VERSION_RE = re.compile(r"(?im)^(maa-cli|MaaCore|maa)\s+(v?\d+\.\d+\.\d+\S*)")
+
+
+def select_phase(
+    argv: list[str],
+    at: datetime | None = None,
+    cwd: Path | None = None,
+) -> str:
+    """哪一场的卡：argv > **工作目录名** > 按北京时间的小时兜底。
+
+    与 `maa_daily.select_phase()` 同一套做法——Hermes 的 `--script` 不支持 argv，
+    cron 靠 `--workdir ~/.hermes/state/maa/{am,pm}` 传场次。
+    """
+    if len(argv) == 1 and argv[0] in PHASE_TITLES:
+        return argv[0]
+    if argv:
+        raise ValueError("计划卡场次只接受 am 或 pm")
+    marker = (cwd or Path.cwd()).name.lower()
+    if marker in PHASE_TITLES:
+        return marker
+    return "am" if (at or now_beijing()).hour < 14 else "pm"
+
+
+def activity_deadlines(
+    path: Path | None = None,
+) -> list[tuple[str, datetime]]:
+    """当前活动的 `(名字, 截止时刻)`，时刻已换算成北京时间。
+
+    数据来自 MaaCore 的 `StageActivityV2.json`（地基事实 E）：字段名带 `Utc`，
+    但实际是 `TimeZone` 那个时区的本地时间，maa-cli 源码的注释也这么说。
+    **文件不存在 / 解析失败 / 字段缺失一律返回空表，绝不抛**——
+    卡片不该因为一条旁路信息整张消失（D-2 的教训）。
+    """
+    try:
+        raw = load_json(path or DEFAULT_STAGE_ACTIVITY_PATH, None)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    side_stories = (raw.get("Official") or {}).get("sideStoryStage")
+    if not isinstance(side_stories, dict):
+        return []
+    result: list[tuple[str, datetime]] = []
+    for prefix, entry in side_stories.items():
+        activity = entry.get("Activity") if isinstance(entry, dict) else None
+        if not isinstance(activity, dict):
+            continue
+        try:
+            offset = timezone(timedelta(hours=int(activity.get("TimeZone", 8))))
+            expire = datetime.strptime(
+                str(activity["UtcExpireTime"]), "%Y/%m/%d %H:%M:%S"
+            ).replace(tzinfo=offset)
+        except (KeyError, TypeError, ValueError):
+            continue
+        title = str(
+            activity.get("Tip") or activity.get("StageName") or prefix
+        )[:120]
+        result.append((title, expire.astimezone(BEIJING)))
+    result.sort(key=lambda item: item[1])
+    return result
+
+
+def activity_deadline_text(
+    config: dict[str, Any], at: datetime | None = None
+) -> str:
+    """计划卡 / 抄作业卡的「活动截止」一行；读不出来就是空串（调用方不显示这行）。"""
+    configured = str(config.get("maa_activity_cache") or "").strip()
+    moment = at or now_beijing()
+    lines: list[str] = []
+    for title, expire in activity_deadlines(
+        Path(configured) if configured else None
+    ):
+        if expire <= moment:
+            continue
+        left = (expire - moment).total_seconds() / 86400
+        lines.append(f"{title} · 截止 {expire:%m-%d %H:%M}（还剩 {left:.1f} 天）")
+    return "\n".join(lines)[:1024]
 
 
 def is_side_story_heading(line: str) -> bool:
@@ -557,8 +644,11 @@ def _stage_select(
     plan: dict[str, Any],
     config: dict[str, Any],
     registry: dict[str, dict[str, Any]],
+    phase: str,
 ) -> dict[str, Any]:
-    custom_id = f"{BUTTON_PREFIX}stage-select"
+    # custom_id 带场次：万一旧卡的组件没收干净（`retire_old_plan_cards()` 是尽力而为），
+    # 点它只会得到「未登记」，而不会把早场的选择悄悄写进晚场。
+    custom_id = f"{BUTTON_PREFIX}{phase}:stage-select"
     selected = str(plan.get("stage", ""))
     select_args: dict[str, list[str]] = {}
     options: list[dict[str, Any]] = []
@@ -572,7 +662,8 @@ def _stage_select(
             "emoji": {"name": "🎯" if selected == stage else "▫️"},
         }
         options.append(option)
-        select_args[value] = ["plan", "set-stage", stage]
+        # 场次写死在登记表里，不从 Discord 直通（不变量 #8）。
+        select_args[value] = ["plan", "set-stage", stage, phase]
     registry[custom_id] = {
         "kind": "exec",
         "script": "maa_action.py",
@@ -583,46 +674,7 @@ def _stage_select(
     return {
         "type": 3,
         "custom_id": custom_id,
-        "placeholder": "🎯 选择今天要刷的关卡",
-        "min_values": 1,
-        "max_values": 1,
-        "options": options,
-    }
-
-
-def _copilot_stage_select(
-    plan: dict[str, Any],
-    config: dict[str, Any],
-    registry: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    """Second dropdown: pick a stage to match prts.plus ops for (抄作业)."""
-    custom_id = f"{maa_copilot.BUTTON_PREFIX}stage-select"
-    select_args: dict[str, list[str]] = {}
-    options: list[dict[str, Any]] = []
-    for index, (label, stage, description) in enumerate(_stage_choices(plan, config)):
-        if not stage:
-            # "上次作战关卡" makes sense for farming, not for copilot: an
-            # empty stage would blow up `copilot find ""`.
-            continue
-        value = f"copilot-choice:{index}"
-        options.append(
-            {
-                "label": label[:100],
-                "value": value,
-                "description": description[:100],
-                "emoji": {"name": "🤖"},
-            }
-        )
-        select_args[value] = ["copilot", "find", stage]
-    registry[custom_id] = {
-        "kind": "exec",
-        "script": "maa_action.py",
-        "select_args": select_args,
-    }
-    return {
-        "type": 3,
-        "custom_id": custom_id,
-        "placeholder": "🤖 抄作业：选择关卡匹配作业",
+        "placeholder": f"🎯 选择{PHASE_TITLES[phase]}要刷的关卡",
         "min_values": 1,
         "max_values": 1,
         "options": options,
@@ -940,60 +992,50 @@ def current_farming_result(
 def build_components(
     plan: dict[str, Any],
     config: dict[str, Any],
+    phase: str,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """恰好两行：一个关卡下拉 + 一个「跳过本场 / 恢复本场」按钮（D2）。
+
+    抄作业选关搬到了聊天触发的独立卡（`maa_action.py copilot card`，D6）。
+    """
     registry: dict[str, dict[str, Any]] = {}
-    stage_select = _stage_select(plan, config, registry)
-    copilot_select = _copilot_stage_select(plan, config, registry)
+    stage_select = _stage_select(plan, config, registry, phase)
 
-    skip_spec = (
-        ("▶️ 恢复自动场次", "unskip", 3, ["plan", "skip-today", "off"])
+    label, suffix, style, args = (
+        ("▶️ 恢复本场", "unskip", 3, ["plan", "skip-today", "off", phase])
         if plan.get("skip")
-        else ("⏭️ 跳过自动场次", "skip", 4, ["plan", "skip-today", "on"])
+        else (
+            f"⏭️ 跳过本场（{PHASE_TITLES[phase]}）",
+            "skip",
+            4,
+            ["plan", "skip-today", "on", phase],
+        )
     )
-    action_specs = [skip_spec, ("📋 最近结果", "log", 2, ["log", "tail"])]
-    action_buttons: list[dict[str, Any]] = []
-    for label, suffix, style, args in action_specs:
-        custom_id = f"{BUTTON_PREFIX}{suffix}"
-        action_buttons.append(_button(label, custom_id, style=style))
-        registry[custom_id] = {
-            "kind": "exec",
-            "script": "maa_action.py",
-            "args": args,
-        }
-
-    explain_id = f"{BUTTON_PREFIX}explain"
-    action_buttons.append(_button("🤖 请 Hermes 解释", explain_id, style=1))
-    channel_id = str(config.get("channel_id", ""))
-    registry[explain_id] = {
-        "kind": "prompt",
-        "thread_id": channel_id,
-        "thread_name": "MAA长草助手",
-        "prompt": (
-            "请读取 ~/.hermes/state/maa/last_run.json 和 runs/ 下最新日志，"
-            "用简短中文解释最近一次 MAA 日常结果、异常和下一步；只读，不修改计划，"
-            "不要声称未从文件验证的执行结果。"
-        ),
+    custom_id = f"{BUTTON_PREFIX}{phase}:{suffix}"
+    registry[custom_id] = {
+        "kind": "exec",
+        "script": "maa_action.py",
+        "args": args,
     }
     rows: list[dict[str, Any]] = [
         {"type": 1, "components": [stage_select]},
-        {"type": 1, "components": action_buttons},
+        {"type": 1, "components": [_button(label, custom_id, style=style)]},
     ]
-    if copilot_select.get("options"):
-        # Discord rejects selects with zero options; skip the row entirely
-        # when there is nothing to offer (e.g. no known stages at all).
-        rows.insert(1, {"type": 1, "components": [copilot_select]})
     return (rows, registry)
 
 
-def apply_auto_stage(result: dict[str, Any], at: datetime | None = None) -> str:
-    """把自动定的关写进当日 `plan.json`。返回写入的关卡，没写返回空串。
+def apply_auto_stage(
+    result: dict[str, Any], phase: str, at: datetime | None = None
+) -> str:
+    """把自动定的关写进当日 `plan.json` 的**这一场**。返回写入的关卡，没写返回空串。
 
-    **绝不覆盖用户的手动选择**：只有当天的覆盖里根本没有 `stage`、或者上一次
-    写它的就是本函数（`stage_source == "auto"`）时才写。用户从下拉 1 选过、
-    或在聊天里说过「今天刷 X」之后，`stage_source` 是 `discord`，当天就不会再被自动改掉。
+    **绝不覆盖用户的手动选择**：只有这一场的覆盖里根本没有 `stage`、或者上一次
+    写它的就是本函数（`stage_source == "auto"`）时才写。用户从下拉选过、
+    或在聊天里说过「早场刷 X」之后，该场 `stage_source` 是 `discord`，
+    当天这一场就不会再被自动改掉——另一场不受影响（D3）。
 
-    只在 07:50 计划卡跑一次（用户拍板）：卡片上写的关就是当天真正会跑的关，
-    早晚两场一致。次日 `plan.json` 按日期自然失效，重新自动算。
+    每场卡各跑一次：卡片上写的关就是这一场真正会跑的关。
+    次日 `plan.json` 按日期自然失效，重新自动算。
     """
     stage, _why = auto_stage(result)
     if not stage:
@@ -1003,48 +1045,47 @@ def apply_auto_stage(result: dict[str, Any], at: datetime | None = None) -> str:
     # 点一次「跳过」也会把它写成 discord，拿它当闸门等于点跳过就冻住当天的自动定关。
     with state_lock():
         current = load_json(PLAN_PATH, {})
-        if not isinstance(current, dict) or current.get("date") != moment.date().isoformat():
-            current = {"date": moment.date().isoformat()}
-        if "stage" in current and current.get("stage_source") != "auto":
+        if (
+            not isinstance(current, dict)
+            or current.get("date") != moment.date().isoformat()
+            or not isinstance(current.get("sessions"), dict)
+        ):
+            current = {"date": moment.date().isoformat(), "sessions": {}}
+        sessions = current["sessions"]
+        session = sessions.get(phase)
+        session = dict(session) if isinstance(session, dict) else {}
+        if "stage" in session and session.get("stage_source") != "auto":
             return ""
-        current["stage"] = stage
-        current["stage_source"] = "auto"
+        session["stage"] = stage
+        session["stage_source"] = "auto"
+        session["updated_at"] = moment.isoformat()
+        sessions[phase] = session
         current["updated_at"] = moment.isoformat()
         atomic_write_json(PLAN_PATH, current)
     return stage
 
 
-def today_stage_source(at: datetime | None = None) -> str:
-    """当天的 `plan.stage` 是谁写的：`auto`（缺口算的）/ `discord`（你选的）/ 空。
-
-    **必须直接读 `plan.json`**：`effective_plan()` 只把 `stage` / `skip` 两个键叠进
-    默认计划，`normalize_plan()` 会把 `stage_source` 连同其余字段一起丢掉——
-    从它返回的 plan 里查这个字段永远是空的。
-    """
-    moment = at or now_beijing()
-    current = load_json(PLAN_PATH, {})
-    if not isinstance(current, dict):
-        return ""
-    if current.get("date") != moment.date().isoformat():
-        return ""
-    return str(current.get("stage_source") or "")
+def today_stage_source(phase: str, at: datetime | None = None) -> str:
+    """这一场今天的关是谁写的：`auto`（缺口算的）/ `discord`（你选的）/ 空。"""
+    return str(plan_sessions(at).get(phase, {}).get("stage_source") or "")
 
 
 def build_embed(
     plan: dict[str, Any],
     config: dict[str, Any],
+    phase: str,
     update: dict[str, Any] | None = None,
     farming: dict[str, Any] | None = None,
     stage_source: str = "",
+    at: datetime | None = None,
 ) -> dict[str, Any]:
     activity_stages = config.get("activity_stages", [])
     activity_note = "、".join(str(item) for item in activity_stages) or "未配置"
-    # skip 只作用于 08:00/22:00；手动开跑是明确指令，永远照跑，别让卡片读成全停。
-    skip = "是（手动开跑不受影响）" if plan.get("skip") else "否"
-    # 「刷什么」要能一眼看出这关是自动定的还是自己选的——下拉 3 删掉之后，
-    # 用户判断「缺口算出来是什么」全靠这一行和下面那段说明。归属只认
-    # `stage_source`（`today_stage_source()` 从 plan.json 读），不拿「今天算出来的关
-    # 恰好等于计划里的关」当依据：手选的关和缺口算的关撞上时那会说成自动选的。
+    # skip 只作用于**本场**；今天的另一场和手动开跑都不受影响（D2）。
+    skip = "是（另一场与手动开跑不受影响）" if plan.get("skip") else "否"
+    # 「刷什么」要能一眼看出这关是自动定的还是自己选的。归属只认
+    # `stage_source`（`today_stage_source()` 按场次从 plan.json 读），不拿「今天算出来
+    # 的关恰好等于计划里的关」当依据：手选的关和缺口算的关撞上时那会说成自动选的。
     stage_line = plan_stage_label(plan)
     if stage_source == "auto":
         stage_line = f"{stage_line}（按材料缺口自动选）"
@@ -1052,37 +1093,42 @@ def build_embed(
         stage_line = f"{stage_line}（你手动选的）"
     fields: list[dict[str, Any]] = [
         {"name": "刷什么", "value": stage_line, "inline": True},
-        {
-            "name": "🧪 理智规则",
-            "value": medicine_label(str(plan.get("medicine", "none"))),
-            "inline": False,
-        },
-        {
-            "name": "每日剿灭",
-            "value": "当天第一场用代理卡全权委托；满 1800 合成玉/周后自动停，当天不再进第二次",
-            "inline": False,
-        },
-        {"name": "跳过自动场次", "value": skip, "inline": True},
-        {"name": "当前活动关", "value": activity_note[:1024], "inline": False},
-        {
-            "name": "自动场次",
-            "value": "08:00 早场 · 22:00 晚场（北京时间）",
-            "inline": False,
-        },
     ]
     if farming is not None:
         auto, why = auto_stage(farming)
-        lines = [f"{'✅ 今天自动定为 ' + auto if auto else '⏸️ 今天没有自动改关'}：{why}"]
+        lines = [f"{'✅ 本场自动定为 ' + auto if auto else '⏸️ 本场没有自动改关'}：{why}"]
         note = farming_note(farming)
         if note:
             lines.append(note)
         fields.append(
             {
-                "name": "📦 材料缺口" + ("（降级）" if farming.get("degraded") else ""),
+                "name": "为什么" + ("（降级）" if farming.get("degraded") else ""),
                 "value": "\n".join(lines)[:1024],
                 "inline": False,
             }
         )
+    fields.append({"name": "本场跳过", "value": skip, "inline": True})
+    fields.append(
+        {"name": "当前活动关", "value": activity_note[:1024], "inline": False}
+    )
+    deadline = activity_deadline_text(config, at)
+    if deadline:
+        # 读不出来就整行不显示——这是旁路信息，不值得占一行说「未知」。
+        fields.append({"name": "活动截止", "value": deadline, "inline": False})
+    fields.append(
+        {
+            "name": "🧪 理智规则",
+            "value": medicine_label(str(plan.get("medicine", "none"))),
+            "inline": False,
+        }
+    )
+    fields.append(
+        {
+            "name": "每日剿灭",
+            "value": "当天第一场用代理卡全权委托；满 1800 合成玉/周后自动停，当天不再进第二次",
+            "inline": False,
+        }
+    )
     if update:
         fields.append(
             {
@@ -1092,19 +1138,137 @@ def build_embed(
             }
         )
     return {
-        "title": "🌱 MAA 今日计划",
-        "description": "从下拉菜单选择关卡；今天的覆盖会在明天自动失效。",
+        "title": f"{CARD_TITLE_PREFIX} · {PHASE_TITLES[phase]}",
+        "description": "从下拉菜单选择本场要刷的关卡；今天的覆盖会在明天自动失效。",
         "color": 0x57F287,
         "fields": fields,
         "footer": {
             "text": "体力不足时停止 · 碎石永久关闭 · 计划变更不会打断已开始的场次"
         },
-        "timestamp": now_beijing().isoformat(),
+        "timestamp": (at or now_beijing()).isoformat(),
     }
 
 
+# ---------------------------------------------------------------------------
+# 抄作业卡（四期 1c）：聊天说「抄作业」→ 一览 + 一个下拉，选中即去搜作业
+# ---------------------------------------------------------------------------
+
+COPILOT_CARD_TITLE = "🤖 抄作业：现在能抄的关"
+
+
+def copilot_card_stages(
+    config: dict[str, Any], at: datetime | None = None
+) -> tuple[list[dict[str, Any]], bool]:
+    """`([{stage, code, materials, nav, reason}], 是不是活动期)`。
+
+    **只读本地**：`config.activity_stages` 这份运行时缓存、上游 `stages.json`
+    的主掉落、本地关卡索引、上游 `tasks/Stages/*.json` 的导航键。零网络、零子进程，
+    整条按钮路径必须 < 20s（不变量 #6）。
+
+    活动期只列活动关（D5 的候选集）；没有活动就退化成**当天开放的资源本 + `1-7`**，
+    这些关的导航同样由上游提供（`Supplies.json` 键 / `EpisodeN`）。
+    """
+    import maa_clearing
+
+    index = maa_copilot.load_stage_index(config)
+    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
+    drops = stage_drops(config)
+    activity = [
+        str(item).strip()
+        for item in (config.get("activity_stages") or [])
+        if str(item).strip()
+    ]
+    candidates = activity or (
+        [stage for _label, stage, _desc in current_supply_choices(config, at)] + ["1-7"]
+    )
+    rows: list[dict[str, Any]] = []
+    for stage in candidates:
+        if any(row["stage"] == stage for row in rows):
+            continue
+        resolved = maa_copilot.resolve_copilot_stage(stage, index)
+        supported, detail = nav_of(stage)
+        if not supported:
+            # 上游没写导航定义的关不自动进、也不给下拉（D8 / 不变量 #37）。
+            reason = detail or "上游无导航"
+        elif resolved is None:
+            # 有导航键但本地 Tile-Pos 索引里没有 → `copilot find` 那步会直接拒，
+            # 与其发一个点了必失败的选项，不如在一览里说清楚。
+            reason = "不在本地关卡索引里"
+        else:
+            reason = ""
+        rows.append(
+            {
+                "stage": stage,
+                "code": resolved[1] if resolved else "",
+                "materials": (drops.get(stage) or {}).get("materials") or [],
+                "nav": not reason,
+                "reason": reason,
+            }
+        )
+    return rows, bool(activity)
+
+
+def copilot_card_view(
+    config: dict[str, Any], at: datetime | None = None
+) -> tuple[dict[str, Any], list[tuple[str, str, str]]]:
+    """抄作业卡的 `(embed, [(标签, 关卡, 说明)])`。选项已按导航键过滤。"""
+    rows, in_activity = copilot_card_stages(config, at)
+    lines: list[str] = []
+    options: list[tuple[str, str, str]] = []
+    for row in rows:
+        materials = "、".join(row["materials"])
+        mark = "✅ 上游有导航" if row["nav"] else f"⛔ {row['reason']}"
+        lines.append(
+            f"`{row['stage']}`"
+            + (f" · {materials}" if materials else "")
+            + f" · {mark}"
+        )
+        if row["nav"]:
+            label = f"{row['stage']} · {materials}" if materials else row["stage"]
+            options.append(
+                (
+                    label,
+                    row["stage"],
+                    f"主掉落 {materials}" if materials else "去 prts.plus 搜这一关的作业",
+                )
+            )
+    fields: list[dict[str, Any]] = [
+        {
+            "name": "当前开放活动关" if in_activity else "资源本 / 主线（当前无活动）",
+            "value": ("\n".join(lines) or "没有可抄的关")[:1024],
+            "inline": False,
+        }
+    ]
+    deadline = activity_deadline_text(config, at)
+    if deadline:
+        fields.append({"name": "活动截止", "value": deadline, "inline": False})
+    fields.append(
+        {
+            "name": "已抄记录",
+            "value": "未记录（本地记账在后续步骤上线）",
+            "inline": False,
+        }
+    )
+    embed = {
+        "title": COPILOT_CARD_TITLE,
+        "description": (
+            "从下拉里选一关，立刻去 prts.plus 匹配作业；"
+            "上游没写导航定义的关不在下拉里，MAA 进不去。"
+        ),
+        "color": 0x5865F2,
+        "fields": fields,
+        "footer": {"text": "抄作业与日常互斥 · 08:00 / 22:00 前 25 分钟不接受"},
+        "timestamp": (at or now_beijing()).isoformat(),
+    }
+    return embed, options[:25]
+
+
 def retire_old_plan_cards(token: str, channel_id: str) -> dict[str, int]:
-    """Remove controls from recent superseded plan cards."""
+    """Remove controls from recent superseded plan cards.
+
+    标题现在带场次后缀（`… · 早场 08:00`），所以按**前缀**匹配——
+    21:50 的晚场卡要能收掉早上那张。
+    """
     result = {"retired": 0, "failed": 0}
     messages = discord_request(
         token,
@@ -1118,7 +1282,8 @@ def retire_old_plan_cards(token: str, channel_id: str) -> dict[str, int]:
             continue
         embeds = message.get("embeds", [])
         if not isinstance(embeds, list) or not any(
-            isinstance(embed, dict) and embed.get("title") == "🌱 MAA 今日计划"
+            isinstance(embed, dict)
+            and str(embed.get("title") or "").startswith(CARD_TITLE_PREFIX)
             for embed in embeds
         ):
             continue
@@ -1138,13 +1303,18 @@ def retire_old_plan_cards(token: str, channel_id: str) -> dict[str, int]:
     return result
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    phase = select_phase(list(argv or []))
     config = load_config()
     channel_id = str(config.get("channel_id", "")).strip()
     if not channel_id.isdigit():
         raise RuntimeError("config.json 中尚未配置 Discord channel_id")
     token = discord_token()
-    update = check_and_update_upstream(token, channel_id, config)
+    # D1：只有早场卡跟随上游更新。晚场卡跑 brew / `maa update` 既没有意义
+    # （早上刚跟过），又会在 21:50 引入一次几分钟的网络等待。
+    update = (
+        check_and_update_upstream(token, channel_id, config) if phase == "am" else None
+    )
     # Availability changes daily at the game reset and independently of the
     # MaaCore package update, so probe it for every plan card.
     activity_ok, activity_detail = refresh_activity_stages(config)
@@ -1170,11 +1340,11 @@ def main() -> int:
     # so the card is always derived from the just-persisted source of truth.
     config = load_config()
     # 材料缺口 → 自动定关，必须发生在读 plan 和建卡片**之前**：卡片上写的关
-    # 就是当天两场真正会跑的关。用户手动选过的当天不动（见 apply_auto_stage）。
-    farming = current_farming_result(effective_plan(), config)
-    apply_auto_stage(farming)
-    plan = effective_plan()
-    components, entries = build_components(plan, config)
+    # 就是**本场**真正会跑的关。用户手动选过的那一场当天不动（见 apply_auto_stage）。
+    farming = current_farming_result(effective_plan(phase=phase), config)
+    apply_auto_stage(farming, phase)
+    plan = effective_plan(phase=phase)
+    components, entries = build_components(plan, config, phase)
 
     # Registry writes are a merge under agent-book's exact same lock.
     with state_lock():
@@ -1196,7 +1366,9 @@ def main() -> int:
     cleanup_result = cleanup_old_threads(token)
     cleanup_run_files(int(config.get("retention_days", 14)))
     retired = retire_old_plan_cards(token, channel_id)
-    embed = build_embed(plan, config, update, farming, today_stage_source())
+    embed = build_embed(
+        plan, config, phase, update, farming, today_stage_source(phase)
+    )
     if cleanup_result["failed"]:
         embed["footer"]["text"] += f" · {cleanup_result['failed']} 个旧子区删除失败"
     if retired["failed"]:
@@ -1211,14 +1383,14 @@ def main() -> int:
             "allowed_mentions": {"parse": []},
         },
     )
-    if not update.get("ok"):
+    if update is not None and not update.get("ok"):
         raise RuntimeError("maa 上游更新失败；已发送红色告警")
     return 0
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(sys.argv[1:]))
     except Exception as exc:
         print(f"MAA 计划卡失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)

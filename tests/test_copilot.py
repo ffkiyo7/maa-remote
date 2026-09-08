@@ -771,7 +771,7 @@ class ButtonRegistryTests(unittest.TestCase):
         # (with trailing colon); the copilot prefix uses a hyphen, so the
         # morning sweep can never touch candidate buttons.
         self.assertFalse("hermes:btn:maa-copilot:x".startswith("hermes:btn:maa:"))
-        self.assertFalse("hermes:btn:maa-copilot:stage-select".startswith("hermes:btn:maa:"))
+        self.assertFalse("hermes:btn:maa-copilot:card:stage-select".startswith("hermes:btn:maa:"))
         self.assertFalse("hermes:btn:maa-copilot:aaa111bbb222:1".startswith("hermes:btn:maa:"))
         self.assertTrue("hermes:btn:maa-copilot:x".startswith("hermes:btn:maa-copilot:"))
 
@@ -797,7 +797,7 @@ class ButtonRegistryTests(unittest.TestCase):
                 "hermes:btn:maa-copilot:aaa111bbb222:1": {},
                 "hermes:btn:maa-copilot:aaa111bbb222:cancel": {},
                 "hermes:btn:maa-copilot:ccc333ddd444:1": {},
-                "hermes:btn:maa-copilot:stage-select": {},
+                "hermes:btn:maa-copilot:card:stage-select": {},
             })
             with patch.object(maa_common, "BUTTONS_PATH", buttons):
                 maa_copilot.prune_search_buttons("aaa111bbb222")
@@ -805,7 +805,7 @@ class ButtonRegistryTests(unittest.TestCase):
             self.assertNotIn("hermes:btn:maa-copilot:aaa111bbb222:1", registry)
             self.assertNotIn("hermes:btn:maa-copilot:aaa111bbb222:cancel", registry)
             self.assertIn("hermes:btn:maa-copilot:ccc333ddd444:1", registry)
-            self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+            self.assertIn("hermes:btn:maa-copilot:card:stage-select", registry)
 
     def test_prune_search_buttons_registry_in_place_removes_all_owned(self) -> None:
         # P0-3: count=0 used to leave :1/:2/:3/:raid-* orphaned forever;
@@ -819,13 +819,13 @@ class ButtonRegistryTests(unittest.TestCase):
             "hermes:btn:maa-copilot:aaa111bbb222:raid-3": {},
             "hermes:btn:maa-copilot:aaa111bbb222:again": {},
             "hermes:btn:maa-copilot:aaa111bbb222:cancel": {},
-            "hermes:btn:maa-copilot:stage-select": {},
+            "hermes:btn:maa-copilot:card:stage-select": {},
             "hermes:btn:agent-book:x": {},
         }
         maa_copilot.prune_search_buttons("aaa111bbb222", registry)
         leftovers = [k for k in registry if "aaa111bbb222" in k]
         self.assertEqual(leftovers, [])
-        self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+        self.assertIn("hermes:btn:maa-copilot:card:stage-select", registry)
         self.assertIn("hermes:btn:agent-book:x", registry)
 
     def test_supersede_search_is_atomic_and_never_overwrites_executing(self) -> None:
@@ -1668,6 +1668,8 @@ class ActivityAutomationTests(unittest.TestCase):
                  patch.object(worker, "_require_auto_run_preflight"), \
                  patch.object(worker, "_prepare_op_file",
                               side_effect=RuntimeError("作业下载失败")), \
+                 patch.object(worker, "emulator_is_online",
+                              return_value=(False, "离线")), \
                  patch.object(worker, "open_emulator") as open_emulator:
                 rc = worker._run_locked(queued, candidate, 1, "normal")
 
@@ -1827,6 +1829,8 @@ class ActivityAutomationTests(unittest.TestCase):
                 patch.object(worker, "_prepare_op_file",
                              return_value=("maa://7", False)),
                 patch.object(worker, "require_executable"),
+                patch.object(worker, "emulator_is_online",
+                             return_value=(False, "离线")),
                 patch.object(worker, "open_emulator"),
                 patch.object(worker, "wait_for_android"),
                 patch.object(worker, "verify_game_installed"),
@@ -1880,6 +1884,8 @@ class ActivityAutomationTests(unittest.TestCase):
                               side_effect=RuntimeError("理智不足")), \
                  patch.object(worker, "discord_request"), \
                  patch.object(worker, "merge_last_run"), \
+                 patch.object(worker, "emulator_is_online",
+                              return_value=(False, "离线")), \
                  patch.object(worker, "open_emulator") as open_emulator:
                 rc = worker._run_locked(state, candidate, 1, "normal")
         self.assertEqual(rc, 1)

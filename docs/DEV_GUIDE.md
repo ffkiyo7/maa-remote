@@ -36,27 +36,27 @@
    │ */15 * * * * maa_activity_watch  │      │                              │
    │ 30 20 * * *  maa_depot.py         │      │                              │
    │ (京 04:30；到期才开模拟器)       │      │                              │
-   │ 50 23 * * *  maa_plan_card.py     │      │ 组件交互 hermes:btn:maa:*    │
-   │ (京 07:50)                        │      │   → buttons.json 查登记      │
-   │  0  0 * * *  maa_daily.py  am     │      │   → exec 白名单校验          │
-   │ (京 08:00, workdir=…/maa/am)      │      │   → maa_action.py（≤20s）    │
-   │  0 14 * * *  maa_daily.py  pm     │      │                              │
-   │ (京 22:00, workdir=…/maa/pm)      │      │ 自然语言（免 @ 频道）        │
-   └───────────────────────────────────┘      │   → maa-operator 技能        │
-                                              │   → terminal 调 maa_action.py│
-                                              └────┬─────────────────────────┘
+   │ 50 23 * * *  maa_plan_card.py am  │      │ 组件交互 hermes:btn:maa:*    │
+   │ (京 07:50, workdir=…/maa/am)      │      │   → buttons.json 查登记      │
+   │ 50 13 * * *  maa_plan_card.py pm  │      │   → exec 白名单校验          │
+   │ (京 21:50, workdir=…/maa/pm)      │      │   → maa_action.py（≤20s）    │
+   │  0  0 * * *  maa_daily.py  am     │      │                              │
+   │ (京 08:00, workdir=…/maa/am)      │      │ 自然语言（免 @ 频道）        │
+   │  0 14 * * *  maa_daily.py  pm     │      │   → maa-operator 技能        │
+   │ (京 22:00, workdir=…/maa/pm)      │      │   → terminal 调 maa_action.py│
+   └───────────────────────────────────┘      └────┬─────────────────────────┘
                                                    │ 只写 plan.json / 派发
                         ┌──────────────────────────┘
                         ▼
    ~/.hermes/state/maa/{config,defaults,plan,last_run}.json + run.lock + runs/
-                        │  effective_plan() = defaults ⊕ 当天的 plan 覆盖
+                        │  effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次>
                         ▼
-   maa_daily.py ── flock ── 快照 runs/<date>-<phase>.json ── 起 BlueStacks
+   maa_daily.py ── flock ── 探模拟器 ── 快照 runs/<date>-<phase>.json ── 起 BlueStacks
         └─ 渲染 daily.toml ─ maa run daily ─ 5s 一次编辑子区消息
                                  └─ 截图 ─ closedown/退出/断 ADB ─ 战报 embed
 ```
 
-五条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
+六条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
 stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）。
 
 ---
@@ -65,8 +65,8 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 | 文件 | 角色 | 触发方式 | 典型耗时 |
 |---|---|---|---|
-| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry` | 被其他几个 import | — |
-| `scripts/maa_plan_card.py` | 每日计划卡；每次先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50 | 数秒～5 分钟（含 `maa update` / `brew`） |
+| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry`、**场次级计划求值**（`plan_sessions` / `effective_plan`）、**模拟器占用探测**（`emulator_is_online` / `report_emulator_busy`） | 被其他几个 import | — |
+| `scripts/maa_plan_card.py` | 早晚两张计划卡 + 抄作业卡的渲染层；早场卡还先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50（am）/ 21:50（pm）；抄作业卡由 `maa_action.py` 调 | 早场数秒～5 分钟（含 `maa update` / `brew`），晚场数秒 |
 | `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率 | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；活动切换时派发 Top-1 作业搜索，维护重试/取消/完成状态 | cron 每 15 分钟 | 通常 <1s；需要搜索时后台 5~20s |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
@@ -82,29 +82,79 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 ---
 
-## 3. 链路一：计划卡（`maa_plan_card.py`，京 07:50）
+## 3. 链路一：两张计划卡（`maa_plan_card.py`，京 07:50 早场 / 21:50 晚场）
 
-`main()`（`scripts/maa_plan_card.py`）严格按这个顺序：
+**一天两张卡，一张管一场**（四期 D1）。场次的来源与日常一样是
+**workdir 名**（`~/.hermes/state/maa/{am,pm}`），也接受 argv；两者都没有时按小时兜底
+（`select_phase()`，`< 14 点` → `am`）。Hermes 的 `--script` 不支持 argv，所以 cron 用 workdir。
 
-1. **`check_and_update_upstream()`** — 每次计划卡都跑：`brew outdated/upgrade` 跟随
+`main(argv)`（`scripts/maa_plan_card.py`）严格按这个顺序：
+
+1. **`check_and_update_upstream()` — 只有早场卡跑**：`brew outdated/upgrade` 跟随
    maa-cli，再依次用 `maa update --batch` 和 `maa hot-update --batch` 更新 Beta
    MaaCore 与 MaaResource 热更新层（超时分别 180s / 300s）。
    **这条必须保留本机代理**（`maa_subprocess_env(..., keep_proxy=True)`），否则直连
-   GitHub 会超时。有新版本就装上，把版本写回 `config.json`，摘要进计划卡「上游更新」
+   GitHub 会超时。有新版本就装上，把版本写回 `config.json`，摘要进早场卡「上游更新」
    字段。失败发红色 Embed 告警，并在 `main()` 末尾 `raise` 让 cron 记为失败。
-2. **`refresh_activity_stages()`** — 每天都跑 `maa activity Official`，解析出形如 `TO-9`
+   **晚场卡整步跳过**（`update is None`）：早上刚跟过，21:50 再花几分钟等网络只会
+   让晚场卡迟到；`main()` 末尾那个 `raise` 也因此要判 `update is not None`。
+2. **`refresh_activity_stages()`** — 两张卡都跑 `maa activity Official`，解析出形如 `TO-9`
    的活动关列表写回 `config.json`；同时检测公告里的「资源收集」字样，命中则置
    `all_supply_stages_open=true`（全部资源本开放）。
 3. **重新 `load_config()`** — 上一步刚改过磁盘上的 config，卡片必须从落盘后的真值渲染。
-4. **`build_components()`** — 组装刷图/抄作业两个下拉 + 三个按钮，同时产出登记表条目。
-5. **写按钮登记（关键）** — 在 `state_lock()` 里 **先删所有 `hermes:btn:maa:` 前缀的 key，
+4. **算本场默认关** — `current_farming_result(effective_plan(phase=phase), config)` →
+   `apply_auto_stage(farming, phase)`，写的是 `plan.json` 的 `sessions.<phase>`。
+5. **`build_components(plan, config, phase)`** — **恰好两行**：一个关卡下拉 + 一个
+   「跳过本场 / 恢复本场」按钮，同时产出登记表条目。
+6. **写按钮登记（关键）** — 在 `state_lock()` 里 **先删所有 `hermes:btn:maa:` 前缀的 key，
    再 merge 写回** `~/.hermes/state/agent-book/buttons.json`。这个文件是**全局共享**的，
    agent-book 的按钮也在里面，**绝不能整体覆盖**。删前缀的副作用是旧卡片上的
-   MAA 控件立即失效（点了会报未登记）。
-6. `cleanup_old_threads()` 删 >24h 的子区、`cleanup_run_files()` 删 >14 天的 `runs/` 产物。
-7. `retire_old_plan_cards()` — 扫最近 100 条消息，把标题为 `🌱 MAA 今日计划` 且仍带
-   components 的旧卡片 `PATCH components: []`，避免同时存在多张可点的卡。
-8. 发新卡片。
+   MAA 控件立即失效（点了会报未登记）——21:50 那趟顺手废掉早场卡的控件，是**预期行为**。
+7. `cleanup_old_threads()` 删 >24h 的子区、`cleanup_run_files()` 删 >14 天的 `runs/` 产物。
+8. `retire_old_plan_cards()` — 扫最近 100 条消息，把标题**以 `🌱 MAA 今日计划` 开头**
+   （现在带 `· 早场 08:00` / `· 晚场 22:00` 后缀）且仍带 components 的旧卡片
+   `PATCH components: []`，避免同时存在多张可点的卡。
+9. 发新卡片。
+
+### 卡片上有什么
+
+| 字段 | 内容 |
+|---|---|
+| 刷什么 | 本场的关 + 归属（`（按材料缺口自动选）` / `（你手动选的）`，来自 `today_stage_source(phase)`） |
+| 为什么 | 缺口理由或降级说明（原来的「📦 材料缺口」字段） |
+| 本场跳过 | 是 / 否，并写明另一场与手动开跑不受影响 |
+| 当前活动关 | `config.activity_stages` |
+| 活动截止 | `activity_deadline_text()` 读 MaaCore 的 `StageActivityV2.json`。**读不出来整行不显示** |
+| 🧪 理智规则 / 每日剿灭 | 不变 |
+| 上游更新 | **只有早场卡有** |
+
+`activity_deadlines()` 读 `~/Library/Caches/com.loong.maa/StageActivityV2.json` 的
+`Official.sideStoryStage.<前缀>.Activity.{Tip,UtcExpireTime,TimeZone}`。字段名带 `Utc`
+但**实际是 `TimeZone` 那个时区的本地时间**（maa-cli 源码注释亦如此），所以要按 `TimeZone`
+构造 tzinfo 再换算成北京时间。文件不存在 / JSON 坏 / 字段缺失**一律返回空表、绝不抛**——
+旁路信息不该带走整张卡（D-2 的教训）。路径可用 `config.maa_activity_cache` 覆盖（单测用）。
+
+### 抄作业卡（`copilot card`，四期 1c）
+
+渲染在 `copilot_card_view()`（同文件），派发在 `maa_action.copilot_card()`：
+
+```
+聊天「抄作业 / 有什么关能抄」
+  → maa_action.py copilot card      只读本地，一次 Discord POST，同步做完（<20s）
+      ├─ copilot_card_stages()：activity_stages（无活动 → 当天资源本 + 1-7）
+      │    × stage_drops() 主掉落 × maa_clearing.nav_checker() 导航键 × 本地关卡索引
+      ├─ 一览列全部候选（含「⛔ 上游无导航」），下拉只放**有导航**的关
+      ├─ 收旧卡：retire_discord_components(上一张 message_id) → 删旧登记
+      ├─ state_lock() 下 merge 写 hermes:btn:maa-copilot:card:stage-select
+      └─ 发卡 → 把新 message_id 写进 copilot/card.json（0600）
+  选中一关 → select_args → ["copilot","find",<关卡>] → 现有搜索 → 候选卡流程（不变）
+```
+
+**第四个按钮前缀 `hermes:btn:maa-copilot:card:`**：它在 `hermes:btn:maa-copilot:` 之下，
+所以计划卡那趟 `hermes:btn:maa:` 的整段清扫碰不到；又因为 `card` 不是 12 位 hex
+（`SEARCH_TOKEN_RE`），`prune_expired_searches()` 也永远轮不到它——那个函数只按
+`searches/<token>.json` 里真实存在的 token 清。**`card.json` 因此绝不能放进 `searches/`**，
+放进去会被当成一次过期搜索连文件带登记一起删掉。
 
 ### 关卡下拉是怎么构成的
 
@@ -122,15 +172,20 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 选项的 `value` 是**不透明的 `choice:N`**，真正的 argv 存在登记项的 `select_args` 里：
 
 ```jsonc
-"hermes:btn:maa:stage-select": {
+"hermes:btn:maa:am:stage-select": {
   "kind": "exec", "script": "maa_action.py",
-  "select_args": { "choice:0": ["plan","set-stage",""], "choice:1": ["plan","set-stage","1-7"], … }
+  "select_args": { "choice:0": ["plan","set-stage","","am"], "choice:1": ["plan","set-stage","1-7","am"], … }
 }
 ```
 
 adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直接变成命令行参数**；未知值、
 多值一律拒。改下拉相关代码时必须保持这个性质（对应测试
 `test_adapter_patch_dispatches_only_registered_select_values`）。
+
+**场次也走同一条路**：`am` / `pm` 由登记表写死在 argv 末尾，Discord 侧注入不了场次。
+custom_id 里也带场次（`hermes:btn:maa:{phase}:stage-select` / `:skip` / `:unskip`）——
+万一 `retire_old_plan_cards()` 没收干净旧卡（它是尽力而为的），点旧卡只会得到
+「未登记」，而不会把早场的选择悄悄写进晚场。
 
 ### 材料缺口 → 自动定关（三期步骤 6，2026-09-08 改版）
 
@@ -161,13 +216,15 @@ depot.json ── consumption_rates_window(≥4 周) ── farming_recommendati
 - **写的是同一个 `plan.stage` 字段**，不是新字段：`daily.toml` 只有一个「刷理智」
   Fight 块，两个字段会立刻产生「谁赢」的歧义。
 - **`stage_source` 区分「自动定的」和「你选的」**，且必须留在
-  `maa_action._today_override()` 的字段白名单里——掉了它，点一次「跳过」就会把
-  当天的自动定关当成手动选择冻住。写它的只有两处：`apply_auto_stage()`（`auto`）与
-  `maa_action.set_stage()`（`discord`），两处缺一，闸门就形同虚设。
-  卡片上「这关是谁定的」那行走 `today_stage_source()`——它**直接读 `plan.json`**，
-  因为 `effective_plan()` 只把 `stage` / `skip` 叠进默认计划，`normalize_plan()`
-  会把 `stage_source` 连同其余字段一起丢掉，从它返回的 plan 里查永远是空的。
-- 只在 07:50 算一次：卡片上写的关就是当天两场真正会跑的关。
+  `maa_action._today_override()` 的字段白名单（`maa_common.PLAN_SESSION_FIELDS`）里——
+  掉了它，点一次「跳过」就会把那一场的自动定关当成手动选择冻住。写它的只有两处：
+  `apply_auto_stage()`（`auto`）与 `maa_action.set_stage()`（`discord`），
+  两处缺一，闸门就形同虚设。
+  `normalize_plan()` 现在**把 `stage_source` 带过去**（以前会连同其余字段一起丢掉），
+  所以 `effective_plan()` 返回的 plan 里查得到它；卡片上「这关是谁定的」那行仍走
+  `today_stage_source(phase)`，它按场次读 `plan.json`。
+- **每张卡各算一次，各写各的场次**：早场卡写 `sessions.am`，晚场卡写 `sessions.pm`。
+  用户在早场手动选过之后晚场照样自动算（D3）。
 
 排序指标只有一个：`可用天数 = 当前库存 / 该材料日均消耗`，升序。三条降级路径：
 
@@ -185,7 +242,7 @@ depot.json ── consumption_rates_window(≥4 周) ── farming_recommendati
 取数口径在 `maa_depot.consumption_rates_window()`：取 `to` 落在窗口内的区间，
 `sum(consumed) / sum(days)`——不是只看最近一次对表，那正是把突发消耗看成 0 的原因。
 
-`🤖 请 Hermes 解释` 是唯一 `kind:"prompt"` 的按钮——它起一个只读的 agent 会话，不是 exec。
+现在所有登记项都是 `kind: "exec"`；`kind: "prompt"` 那条路径在 MAA 这边已经没有使用者。
 
 ---
 
@@ -268,16 +325,20 @@ worker 写执行终态，watcher 统一记 completed。
    > 快照是「跑起来之后再改计划不影响本场」的实现基础——后续对 `plan.json` 的写入
    > 既改不了内存里这个 dict，也改不了这个文件。
 4. `plan.skip` 为真**且 `phase != "now"`** → 发一条灰色「已跳过」Embed，`status=skipped`，
-   结束。**不开模拟器。** skip 只关掉 08:00/22:00 两个自动场次；手动场是用户当场下的
-   明确指令，本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会提示这一点）。
-4.5. **探模拟器（只对 `am`/`pm`）** — `emulator_is_online()`：`pgrep -f BlueStacks`
-   **或** `adb connect` + `getprop sys.boot_completed == 1`，任一命中即算「用户正在玩」，
-   `report_emulator_busy()` 发灰色「已跳过」Embed、写 `status=skipped` /
-   `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
+   结束。**不开模拟器。** skip 现在是**按场次**的（四期 D2）：它来自
+   `sessions.<phase>`，关掉早场不影响晚场；手动场是用户当场下的明确指令，
+   本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会列出哪几场设了跳过）。
+4.5. **探模拟器（只对 `am`/`pm`）** — `maa_common.emulator_is_online()`：
+   `pgrep -f BlueStacks` **或** `adb connect` + `getprop sys.boot_completed == 1`，
+   任一命中即算「用户正在玩」，`report_emulator_busy()` 发灰色「已跳过」Embed、写
+   `status=skipped` / `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
    起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把 BlueStacks
    关掉，等于把正在玩的用户踢出游戏。`now` 不走这条闸门（用户明确要求照跑）。
    探测预算 5s、失败按离线处理照常执行——**宁可误抢一次设备，也不能因为探测自己坏了
    就永久停摆**（不变量 #24）。
+   **实现只有一份**，在 `maa_common.py`：日常、抄作业 worker、通关队列、Depot 四条自动
+   链路共用它（四期 D18）。`maa_daily.report_emulator_busy()` 只是把日常的文案与
+   `last_run` 字段套进 `maa_common.report_emulator_busy()` 的薄封装。
    > 别和第 8 步的 `settle_android_runtime()` 搞混：那个在**开机之后**跑，等 `app_process`
    > 别抖；这个在**开机之前**跑，问的是"设备现在是不是别人的"。
 5. **预检 → 起模拟器** — `require_executable` 校验 maa/adb 可执行（**在开模拟器之前**）→
@@ -386,22 +447,29 @@ worker 写执行终态，watcher 统一记 completed。
 
 | 命令 | 行为 |
 |---|---|
-| `plan set-stage <关卡>` | 白名单校验后写今日覆盖 |
-| `plan skip-today on\|off` | 写今日覆盖 |
-| `plan show` | 只读 |
+| `plan set-stage <关卡> <am\|pm>` | 白名单校验（关卡 + 场次）后写**那一场**的今日覆盖 |
+| `plan skip-today on\|off <am\|pm>` | 写**那一场**的今日覆盖 |
+| `plan show` | 只读，一次念完两场（关、来源、跳不跳） |
 | `run now` | 抢锁探测 → 预检 → `Popen` 派发 `maa_daily.py now` 后立即返回 |
 | `log tail` | 读 `last_run.summary`；若是旧版格式则回读 log 用 `extract_summary` 重建 |
+| `copilot card` | 发抄作业一览卡（§3）。只读本地 + 一次 Discord POST，同步做完 |
 | `clearing status/start/stop/run` | 通关队列（§5.6）；`run` 只 `Popen` 派发 worker |
 | `clearing manual-done <关卡>` | `needs_manual` 卡片的「已完成」按钮，cursor++ |
 
-关卡白名单 `valid_stage()`：空串 ✔ / `^[A-Za-z0-9]{1,8}-\d{1,2}$` ✔ /
+**场次参数不可省**（`dispatch()` 按 argv 长度精确匹配），且只接受 `am` / `pm`；
+`now` 不是可写的场次——手动场按定义不吃任何覆盖（D4）。
+
+场次白名单 `valid_phase()`：只有 `am` / `pm`。关卡白名单 `valid_stage()`：空串 ✔ / `^[A-Za-z0-9]{1,8}-\d{1,2}$` ✔ /
 在 `config.activity_stages` 里 ✔ / 否则**现场跑 `maa activity Official` 并按词边界精确匹配**
 （超时只给 **0.7s**，因为整体预算是 20s）。其余一律拒。
 
 写状态时的两个细节：
-- `_today_override()` 只保留 `date/stage/skip/source/updated_at` 五个键，其余字段丢弃；
-  日期不是今天就整个重置。所以 `plan.json` 天然「今天说的话明天失效」，不需要清理任务。
-- `is_run_locked()` 决定确认话术：正在跑就明确回「不打断本场，X 生效于……」。
+- `_today_override()` 返回 `{date, sessions: {am, pm}}`，每个场次只保留
+  `maa_common.PLAN_SESSION_FIELDS`（`stage/stage_source/skip/source/updated_at`）里的键，
+  非法场次名与白名单外的字段一律丢弃；日期不是今天、或磁盘上还是**旧的按天格式**
+  （顶层 `stage`/`skip`）就整个重置成空。所以 `plan.json` 天然「今天说的话明天失效」，
+  不需要清理任务，**也不需要为旧格式写迁移**——它一天后自然失效。
+- `is_run_locked()` 决定确认话术：正在跑就明确回「不打断本场，改的是哪一场」。
 
 `emit()` 把输出压在 7900 字节内——组件运行器只接受 ≤8192 字节的 JSON。
 
@@ -420,7 +488,7 @@ worker 写执行终态，watcher 统一记 completed。
 `copilot_blackout_minutes`（默认 25）内 `copilot pick` 直接拒绝。
 
 ```
-计划卡第二下拉 / 聊天「抄 TO-9」
+抄作业卡下拉 / 聊天「抄 TO-9」
    → maa_action.py copilot find TO-9     ~10ms（读本地 stage_index，零网络）
        ├─ 写 searches/<token>.json {status:pending}（token=12 位 hex）
        └─ Popen(maa_copilot_worker.py search <token>) 后立即返回
@@ -436,6 +504,7 @@ worker 写执行终态，watcher 统一记 completed。
        └─ Popen(worker run <token> <n> <mode>) 后立即返回
                     worker run（8~15 分钟）
        ├─ run_lock(blocking=False) 抢锁，抢不到恢复确认卡并发「未启动」通知
+       ├─ emulator_is_online()：已在线 → 恢复 done + 发「模拟器正在使用」，什么都不碰
        ├─ 渲染 tasks/copilot-nav.toml（StartUp + Fight times=1 + Custom 界面检查，临时配置禁用战斗点击）——单作业
        │   copilot 不会自己从主界面导航，必须先停在关卡详情界面
        ├─ 模拟器 → maa run copilot-nav（导航失败=MAA 没为该关写导航定义/不可达，直接报错）
@@ -600,13 +669,15 @@ ROI 默认值是**未校准的估计**，第一次 `sanity-probe` 跑完按截�
 ~/.hermes/state/maa/
   config.json     环境与阈值（路径、超时、channel_id、活动关缓存）    ← 计划卡会改写
   defaults.json   持久默认：stage="1-7" / medicine=expiring / tasks 全开
-  plan.json       今日覆盖：{date, stage, skip, source, updated_at}
+  plan.json       今日覆盖（**按场次**）：{date, sessions: {am: {stage, stage_source,
+                  skip, source, updated_at}, pm: {…}}, updated_at}
   last_run.json   最近一次运行状态 + threads[] + 资源更新时间戳
   activity_watch.json 当前活动观察 + 搜索 token + idle/searching/waiting/ready/
                       preparing/executing/dismissed/completed 状态
   depot.json      最近完整 Depot 真值 + 期间掉落增量 + 历次消耗与日均消耗率
   clearing.json   通关队列：stages[] / cursor / 每关失败日期与冻结 / needs_manual
                   / EX 闸门阻塞原因 / 去重通知（0600，atomic_write_json）
+  copilot/card.json 上一张抄作业卡的 message_id（0600）。**不能放进 copilot/searches/**
   run.lock        flock 独占锁（执行）
   last_run.lock   flock 独占锁（保护 last_run.json 的跨进程 read-modify-write）
   am/ pm/         空目录，仅用于给 cron 传场次
@@ -617,17 +688,24 @@ ROI 默认值是**未校准的估计**，第一次 `sanity-probe` 跑完按截�
   state.lock      共享写锁
 ```
 
-**计划的求值**（`effective_plan()`，`scripts/maa_common.py`）：
+**计划的求值**（`effective_plan(at, phase)`，`scripts/maa_common.py`）：
 
 ```
 result = normalize_plan(defaults.json)
-if plan.json.date == 今天(Asia/Shanghai):   只叠加 stage 和 skip 两个键
+if plan.json.date == 今天(Asia/Shanghai):
+    只叠加 sessions[phase] 里的 stage / stage_source / skip 三个键
 result = normalize_plan(result)             ← 再规范化一次
 ```
 
-`normalize_plan()` 每次都**强制** `medicine="expiring"`、`stone=0`，
-即使磁盘上被人手工塞了别的值也没用（对应测试
-`test_persisted_medicine_choice_cannot_disable_fixed_expiry_policy`）。
+- `phase ∈ {am, pm, now}`。**`now` 永远拿不到覆盖**：没有任何写路径会产生
+  `sessions.now`（`plan set-stage` / `skip-today` 只接受 `am` / `pm`），
+  所以手动场天然走缺口默认关（D4）。
+- 磁盘上是**旧的按天格式**（顶层 `stage` / `skip`）时 `plan_sessions()` 返回空表，
+  等于当天没有覆盖。**不做迁移**：那份数据一天后本来就失效。
+- `normalize_plan()` 每次都**强制** `medicine="expiring"`、`stone=0`，
+  即使磁盘上被人手工塞了别的值也没用（对应测试
+  `test_persisted_medicine_choice_cannot_disable_fixed_expiry_policy`）；
+  但它**保留 `stage_source`**——那是卡片判断「这关是谁定的」的唯一依据。
 
 **三把锁，别搞混**：
 
@@ -726,17 +804,24 @@ cron 本身只在首次创建时需要注册：
 ```bash
 hermes cron create "*/15 * * * *" --name "MAA 活动作业监控" --script maa_activity_watch.py --no-agent --deliver local
 hermes cron create "30 20 * * *"  --name "MAA 仓库对表"     --script maa_depot.py --no-agent --deliver local
-hermes cron create "50 23 * * *" --name "MAA 计划卡"  --script maa_plan_card.py --no-agent --deliver local
+hermes cron create "50 23 * * *" --name "MAA 计划卡·早" --script maa_plan_card.py --no-agent --deliver local --workdir ~/.hermes/state/maa/am
+hermes cron create "50 13 * * *" --name "MAA 计划卡·晚" --script maa_plan_card.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 hermes cron create "0 0 * * *"   --name "MAA 日常·早" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/am
 hermes cron create "0 14 * * *"  --name "MAA 日常·晚" --script maa_daily.py --no-agent --deliver local --workdir ~/.hermes/state/maa/pm
 ```
 
 cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot 的 `20:30 UTC` 是
-次日北京时间 `04:30`；脚本内部一律用 `Asia/Shanghai`。
-改时间时两边都要想清楚。当前在册：`3ba48fb85d0b`（活动作业监控）、
-`b2f15f13589f`（仓库对表）、`03d5e98ce8d4`（计划卡）、`50cd1fb095f2`（早）、
-`4f48cf619d9f`（晚），可用
-`hermes cron list` 复核。
+次日北京时间 `04:30`，计划卡的 `50 23` / `50 13 UTC` 是京 `07:50` / `21:50`；
+脚本内部一律用 `Asia/Shanghai`。改时间时两边都要想清楚。
+
+**计划卡现在也靠 workdir 传场次**（四期 1b）。在册的那条计划卡 cron
+（`03d5e98ce8d4`）**没有 workdir**，部署这一步时要么 `hermes cron update` 给它加上
+`--workdir ~/.hermes/state/maa/am`，要么删了按上面重建；晚场那条是**新建**的。
+不改也不会崩（`select_phase()` 会按小时兜底判成 `am`），但那是兜底不是设计。
+
+当前在册：`3ba48fb85d0b`（活动作业监控）、`b2f15f13589f`（仓库对表）、
+`03d5e98ce8d4`（计划卡·早，待补 workdir）、`50cd1fb095f2`（日常早）、
+`4f48cf619d9f`（日常晚），可用 `hermes cron list` 复核。
 
 ---
 
@@ -753,16 +838,17 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 5 | 截图发生在 `maa run` 之后、`closedown` 之前；CloseDown 不进任务链 | `execute()` 步骤 9/10 + `daily.toml` 注释 |
 | 5b | 日常战报的截图必须 OCR 确认在游戏主页；抄作业不受这条闸门约束 | `capture_home_screenshot()` / `verify_home_screenshot()`；`maa_copilot_worker` 直接用 `capture_screenshot()` |
 | 5c | `Custom` 的 `task_names` 每项都带 `Home@` 前缀，`#back` 才有得解析 | `maa_daily.HOME_TASK_NAMES` + `config/maa-cli/tasks/daily.toml` 注释 |
-| 5d | `skip` 只挡自动场次；`phase == "now"` 永远照跑 | `execute()` 的 skip 分支带 `and phase != "now"` |
+| 5d | `skip` 只挡**设它的那一场**；`phase == "now"` 永远照跑 | `execute()` 的 skip 分支带 `and phase != "now"` + `SessionDailyTests` |
 | 6 | 按钮脚本必须 < 20s 返回 | `run_now()`/`copilot_*` 用 `Popen`；活动关探测 0.7s |
-| 7 | `buttons.json` 只能 merge，且只碰 `hermes:btn:maa:` 前缀 | `maa_plan_card.main()` |
-| 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv | adapter 补丁 + `_stage_select()`/`_copilot_stage_select()` |
+| 7 | `buttons.json` 只能 merge，且计划卡只碰 `hermes:btn:maa:` 前缀 | `maa_plan_card.main()` |
+| 8 | Discord 下拉值必须经 `select_args` 查表，不能直通 argv。**场次（`am`/`pm`）同样写死在登记表的 argv 里**，Discord 侧注入不了 | adapter 补丁 + `maa_plan_card._stage_select()` + `maa_action._copilot_card_components()` + `test_every_control_carries_its_own_phase` |
 | 9 | 原始 CLI 文本不进 Discord | `progress_content` / `extract_summary` / `_copilot_summary` 是唯一出口 |
 | 10 | 开跑后快照即冻结，改计划不影响本场 | `runs/<date>-<phase>.json` + 内存 plan |
 | 11 | 所有 maa-cli 子进程显式注入 `MAA_CONFIG_DIR` | `maa_subprocess_env()`（macOS 默认目录不是 `~/.config/maa-cli`） |
 | 12 | 日常 `maa run` 剔除代理；`maa update` / brew 保留代理以便访问 GitHub | `maa_subprocess_env(keep_proxy=…)` |
 | 13 | 抄作业与日常互斥：同一时刻只有一场 MAA（`run.lock`）；08:00/22:00 前 `copilot_blackout_minutes` 内拒绝 pick | `copilot_pick()` 预检 + worker `run_lock(blocking=False)` |
 | 14 | 抄作业按钮用 `hermes:btn:maa-copilot:` 前缀（连字符），早清扫 `hermes:btn:maa:` 碰不到；过期由 `prune_expired_searches()` 清理 | `maa_copilot.BUTTON_PREFIX` + `maa_plan_card` 锁块 |
+| 14b | **抄作业卡**用 `hermes:btn:maa-copilot:card:` 前缀：它在 #14 的前缀之下（躲开计划卡清扫），而 `card` 不是 12 位 hex，`prune_expired_searches()` 只按 `searches/<token>.json` 里真实存在的 token 清，也碰不到它。因此 `card.json` **必须放在 `copilot/` 而不是 `copilot/searches/`**——放进去会被当成一次过期搜索，连文件带登记一起删。发新卡的顺序固定为「PATCH 旧卡组件 → 删旧登记 → merge 写新登记 → 发卡 → 记新 message_id」，反过来会出现「旧卡还能点、登记已指向新卡」的窗口 | `maa_copilot.CARD_BUTTON_PREFIX` / `CARD_PATH` + `maa_action.copilot_card()` + `CopilotCardTests` |
 | 15 | 抄作业路径永不传 `--use-sanity-potion`（`--ignore-requirements` 只在用户点的候选 `ratio < 1.0` 时出现） | `_run_locked()` argv 构造 + 测试断言 |
 | 16 | 森空岛/鹰角 token 永不经 Discord、argv、agent 上下文；`copilot/` 下文件 0600 | `maa_skland.py` stdin/环境变量注入 + 测试 |
 | 17 | 抄作业关卡只接受本地 `stage_index` 精确查表，不许猜别名 | `valid_copilot_stage()` |
@@ -772,20 +858,22 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 | 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |
 | 23 | Depot 不得在计划卡链路内运行；独立 cron 每日只做 7 天到期检查。任何日常抢锁失败都必须写 `last_lock_conflict_*`、发 Discord 并返回失败；`merge_last_run()` 必须持专用锁，不能用陈旧整份文件覆盖持锁任务的新状态 | `maa_depot.main()` / `maa_daily.report_lock_conflict()` / `maa_common.last_run_lock()` + 调度与锁冲突回归测试 |
-| 24 | 自动场次（`am`/`pm`）在 `open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本场，且**必须发 Discord 并写 `last_run.json`**（`status=skipped` + `skip_reason=emulator_busy`），文案要给出「说『现在跑』」这条出路。`now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同） | `maa_daily.AUTO_PHASES` / `emulator_is_online()` / `report_emulator_busy()` + `EmulatorProbeTests` |
+| 24 | **每一条自动链路**（日常 `am`/`pm`、抄作业 worker、通关队列、Depot）在拿到 `run.lock` 之后、`open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本次，且**必须发 Discord 并写 `last_run.json`**（日常写 `status=skipped` + `skip_reason=emulator_busy`，Depot 写 `depot_status="skipped_busy"` 且**不动 `snapshot_at`**，抄作业把搜索恢复成 `done` 让原卡可再点），文案要给出出路。日常的 `now` 与 `cmd_sanity_probe` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同）。**实现只允许有一份**，在 `maa_common.py`；`maa_daily` 那个同名函数只是薄封装 | `maa_common.emulator_is_online()` / `report_emulator_busy()` + `maa_daily.AUTO_PHASES` + `EmulatorProbeTests` / `EmulatorProbeSharedTests` |
 | 25 | `state/config.json` 里**由线上进程写回的运行时缓存键**（当前 `maa_core_version`、`maa_cli_version`、`activity_stages`）必须列入 `deploy.PRESERVED_RUNTIME_CACHE_KEYS`：线上已有值一律保留，仓库种子**只在首次部署时兜底**。**新增此类键时必须同步加进这个元组**，否则每次 `deploy.py` 都会用种子盖掉线上真值（2026-09-02 已实际发生过一次） | `deploy.PRESERVED_RUNTIME_CACHE_KEYS` / `deploy_state()` + `test_every_known_runtime_cache_key_is_preserved_on_deploy`（手工清单比对，漏加即红）、`test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent` |
 | 26 | 「刷理智」与「每日剿灭」是 `render_daily_toml()` 里**两个独立开关**（`plan["farming"]` / `plan["annihilation"]`，`tasks.fight` 仍是二者的总开关）。通关队列**只摘刷理智、永远保留剿灭**（周上限 1800 合成玉、代理卡驱动，摘掉纯亏）。队列状态读不出来时**按不活跃处理**——宁可多刷一场，也不能因为读状态失败就一整天什么都不打 | `render_daily_toml` 的两个 `if` + `attach_clearing_yield()` + `ClearingDailyYieldTests` |
 | 27 | 「队列活跃」= cursor 未到末尾 **且** 今日无 nav 冻结 **且** 不在 `needs_manual` 等待 **且** 今日未被 `mark_blocked()` 堵住，**四**条件缺一不可。**冻结日、等待日、被堵日日常都照常刷理智**：少判任何一条都会让那天既不打队列也不刷理智，理智白白溢出且日常判绿无人察觉。第 4 条专治「理智成本算不出来」——它不像理智不够那样等等就好，会让队列永久「活跃但打不了」；按日期记、次日自动重试一次，排得出关时 `clear_blocked()` 解除。**理智不够不记这一笔** | `maa_clearing.queue_is_active()` / `mark_blocked()` + `test_queue_is_active_requires_all_three_conditions` / `test_frozen_day_still_farms` / `test_needs_manual_waiting_day_still_farms` / `ClearingUnknownCostBlockTests` |
 | 28 | 队列排关前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的关**不入当轮、不进预算、cursor 不前进**（那不是「打完了」，是「算不出来」，前进会把它永久跳过），提示只发一次 | `maa_clearing.sanity_budget()` / `plan_round()` + `ClearingQueueTests` |
 | 29 | EX 开放闸门是**独立于 `zone_progress_warning()`** 的第二条单向规则，两个模块互不 import；森空岛不可用一律 **fail-closed 不入队 EX**，且必须**可见**：写 `clearing.json` 的 `ex_gate_blocked_reason/_since`，并发一次去重后的 Discord 卡片（同原因不刷屏、原因变了重新发）。⚠️ `totalStage == 0` 这条推论**未实地验证**，下个活动上线当天要核对 | `maa_clearing.ex_gate()` / `apply_ex_gate()` + `test_ex_gate_*`（含 AST 结构断言） |
 | 30 | `needs_manual` 的 N 按**不同日期**计（`Asia/Shanghai` 日界），不按尝试次数计；触发后 cursor **不前进**，只有用户点「已完成」才前进。队列按钮用**第三个前缀** `hermes:btn:maa-clearing:`，不进 `hermes:btn:maa:` 的 07:50 清扫（卡片要跨天存活），也不进 `hermes:btn:maa-copilot:` 的 token TTL 清扫（队列没有 token）——不变量 #7/#14 的边界因此一字未改 | `maa_clearing.record_stage_failure()` / `BUTTON_PREFIX` + `test_manual_threshold_counts_distinct_dates_not_attempts` / `test_manual_card_button_uses_its_own_prefix` |
-| 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 改版：原第三个下拉已删除——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage()` 写进当天 `plan.stage`（**同一个字段**：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`。**用户手动选过（`stage_source="discord"`）当天就不许再自动改**；`stage_source` 必须留在 `maa_action._today_override()` 的字段白名单里，否则点一次「跳过」就把当天的自动定关冻住。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则。**降级期（无实测消耗）一律不自动改关**——那时的排序只是手工权重，拿猜的结果改每天刷什么正是「不许猜关」要防的事 | `auto_stage()` / `apply_auto_stage()` + `FarmingAutoStageTests` |
+| 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 改版：原第三个下拉已删除——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage(result, phase)` 写进当天**那一场**的 `sessions.<phase>.stage`（**同一个字段**：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`。**用户在某一场手动选过（`stage_source="discord"`）当天那一场就不许再自动改**，另一场不受影响；`stage_source` 必须留在 `maa_common.PLAN_SESSION_FIELDS` 白名单里，否则点一次「跳过」就把那一场的自动定关冻住。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则。**降级期（无实测消耗）一律不自动改关**——那时的排序只是手工权重，拿猜的结果改每天刷什么正是「不许猜关」要防的事 | `auto_stage()` / `apply_auto_stage()` + `FarmingAutoStageTests` |
 | 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
 | 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基，活动关的材料不靠手工维护。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在「今天真的选得到的关」里取第一个命中——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选排序：手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底（`stages.json` **没有掉率**，这是启发式；排序不确定会让同样的库存今天推 A 明天推 B）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` |
 | 33 | 队列 cursor **只在这一关被判定为通关时**才前进：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行） | `maa_clearing.copilot_outcome()` + `ClearingVictoryJudgementTests` |
 | 34 | EX 段的突袭用队列条目的 `#raid` 后缀表示，突袭紧跟对应普通关；**除了 `maa copilot --raid` 的取值，理智查表 / 导航 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.ex_segment()` / `split_entry()` + `ClearingRaidTests` |
 | 35 | 通关队列派发失败（worker 未部署 / `Popen` 抛错）必须**写 `last_run` 并发 Discord**，不能只写状态（护栏 4）。「功能未启用」「队列不活跃」是正常无操作，不发 | `maa_daily.report_clearing_dispatch_failure()` + `ClearingDispatchNoticeTests` |
 | 36 | EX 关理智只信两处：`stages.json` 真值（优先）与编队界面 OCR 缓存。OCR 读不出（ocrbox 缺失 / 崩溃 / ROI 内无数字 / 两个不同数字）**一律 `None`，不许猜数、不许拿 0 或同活动普通关的值顶替**；`None` 的关不入轮、不进预算、cursor 不动，按「今日堵住」记账。普通关的 `stage_sanity_cost()` 行为不变 | `maa_clearing.sanity_cost_from_ocr()` / `ocr_sanity_cost()` / `resolve_cost()` + `SanityOcrTests` / `ClearingSanityProbeTests` |
+| 39 | **计划的覆盖是按场次的**：`plan.json` 的形状是 `{date, sessions: {am, pm}, updated_at}`，`effective_plan(at, phase)` 只叠 `sessions[phase]`。改早场绝不影响晚场（D3）。**`now` 永远叠不到任何场次**——没有写路径能产生 `sessions.now`（`plan set-stage` / `skip-today` 只接受 `am`/`pm`），所以手动场按定义走缺口默认关（D4）。磁盘上是旧的按天格式（顶层 `stage`/`skip`）时**读成空**、不迁移、不抛 | `maa_common.plan_sessions()` / `effective_plan()` / `maa_action._today_override()` + `PlanTests.test_session_overrides_apply_per_phase_and_expire_next_day` / `test_legacy_day_level_plan_reads_as_empty_and_never_raises` / `SessionDailyTests` |
+| 40 | **晚场计划卡不跟随上游更新**（D1）：`brew` / `maa update` / `maa hot-update` 只在早场卡跑。晚场卡因此也没有「上游更新」字段，`main()` 末尾那个「更新失败就 raise」只在 `update is not None` 时判。计划卡**恰好两行控件**：一个 `stage-select` 下拉 + 一个「跳过本场 / 恢复本场」按钮；登记表里不许再出现 `explain` / `log` / `farming-select` / 抄作业下拉的键 | `maa_plan_card.main()` / `build_components()` + `PlanCardPhaseTests.test_the_evening_card_never_follows_upstream` / `DiscordCardTests.test_the_card_has_exactly_one_select_and_one_button` |
 | 37 | 队列**只跑上游 `tasks/Stages/<前缀>.json` 里已有顶层键的关**（前缀 = 关卡名第一个 `-` 之前；突袭条目按去掉 `#raid` 的普通关名查）。本项目**不再自写导航定义**，也**不读、不建** `~/.config/maa-cli/resource/tasks/Stages/`；只读 `maa_copilot._resource_dirs()` 给的上游目录，文件缺失 / 读失败 / JSON 坏 / 顶层不是对象**一律视为无键**（fail-closed，异常摘要进原因）。无键的关**不排入当轮**且**立刻**走 needs_manual（`record_stage_failure(immediate=True)`，**同一个出口**，不等 `clearing_manual_after_days` 的 N 日规则——导航定义不会自己长出来），`clearing.json` 记 `reason: "no_nav_definition"`，卡片写明「MAA 未为该关写导航定义」，同原因只发一次；cursor 不前进，用户点「已完成」后照常前进 | `maa_clearing.nav_checker()` / `read_nav_keys()` / `plan_round(nav_of=…)` + `ClearingNavDefinitionGateTests` |
 
 ---
@@ -801,8 +889,8 @@ python3 deploy.py
 # 4. 若改了 adapter/config.yaml/.env/SKILL.md
 hermes gateway restart
 # 5. 真机验证（cron run 是在下一个调度 tick 触发，不是立即执行）
-hermes cron run 03d5e98ce8d4          # 计划卡
-python3 ~/.hermes/scripts/maa_action.py plan show
+hermes cron run 03d5e98ce8d4          # 早场计划卡（workdir=…/maa/am）
+python3 ~/.hermes/scripts/maa_action.py plan show     # 一次念完两场
 hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、真的耗理智）
 ```
 
@@ -860,7 +948,11 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
 | 场次 30～40 秒就红，日志只有五行且有 `TouchModeNotAvailable`，截图是模拟器桌面 | 没连上模拟器，MaaCore 在 StartUp 里 SIGSEGV 了 → §11.14。看 `last_run.connect_retries` 确认重试有没有接上；`com.loong.maa/crash.log` 是第二现场 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
-| 点按钮/下拉没反应或报未登记 | 卡片过期（每天 07:50 会清前缀重写）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
+| 点按钮/下拉没反应或报未登记 | 卡片过期（07:50 与 21:50 各清一次 `hermes:btn:maa:` 前缀并重写，所以 21:50 之后早场卡必然点不动）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
+| 早场改的关晚上也生效了 / 改一场把另一场也改了 | 看 `plan.json` 的 `sessions`：是不是被写成了旧的顶层 `stage`。写路径只有 `maa_action._save_override(phase, …)` 和 `maa_plan_card.apply_auto_stage(result, phase)` 两处 |
+| 卡片上没有「活动截止」这一行 | 是设计：`~/Library/Caches/com.loong.maa/StageActivityV2.json` 读不出来就整行不显示。跑一次 `maa activity Official` 让它刷出来，或用 `config.maa_activity_cache` 指到别处 |
+| 说「抄作业」发的卡下拉是空的 | 一览里每关都标了「⛔ 上游无导航」——下拉只放上游写了导航定义的关（不变量 #37）。等热更新带来导航定义，或改抄资源本 / 主线 |
+| 日常/抄作业/队列/Depot 报「模拟器正在使用」 | 探测命中了（不变量 #24）。`pgrep -fi bluestacks` 看是不是真有残留进程；确实是残留就 `pkill` 掉再重试。日常想强行跑就说「现在跑」 |
 | 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `activity_snapshot()` / `parse_activity_events()` 的分区解析与正则 |
 | 新活动上线后没有确认卡 | `hermes cron list` 看“MAA 活动作业监控”；再看 `activity_watch.json` 与对应 `copilot/searches/<token>.json`。waiting 会按 `activity_search_retry_minutes` 自动重试 |
 | 自动确认提示理智读取失败 | 森空岛凭据已过期或 API 变化；只在本机终端重新跑 `maa_skland.py link`，不要把 token 发到 Discord |

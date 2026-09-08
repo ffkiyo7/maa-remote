@@ -1,7 +1,7 @@
 ---
 name: maa-operator
-description: "通过受控脚本查看或修改今天的 MAA 日常计划，支持关卡、跳过、抄作业和查看中文执行结果。"
-version: 2.1.0
+description: "通过受控脚本查看或修改今天早场 / 晚场各自的 MAA 日常计划，支持关卡、跳过、抄作业和查看中文执行结果。"
+version: 3.0.0
 metadata:
   hermes:
     tags: [maa, arknights, games, automation]
@@ -28,8 +28,12 @@ metadata:
    不在技能中写死。
 5. 理智规则固定为普通理智药 0、自动使用临期药、碎石 0，默认关卡是 `1-7`，并持续
    作战到剩余理智不足；不接受修改吃药或碎石。当天第一场会用代理卡全权委托刷当期
-   剿灭，满 1800 合成玉/周后自动停，同一游戏日不再进第二次。只允许修改今天的关卡
-   和是否跳过。不得修改任务链、次数、ADB、Discord、模拟器或默认配置。
+   剿灭，满 1800 合成玉/周后自动停，同一游戏日不再进第二次。只允许修改今天**某一场**
+   的关卡和是否跳过。不得修改任务链、次数、ADB、Discord、模拟器或默认配置。
+5b. **计划是按场次的**：`am` = 早场 08:00，`pm` = 晚场 22:00。`plan set-stage` 与
+   `plan skip-today` 都**必须**带场次参数，只接受 `am` / `pm`；改一场不影响另一场。
+   用户没说是哪一场时**先问**，不要替他挑，也不要两场都改。「现在跑」的手动场
+   不吃任何场次覆盖，永远走缺口默认关。
 6. 原样转述脚本 JSON 中的 `message`。若 `ok:false`，不要自行改写成成功，也不要
    绕过校验重试别的写法。
 7. **绝不索取、接收、复述或写入森空岛/鹰角 token**。用户想在聊天里贴 token 时，
@@ -44,13 +48,14 @@ metadata:
 用 terminal 以 argv 形式执行，不拼接额外 shell 操作：
 
 ```text
-python3 ~/.hermes/scripts/maa_action.py plan set-stage <关卡>
-python3 ~/.hermes/scripts/maa_action.py plan set-stage ""
-python3 ~/.hermes/scripts/maa_action.py plan skip-today on
-python3 ~/.hermes/scripts/maa_action.py plan skip-today off
+python3 ~/.hermes/scripts/maa_action.py plan set-stage <关卡> <am|pm>
+python3 ~/.hermes/scripts/maa_action.py plan set-stage "" <am|pm>
+python3 ~/.hermes/scripts/maa_action.py plan skip-today on <am|pm>
+python3 ~/.hermes/scripts/maa_action.py plan skip-today off <am|pm>
 python3 ~/.hermes/scripts/maa_action.py plan show
 python3 ~/.hermes/scripts/maa_action.py run now
 python3 ~/.hermes/scripts/maa_action.py log tail
+python3 ~/.hermes/scripts/maa_action.py copilot card
 python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
 python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
@@ -69,15 +74,18 @@ token 形如 12 位十六进制，来自搜索确认消息，不要猜测。
 
 ## 意图映射
 
-- “刷 CE-6 / 今天 CE-6 / 改成 1-7” → `plan set-stage CE-6` / `1-7`
-- “刷上次的本” → `plan set-stage ""`
-- “默认关卡 / 恢复 1-7” → `plan set-stage 1-7`
+- “早上刷 CE-6 / 晚上改成 1-7” → `plan set-stage CE-6 am` / `plan set-stage 1-7 pm`
+- “刷上次的本” → `plan set-stage "" <am|pm>`
+- “默认关卡 / 恢复 1-7” → `plan set-stage 1-7 <am|pm>`
 - “吃药 / 不吃药 / 揉揉乐” → 说明规则已固定：普通药 0、只自动使用临期药、碎石 0
-- “今天别跑 / 跳过今天” → `plan skip-today on`（只关掉 08:00、22:00 两个自动场次）
-- “恢复今天” → `plan skip-today off`
-- “今天怎么跑 / 看计划” → `plan show`
-- “现在跑” → `run now`（手动场豁免 skip：设了跳过也照跑，这是明确指令）
+- “早场别跑 / 今晚跳过” → `plan skip-today on am` / `plan skip-today on pm`
+  （只关掉那一场，另一场照常）
+- “恢复早场 / 晚上还是跑吧” → `plan skip-today off <am|pm>`
+- “今天怎么跑 / 看计划” → `plan show`（一次念完两场）
+- “现在跑” → `run now`（手动场豁免 skip 且不吃场次覆盖：设了跳过也照跑，走默认关）
 - “看日志 / 最近怎么了” → `log tail`（只返回中文结果，不展示 CLI 原文）
+- “抄作业 / 有什么关能抄 / 抄作业卡” → `copilot card`（发一张当前能抄的关一览卡，
+  用户从卡上的下拉选关；不要替用户选）
 - “抄 TO-9 / TO-9 有没有作业 / 帮我抄一下” → `copilot find TO-9`
 - “作业结果呢 / 匹配到哪了” → 让用户直接看频道里的候选卡片；也可 `copilot status <token>`
 - “换一批 / 重找” → 候选卡片上的 🔄 按钮（`copilot again`），不用手拼

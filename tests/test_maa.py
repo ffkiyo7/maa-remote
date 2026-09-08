@@ -90,7 +90,8 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(maa_common.normalize_plan({})["stage"], "1-7")
         self.assertEqual(maa_common.normalize_plan({"stage": ""})["stage"], "")
 
-    def test_today_override_applies_and_stale_override_expires(self) -> None:
+    def test_session_overrides_apply_per_phase_and_expire_next_day(self) -> None:
+        """四期 1a：覆盖是按场次的，`now` 一场都不叠（D4）。"""
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             defaults = root / "defaults.json"
@@ -98,28 +99,79 @@ class PlanTests(unittest.TestCase):
             maa_common.atomic_write_json(defaults, {"stage": "1-7", "medicine": "none"})
             maa_common.atomic_write_json(
                 override,
-                {"date": "2026-08-02", "stage": "CE-6", "medicine": "expiring"},
+                {
+                    "date": "2026-08-02",
+                    "sessions": {
+                        "am": {"stage": "CE-6", "stage_source": "discord", "skip": True},
+                        "pm": {"stage": "SK-5"},
+                    },
+                },
             )
+            at = datetime(2026, 8, 2, tzinfo=BEIJING)
             with patch.object(maa_common, "DEFAULTS_PATH", defaults), patch.object(
                 maa_common, "PLAN_PATH", override
             ):
-                today = maa_common.effective_plan(datetime(2026, 8, 2, tzinfo=BEIJING))
-                tomorrow = maa_common.effective_plan(datetime(2026, 8, 3, tzinfo=BEIJING))
-            self.assertEqual(today["stage"], "CE-6")
-            self.assertEqual(today["medicine"], "expiring")
-            self.assertEqual(tomorrow["stage"], "1-7")
-            self.assertEqual(tomorrow["medicine"], "expiring")
+                morning = maa_common.effective_plan(at, "am")
+                evening = maa_common.effective_plan(at, "pm")
+                manual = maa_common.effective_plan(at, "now")
+                tomorrow = maa_common.effective_plan(
+                    datetime(2026, 8, 3, tzinfo=BEIJING), "am"
+                )
+        self.assertEqual(morning["stage"], "CE-6")
+        self.assertTrue(morning["skip"])
+        # 早场的关与跳过都不会漏到晚场（D3）。
+        self.assertEqual(evening["stage"], "SK-5")
+        self.assertFalse(evening["skip"])
+        # 手动场永远是缺口默认关（D4）。
+        self.assertEqual(manual["stage"], "1-7")
+        self.assertFalse(manual["skip"])
+        self.assertEqual(tomorrow["stage"], "1-7")
+        self.assertEqual(tomorrow["medicine"], "expiring")
+
+    def test_legacy_day_level_plan_reads_as_empty_and_never_raises(self) -> None:
+        """旧的按天格式（顶层 stage/skip）不迁移，直接当空——一天后自然失效。"""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            defaults = root / "defaults.json"
+            override = root / "plan.json"
+            maa_common.atomic_write_json(defaults, {"stage": "1-7"})
+            at = datetime(2026, 8, 2, tzinfo=BEIJING)
+            for legacy in (
+                {"date": "2026-08-02", "stage": "CE-6", "skip": True},
+                {"date": "2026-08-02", "sessions": ["not", "a", "dict"]},
+                ["not a dict at all"],
+            ):
+                maa_common.atomic_write_json(override, legacy)
+                with self.subTest(legacy=legacy):
+                    with patch.object(
+                        maa_common, "DEFAULTS_PATH", defaults
+                    ), patch.object(maa_common, "PLAN_PATH", override):
+                        self.assertEqual(maa_common.plan_sessions(at), {})
+                        for phase in ("am", "pm", "now"):
+                            plan = maa_common.effective_plan(at, phase)
+                            self.assertEqual(plan["stage"], "1-7")
+                            self.assertFalse(plan["skip"])
+
+    def test_normalize_plan_carries_stage_source_through(self) -> None:
+        """不再吃掉 `stage_source`：卡片靠它说「这关是谁定的」。"""
+        self.assertEqual(
+            maa_common.normalize_plan({"stage_source": "auto"})["stage_source"], "auto"
+        )
+        self.assertNotIn("stage_source", maa_common.normalize_plan({}))
 
     def test_skip_wording_everywhere_says_manual_still_runs(self) -> None:
         skipped = maa_common.normalize_plan({"skip": True})
-        self.assertIn("现在跑", maa_action._confirmation(skipped, False))
-        card = maa_plan_card.build_embed(skipped, {})
-        field = next(f for f in card["fields"] if f["name"] == "跳过自动场次")
-        self.assertIn("手动开跑不受影响", field["value"])
+        receipt = maa_action._confirmation(skipped, False, "am")
+        self.assertIn("现在跑", receipt)
+        self.assertIn("早场（08:00）", receipt)
+        self.assertIn("晚场（22:00）不受影响", receipt)
+        card = maa_plan_card.build_embed(skipped, {}, "am")
+        field = next(f for f in card["fields"] if f["name"] == "本场跳过")
+        self.assertIn("另一场与手动开跑不受影响", field["value"])
         annihilation = next(f for f in card["fields"] if f["name"] == "每日剿灭")
         self.assertIn("1800", annihilation["value"])
         components, registry = maa_plan_card.build_components(
-            maa_common.normalize_plan({"skip": False}), {"channel_id": "1"}
+            maa_common.normalize_plan({"skip": False}), {"channel_id": "1"}, "am"
         )
         labels = [
             component["label"]
@@ -127,11 +179,10 @@ class PlanTests(unittest.TestCase):
             for component in row.get("components", [])
             if "label" in component
         ]
-        self.assertIn("⏭️ 跳过自动场次", labels)
-        self.assertNotIn("⏭️ 今天跳过", labels)
+        self.assertIn("⏭️ 跳过本场（早场 08:00）", labels)
         self.assertTrue(any(entry["kind"] == "exec" for entry in registry.values()))
 
-    def test_run_now_receipt_flags_the_skip_override(self) -> None:
+    def test_run_now_receipt_names_the_skipped_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             script = Path(raw) / "maa_daily.py"
             script.write_text("#!/usr/bin/env python3\n")
@@ -143,13 +194,18 @@ class PlanTests(unittest.TestCase):
                 maa_action.subprocess, "Popen", lambda *args, **kwargs: None
             ):
                 with patch.object(
-                    maa_action, "effective_plan", lambda: {"skip": True}
+                    maa_action,
+                    "effective_plan",
+                    lambda phase="now": {"skip": phase == "pm"},
                 ):
                     ok, message = maa_action.run_now()
                 self.assertTrue(ok)
                 self.assertIn("手动场照跑", message)
+                # 跳过是按场次的：回执要说清是哪一场。
+                self.assertIn("晚场（22:00）", message)
+                self.assertNotIn("早场", message)
                 with patch.object(
-                    maa_action, "effective_plan", lambda: {"skip": False}
+                    maa_action, "effective_plan", lambda phase="now": {"skip": False}
                 ):
                     _ok, plain = maa_action.run_now()
                 self.assertNotIn("跳过", plain)
@@ -727,7 +783,7 @@ Opening mini games:
     def test_buttons_fit_limits_and_registry_is_deterministic(self) -> None:
         plan = maa_common.normalize_plan({"stage": "CE-6", "medicine": "none"})
         components, registry = maa_plan_card.build_components(
-            plan, {"channel_id": "123", "activity_stages": []}
+            plan, {"channel_id": "123", "activity_stages": []}, "am"
         )
         self.assertLessEqual(len(components), 5)
         for row in components:
@@ -736,21 +792,82 @@ Opening mini games:
         self.assertEqual(select["type"], 3)
         self.assertLessEqual(len(select["options"]), 25)
         self.assertEqual(sum(bool(option.get("default")) for option in select["options"]), 1)
-        self.assertIn("select_args", registry["hermes:btn:maa:stage-select"])
+        self.assertIn("select_args", registry["hermes:btn:maa:am:stage-select"])
         self.assertNotIn("hermes:btn:maa:run-now", registry)
         self.assertFalse(any("medicine" in key for key in registry))
+
+    def test_the_card_has_exactly_one_select_and_one_button(self) -> None:
+        """D2：计划卡只剩一个下拉 + 一个「跳过本场」按钮，恰好两行。"""
+        for phase, expect_label in (
+            ("am", "⏭️ 跳过本场（早场 08:00）"),
+            ("pm", "⏭️ 跳过本场（晚场 22:00）"),
+        ):
+            with self.subTest(phase=phase):
+                rows, registry = maa_plan_card.build_components(
+                    maa_common.normalize_plan({}),
+                    {"channel_id": "123", "activity_stages": []},
+                    phase,
+                )
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(len(rows[0]["components"]), 1)
+                self.assertEqual(rows[0]["components"][0]["type"], 3)
+                self.assertEqual(len(rows[1]["components"]), 1)
+                self.assertEqual(rows[1]["components"][0]["type"], 2)
+                self.assertEqual(rows[1]["components"][0]["label"], expect_label)
+                # 被删掉的控件不许留在登记表里。
+                self.assertEqual(len(registry), 2)
+                for key in registry:
+                    self.assertNotIn("explain", key)
+                    self.assertNotIn("log", key)
+                    self.assertNotIn("farming-select", key)
+                self.assertFalse(
+                    any(key.startswith("hermes:btn:maa-copilot:") for key in registry)
+                )
+                self.assertTrue(
+                    all(entry["kind"] == "exec" for entry in registry.values())
+                )
+
+    def test_resuming_a_skipped_session_offers_the_restore_button(self) -> None:
+        rows, registry = maa_plan_card.build_components(
+            maa_common.normalize_plan({"skip": True}),
+            {"channel_id": "123", "activity_stages": []},
+            "pm",
+        )
+        button = rows[1]["components"][0]
+        self.assertEqual(button["label"], "▶️ 恢复本场")
+        self.assertEqual(
+            registry[button["custom_id"]]["args"],
+            ["plan", "skip-today", "off", "pm"],
+        )
 
     def test_activity_dropdown_uses_configured_stages(self) -> None:
         plan = maa_common.normalize_plan({})
         components, registry = maa_plan_card.build_components(
-            plan, {"channel_id": "123", "activity_stages": ["HS-9"]}
+            plan, {"channel_id": "123", "activity_stages": ["HS-9"]}, "pm"
         )
         select = components[0]["components"][0]
         option = next(option for option in select["options"] if option["label"] == "HS-9")
         self.assertEqual(
-            registry["hermes:btn:maa:stage-select"]["select_args"][option["value"]],
-            ["plan", "set-stage", "HS-9"],
+            registry["hermes:btn:maa:pm:stage-select"]["select_args"][option["value"]],
+            ["plan", "set-stage", "HS-9", "pm"],
         )
+
+    def test_every_control_carries_its_own_phase(self) -> None:
+        """不变量 #8 的场次版：场次写死在登记表里，不从 Discord 直通。"""
+        for phase in ("am", "pm"):
+            with self.subTest(phase=phase):
+                _rows, registry = maa_plan_card.build_components(
+                    maa_common.normalize_plan({}),
+                    {"channel_id": "123", "activity_stages": ["HS-9"]},
+                    phase,
+                )
+                select = registry[f"hermes:btn:maa:{phase}:stage-select"]
+                for value, args in select["select_args"].items():
+                    self.assertTrue(value.startswith("choice:"))
+                    self.assertEqual(args[0], "plan")
+                    self.assertEqual(args[-1], phase)
+                skip = registry[f"hermes:btn:maa:{phase}:skip"]
+                self.assertEqual(skip["args"], ["plan", "skip-today", "on", phase])
 
     def test_dropdown_includes_every_regular_supply_stage(self) -> None:
         plan = maa_common.normalize_plan({"stage": "AP-5"})
@@ -761,6 +878,7 @@ Opening mini games:
                 "activity_stages": [],
                 "all_supply_stages_open": True,
             },
+            "am",
         )
         select = components[0]["components"][0]
         options = {option["label"]: option for option in select["options"]}
@@ -771,10 +889,12 @@ Opening mini games:
             "LS-6 · 作战记录": "LS-6",
             "SK-5 · 基建材料": "SK-5",
         }
-        select_args = registry["hermes:btn:maa:stage-select"]["select_args"]
+        select_args = registry["hermes:btn:maa:am:stage-select"]["select_args"]
         for label, stage in expected.items():
             option = options[label]
-            self.assertEqual(select_args[option["value"]], ["plan", "set-stage", stage])
+            self.assertEqual(
+                select_args[option["value"]], ["plan", "set-stage", stage, "am"]
+            )
         self.assertTrue(options["AP-5 · 红票"]["default"])
 
     def test_supply_dropdown_uses_cn_reset_and_weekday_schedule(self) -> None:
@@ -1179,6 +1299,7 @@ Opening mini games:
         card = maa_plan_card.build_embed(
             maa_common.normalize_plan({"skip": False}),
             {},
+            "am",
             {
                 "ok": True,
                 "changed": True,
@@ -1187,6 +1308,13 @@ Opening mini games:
         )
         field = next(item for item in card["fields"] if item["name"] == "上游更新")
         self.assertIn("今天已更新", field["value"])
+        self.assertEqual(card["title"], "🌱 MAA 今日计划 · 早场 08:00")
+        # 晚场卡不跟随上游更新（D1），所以它连这个字段都没有。
+        evening = maa_plan_card.build_embed(
+            maa_common.normalize_plan({}), {}, "pm"
+        )
+        self.assertEqual(evening["title"], "🌱 MAA 今日计划 · 晚场 22:00")
+        self.assertNotIn("上游更新", [item["name"] for item in evening["fields"]])
 
     def test_failed_upstream_update_is_recorded_and_alerted(self) -> None:
         at = datetime(2026, 8, 8, 7, 50, tzinfo=BEIJING)
@@ -2229,8 +2357,10 @@ class DepotTests(unittest.TestCase):
         failed = SimpleNamespace(returncode=1, stdout="", stderr="recognition failed")
         config = {"maa_bin": "/maa", "adb_path": "/adb"}
         with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-            maa_daily, "require_executable"
-        ), patch.object(maa_daily, "open_emulator"), patch.object(
+            maa_depot, "emulator_is_online", return_value=(False, "离线")
+        ), patch.object(maa_daily, "require_executable"), patch.object(
+            maa_daily, "open_emulator"
+        ), patch.object(
             maa_daily, "wait_for_android"
         ), patch.object(maa_daily, "verify_game_installed"), patch.object(
             maa_daily, "settle_android_runtime"
@@ -2316,7 +2446,11 @@ class LockConflictTests(unittest.TestCase):
 
 
 class EmulatorProbeTests(unittest.TestCase):
-    """PLAN_NAV_GATE B: automatic phases must not steal a device in use."""
+    """PLAN_NAV_GATE B: automatic phases must not steal a device in use.
+
+    实现自四期 1d 起在 `maa_common`，四条自动链路共用（D18）；
+    这里直接测那一份，`maa_daily.emulator_is_online` 只是同一个对象。
+    """
 
     @staticmethod
     def _completed(returncode: int, stdout: str = "") -> SimpleNamespace:
@@ -2326,9 +2460,9 @@ class EmulatorProbeTests(unittest.TestCase):
         # A freshly launched BlueStacks has no Android yet, so the process
         # signal must be able to answer "online" without asking ADB at all.
         with patch.object(
-            maa_daily.subprocess, "run", return_value=self._completed(0, "4242\n")
+            maa_common.subprocess, "run", return_value=self._completed(0, "4242\n")
         ) as run:
-            online, detail = maa_daily.emulator_is_online({})
+            online, detail = maa_common.emulator_is_online({})
         self.assertTrue(online)
         self.assertIn("进程在跑", detail)
         self.assertEqual(run.call_count, 1)
@@ -2338,15 +2472,15 @@ class EmulatorProbeTests(unittest.TestCase):
         # A hung process can outlive its device and vice versa, so ADB is the
         # second half of the OR.
         results = [self._completed(1), self._completed(0), self._completed(0, "1\n")]
-        with patch.object(maa_daily.subprocess, "run", side_effect=results):
-            online, detail = maa_daily.emulator_is_online({})
+        with patch.object(maa_common.subprocess, "run", side_effect=results):
+            online, detail = maa_common.emulator_is_online({})
         self.assertTrue(online)
         self.assertIn("sys.boot_completed", detail)
 
     def test_probe_reports_offline_when_both_signals_miss(self) -> None:
         results = [self._completed(1), self._completed(0), self._completed(0, "\n")]
-        with patch.object(maa_daily.subprocess, "run", side_effect=results):
-            online, detail = maa_daily.emulator_is_online({})
+        with patch.object(maa_common.subprocess, "run", side_effect=results):
+            online, detail = maa_common.emulator_is_online({})
         self.assertFalse(online)
         self.assertIn("未连上", detail)
 
@@ -2354,30 +2488,40 @@ class EmulatorProbeTests(unittest.TestCase):
         # Grabbing the device once by mistake is far cheaper than a daily that
         # stops forever because the probe itself broke (B-4).
         for failure in (
-            maa_daily.subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
+            maa_common.subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
             OSError("adb missing"),
         ):
             with self.subTest(failure=type(failure).__name__):
-                with patch.object(maa_daily.subprocess, "run", side_effect=failure):
-                    online, detail = maa_daily.emulator_is_online({})
+                with patch.object(maa_common.subprocess, "run", side_effect=failure):
+                    online, detail = maa_common.emulator_is_online({})
                 self.assertFalse(online)
                 self.assertTrue(detail)
 
-    def test_probe_never_calls_the_180_second_boot_wait(self) -> None:
-        # `wait_for_android` waits up to 180s for a device we just started;
-        # reusing it here would blow the run budget and 不变量 #6.
+    def test_the_probe_budget_is_bounded_and_disablable(self) -> None:
+        # `wait_for_android` 要等 180s、`settle_android_runtime` 是开机后的稳定性探测，
+        # 复用任何一个都会撑爆运行预算和不变量 #6。公共层不 import `maa_daily`，
+        # 结构上就够不着它们。
+        source = (ROOT / "scripts" / "maa_common.py").read_text(encoding="utf-8")
+        self.assertNotIn("import maa_daily", source)
+        with patch.object(maa_common.subprocess, "run") as run:
+            online, detail = maa_common.emulator_is_online({"emulator_probe_timeout": 0})
+        self.assertFalse(online)
+        self.assertIn("探测已禁用", detail)
+        run.assert_not_called()
+        timeouts = []
         with patch.object(
-            maa_daily.subprocess, "run", return_value=self._completed(0, "4242\n")
-        ), patch.object(maa_daily, "wait_for_android") as wait, patch.object(
-            maa_daily, "settle_android_runtime"
-        ) as settle:
-            maa_daily.emulator_is_online({})
-        wait.assert_not_called()
-        settle.assert_not_called()
+            maa_common.subprocess,
+            "run",
+            side_effect=lambda *a, **k: timeouts.append(k["timeout"])
+            or self._completed(1),
+        ):
+            maa_common.emulator_is_online({})
+        self.assertTrue(timeouts)
+        self.assertLessEqual(sum(timeouts), 8.0)
 
     def test_probe_refuses_an_unvalidated_app_name_without_blocking_the_run(self) -> None:
-        with patch.object(maa_daily.subprocess, "run") as run:
-            online, detail = maa_daily.emulator_is_online({"emulator_app": "evil; rm -rf /"})
+        with patch.object(maa_common.subprocess, "run") as run:
+            online, detail = maa_common.emulator_is_online({"emulator_app": "evil; rm -rf /"})
         self.assertFalse(online)
         self.assertIn("非法字符", detail)
         run.assert_not_called()
@@ -2403,10 +2547,20 @@ class EmulatorProbeTests(unittest.TestCase):
             maa_daily, "emulator_is_online", probe
         ), patch.object(maa_daily, "merge_last_run") as merge, patch.object(
             maa_daily, "discord_request"
-        ) as request, patch.object(maa_daily, "require_executable"), patch.object(
+        ) as request, patch.object(
+            # 探测在线的汇报走 maa_common 那份通用实现（四期 1d），
+            # 它的 Discord / 状态写入必须一起桩掉，否则单测会真的打网络。
+            maa_common, "merge_last_run"
+        ) as common_merge, patch.object(
+            maa_common, "discord_request"
+        ) as common_request, patch.object(
+            maa_common, "discord_token", return_value="token"
+        ), patch.object(maa_daily, "require_executable"), patch.object(
             maa_daily, "open_emulator", side_effect=RuntimeError("STOP: probe passed")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
+        merge.call_args_list = merge.call_args_list + common_merge.call_args_list
+        request.call_args_list = request.call_args_list + common_request.call_args_list
         return SimpleNamespace(
             code=code, merge=merge, request=request, opened=opened, probe=probe
         )
@@ -3034,6 +3188,62 @@ class ClearingDailyYieldTests(unittest.TestCase):
         self.assertTrue(plan["farming"])
 
 
+class LogTailTests(unittest.TestCase):
+    """`log tail` 是聊天命令（「最近怎么了 / 看日志」），计划卡上没有对应按钮。
+
+    四期步骤 1 只删了卡片上的「📋 最近结果」按钮，命令必须还在。
+    """
+
+    def test_log_tail_is_on_the_dispatch_allowlist(self) -> None:
+        with patch.object(maa_action, "log_tail", return_value=(True, "t")) as tail:
+            self.assertEqual(maa_action.dispatch(["log", "tail"]), (True, "t"))
+        tail.assert_called_once_with()
+        ok, message = maa_action.dispatch(["log"])
+        self.assertFalse(ok)
+        self.assertIn("log tail", message)
+
+    def test_missing_state_says_so_instead_of_failing(self) -> None:
+        with patch.object(maa_action, "load_json", return_value={}):
+            ok, message = maa_action.log_tail()
+        self.assertTrue(ok)
+        self.assertIn("还没有 MAA 执行结果", message)
+
+    def test_translated_summary_is_returned_as_is(self) -> None:
+        state = {
+            "status": "success",
+            "summary": "🌟 总体：✅ 成功\n· 刷理智：1-7 ×3",
+            "finished_at": "2026-09-09T08:31:02+08:00",
+        }
+        with patch.object(maa_action, "load_json", return_value=state):
+            ok, message = maa_action.log_tail()
+        self.assertTrue(ok)
+        self.assertIn("📋 最近一次结果（2026-09-09 08:31:02）", message)
+        self.assertIn("🌟 总体：✅ 成功", message)
+
+    def test_legacy_state_is_rebuilt_from_the_log_without_raw_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = Path(raw) / "run.log"
+            log_path.write_text("[Fight] 1-7 raw cli line\n", encoding="utf-8")
+            state = {
+                "status": "success",
+                "summary": "Fight completed",
+                "log": str(log_path),
+                "plan": {"tasks": {"fight": True}},
+            }
+            with patch.object(
+                maa_action, "load_json", return_value=state
+            ), patch.object(
+                maa_daily, "extract_summary", return_value="🌟 总体：✅ 成功"
+            ) as extract:
+                ok, message = maa_action.log_tail()
+        self.assertTrue(ok)
+        self.assertEqual(extract.call_args.args[0], ["[Fight] 1-7 raw cli line"])
+        self.assertEqual(extract.call_args.kwargs["plan"], {"tasks": {"fight": True}})
+        self.assertTrue(extract.call_args.kwargs["ok"])
+        self.assertIn("🌟 总体：✅ 成功", message)
+        self.assertNotIn("raw cli line", message)
+
+
 class ClearingActionTests(unittest.TestCase):
     """`maa_action.py` 的新子命令必须进白名单并保持 <20s 的派发姿态。"""
 
@@ -3309,25 +3519,25 @@ class FarmingAutoStageTests(unittest.TestCase):
         )
         maa_plan_card._STAGE_DROPS_CACHE.clear()
 
-    def _components(self):
+    def _components(self, phase: str = "am"):
         with patch.object(maa_plan_card, "load_depot_state", return_value={}):
-            return maa_plan_card.build_components(self.plan, self.config)
+            return maa_plan_card.build_components(self.plan, self.config, phase)
 
-    # --- 下拉 3 已经删掉 --------------------------------------------------
-    def test_the_farming_select_is_gone_and_the_other_two_remain(self) -> None:
+    # --- 只剩一个下拉 ----------------------------------------------------
+    def test_only_the_farming_stage_select_remains(self) -> None:
         rows, registry = self._components()
         self.assertNotIn("hermes:btn:maa:farming-select", registry)
-        self.assertIn("hermes:btn:maa:stage-select", registry)
-        self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
+        self.assertIn("hermes:btn:maa:am:stage-select", registry)
+        # 抄作业下拉搬到了独立卡（D6），计划卡上不再有它。
+        self.assertNotIn("hermes:btn:maa-copilot:stage-select", registry)
         custom_ids = [
             component["custom_id"]
             for row in rows
             for component in row["components"]
             if component.get("type") == 3
         ]
-        self.assertNotIn("hermes:btn:maa:farming-select", custom_ids)
-        self.assertEqual(len(custom_ids), len(set(custom_ids)))
-        self.assertLessEqual(len(rows), 5)
+        self.assertEqual(custom_ids, ["hermes:btn:maa:am:stage-select"])
+        self.assertEqual(len(rows), 2)
 
     # --- 派生映射：新活动自动跟随 ----------------------------------------
     def test_activity_stage_labels_carry_their_drop_from_upstream(self) -> None:
@@ -3467,7 +3677,7 @@ class FarmingAutoStageTests(unittest.TestCase):
         self.assertEqual(stage, "SK-5")
         self.assertIn("碳素", why)
 
-    def test_auto_stage_writes_the_plan_and_never_overwrites_a_manual_pick(self) -> None:
+    def test_auto_stage_writes_this_session_and_never_overwrites_a_manual_pick(self) -> None:
         result = {"degraded": False, "items": [
             {"material": "碳素", "stage": "SK-5", "stock": 20, "per_day": 10.0,
              "days_left": 2.0, "weight": 0, "basis": "measured"},
@@ -3477,22 +3687,27 @@ class FarmingAutoStageTests(unittest.TestCase):
             plan_path = Path(tmp) / "plan.json"
             with patch.object(maa_plan_card, "PLAN_PATH", plan_path), \
                  patch.object(maa_common, "PLAN_PATH", plan_path):
-                # 1) 空计划：自动写入，并标明是自动定的
-                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "SK-5")
+                # 1) 空计划：写进**这一场**，并标明是自动定的
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "am", at), "SK-5")
                 written = json.loads(plan_path.read_text(encoding="utf-8"))
-                self.assertEqual(written["stage"], "SK-5")
-                self.assertEqual(written["stage_source"], "auto")
+                self.assertEqual(written["sessions"]["am"]["stage"], "SK-5")
+                self.assertEqual(written["sessions"]["am"]["stage_source"], "auto")
+                self.assertNotIn("pm", written["sessions"])
                 # 2) 自己写的可以再改（次日重算走的就是这条）
-                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "SK-5")
-                # 3) 用户手动选过就不许动
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "am", at), "SK-5")
+                # 3) 用户手动选过的那一场不许动，另一场照样能写（D3）
                 plan_path.write_text(
-                    json.dumps({"date": at.date().isoformat(), "stage": "CE-6",
-                                "stage_source": "discord"}),
+                    json.dumps({
+                        "date": at.date().isoformat(),
+                        "sessions": {"am": {"stage": "CE-6", "stage_source": "discord"}},
+                    }),
                     encoding="utf-8",
                 )
-                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "")
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "am", at), "")
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "pm", at), "SK-5")
                 kept = json.loads(plan_path.read_text(encoding="utf-8"))
-                self.assertEqual(kept["stage"], "CE-6")
+                self.assertEqual(kept["sessions"]["am"]["stage"], "CE-6")
+                self.assertEqual(kept["sessions"]["pm"]["stage"], "SK-5")
 
     def test_stage_source_survives_the_action_field_allowlist(self) -> None:
         """点一次「跳过」不能把当天的自动定关冻住——`stage_source` 必须在白名单里。"""
@@ -3500,13 +3715,21 @@ class FarmingAutoStageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = Path(tmp) / "plan.json"
             plan_path.write_text(
-                json.dumps({"date": at.date().isoformat(), "stage": "SK-5",
-                            "stage_source": "auto"}),
+                json.dumps({
+                    "date": at.date().isoformat(),
+                    "sessions": {
+                        "am": {"stage": "SK-5", "stage_source": "auto", "junk": 1},
+                        "zz": {"stage": "不是场次"},
+                    },
+                }),
                 encoding="utf-8",
             )
             with patch.object(maa_action, "PLAN_PATH", plan_path):
                 kept = maa_action._today_override()
-        self.assertEqual(kept["stage_source"], "auto")
+        self.assertEqual(kept["sessions"]["am"]["stage_source"], "auto")
+        # 白名单之外的字段与非法场次一律丢掉。
+        self.assertNotIn("junk", kept["sessions"]["am"])
+        self.assertNotIn("zz", kept["sessions"])
 
     def test_choosing_a_stage_in_discord_marks_it_so_auto_leaves_it_alone(self) -> None:
         """闸门的另一半：`plan set-stage` 必须真的写下 `stage_source="discord"`。
@@ -3531,16 +3754,47 @@ class FarmingAutoStageTests(unittest.TestCase):
                               return_value=contextlib.nullcontext()), \
                  patch.object(maa_plan_card, "state_lock",
                               return_value=contextlib.nullcontext()):
-                ok, _message = maa_action.set_stage("CE-6")
+                ok, _message = maa_action.set_stage("CE-6", "am")
                 self.assertTrue(ok)
                 written = json.loads(plan_path.read_text(encoding="utf-8"))
-                self.assertEqual(written["stage_source"], "discord")
+                self.assertEqual(written["sessions"]["am"]["stage_source"], "discord")
                 # 自动定关看到 discord 就收手，用户选的关原样留着。
-                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "")
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "am", at), "")
                 self.assertEqual(
-                    json.loads(plan_path.read_text(encoding="utf-8"))["stage"], "CE-6"
+                    json.loads(plan_path.read_text(encoding="utf-8"))
+                    ["sessions"]["am"]["stage"],
+                    "CE-6",
                 )
-                self.assertEqual(maa_plan_card.today_stage_source(at), "discord")
+                self.assertEqual(maa_plan_card.today_stage_source("am", at), "discord")
+                self.assertEqual(maa_plan_card.today_stage_source("pm", at), "")
+
+    def test_set_stage_and_skip_reject_an_unknown_phase(self) -> None:
+        """场次只接受 am / pm；非法值一律拒绝，且不写盘。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            with patch.object(maa_action, "PLAN_PATH", plan_path), \
+                 patch.object(maa_action, "load_config", return_value={}), \
+                 patch.object(maa_action, "is_run_locked", return_value=False):
+                for phase in ("foo", "now", "AM", ""):
+                    with self.subTest(phase=phase):
+                        ok, message = maa_action.set_stage("1-7", phase)
+                        self.assertFalse(ok)
+                        self.assertIn("场次只接受", message)
+                        ok, message = maa_action.skip_today("on", phase)
+                        self.assertFalse(ok)
+                        self.assertIn("场次只接受", message)
+            self.assertFalse(plan_path.exists())
+
+    def test_dispatch_requires_the_phase_argument(self) -> None:
+        for argv in (
+            ["plan", "set-stage", "1-7"],
+            ["plan", "skip-today", "on"],
+            ["plan", "skip-today"],
+        ):
+            with self.subTest(argv=argv):
+                ok, message = maa_action.dispatch(argv)
+                self.assertFalse(ok)
+                self.assertIn("不支持的动作", message)
 
     def test_the_card_says_who_picked_todays_stage(self) -> None:
         """删掉下拉 3 之后，「这关是自动定的还是我选的」全靠这一行。
@@ -3552,12 +3806,12 @@ class FarmingAutoStageTests(unittest.TestCase):
         farming = {"degraded": False, "items": [], "skipped_no_stage": [],
                    "skipped_closed": []}
         auto = maa_plan_card.build_embed(
-            self.plan, self.config, None, farming, "auto"
+            self.plan, self.config, "am", None, farming, "auto"
         )
         picked = maa_plan_card.build_embed(
-            self.plan, self.config, None, farming, "discord"
+            self.plan, self.config, "am", None, farming, "discord"
         )
-        neither = maa_plan_card.build_embed(self.plan, self.config, None, farming)
+        neither = maa_plan_card.build_embed(self.plan, self.config, "am", None, farming)
 
         def stage_field(embed: dict) -> str:
             return next(f["value"] for f in embed["fields"] if f["name"] == "刷什么")
@@ -3571,24 +3825,26 @@ class FarmingAutoStageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             plan_path = Path(tmp) / "plan.json"
             plan_path.write_text(
-                json.dumps({"date": "2026-09-29", "stage": "SK-5",
-                            "stage_source": "auto"}),
+                json.dumps({
+                    "date": "2026-09-29",
+                    "sessions": {"am": {"stage": "SK-5", "stage_source": "auto"}},
+                }),
                 encoding="utf-8",
             )
-            with patch.object(maa_plan_card, "PLAN_PATH", plan_path):
-                self.assertEqual(maa_plan_card.today_stage_source(at), "")
+            with patch.object(maa_common, "PLAN_PATH", plan_path):
+                self.assertEqual(maa_plan_card.today_stage_source("am", at), "")
 
     def test_the_card_says_when_the_recommendation_is_a_guess(self) -> None:
-        """不变量 #32：降级必须**可见**——而且降级期明说今天不自动改关。"""
+        """不变量 #32：降级必须**可见**——而且降级期明说本场不自动改关。"""
         result = maa_plan_card.farming_recommendations(self.config, {}, {"1-7"}, None)
-        embed = maa_plan_card.build_embed(self.plan, self.config, None, result)
+        embed = maa_plan_card.build_embed(self.plan, self.config, "am", None, result)
         names = [field["name"] for field in embed["fields"]]
-        self.assertIn("📦 材料缺口（降级）", names)
+        self.assertIn("为什么（降级）", names)
         value = next(
-            field["value"] for field in embed["fields"] if field["name"].startswith("📦")
+            field["value"] for field in embed["fields"] if field["name"].startswith("为什么")
         )
         self.assertIn("降级模式", value)
-        self.assertIn("今天没有自动改关", value)
+        self.assertIn("本场没有自动改关", value)
 
     def test_the_seeded_table_only_names_stages_the_card_can_offer(self) -> None:
         # 种子里不许出现猜的关：每一个都必须是 1-7 或 SUPPLY_STAGES 里的资源本。
@@ -4093,6 +4349,8 @@ class ClearingSanityProbeTests(unittest.TestCase):
             w, "RUNS_DIR", Path(raw)
         ), patch.object(w, "require_executable"), patch.object(
             w, "merge_last_run"
+        ), patch.object(
+            w, "emulator_is_online", return_value=(False, "离线")
         ), patch.object(w, "open_emulator"), patch.object(
             w, "wait_for_android"
         ), patch.object(w, "verify_game_installed"), patch.object(
@@ -4208,6 +4466,621 @@ class ClearingSanityProbeTests(unittest.TestCase):
         # 校准入口只在本机终端跑，不进 Discord 白名单（不变量 #8 的边界不变）。
         ok, _ = maa_action.dispatch(["sanity-probe", "1-7"])
         self.assertFalse(ok)
+
+
+class SessionDailyTests(unittest.TestCase):
+    """四期 1a：`execute(phase)` 只吃**这一场**的覆盖，`now` 一场都不吃。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.defaults = root / "defaults.json"
+        self.plan_path = root / "plan.json"
+        maa_common.atomic_write_json(self.defaults, {"stage": "1-7"})
+        maa_common.atomic_write_json(
+            self.plan_path,
+            {
+                "date": datetime(2026, 8, 8, tzinfo=BEIJING).date().isoformat(),
+                "sessions": {"am": {"stage": "CE-6", "skip": True}},
+            },
+        )
+
+    def _execute(self, phase: str):
+        at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
+        lock = unittest.mock.MagicMock()
+        lock.__enter__.return_value = True
+        lock.__exit__.return_value = False
+        with patch.object(maa_daily, "now_beijing", return_value=at), patch.object(
+            maa_daily, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(maa_daily, "discord_token", return_value="token"), patch.object(
+            maa_daily, "load_json", return_value={}
+        ), patch.object(maa_common, "DEFAULTS_PATH", self.defaults), patch.object(
+            maa_common, "PLAN_PATH", self.plan_path
+        ), patch.object(maa_daily, "run_lock", return_value=lock), patch.object(
+            maa_daily, "cleanup_run_files"
+        ), patch.object(maa_daily, "atomic_write_json") as snapshot, patch.object(
+            maa_daily, "emulator_is_online", return_value=(False, "离线")
+        ), patch.object(maa_daily, "merge_last_run"), patch.object(
+            maa_daily, "discord_request"
+        ) as request, patch.object(maa_daily, "require_executable"), patch.object(
+            maa_daily, "open_emulator", side_effect=RuntimeError("STOP: 已越过跳过闸门")
+        ) as opened, patch.object(maa_daily, "send_direct_failure"):
+            code = maa_daily.execute(phase)
+        return SimpleNamespace(
+            code=code, opened=opened, request=request, snapshot=snapshot
+        )
+
+    def test_a_skipped_morning_does_not_silence_the_evening_or_a_manual_run(self) -> None:
+        morning = self._execute("am")
+        morning.opened.assert_not_called()
+        titles = [
+            call.args[3]["embeds"][0]["title"]
+            for call in morning.request.call_args_list
+            if call.args[1] == "POST"
+        ]
+        self.assertTrue(any("已跳过" in title for title in titles))
+        for phase in ("pm", "now"):
+            with self.subTest(phase=phase):
+                other = self._execute(phase)
+                other.opened.assert_called_once()
+
+    def test_each_phase_snapshots_its_own_stage(self) -> None:
+        morning = self._execute("am")
+        evening = self._execute("pm")
+        # 早场被跳过前也会先落一份快照，晚场则走默认关。
+        self.assertEqual(morning.snapshot.call_args.args[1]["plan"]["stage"], "CE-6")
+        self.assertEqual(evening.snapshot.call_args.args[1]["plan"]["stage"], "1-7")
+
+    def test_should_skip_never_silences_a_manual_run(self) -> None:
+        skipped = maa_common.normalize_plan({"skip": True})
+        self.assertTrue(maa_daily.should_skip(skipped, "am"))
+        self.assertTrue(maa_daily.should_skip(skipped, "pm"))
+        self.assertFalse(maa_daily.should_skip(skipped, "now"))
+
+
+class PlanCardPhaseTests(unittest.TestCase):
+    """四期 1b：早晚两张卡，晚场卡不跟随上游更新（D1）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.buttons = root / "buttons.json"
+        self.plan_path = root / "plan.json"
+        self.defaults = root / "defaults.json"
+        maa_common.atomic_write_json(self.defaults, {"stage": "1-7"})
+        maa_common.atomic_write_json(self.buttons, {"hermes:btn:agent-book:x": {}})
+
+    def _main(self, argv: list[str]):
+        with patch.object(
+            maa_plan_card, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(
+            maa_plan_card, "discord_token", return_value="token"
+        ), patch.object(
+            maa_plan_card, "check_and_update_upstream", return_value={"ok": True}
+        ) as upstream, patch.object(
+            maa_plan_card, "refresh_activity_stages", return_value=(True, "")
+        ), patch.object(
+            maa_plan_card, "load_depot_state", return_value={}
+        ), patch.object(
+            maa_plan_card, "activity_deadline_text", return_value=""
+        ), patch.object(
+            maa_plan_card, "state_lock", return_value=contextlib.nullcontext()
+        ), patch.object(maa_plan_card, "BUTTONS_PATH", self.buttons), patch.object(
+            maa_plan_card, "PLAN_PATH", self.plan_path
+        ), patch.object(maa_common, "PLAN_PATH", self.plan_path), patch.object(
+            maa_common, "DEFAULTS_PATH", self.defaults
+        ), patch.object(
+            maa_plan_card, "cleanup_old_threads", return_value={"failed": 0}
+        ), patch.object(maa_plan_card, "cleanup_run_files"), patch.object(
+            maa_plan_card, "retire_old_plan_cards", return_value={"failed": 0}
+        ), patch.object(maa_plan_card, "discord_request") as request:
+            code = maa_plan_card.main(argv)
+        return SimpleNamespace(code=code, upstream=upstream, request=request)
+
+    def test_the_evening_card_never_follows_upstream(self) -> None:
+        evening = self._main(["pm"])
+        self.assertEqual(evening.upstream.call_count, 0)
+        payload = evening.request.call_args.args[3]
+        self.assertEqual(payload["embeds"][0]["title"], "🌱 MAA 今日计划 · 晚场 22:00")
+        self.assertEqual(len(payload["components"]), 2)
+        morning = self._main(["am"])
+        self.assertEqual(morning.upstream.call_count, 1)
+
+    def test_the_card_phase_comes_from_the_workdir_name(self) -> None:
+        for marker, expected in (("am", "am"), ("pm", "pm"), ("runs", "am")):
+            with self.subTest(marker=marker):
+                self.assertEqual(
+                    maa_plan_card.select_phase(
+                        [],
+                        at=datetime(2026, 9, 9, 7, 50, tzinfo=BEIJING),
+                        cwd=Path("/x") / marker,
+                    ),
+                    expected,
+                )
+        self.assertEqual(
+            maa_plan_card.select_phase(
+                [], at=datetime(2026, 9, 9, 21, 50, tzinfo=BEIJING), cwd=Path("/x/runs")
+            ),
+            "pm",
+        )
+        with self.assertRaisesRegex(ValueError, "只接受 am 或 pm"):
+            maa_plan_card.select_phase(["evening"])
+
+    def test_each_card_writes_only_its_own_session(self) -> None:
+        with patch.object(
+            maa_plan_card, "auto_stage", return_value=("SK-5", "碳素快没了")
+        ):
+            self._main(["am"])
+            self._main(["pm"])
+        written = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        registry = json.loads(self.buttons.read_text(encoding="utf-8"))
+        # 自动定关写的是**场次**，不是旧的顶层 stage/skip 结构。
+        self.assertEqual(set(written["sessions"]), {"am", "pm"})
+        self.assertEqual(written["sessions"]["am"]["stage"], "SK-5")
+        self.assertEqual(written["sessions"]["am"]["stage_source"], "auto")
+        self.assertNotIn("stage", written)
+        # 晚场卡那趟把早场卡的控件整段清掉了（不变量 #7），别人的键留着。
+        self.assertIn("hermes:btn:agent-book:x", registry)
+        self.assertNotIn("hermes:btn:maa:am:stage-select", registry)
+        self.assertIn("hermes:btn:maa:pm:stage-select", registry)
+
+    def test_old_cards_are_retired_by_title_prefix(self) -> None:
+        messages = [
+            {
+                "id": "111",
+                "embeds": [{"title": "🌱 MAA 今日计划 · 早场 08:00"}],
+                "components": [{"type": 1}],
+            },
+            {
+                "id": "222",
+                "embeds": [{"title": "🤖 抄作业：现在能抄的关"}],
+                "components": [{"type": 1}],
+            },
+        ]
+        with patch.object(
+            maa_plan_card, "discord_request", side_effect=[messages, {}]
+        ) as request:
+            result = maa_plan_card.retire_old_plan_cards("token", "123")
+        self.assertEqual(result, {"retired": 1, "failed": 0})
+        self.assertEqual(
+            request.call_args_list[1].args[1:3],
+            ("PATCH", "/channels/123/messages/111"),
+        )
+
+
+class ActivityDeadlineTests(unittest.TestCase):
+    """StageActivityV2 的活动截止时间：读得到就显示，读不到就整行不出现。"""
+
+    def _write(self, payload) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "StageActivityV2.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_expire_time_is_read_in_its_declared_timezone(self) -> None:
+        path = self._write(
+            {
+                "Official": {
+                    "sideStoryStage": {
+                        "SR": {
+                            "Activity": {
+                                "Tip": "SideStory「月行水上」",
+                                "UtcExpireTime": "2026/09/18 03:59:59",
+                                "TimeZone": 8,
+                            }
+                        },
+                        "XX": {"Activity": {"StageName": "别的", "TimeZone": 8}},
+                    }
+                }
+            }
+        )
+        deadlines = maa_plan_card.activity_deadlines(path)
+        self.assertEqual(len(deadlines), 1)
+        title, expire = deadlines[0]
+        self.assertEqual(title, "SideStory「月行水上」")
+        self.assertEqual(expire, datetime(2026, 9, 18, 3, 59, 59, tzinfo=BEIJING))
+        text = maa_plan_card.activity_deadline_text(
+            {"maa_activity_cache": str(path)},
+            datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+        )
+        self.assertIn("截止 09-18 03:59", text)
+        self.assertIn("还剩", text)
+
+    def test_an_unreadable_cache_never_raises_and_shows_no_line(self) -> None:
+        broken = self._write({"Official": {"sideStoryStage": "不是对象"}})
+        broken.with_name("bad.json").write_text("{ 坏 json", encoding="utf-8")
+        for path in (
+            broken,
+            broken.with_name("bad.json"),
+            broken.with_name("missing.json"),
+        ):
+            with self.subTest(path=path.name):
+                self.assertEqual(maa_plan_card.activity_deadlines(path), [])
+                embed = maa_plan_card.build_embed(
+                    maa_common.normalize_plan({}),
+                    {"maa_activity_cache": str(path)},
+                    "am",
+                )
+                self.assertNotIn(
+                    "活动截止", [field["name"] for field in embed["fields"]]
+                )
+
+    def test_an_already_expired_activity_is_not_shown(self) -> None:
+        path = self._write(
+            {
+                "Official": {
+                    "sideStoryStage": {
+                        "SR": {
+                            "Activity": {
+                                "Tip": "旧活动",
+                                "UtcExpireTime": "2026/09/01 03:59:59",
+                                "TimeZone": 8,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            maa_plan_card.activity_deadline_text(
+                {"maa_activity_cache": str(path)},
+                datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+            ),
+            "",
+        )
+
+
+class CopilotCardTests(unittest.TestCase):
+    """四期 1c：聊天触发的抄作业卡——一览 + 一个下拉，只列上游有导航的关。"""
+
+    def setUp(self) -> None:
+        self.index = {
+            "codes": {"SR-8": "act54side_08", "SR-9": "act54side_09", "1-7": "main_01-07",
+                      "CE-6": "wk_melee_6"},
+            "stages": {"act54side_08": "SR-8", "act54side_09": "SR-9",
+                       "main_01-07": "1-7", "wk_melee_6": "CE-6"},
+        }
+        self.nav_keys = {"SR-8", "1-7", "CE-6"}
+
+    def _view(self, config, at=None):
+        def checker(_dirs):
+            def check(stage):
+                if stage in self.nav_keys:
+                    return True, ""
+                return False, f"上游 tasks/Stages 里没有 {stage} 这个顶层键"
+
+            return check
+
+        with patch.object(
+            maa_copilot, "load_stage_index", return_value=self.index
+        ), patch.object(maa_clearing, "nav_checker", side_effect=checker), patch.object(
+            maa_plan_card,
+            "stage_drops",
+            return_value={"SR-8": {"materials": ["异铁组"], "ap": 21}},
+        ), patch.object(maa_plan_card, "activity_deadline_text", return_value=""):
+            return maa_plan_card.copilot_card_view(config, at)
+
+    def test_the_dropdown_only_offers_stages_upstream_can_navigate(self) -> None:
+        embed, options = self._view({"activity_stages": ["SR-8", "SR-9"]})
+        self.assertEqual([stage for _label, stage, _desc in options], ["SR-8"])
+        listing = embed["fields"][0]["value"]
+        # 一览里两关都在，但没导航的那关标出来了（D8 / 不变量 #37）。
+        self.assertIn("SR-8", listing)
+        self.assertIn("异铁组", listing)
+        self.assertIn("SR-9", listing)
+        self.assertIn("⛔ 上游 tasks/Stages 里没有 SR-9", listing)
+
+    def test_a_stage_missing_from_the_local_index_is_flagged_not_offered(self) -> None:
+        # 有导航键但本地 Tile-Pos 索引里没有 → `copilot find` 必拒，
+        # 与其给个点了必失败的选项，不如在一览里说清原因。
+        with patch.object(
+            maa_copilot, "load_stage_index", return_value={"codes": {}, "stages": {}}
+        ), patch.object(
+            maa_clearing, "nav_checker", side_effect=lambda _d: lambda s: (True, "")
+        ), patch.object(maa_plan_card, "stage_drops", return_value={}), patch.object(
+            maa_plan_card, "activity_deadline_text", return_value=""
+        ):
+            rows, _in_activity = maa_plan_card.copilot_card_stages(
+                {"activity_stages": ["SR-9"]}
+            )
+            _embed, options = maa_plan_card.copilot_card_view(
+                {"activity_stages": ["SR-9"]}
+            )
+        self.assertEqual(rows[0]["reason"], "不在本地关卡索引里")
+        self.assertFalse(rows[0]["nav"])
+        self.assertEqual(options, [])
+
+    def test_without_an_activity_it_degrades_to_supplies_and_main(self) -> None:
+        embed, options = self._view(
+            {"activity_stages": [], "all_supply_stages_open": True},
+            datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+        )
+        stages = [stage for _label, stage, _desc in options]
+        self.assertIn("1-7", stages)
+        self.assertIn("CE-6", stages)
+        self.assertNotIn("SR-8", stages)
+        self.assertIn("资源本 / 主线", embed["fields"][0]["name"])
+
+    def test_the_select_values_are_opaque_and_resolved_through_the_registry(self) -> None:
+        rows, entries = maa_action._copilot_card_components(
+            [("SR-8 · 异铁组", "SR-8", "主掉落 异铁组")]
+        )
+        custom_id = "hermes:btn:maa-copilot:card:stage-select"
+        self.assertEqual(rows[0]["components"][0]["custom_id"], custom_id)
+        option = rows[0]["components"][0]["options"][0]
+        self.assertEqual(option["value"], "choice:0")
+        self.assertNotIn("SR-8", option["value"])
+        self.assertEqual(
+            entries[custom_id]["select_args"]["choice:0"],
+            ["copilot", "find", "SR-8"],
+        )
+
+    def test_no_navigable_stage_means_no_control_at_all(self) -> None:
+        # Discord 拒绝零选项的下拉；一览还是要发，不能静默什么都不做。
+        rows, entries = maa_action._copilot_card_components([])
+        self.assertEqual(rows, [])
+        self.assertEqual(entries, {})
+
+    def _send_card(self, options, registry_seed, card_state):
+        posted: list[dict] = []
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            buttons = root / "buttons.json"
+            card_path = root / "card.json"
+            maa_common.atomic_write_json(buttons, registry_seed)
+            if card_state is not None:
+                maa_common.atomic_write_json(card_path, card_state)
+            with patch.object(
+                maa_action, "load_config", return_value={"channel_id": "123"}
+            ), patch.object(
+                maa_plan_card, "copilot_card_view", return_value=({"title": "t"}, options)
+            ), patch.object(maa_copilot, "CARD_PATH", card_path), patch.object(
+                maa_copilot, "ensure_private_dirs"
+            ), patch.object(maa_action, "BUTTONS_PATH", buttons), patch.object(
+                maa_action, "state_lock", return_value=contextlib.nullcontext()
+            ), patch.object(
+                maa_action, "retire_discord_components"
+            ) as retire, patch.object(
+                maa_action, "discord_token", return_value="token"
+            ), patch.object(
+                maa_action,
+                "discord_request",
+                side_effect=lambda *a, **k: posted.append(a) or {"id": "999"},
+            ):
+                ok, message = maa_action.copilot_card()
+            return SimpleNamespace(
+                ok=ok,
+                message=message,
+                retire=retire,
+                posted=posted,
+                registry=json.loads(buttons.read_text(encoding="utf-8")),
+                card=json.loads(card_path.read_text(encoding="utf-8")),
+            )
+
+    def test_a_new_card_retires_the_previous_one_and_its_registry_entry(self) -> None:
+        stale = "hermes:btn:maa-copilot:card:stage-select"
+        result = self._send_card(
+            [("SR-8", "SR-8", "d")],
+            {stale: {"select_args": {"choice:0": ["copilot", "find", "OLD-1"]}},
+             "hermes:btn:agent-book:x": {}},
+            {"message_id": "555"},
+        )
+        self.assertTrue(result.ok)
+        # 旧卡组件先 PATCH 空。
+        self.assertEqual(result.retire.call_args.args[1], "555")
+        # 旧登记被替换成新的，别人的键没动。
+        self.assertEqual(
+            result.registry[stale]["select_args"]["choice:0"],
+            ["copilot", "find", "SR-8"],
+        )
+        self.assertIn("hermes:btn:agent-book:x", result.registry)
+        self.assertEqual(result.card["message_id"], "999")
+
+    def test_a_card_without_options_leaves_no_stale_registry_entry(self) -> None:
+        stale = "hermes:btn:maa-copilot:card:stage-select"
+        result = self._send_card([], {stale: {}}, {"message_id": "555"})
+        self.assertTrue(result.ok)
+        self.assertNotIn(stale, result.registry)
+        self.assertIn("没有上游写了导航定义的关", result.message)
+
+    def test_the_card_prefix_survives_both_sweeps(self) -> None:
+        """它既不进 07:50 的 `hermes:btn:maa:` 清扫，也不被搜索 TTL 清扫误删。"""
+        card_key = f"{maa_copilot.CARD_BUTTON_PREFIX}stage-select"
+        self.assertFalse(card_key.startswith(maa_plan_card.BUTTON_PREFIX))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            buttons = root / "buttons.json"
+            searches = root / "searches"
+            searches.mkdir()
+            maa_common.atomic_write_json(
+                buttons, {"hermes:btn:maa:am:stage-select": {}, card_key: {}}
+            )
+            with patch.object(maa_common, "BUTTONS_PATH", buttons):
+                maa_common.prune_button_registry(maa_plan_card.BUTTON_PREFIX)
+            registry = json.loads(buttons.read_text(encoding="utf-8"))
+            self.assertNotIn("hermes:btn:maa:am:stage-select", registry)
+            self.assertIn(card_key, registry)
+
+            # `prune_expired_searches()` 只按 searches/<token>.json 里的 token 清，
+            # 而 `card` 不是 12 位 hex，也不放在那个目录里。
+            (searches / "aaaaaaaaaaaa.json").write_text(
+                json.dumps({"expires_at": "2020-01-01T00:00:00+08:00"}),
+                encoding="utf-8",
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), patch.object(
+                maa_copilot, "ensure_private_dirs"
+            ):
+                maa_copilot.prune_expired_searches(registry)
+            self.assertIn(card_key, registry)
+            self.assertNotIn(
+                maa_copilot.CARD_PATH.parent / "card.json", list(searches.glob("*.json"))
+            )
+
+    def test_the_card_state_file_is_not_inside_the_searches_directory(self) -> None:
+        # 放进去会被 `prune_expired_searches()` 当成一次搜索删掉，
+        # 顺手把 `hermes:btn:maa-copilot:card:` 的登记也清了。
+        self.assertNotEqual(maa_copilot.CARD_PATH.parent, maa_copilot.SEARCHES_DIR)
+        self.assertFalse(maa_copilot.SEARCH_TOKEN_RE.fullmatch("card"))
+
+
+class EmulatorProbeSharedTests(unittest.TestCase):
+    """四期 1d：一份探测实现，四条自动链路共用（D18 / 不变量 #24）。"""
+
+    def test_there_is_exactly_one_probe_implementation(self) -> None:
+        self.assertIs(maa_daily.emulator_is_online, maa_common.emulator_is_online)
+        self.assertIs(maa_depot.emulator_is_online, maa_common.emulator_is_online)
+        import maa_copilot_worker
+
+        self.assertIs(
+            maa_copilot_worker.emulator_is_online, maa_common.emulator_is_online
+        )
+        source = (ROOT / "scripts" / "maa_daily.py").read_text(encoding="utf-8")
+        self.assertNotIn("def emulator_is_online", source)
+
+    def test_a_busy_emulator_stops_the_copilot_worker_before_it_opens_anything(self) -> None:
+        import maa_copilot_worker as worker
+
+        token = "a" * 12
+        candidate = {"id": 7, "ratio": 1.0}
+        queued = {
+            "token": token,
+            "status": "queued",
+            "stage": "SR-8",
+            "stage_id": "act54side_08",
+            "requested_index": 1,
+            "requested_mode": "normal",
+            "candidates": [candidate],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            (searches / f"{token}.json").write_text(
+                json.dumps(queued), encoding="utf-8"
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), patch.object(
+                worker, "state_lock", return_value=contextlib.nullcontext()
+            ), patch.object(
+                worker, "load_config", return_value={"channel_id": "1"}
+            ), patch.object(
+                worker, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
+            ), patch.object(
+                worker, "discord_token", return_value="token"
+            ), patch.object(worker, "discord_request") as request, patch.object(
+                worker, "merge_last_run"
+            ) as merge, patch.object(
+                worker, "_require_auto_run_preflight"
+            ) as preflight, patch.object(
+                worker, "open_emulator"
+            ) as open_emulator:
+                code = worker._run_locked(queued, candidate, 1, "normal")
+            restored = json.loads((searches / f"{token}.json").read_text("utf-8"))
+        self.assertEqual(code, 0)
+        open_emulator.assert_not_called()
+        preflight.assert_not_called()
+        # 卡恢复成可点，跳过必须可见（护栏 4）。
+        self.assertEqual(restored["status"], "done")
+        body = request.call_args.args[3]["embeds"][0]["description"]
+        self.assertIn("模拟器正在使用", body)
+        self.assertIn("BlueStacks 进程在跑", body)
+        self.assertEqual(merge.call_args.args[0]["skip_reason"], "emulator_busy")
+
+    def test_a_busy_emulator_stops_the_clearing_round_before_it_opens_anything(self) -> None:
+        import maa_copilot_worker as worker
+
+        notices: list[tuple[str, str]] = []
+        with patch.object(
+            worker, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
+        ), patch.object(
+            worker,
+            "_clearing_notice",
+            side_effect=lambda c, t, b, col: notices.append((t, b)),
+        ), patch.object(worker, "open_emulator") as open_emulator, patch.object(
+            worker.maa_copilot, "load_stage_index", return_value={"codes": {}}
+        ):
+            code = worker._clearing_run_locked(
+                {}, maa_clearing.new_state("k", "t", "AT", ["AT-1"]), ["AT-1"], None,
+                datetime(2026, 9, 9, 9, 0, tzinfo=BEIJING),
+            )
+        self.assertEqual(code, 0)
+        open_emulator.assert_not_called()
+        self.assertIn("未启动", notices[0][0])
+        self.assertIn("模拟器正在使用", notices[0][1])
+
+    def test_a_busy_emulator_leaves_the_depot_snapshot_untouched(self) -> None:
+        at = datetime(2026, 9, 9, 4, 30, tzinfo=BEIJING)
+        previous = "2026-09-02T04:30:00+08:00"
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = True
+        context.__exit__.return_value = False
+        with tempfile.TemporaryDirectory() as raw:
+            depot_path = Path(raw) / "depot.json"
+            maa_common.atomic_write_json(
+                depot_path, {"snapshot_at": previous, "snapshot_items": {}}
+            )
+            with patch.object(
+                maa_depot,
+                "_state",
+                side_effect=lambda path=depot_path: maa_common.load_json(path, {}),
+            ), patch.object(maa_depot, "run_lock", return_value=context), patch.object(
+                maa_depot, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
+            ), patch.object(
+                maa_depot, "report_emulator_busy"
+            ) as report, patch.object(
+                maa_depot, "reconcile"
+            ) as writer, patch.object(maa_daily, "open_emulator") as open_emulator:
+                result = maa_depot.run_if_due({"channel_id": "1"}, at=at)
+            after = json.loads(depot_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "skipped_busy")
+        # `snapshot_at` 不能动：动了这次「没跑」就会被记成一次成功对表，
+        # 7 天间隔白白往后推一周。
+        self.assertEqual(result["snapshot_at"], previous)
+        self.assertEqual(after["snapshot_at"], previous)
+        writer.assert_not_called()
+        open_emulator.assert_not_called()
+        self.assertEqual(
+            report.call_args.kwargs["state_update"]["depot_status"], "skipped_busy"
+        )
+
+    def test_the_shared_busy_report_writes_state_and_posts_a_grey_card(self) -> None:
+        at = datetime(2026, 9, 9, 8, 0, tzinfo=BEIJING)
+        with patch.object(maa_common, "merge_last_run") as merge, patch.object(
+            maa_common, "discord_request"
+        ) as request:
+            maa_common.report_emulator_busy(
+                {"channel_id": "123"},
+                title="⏭️ 测试已跳过",
+                reason="模拟器在用",
+                detail="进程在跑",
+                at=at,
+                state_update={"status": "skipped"},
+                token="token",
+            )
+        self.assertEqual(merge.call_args.args[0], {"status": "skipped"})
+        embed = request.call_args.args[3]["embeds"][0]
+        self.assertEqual(embed["color"], 0x99AAB5)
+        self.assertIn("进程在跑", embed["description"])
+
+    def test_a_failing_report_is_never_swallowed(self) -> None:
+        with patch.object(
+            maa_common, "merge_last_run", side_effect=OSError("boom")
+        ), patch.object(
+            maa_common, "discord_request", side_effect=OSError("net")
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                maa_common.report_emulator_busy(
+                    {"channel_id": "1"},
+                    title="t",
+                    reason="r",
+                    detail="d",
+                    at=maa_common.now_beijing(),
+                    state_update={},
+                    token="token",
+                )
+        self.assertIn("状态写入失败", str(caught.exception))
+        self.assertIn("告警发送失败", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ from maa_common import (
     cleanup_run_files,
     discord_request,
     discord_token,
+    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -55,6 +56,12 @@ from maa_common import (
     retire_discord_components,
     run_lock,
     state_lock,
+)
+
+# 探到模拟器在用时的统一说法（D18）。抄作业与队列都还没碰设备，说清楚「未执行」。
+EMULATOR_BUSY_NOTICE = (
+    "检测到模拟器正在使用（多半是你在玩，或上一个任务没退干净），本次未执行，"
+    "也没有碰设备。等你退出后再试一次即可。"
 )
 
 # Use upstream Fight navigation with a process-local, recognition-only FightBegin.
@@ -766,6 +773,24 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
     started = time.monotonic()
     emulator_touched = False
     battle_touched = False
+
+    # D18：抢到锁之后、碰设备之前先探一次。在线就把卡恢复成可点，什么都不做——
+    # 任何失败路径都会 `close_everything()` 退掉 BlueStacks，等于把人踢出游戏。
+    online, probe_detail = emulator_is_online(config)
+    if online:
+        _restore_ready(token, {"queued", "preparing"}, EMULATOR_BUSY_NOTICE)
+        _post_not_started(config, state, f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}")
+        merge_last_run(
+            {
+                "status": "skipped",
+                "phase": f"copilot-{token}",
+                "skip_reason": "emulator_busy",
+                "summary": EMULATOR_BUSY_NOTICE,
+                "emulator_probe": probe_detail,
+                "finished_at": now_beijing().isoformat(),
+            }
+        )
+        return 0
 
     try:
         _require_auto_run_preflight(state, candidate, config)
@@ -1481,6 +1506,17 @@ def _clearing_run_locked(
     failure = ""
     emulator_touched = False
     cleanup_errors: list[str] = []
+
+    # D18：与抄作业同一条闸门——锁到手了不代表设备是空的。
+    online, probe_detail = emulator_is_online(config)
+    if online:
+        _clearing_notice(
+            config,
+            "⏸️ 通关队列本轮未启动",
+            f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}",
+            0x99AAB5,
+        )
+        return 0
 
     def attempt(entry: str) -> bool:
         """打一关；成功前进 cursor 并返回 True，失败记账（可能转 needs_manual）返回 False。"""

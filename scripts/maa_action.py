@@ -20,9 +20,13 @@ from maa_common import (
     CONFIG_PATH,
     LAST_RUN_PATH,
     PLAN_PATH,
+    PLAN_PHASES,
+    PLAN_SESSION_FIELDS,
     RUNS_DIR,
     SCRIPTS_DIR,
     atomic_write_json,
+    discord_request,
+    discord_token,
     effective_plan,
     is_run_locked,
     load_config,
@@ -39,6 +43,8 @@ from maa_common import (
 
 STAGE_PATTERN = re.compile(r"^[A-Za-z0-9]{1,8}-\d{1,2}$")
 ACTIVITY_STAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,30}-\d{1,2}$")
+# 场次的中文说法。只有这两个场次能被覆盖；`now` 是手动场，没有覆盖可写（D4）。
+PHASE_LABELS = {"am": "早场（08:00）", "pm": "晚场（22:00）"}
 
 
 def emit(ok: bool, message: str) -> None:
@@ -81,31 +87,51 @@ def valid_stage(stage: str, config: dict[str, Any]) -> bool:
     return stage == "" or bool(STAGE_PATTERN.fullmatch(stage)) or _activity_output_allows(stage, config)
 
 
+def valid_phase(phase: str) -> bool:
+    """场次只接受 `am` / `pm`。值由登记表的 `select_args` / `args` 写死，不从 Discord 直通。"""
+    return phase in PLAN_PHASES
+
+
 def _today_override() -> dict[str, Any]:
+    """当天的场次表，已按白名单过滤。
+
+    结构是 `{date, sessions: {am: {...}, pm: {...}}, updated_at}`。日期不是今天、
+    或磁盘上还是旧的按天格式（顶层 `stage` / `skip`），一律重置成空——
+    旧格式一天后自然失效，不为它写迁移（四期 1a）。
+    每个场次只保留 `PLAN_SESSION_FIELDS` 里的字段，其中 `stage_source` 是闸门：
+    掉了它，用户点一次「跳过」就会让当天的自动定关被当成手动选择冻住。
+    """
     now = now_beijing()
     current = load_json(PLAN_PATH, {})
-    if not isinstance(current, dict) or current.get("date") != now.date().isoformat():
-        current = {"date": now.date().isoformat()}
-    # Discard all fields outside the script-level allowlist.
-    # `stage_source` must stay in this list: 计划卡的自动定关用它区分「这个关是自动定的」
-    # 和「用户自己选的」。掉了它，用户点一次「跳过」就会让当天的自动定关被当成手动选择冻住。
-    return {
-        key: current[key]
-        for key in ("date", "stage", "stage_source", "skip", "source", "updated_at")
-        if key in current
-    }
+    sessions: Any = {}
+    if isinstance(current, dict) and current.get("date") == now.date().isoformat():
+        sessions = current.get("sessions")
+    kept: dict[str, dict[str, Any]] = {}
+    if isinstance(sessions, dict):
+        for phase in PLAN_PHASES:
+            override = sessions.get(phase)
+            if isinstance(override, dict):
+                kept[phase] = {
+                    key: override[key]
+                    for key in PLAN_SESSION_FIELDS
+                    if key in override
+                }
+    return {"date": now.date().isoformat(), "sessions": kept}
 
 
-def _save_override(key: str, value: Any, **extra: Any) -> dict[str, Any]:
+def _save_override(phase: str, key: str, value: Any, **extra: Any) -> dict[str, Any]:
+    now = now_beijing()
     with state_lock():
         plan = _today_override()
-        plan[key] = value
-        plan.update(extra)
-        plan["source"] = "discord"
-        plan["updated_at"] = now_beijing().isoformat()
+        session = plan["sessions"].setdefault(phase, {})
+        session[key] = value
+        session.update(extra)
+        session["source"] = "discord"
+        session["updated_at"] = now.isoformat()
+        plan["updated_at"] = now.isoformat()
         # There is deliberately no stone field in this write path.
         atomic_write_json(PLAN_PATH, plan)
-    return effective_plan()
+    return effective_plan(phase=phase)
 
 
 def _running_context() -> tuple[str, str]:
@@ -119,32 +145,41 @@ def _running_context() -> tuple[str, str]:
     return phase_label, stage
 
 
-def _confirmation(plan: dict[str, Any], was_running: bool) -> str:
+def _confirmation(plan: dict[str, Any], was_running: bool, phase: str) -> str:
+    """一句回执：改的是**哪一场**、另一场不受影响、正在跑的那场不被打断。"""
     now = now_beijing()
     stage = plan_stage_label(plan)
     medicine = medicine_label(str(plan.get("medicine", "none")))
-    skip = bool(plan.get("skip"))
-    if was_running:
-        phase, running_stage = _running_context()
-        if phase == "早场":
-            target = "晚 10 点那场会跳过" if skip else f"晚 10 点那场刷 {stage}（{medicine}）"
-        elif phase == "晚场":
-            target = "今天没有后续自动场次，本次覆盖明天会自动失效"
-        else:
-            target = "下一场仍在今天时会采用新计划"
-        return f"{phase}正在跑 {running_stage}，不打断它；{target}。"
-    if skip:
-        return (
-            f"今天（{now.month}/{now.day}）的自动场次已设为跳过；"
-            "说「现在跑」仍然可以手动开一场。"
-        )
-    return (
-        f"今天（{now.month}/{now.day}）刷 {stage}，{medicine}；"
-        "早 8 点和晚 10 点各跑一次。"
+    label = PHASE_LABELS.get(phase, "本场")
+    other = "、".join(
+        PHASE_LABELS[other_phase] for other_phase in PLAN_PHASES if other_phase != phase
     )
+    if plan.get("skip"):
+        # 这条回执对 set-stage 和 skip-today 通用，所以跳过时也报一下这场记的关：
+        # 用户改完关才发现本场是跳过的，总比到点没跑再来问强。
+        target = (
+            f"今天（{now.month}/{now.day}）的{label}已设为跳过"
+            f"（本场记的关是 {stage}，恢复后生效）；"
+            f"{other}不受影响，说「现在跑」也仍然可以手动开一场。"
+        )
+    else:
+        target = (
+            f"今天（{now.month}/{now.day}）的{label}刷 {stage}，{medicine}；"
+            f"{other}不受影响。"
+        )
+    if was_running:
+        running_label, running_stage = _running_context()
+        return f"{running_label}正在跑 {running_stage}，不打断它；{target}"
+    return target
 
 
-def set_stage(stage: str) -> tuple[bool, str]:
+def _reject_phase(phase: str) -> tuple[bool, str]:
+    return False, f"场次只接受 am（早场 08:00）或 pm（晚场 22:00），收到 {phase[:20]!r}。"
+
+
+def set_stage(stage: str, phase: str) -> tuple[bool, str]:
+    if not valid_phase(phase):
+        return _reject_phase(phase)
     config = load_config()
     if not valid_stage(stage, config):
         return (
@@ -153,9 +188,9 @@ def set_stage(stage: str) -> tuple[bool, str]:
             "或当前活动关。碎石设置永远不受支持。",
         )
     was_running = is_run_locked()
-    # 标成 discord：当天的自动定关不再覆盖它（`maa_plan_card.apply_auto_stage()`）。
-    plan = _save_override("stage", stage, stage_source="discord")
-    return True, _confirmation(plan, was_running)
+    # 标成 discord：当天这一场的自动定关不再覆盖它（`maa_plan_card.apply_auto_stage()`）。
+    plan = _save_override(phase, "stage", stage, stage_source="discord")
+    return True, _confirmation(plan, was_running, phase)
 
 
 def set_medicine(value: str) -> tuple[bool, str]:
@@ -163,21 +198,32 @@ def set_medicine(value: str) -> tuple[bool, str]:
     return False, "理智规则已固定：普通理智药 0，只自动使用临期药，碎石 0。"
 
 
-def skip_today(value: str) -> tuple[bool, str]:
+def skip_today(value: str, phase: str) -> tuple[bool, str]:
     if value not in {"on", "off"}:
         return False, "skip-today 只接受 on 或 off。"
+    if not valid_phase(phase):
+        return _reject_phase(phase)
     was_running = is_run_locked()
-    plan = _save_override("skip", value == "on")
-    return True, _confirmation(plan, was_running)
+    plan = _save_override(phase, "skip", value == "on")
+    return True, _confirmation(plan, was_running, phase)
 
 
 def show_plan() -> tuple[bool, str]:
-    plan = effective_plan()
-    status = "跳过" if plan.get("skip") else "照常执行"
+    """两场各念一遍：刷什么、关是谁定的、跳不跳。"""
+    origins = {"auto": "按材料缺口自动定的", "discord": "你手动选的"}
+    lines: list[str] = []
+    for phase in PLAN_PHASES:
+        plan = effective_plan(phase=phase)
+        origin = origins.get(str(plan.get("stage_source") or ""), "默认关")
+        status = "跳过" if plan.get("skip") else "照常执行"
+        lines.append(
+            f"· {PHASE_LABELS[phase]}：{plan_stage_label(plan)}（{origin}）；{status}"
+        )
     return (
         True,
-        f"今天刷：{plan_stage_label(plan)}；理智药："
-        f"{medicine_label(str(plan.get('medicine', 'none')))}；{status}；碎石：0。",
+        "今天的计划：\n"
+        + "\n".join(lines)
+        + f"\n理智药：{medicine_label('expiring')}；碎石：0。",
     )
 
 
@@ -202,7 +248,13 @@ def run_now() -> tuple[bool, str]:
         start_new_session=True,
         close_fds=True,
     )
-    note = "（今天设了跳过自动场次，手动场照跑）" if effective_plan().get("skip") else ""
+    # 跳过是按场次的（D2），所以这里要逐场看，不能再说「今天设了跳过」。
+    skipped = [
+        PHASE_LABELS[phase]
+        for phase in PLAN_PHASES
+        if effective_plan(phase=phase).get("skip")
+    ]
+    note = f"（今天的{'、'.join(skipped)}设了跳过，手动场照跑）" if skipped else ""
     return True, f"▶️ 已派发手动场{note}；后台会自行加锁，开跑消息稍后出现在频道。"
 
 
@@ -361,6 +413,113 @@ def start_copilot_search(
 def copilot_find(stage: str) -> tuple[bool, str]:
     ok, message, _token = start_copilot_search(stage)
     return ok, message
+
+
+def _copilot_card_components(
+    options: list[tuple[str, str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """抄作业卡的一行下拉 + 它的登记项。值仍是不透明编号（不变量 #8）。"""
+    if not options:
+        # Discord 拒绝零选项的下拉；没有可抄的关就只发一览，不发控件。
+        return [], {}
+    select_args: dict[str, list[str]] = {}
+    select_options: list[dict[str, Any]] = []
+    for index, (label, stage, description) in enumerate(options):
+        value = f"choice:{index}"
+        select_options.append(
+            {
+                "label": label[:100],
+                "value": value,
+                "description": description[:100],
+                "emoji": {"name": "🤖"},
+            }
+        )
+        select_args[value] = ["copilot", "find", stage]
+    custom_id = f"{maa_copilot.CARD_BUTTON_PREFIX}stage-select"
+    rows = [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 3,
+                    "custom_id": custom_id,
+                    "placeholder": "🤖 选一关，选中即开始搜作业",
+                    "min_values": 1,
+                    "max_values": 1,
+                    "options": select_options,
+                }
+            ],
+        }
+    ]
+    entries = {
+        custom_id: {
+            "kind": "exec",
+            "script": "maa_action.py",
+            "select_args": select_args,
+        }
+    }
+    return rows, entries
+
+
+def copilot_card() -> tuple[bool, str]:
+    """发一张「现在能抄的关」卡（D6 的卡片部分）。
+
+    只读本地数据、一次 Discord POST，因此可以在动作脚本里同步做完，
+    不必派 worker（不变量 #6 的 20s 预算够）。
+    """
+    from maa_plan_card import copilot_card_view
+
+    config = load_config()
+    channel_id = str(config.get("channel_id", "")).strip()
+    if not channel_id.isdigit():
+        return False, "config.json 中尚未配置 Discord channel_id。"
+    embed, options = copilot_card_view(config)
+    rows, entries = _copilot_card_components(options)
+
+    maa_copilot.ensure_private_dirs()
+    previous = load_json(maa_copilot.CARD_PATH, {})
+    warning = ""
+    # 先收旧卡：组件 PATCH 空 → 删旧登记 → 再写新登记。反过来做会出现
+    # 「旧卡还挂着按钮、登记已经指向新卡」的一段窗口。
+    try:
+        retire_discord_components(
+            config, previous.get("message_id") if isinstance(previous, dict) else None
+        )
+    except Exception as exc:
+        warning = f"；上一张卡的按钮收起失败：{type(exc).__name__}: {exc}"
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        for custom_id in [
+            key
+            for key in registry
+            if key.startswith(maa_copilot.CARD_BUTTON_PREFIX)
+        ]:
+            registry.pop(custom_id)
+        registry.update(entries)
+        atomic_write_json(BUTTONS_PATH, registry)
+
+    message = discord_request(
+        discord_token(),
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {
+            "embeds": [embed],
+            "components": rows,
+            "allowed_mentions": {"parse": []},
+        },
+    )
+    atomic_write_json(
+        maa_copilot.CARD_PATH,
+        {
+            "message_id": str(message.get("id", "")) if isinstance(message, dict) else "",
+            "posted_at": now_beijing().isoformat(),
+        },
+    )
+    if not options:
+        return True, f"🤖 抄作业卡已发；当前没有上游写了导航定义的关可抄{warning}。"
+    return True, f"🤖 抄作业卡已发，共 {len(options)} 关可选{warning}。"
 
 
 def copilot_again(token: str) -> tuple[bool, str]:
@@ -706,16 +865,18 @@ def clearing_run() -> tuple[bool, str]:
 
 
 def dispatch(argv: list[str]) -> tuple[bool, str]:
-    if argv[:2] == ["plan", "set-stage"] and len(argv) == 3:
-        return set_stage(argv[2])
-    if argv[:2] == ["plan", "skip-today"] and len(argv) in {2, 3}:
-        return skip_today(argv[2] if len(argv) == 3 else "on")
+    if argv[:2] == ["plan", "set-stage"] and len(argv) == 4:
+        return set_stage(argv[2], argv[3])
+    if argv[:2] == ["plan", "skip-today"] and len(argv) == 4:
+        return skip_today(argv[2], argv[3])
     if argv == ["plan", "show"]:
         return show_plan()
     if argv == ["run", "now"]:
         return run_now()
     if argv == ["log", "tail"]:
         return log_tail()
+    if argv == ["copilot", "card"]:
+        return copilot_card()
     if argv[:2] == ["copilot", "find"] and len(argv) == 3:
         return copilot_find(argv[2])
     if argv[:2] == ["copilot", "again"] and len(argv) == 3:
@@ -737,8 +898,9 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
     if argv[:2] == ["clearing", "manual-done"] and len(argv) == 3:
         return clearing_manual_done(argv[2])
     return False, (
-        "不支持的动作；只允许 plan set-stage/skip-today/show、run now、log tail、"
-        "copilot find/again/cancel/status/pick、"
+        "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
+        "plan skip-today <on|off> <am|pm>、plan show、run now、log tail、"
+        "copilot card/find/again/cancel/status/pick、"
         "clearing status/start/stop/run/manual-done。"
     )
 

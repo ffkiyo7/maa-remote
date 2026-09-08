@@ -21,6 +21,7 @@ from maa_common import (
     LAST_RUN_PATH,
     MAA_CONFIG_DIR,
     RUNS_DIR,
+    SAFE_APP_RE,
     SCRIPTS_DIR,
     atomic_write_json,
     atomic_write_text,
@@ -30,6 +31,7 @@ from maa_common import (
     discord_token,
     discord_upload,
     effective_plan,
+    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -37,13 +39,13 @@ from maa_common import (
     merge_last_run,
     now_beijing,
     plan_stage_label,
+    report_emulator_busy as common_report_emulator_busy,
     require_executable,
     run_lock,
 )
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
 SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
 # Only the cron-driven phases defer to a running emulator. `now` is the user
@@ -731,104 +733,6 @@ def open_emulator(config: dict[str, Any]) -> None:
         raise RuntimeError(f"无法启动 {app}: {(result.stderr or result.stdout).strip()}")
 
 
-def emulator_is_online(config: dict[str, Any]) -> tuple[bool, str]:
-    """Is the emulator already up — i.e. is the user playing right now?
-
-    Runs on automatic phases only, after `run_lock` and before
-    `open_emulator()` (PLAN_NAV_GATE B). Motivation is `PLAN_NAV_GATE.md`
-    结论 3: any failure path calls `close_everything()`, which quits BlueStacks
-    outright, so an automatic run that starts while the user is playing kicks
-    them out of the game. The user's decision was to probe first rather than to
-    teach the cleanup "don't close what you didn't open".
-
-    **This is not `settle_android_runtime()`.** That one runs *after* we opened
-    the emulator and Android booted, and waits for `app_process` to stop
-    stuttering so MaaTouch does not time out (§11.14). This one runs *before*
-    we open anything and asks a completely different question. It is also not
-    `wait_for_android()`: that waits up to 180s for a device we just started;
-    this must answer in seconds about a device we did not start.
-
-    Two signals, OR'd — either one means "online":
-
-      1. the emulator process exists (`pgrep -f`)
-      2. adb connects and `sys.boot_completed` is `1`
-
-    Neither alone suffices: a just-launched BlueStacks has no Android yet, so
-    adb misses a device the user is plainly using; and a hung process can
-    outlive its device, so pgrep hits when nothing actually works.
-
-    **Never raises.** A probe that errors or times out reports offline and the
-    run proceeds: grabbing the device once by mistake is far cheaper than a
-    daily that stops forever because the probe itself broke (B-4). The whole
-    thing is bounded by `emulator_probe_timeout` (default 5s) so it cannot eat
-    into the run or the <20s button budget (不变量 #6).
-    """
-    budget = max(0.0, float(config.get("emulator_probe_timeout", 5)))
-    if not budget:
-        return False, "探测已禁用（emulator_probe_timeout = 0）"
-    deadline = time.monotonic() + budget
-
-    def remaining(cap: float) -> float:
-        return min(cap, deadline - time.monotonic())
-
-    app = str(config.get("emulator_app", "BlueStacks"))
-    if not SAFE_APP_RE.fullmatch(app):
-        # Same guard as open_emulator(): never hand an unvalidated name to a
-        # subprocess. Refusing to probe is not refusing to run.
-        return False, "emulator_app 名称含非法字符，跳过探测"
-    notes: list[str] = []
-    slice_ = remaining(2.0)
-    if slice_ > 0:
-        try:
-            found = subprocess.run(
-                ["pgrep", "-f", app],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=slice_,
-            )
-            if found.returncode == 0 and found.stdout.strip():
-                return True, f"{app} 进程在跑"
-            notes.append(f"{app} 进程不在")
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            notes.append(f"进程探测失败（{type(exc).__name__}）")
-    else:
-        notes.append("进程探测超预算未跑")
-
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    slice_ = remaining(3.0)
-    if slice_ <= 0:
-        notes.append("ADB 探测超预算未跑")
-        return False, "；".join(notes)
-    try:
-        subprocess.run(
-            [adb, "connect", address],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=slice_,
-        )
-        slice_ = remaining(3.0)
-        if slice_ <= 0:
-            notes.append("ADB getprop 超预算未跑")
-            return False, "；".join(notes)
-        boot = subprocess.run(
-            [adb, "-s", address, "shell", "getprop", "sys.boot_completed"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=slice_,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        notes.append(f"ADB 探测失败（{type(exc).__name__}）")
-        return False, "；".join(notes)
-    if boot.returncode == 0 and boot.stdout.strip() == "1":
-        return True, f"ADB {address} 已就绪（sys.boot_completed = 1）"
-    notes.append("ADB 未连上或系统未就绪")
-    return False, "；".join(notes)
-
-
 def report_emulator_busy(
     config: dict[str, Any],
     token: str,
@@ -841,41 +745,23 @@ def report_emulator_busy(
     reason = (
         "检测到模拟器正在运行，判定你在玩，本场不抢设备。需要照跑就说「现在跑」。"
     )
-    errors: list[str] = []
-    try:
-        merge_last_run(
-            {
-                "status": "skipped",
-                "phase": phase,
-                "skip_reason": "emulator_busy",
-                "summary": reason,
-                "emulator_probe": detail,
-                "finished_at": attempted_at.isoformat(),
-            }
-        )
-    except Exception as exc:
-        errors.append(f"跳过状态写入失败：{type(exc).__name__}: {exc}")
-    try:
-        discord_request(
-            token,
-            "POST",
-            f"/channels/{channel_id}/messages",
-            {
-                "embeds": [
-                    {
-                        "title": f"⏭️ MAA 日常·{PHASE_LABELS[phase]}场已跳过",
-                        "description": f"{reason}\n探测：{detail}",
-                        "color": 0x99AAB5,
-                        "timestamp": attempted_at.isoformat(),
-                    }
-                ],
-                "allowed_mentions": {"parse": []},
-            },
-        )
-    except Exception as exc:
-        errors.append(f"跳过告警发送失败：{type(exc).__name__}: {exc}")
-    if errors:
-        raise RuntimeError("；".join(errors))
+    common_report_emulator_busy(
+        config,
+        title=f"⏭️ MAA 日常·{PHASE_LABELS[phase]}场已跳过",
+        reason=reason,
+        detail=detail,
+        at=attempted_at,
+        state_update={
+            "status": "skipped",
+            "phase": phase,
+            "skip_reason": "emulator_busy",
+            "summary": reason,
+            "emulator_probe": detail,
+            "finished_at": attempted_at.isoformat(),
+        },
+        token=token,
+        channel_id=channel_id,
+    )
 
 
 def emulator_boot_diagnostic(config: dict[str, Any]) -> str:
@@ -1544,10 +1430,10 @@ def send_direct_failure(
 def should_skip(plan: dict[str, Any], phase: str) -> bool:
     """Whether this run bails out before touching the emulator.
 
-    `skip` only silences the 08:00 / 22:00 cron sessions.  A manual run is the
-    user asking for it right now, which overrides today's plan by definition —
-    otherwise "跳过今天" would leave no way to run at all short of un-skipping,
-    which would also bring the automatic sessions back.
+    `skip` is now **per session** (四期 D2): it comes from `sessions.<phase>`,
+    so silencing 08:00 leaves 22:00 alone.  A manual run is the user asking for
+    it right now, which overrides today's plan by definition — otherwise
+    "跳过本场" would leave no way to run at all short of un-skipping.
     """
     return bool(plan.get("skip")) and phase != "now"
 
@@ -1607,8 +1493,10 @@ def execute(phase: str) -> int:
     last_run_state = load_json(LAST_RUN_PATH, {})
     if not isinstance(last_run_state, dict):
         last_run_state = {}
+    # 计划按场次求值（四期 D1~D3）：早场改的关不会带到晚场，
+    # 手动场 `now` 没有场次覆盖，永远走缺口默认关（D4）。
     plan = attach_clearing_yield(
-        attach_annihilation(effective_plan(started), started, last_run_state),
+        attach_annihilation(effective_plan(started, phase), started, last_run_state),
         config,
         started,
     )
@@ -1662,8 +1550,8 @@ def execute(phase: str) -> int:
                     "embeds": [
                         {
                             "title": f"⏭️ MAA 日常·{PHASE_LABELS[phase]}已跳过",
-                            "description": "今日计划设置了跳过自动场次；未启动模拟器。"
-                            "手动开跑（「现在跑」）不受影响。",
+                            "description": "计划卡上把**本场**设成了跳过；未启动模拟器。"
+                            "今天的另一场和手动开跑（「现在跑」）都不受影响。",
                             "color": 0x99AAB5,
                             "timestamp": started.isoformat(),
                         }

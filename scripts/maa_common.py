@@ -6,9 +6,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -66,6 +68,14 @@ PROXY_ENV_KEYS = (
     "https_proxy",
     "http_proxy",
 )
+# 计划的覆盖是**按场次**的（四期 D1~D3）：早场改了关，晚场仍走缺口默认。
+# `now`（手动场）不属于任何场次，永远只吃 defaults（D4）。
+PLAN_PHASES = ("am", "pm")
+# 一个场次覆盖允许持久化的字段。`stage_source` 必须在里面：卡片靠它区分
+# 「这关是自动定的」和「你自己选的」，掉了它点一次「跳过」就会冻住当天的自动定关。
+PLAN_SESSION_FIELDS = ("stage", "stage_source", "skip", "source", "updated_at")
+# 传给 `open -a` / `pgrep -f` 的模拟器名白名单：任何子进程都不接受未校验的名字。
+SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
 
 
 def now_beijing() -> datetime:
@@ -278,7 +288,7 @@ def _normalized_tasks(value: Any) -> dict[str, bool]:
 
 def normalize_plan(value: Any) -> dict[str, Any]:
     raw = value if isinstance(value, dict) else {}
-    return {
+    result = {
         "stage": str(raw.get("stage", DEFAULT_PLAN["stage"])),
         # Medication is intentionally not user-configurable. MaaCore receives
         # medicine=0 plus medicine_expire_days from the trusted local config.
@@ -288,16 +298,54 @@ def normalize_plan(value: Any) -> dict[str, Any]:
         "stone": 0,
         "tasks": _normalized_tasks(raw.get("tasks")),
     }
+    # `stage_source` 要**穿过**这层规范化：它是「这关是谁定的」的唯一依据。
+    # 以前这里把它连同其余字段一起丢掉，卡片只好绕开 `effective_plan()`
+    # 直接读 `plan.json`（PLAN_CLEARING 不变量 #31 的教训）。
+    stage_source = str(raw.get("stage_source") or "")
+    if stage_source:
+        result["stage_source"] = stage_source
+    return result
 
 
-def effective_plan(at: datetime | None = None) -> dict[str, Any]:
+def plan_sessions(at: datetime | None = None) -> dict[str, dict[str, Any]]:
+    """当天 `plan.json` 的场次表 `{场次: 覆盖}`。
+
+    只认新结构 `{date, sessions: {am, pm}, updated_at}`。**旧的按天格式**
+    （顶层 `stage` / `skip`）读到就当空——它一天后自然失效，不值得为它写迁移。
+    """
+    moment = at or now_beijing()
+    raw = load_json(PLAN_PATH, {})
+    if not isinstance(raw, dict) or raw.get("date") != moment.date().isoformat():
+        return {}
+    sessions = raw.get("sessions")
+    if not isinstance(sessions, dict):
+        return {}
+    return {
+        str(name): dict(override)
+        for name, override in sessions.items()
+        if isinstance(override, dict)
+    }
+
+
+def session_override(phase: str, at: datetime | None = None) -> dict[str, Any]:
+    """一个场次今天的覆盖；没有就是空 dict。"""
+    return plan_sessions(at).get(str(phase), {})
+
+
+def effective_plan(
+    at: datetime | None = None, phase: str = "now"
+) -> dict[str, Any]:
+    """defaults ⊕ 当天 `sessions.<phase>` 的覆盖。
+
+    `phase` 取 `am` / `pm` / `now`。手动场 `now` 从来没有人写过它的场次覆盖，
+    所以它天然等于默认计划——这就是 D4「现在跑取缺口默认关，不看卡片上的手动选择」。
+    """
     at = at or now_beijing()
     result = normalize_plan(load_json(DEFAULTS_PATH, DEFAULT_PLAN))
-    override = load_json(PLAN_PATH, {})
-    if isinstance(override, dict) and override.get("date") == at.date().isoformat():
-        for key in ("stage", "skip"):
-            if key in override:
-                result[key] = override[key]
+    override = session_override(phase, at)
+    for key in ("stage", "stage_source", "skip"):
+        if key in override:
+            result[key] = override[key]
     result = normalize_plan(result)
     result["date"] = at.date().isoformat()
     return result
@@ -523,6 +571,147 @@ def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
         current["threads"] = threads
         atomic_write_json(LAST_RUN_PATH, current)
         return current
+
+
+# ---------------------------------------------------------------------------
+# 模拟器占用探测（四期 D18）：所有自动行为开模拟器前都走这一份实现
+# ---------------------------------------------------------------------------
+
+def emulator_is_online(config: dict[str, Any]) -> tuple[bool, str]:
+    """模拟器是不是已经开着——也就是「用户此刻在玩」？
+
+    在**每一条自动链路**抢到 `run.lock` 之后、`open_emulator()` 之前调用
+    （日常 am/pm、抄作业 worker、通关队列、Depot）。动机是 `PLAN_NAV_GATE.md`
+    结论 3：任何失败路径都会 `close_everything()` 直接退掉 BlueStacks，
+    等于把正在玩的用户踢出游戏。用户的决定是「先探，不改清理逻辑」。
+
+    **这不是 `settle_android_runtime()`**：那个在我们开完模拟器、安卓起来之后跑，
+    等 `app_process` 别抖，免得 MaaTouch 超时（DEV_GUIDE §11.14）。也不是
+    `wait_for_android()`：那个为刚启动的设备等 180 秒；这个必须在几秒内回答
+    一台**不是我们启动**的设备的状态。
+
+    两个信号取或——命中任一即「在线」：
+
+      1. 模拟器进程存在（`pgrep -f`）
+      2. adb 连得上且 `sys.boot_completed` 是 `1`
+
+    单独哪个都不够：刚拉起的 BlueStacks 还没有安卓，adb 会漏掉用户明明在用的设备；
+    而挂死的进程能比它的设备活得久，pgrep 会在什么都不工作时命中。
+
+    **永不抛异常。** 探测本身出错或超时一律报离线、照常执行：误抢一次设备远比
+    「探测坏了导致日常永久停摆」便宜（B-4）。总预算 `emulator_probe_timeout`
+    （默认 5s），不会吃掉运行时间，也守得住 <20s 的按钮预算（不变量 #6）。
+    """
+    budget = max(0.0, float(config.get("emulator_probe_timeout", 5)))
+    if not budget:
+        return False, "探测已禁用（emulator_probe_timeout = 0）"
+    deadline = time.monotonic() + budget
+
+    def remaining(cap: float) -> float:
+        return min(cap, deadline - time.monotonic())
+
+    app = str(config.get("emulator_app", "BlueStacks"))
+    if not SAFE_APP_RE.fullmatch(app):
+        # Same guard as open_emulator(): never hand an unvalidated name to a
+        # subprocess. Refusing to probe is not refusing to run.
+        return False, "emulator_app 名称含非法字符，跳过探测"
+    notes: list[str] = []
+    slice_ = remaining(2.0)
+    if slice_ > 0:
+        try:
+            found = subprocess.run(
+                ["pgrep", "-f", app],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=slice_,
+            )
+            if found.returncode == 0 and found.stdout.strip():
+                return True, f"{app} 进程在跑"
+            notes.append(f"{app} 进程不在")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            notes.append(f"进程探测失败（{type(exc).__name__}）")
+    else:
+        notes.append("进程探测超预算未跑")
+
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    slice_ = remaining(3.0)
+    if slice_ <= 0:
+        notes.append("ADB 探测超预算未跑")
+        return False, "；".join(notes)
+    try:
+        subprocess.run(
+            [adb, "connect", address],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=slice_,
+        )
+        slice_ = remaining(3.0)
+        if slice_ <= 0:
+            notes.append("ADB getprop 超预算未跑")
+            return False, "；".join(notes)
+        boot = subprocess.run(
+            [adb, "-s", address, "shell", "getprop", "sys.boot_completed"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=slice_,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        notes.append(f"ADB 探测失败（{type(exc).__name__}）")
+        return False, "；".join(notes)
+    if boot.returncode == 0 and boot.stdout.strip() == "1":
+        return True, f"ADB {address} 已就绪（sys.boot_completed = 1）"
+    notes.append("ADB 未连上或系统未就绪")
+    return False, "；".join(notes)
+
+
+def report_emulator_busy(
+    config: dict[str, Any],
+    *,
+    title: str,
+    reason: str,
+    detail: str,
+    at: datetime,
+    state_update: dict[str, Any],
+    token: str = "",
+    channel_id: str = "",
+) -> None:
+    """探到模拟器在用 → 写 `last_run.json` + 发一张灰卡。
+
+    每条自动链路的「已在线」分支都走这里：跳过必须**看得见**，
+    静默 return 是 PLAN_CLEARING 护栏 4 明令禁止的（不变量 #24）。
+    两件事各自 try，任一失败都汇总成 RuntimeError 抛给调用方。
+    """
+    errors: list[str] = []
+    try:
+        merge_last_run(state_update)
+    except Exception as exc:
+        errors.append(f"跳过状态写入失败：{type(exc).__name__}: {exc}")
+    try:
+        channel = channel_id or str(config.get("channel_id", "")).strip()
+        discord_request(
+            token or discord_token(),
+            "POST",
+            f"/channels/{channel}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": title,
+                        "description": f"{reason}\n探测：{detail}",
+                        "color": 0x99AAB5,
+                        "timestamp": at.isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+    except Exception as exc:
+        errors.append(f"跳过告警发送失败：{type(exc).__name__}: {exc}")
+    if errors:
+        raise RuntimeError("；".join(errors))
 
 
 def cleanup_old_threads(token: str, at: datetime | None = None) -> dict[str, int]:
