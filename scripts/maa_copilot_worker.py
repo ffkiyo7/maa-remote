@@ -124,12 +124,11 @@ def _claim_search(token: str) -> dict[str, Any] | None:
 def _roster_for_search(
     config: dict[str, Any], *, auto_confirm: bool
 ) -> tuple[dict[str, Any] | None, str]:
-    """Automatic confirmation requires a fresh roster; manual search may degrade."""
+    """Refresh every search; manual failures remain visible and may degrade."""
     try:
         import maa_skland
 
-        if auto_confirm or maa_skland.roster_needs_refresh(config):
-            maa_skland.refresh_roster()
+        maa_skland.refresh_roster()
     except Exception as exc:
         if auto_confirm:
             raise RuntimeError(
@@ -224,9 +223,11 @@ def cmd_search(token: str) -> int:
                 candidates,
                 roster_ok,
                 code,
-                roster_hint=maa_copilot.roster_age_hint(roster)
-                if roster_ok
-                else "",
+                roster_hint="\n".join(filter(None, [
+                    maa_copilot.roster_age_hint(roster) if roster_ok else "",
+                    f"⚠️ 森空岛刷新失败，本次未取得最新进度：{roster_refresh_error}"
+                    if roster_refresh_error else "",
+                ])),
                 stage_id=stage_id,
                 roster=roster,
                 auto_confirm=auto_confirm,

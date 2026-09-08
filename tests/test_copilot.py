@@ -2251,7 +2251,7 @@ class ReviewFixTests(unittest.TestCase):
                     )
 
     def test_roster_refresh_failure_degrades_to_stale_roster(self) -> None:
-        # P1-5: lazy refresh runs inside cmd_search; a throwing refresh must
+        # Every search refreshes; a throwing refresh must
         # not abort the search — the stale roster still produces candidates.
         import maa_copilot_worker as worker
         import maa_skland
@@ -2281,19 +2281,44 @@ class ReviewFixTests(unittest.TestCase):
                  patch.object(maa_copilot, "search_copilots",
                               return_value=[op_item(1, "act53side_09")]), \
                  patch.object(maa_copilot, "build_candidate_card",
-                              return_value=({"title": "x"}, [], {})), \
+                              return_value=({"title": "x"}, [], {})) as build_card, \
                  patch.object(worker, "discord_request", return_value={"id": "111"}), \
                  patch.object(worker, "discord_token", return_value="tok"), \
                  patch.object(worker, "state_lock",
                               return_value=contextlib.nullcontext()), \
-                 patch.object(maa_skland, "roster_needs_refresh", return_value=True), \
                  patch.object(maa_skland, "refresh_roster",
                               side_effect=RuntimeError("skland down")):
                 with contextlib.redirect_stdout(io.StringIO()):
                     rc = worker.cmd_search("a" * 12)
             self.assertEqual(rc, 0)
+            self.assertIn("未取得最新进度", build_card.call_args.kwargs["roster_hint"])
+            self.assertIn("skland down", build_card.call_args.kwargs["roster_hint"])
             state = json.loads((searches / ("a" * 12 + ".json")).read_text(encoding="utf-8"))
             self.assertEqual(state["status"], "done")
+
+    def test_manual_search_refreshes_even_with_recent_cached_progress(self) -> None:
+        import maa_copilot_worker as worker
+        import maa_skland
+
+        cached = roster({})
+        cached["fetched_at"] = datetime.now(BEIJING).isoformat()
+        cached["activity_progress"] = {"act54side": [
+            {"zoneId": "act54side_zone1", "clearedStage": 0, "totalStage": 11}
+        ]}
+        fresh = {**cached, "activity_progress": {"act54side": [
+            {"zoneId": "act54side_zone1", "clearedStage": 11, "totalStage": 11}
+        ]}}
+        with patch.object(maa_skland, "roster_needs_refresh", return_value=False), \
+             patch.object(maa_skland, "refresh_roster", return_value=fresh) as refresh, \
+             patch.object(maa_copilot, "load_roster",
+                          side_effect=lambda: fresh if refresh.called else cached):
+            actual, error = worker._roster_for_search(
+                {"skland_roster_refresh_days": 7}, auto_confirm=False
+            )
+        refresh.assert_called_once_with()
+        self.assertEqual(error, "")
+        self.assertIs(actual, fresh)
+        self.assertIsNone(maa_copilot.zone_progress_warning("SR-8", "act54side_08", actual))
 
     def test_module_levels_keep_locked_slots_in_place(self) -> None:
         # P1-6: filtering locked equips collapsed the list and shifted
