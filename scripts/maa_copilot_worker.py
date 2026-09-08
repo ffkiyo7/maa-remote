@@ -16,10 +16,13 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,7 +39,6 @@ from maa_daily import (
 from maa_common import (
     BUTTONS_PATH,
     LAST_RUN_PATH,
-    MAA_CONFIG_DIR,
     RUNS_DIR,
     SCRIPTS_DIR,
     atomic_write_json,
@@ -55,10 +57,8 @@ from maa_common import (
     state_lock,
 )
 
-# Single-op `maa copilot` must start from the stage's formation screen.
-# A Fight task with times=0 runs the full chain (incl. StageNavigationTask)
-# but starts no battle, parking the game exactly there.  Rendered per run
-# because maa-cli has no CLI stage override.
+# Use upstream Fight navigation with a process-local, recognition-only FightBegin.
+# v6.17.2 skips ALL Fight subtasks for times=0. Never alter shared resources.
 NAV_TOML_TEMPLATE = """[[tasks]]
 name = "启动国服"
 type = "StartUp"
@@ -71,12 +71,18 @@ name = "导航到关卡"
 type = "Fight"
 [tasks.params]
 stage = "{stage}"
-times = 0
+times = 1
 series = 0
 medicine = 0
 stone = 0
 server = "CN"
 client_type = "Official"
+
+[[tasks]]
+name = "检查关卡界面"
+type = "Custom"
+[tasks.params]
+task_names = ["CopilotNavigationReady"]
 """
 
 # The takeover popup appears when the agent-command (代理指挥) switch is on:
@@ -860,28 +866,9 @@ def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mo
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
-        # Navigation task: StartUp + Fight(times=0) parks the game at the
-        # formation screen; single-op copilot cannot navigate on its own.
-        nav_path = MAA_CONFIG_DIR / "tasks" / "copilot-nav.toml"
-        nav_toml = NAV_TOML_TEMPLATE.format(stage=stage_label)
-        atomic_write_text(nav_path, nav_toml)
-        nav_result = subprocess.run(
-            [maa_bin, "run", "copilot-nav", "-v", "--batch"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=900,
-            env=env,
-        )
-        nav_output = f"{nav_result.stdout}\n{nav_result.stderr}"
-        with log_path.open("a", encoding="utf-8") as log_handle:
-            log_handle.write(nav_output)
-        if nav_result.returncode != 0 or "Fight Completed" not in nav_output:
-            detail = nav_output.strip().splitlines()[-3:]
-            raise RuntimeError(
-                "导航到编队界面失败（关卡可能未解锁或不可达）："
-                + (" | ".join(detail)[-500:] if detail else f"退出码 {nav_result.returncode}")
-            )
+        navigated, detail = _navigate_to_stage(config, stage_label, env, log_path)
+        if not navigated:
+            raise RuntimeError(detail)
 
         # The card can sit open while the emulator boots.  Recheck the live
         # activity and AP once more at the last safe point before a battle can
@@ -1163,29 +1150,54 @@ def _clearing_pick_op(
     return None
 
 
-def _clearing_navigate(
+@contextmanager
+def _navigation_config(stage: str, env: dict[str, str]):
+    """Isolate the no-battle override from daily runs and subsequent Copilot."""
+    source = Path(env["MAA_CONFIG_DIR"])
+    with tempfile.TemporaryDirectory(prefix="maa-copilot-nav-") as raw:
+        root = Path(raw)
+        for name in ("profiles", "resource"):
+            if (source / name).is_dir():
+                shutil.copytree(source / name, root / name)
+        for name in ("cli.toml", "asst.toml"):
+            if (source / name).is_file():
+                shutil.copy2(source / name, root / name)
+        # Keep upstream recognition, but no click, subtask, or continuation into battle.
+        ready = {
+            "baseTask": "BattleStartPre", "algorithm": "OcrDetect", "action": "DoNothing",
+            "sub": [], "next": [], "onErrorNext": [], "exceededNext": [],
+        }
+        resource = root / "resource" / "tasks" / "tasks.json"
+        overlay = load_json(resource, {})
+        overlay["FightBegin"] = dict(ready)
+        overlay["CopilotNavigationReady"] = dict(ready)
+        atomic_write_json(resource, overlay)
+        atomic_write_text(root / "tasks" / "copilot-nav.toml", NAV_TOML_TEMPLATE.format(stage=stage))
+        yield {**env, "MAA_CONFIG_DIR": str(root)}
+
+
+def _navigate_to_stage(
     config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
-    """`Fight(times=0)` 把游戏停在该关的编队界面。返回 `(是否到达, 失败明细)`。"""
+    """Run upstream navigation, then recognize the stage screen without clicking."""
+    import maa_clearing
+
+    supported, detail = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))(stage)
+    if not supported:
+        return False, detail
     maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
-    nav_path = MAA_CONFIG_DIR / "tasks" / "copilot-nav.toml"
-    atomic_write_text(nav_path, NAV_TOML_TEMPLATE.format(stage=stage))
-    nav_result = subprocess.run(
-        [maa_bin, "run", "copilot-nav", "-v", "--batch"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=900,
-        env=env,
-    )
+    with _navigation_config(stage, env) as nav_env:
+        nav_result = subprocess.run(
+            [maa_bin, "run", "copilot-nav", "--user-resource", "-v", "--batch"],
+            capture_output=True, text=True, check=False, timeout=900, env=nav_env,
+        )
     nav_output = f"{nav_result.stdout}\n{nav_result.stderr}"
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(nav_output)
-    if nav_result.returncode != 0 or "Fight Completed" not in nav_output:
+    if (nav_result.returncode != 0 or "Fight Completed" not in nav_output
+            or "Custom Completed" not in nav_output):
         detail = " | ".join(nav_output.strip().splitlines()[-3:])[-400:]
-        # 导航失败多半是「MAA 没为该关写导航定义」（步骤 2 的地基），
-        # 不一定是关卡未解锁。
-        return False, f"{stage} 导航到编队界面失败：{detail}"
+        return False, f"{stage} 导航或关卡界面检查失败：{detail}"
     return True, ""
 
 
@@ -1203,7 +1215,7 @@ def _clearing_probe_sanity(
     """
     import maa_clearing
 
-    nav_ok, nav_detail = _clearing_navigate(config, stage, env, log_path)
+    nav_ok, nav_detail = _navigate_to_stage(config, stage, env, log_path)
     if not nav_ok:
         return None, "nav", nav_detail
     shot_ok, shot_detail = capture_screenshot(config, png_path)
@@ -1237,7 +1249,7 @@ def _clearing_fight_stage(
         return False, "op", f"{stage} 暂时没有完全满足当前干员练度的作业"
     uri, _rewritten = _prepare_op_file(candidate, stage_id, config)
 
-    nav_ok, nav_detail = _clearing_navigate(config, stage, env, log_path)
+    nav_ok, nav_detail = _navigate_to_stage(config, stage, env, log_path)
     if not nav_ok:
         return False, "nav", nav_detail
 
@@ -1351,7 +1363,39 @@ def cmd_clearing() -> int:
         # `stages.json` 有真值以它为准；没有（EX 关）才用步骤 4 的 OCR 缓存。
         return maa_clearing.resolve_cost(entry, state, lookup)
 
-    plan_result = maa_clearing.plan_round(state, budget, cost_of, at=at)
+    # 上游导航键闸门（2026-09-05 范围变更）：队列只跑上游 `tasks/Stages/<前缀>.json`
+    # 已经写了导航键的关。`_resource_dirs()` 只读不改；本项目**不再**自写导航定义，
+    # 也不读 `~/.config/maa-cli/resource/tasks/Stages/`。每轮建一次，按前缀缓存。
+    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
+
+    plan_result = maa_clearing.plan_round(state, budget, cost_of, at=at, nav_of=nav_of)
+    # 上游没导航定义的关：**立刻**走 needs_manual（同一个出口，`immediate=True`），
+    # 不等 `clearing_manual_after_days` 的 N 日规则——那条规则赌的是「明天也许就好了」，
+    # 而导航定义不会自己长出来。cursor 不前进，用户点「已完成」后照常前进。
+    # 只在它排在队首（本轮一关都排不出）时立刻转：它前面还有能打的关时先把那些打完，
+    # 下一轮它成为队首再转，同样一关都不会被跳过。
+    missing_nav = plan_result.get("missing_nav") or []
+    if missing_nav and not plan_result["stages"]:
+        blocked_entry = str(missing_nav[0])
+        nav_detail = str(plan_result.get("nav_detail") or "")
+        state, turned = maa_clearing.record_stage_failure(
+            state,
+            blocked_entry,
+            kind="nav_definition",
+            detail=nav_detail,
+            config=config,
+            at=at,
+            immediate=True,
+            reason_code=maa_clearing.NAV_MISSING_REASON,
+        )
+        maa_clearing.save_state(state)
+        # 同原因只发一次（复用 fail-closed 可见性的去重范式）；换了关或换了原因要重发。
+        if turned and maa_clearing.should_notify(
+            state, "nav_definition", f"{blocked_entry}|{nav_detail}"
+        ):
+            _clearing_post_manual_card(config, state, blocked_entry)
+        maa_clearing.save_state(state)
+        return 0
     # 步骤 4：理智未知的关不再直接堵住——本轮去它的编队界面 OCR 一次，
     # 读到就缓存（下一轮排得进），读不出才按「今日堵住」记账（在锁内做）。
     # 当天已经因此堵过就不再开模拟器重试，与 nav 冻结同尺度。

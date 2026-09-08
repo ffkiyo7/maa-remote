@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -292,6 +293,99 @@ def apply_ex_gate(
 
 
 # ---------------------------------------------------------------------------
+# 上游导航键闸门（2026-09-05 范围变更：**不再自写导航定义**）
+# ---------------------------------------------------------------------------
+
+# 队列只跑上游 `tasks/Stages/<前缀>.json` 里**已有导航键**的关。原计划的
+# 「导航定义生成器」整段取消，于是「上游没写导航定义」这件事就不再是可以等的
+# 临时状态，而是**永远不会自动变好**：等 `clearing_manual_after_days` 的 N 日
+# 规则毫无意义（每天撞一次、每天失败，N 天后才走到同一个出口，白白浪费 N 天的
+# 理智和 N 张失败卡片）。所以排进当轮之前先查一次，没有键就**立刻**走
+# needs_manual —— 用的还是同一个出口（`record_stage_failure(immediate=True)`），
+# 不新造第二条。
+NAV_MISSING_REASON = "no_nav_definition"
+
+# 只读**上游** resource 目录（`maa_copilot._resource_dirs()` 给的那几个）。
+# 故意不读也不建 `~/.config/maa-cli/resource/tasks/Stages/`：本项目不再往那里
+# 写自造的导航定义，读它只会让「上游有没有这关」这个判断失真。
+NAV_STAGES_SUBDIR = ("tasks", "Stages")
+
+
+def stage_nav_prefix(stage: str) -> str:
+    """关卡名 → Stages 文件名前缀：`SR-5` → `SR`，`AT-EX-1` → `AT`。"""
+    text = str(stage or "").strip()
+    return text.split("-", 1)[0] if text else ""
+
+
+def read_nav_keys(
+    resource_dirs: Iterable[Path], prefix: str
+) -> tuple[set[str], str]:
+    """读上游 `tasks/Stages/<prefix>.json` 的**顶层键**，返回 `(键集, 异常摘要)`。
+
+    文件不存在 / 读失败 / JSON 坏 / 顶层不是对象 → 一律**视为无键**（fail-closed）
+    并把异常摘要带出去，写进 `clearing.json` 与卡片，绝不当成「有导航定义」。
+    """
+    prefix = str(prefix or "")
+    if not prefix:
+        return set(), "关卡名没有前缀，定位不到 Stages 文件"
+    keys: set[str] = set()
+    errors: list[str] = []
+    parsed = False
+    for resource_dir in resource_dirs:
+        path = (Path(resource_dir) / "tasks" / "tasks.json" if prefix == "tasks"
+                else Path(resource_dir).joinpath(*NAV_STAGES_SUBDIR, f"{prefix}.json"))
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            errors.append(f"{path} 不存在")
+            continue
+        except (OSError, ValueError) as exc:
+            errors.append(f"{path} 读不出来：{type(exc).__name__}: {exc}")
+            continue
+        if not isinstance(data, dict):
+            errors.append(f"{path} 顶层不是对象")
+            continue
+        parsed = True
+        keys.update(str(key) for key in data)
+    if parsed:
+        return keys, ""
+    return set(), "；".join(errors)[:300] or f"没找到 tasks/Stages/{prefix}.json"
+
+
+def nav_checker(
+    resource_dirs: Iterable[Path],
+) -> Callable[[str], tuple[bool, str]]:
+    """按前缀缓存的导航键判定器：`(entry) -> (上游有导航定义吗, 没有的话为什么)`。
+
+    每个前缀只 open 一次文件（一轮里几十个条目共用同一份缓存），调用方每轮建一次。
+    **突袭条目按普通关名查**（`split_entry()`），与理智查表一致。
+    """
+    dirs = [Path(path) for path in resource_dirs]
+    cache: dict[str, tuple[set[str], str]] = {}
+
+    def check(entry: str) -> tuple[bool, str]:
+        stage, _mode = split_entry(entry)
+        prefix = stage_nav_prefix(stage)
+        # Supplies and chapter navigation are provided upstream outside activity files.
+        if prefix in {"CE", "LS", "AP", "CA", "SK", "PR"}:
+            prefix = "Supplies"
+        main = re.fullmatch(r"[A-Za-z]{0,3}(\d{1,2})-\d{1,2}", stage)
+        if main:
+            prefix = "tasks"
+        if prefix not in cache:
+            cache[prefix] = read_nav_keys(dirs, prefix)
+        keys, error = cache[prefix]
+        if stage in keys or (main and f"Episode{main[1]}" in keys):
+            return True, ""
+        if error:
+            return False, f"上游没有 {stage} 的导航定义：{error}"
+        return False, f"上游 tasks/Stages/{prefix}.json 里没有 {stage} 这个顶层键"
+
+    return check
+
+
+# ---------------------------------------------------------------------------
 # 理智预算
 # ---------------------------------------------------------------------------
 
@@ -374,6 +468,8 @@ def record_stage_failure(
     detail: str = "",
     config: dict[str, Any] | None = None,
     at: datetime | None = None,
+    immediate: bool = False,
+    reason_code: str = "",
 ) -> tuple[dict[str, Any], bool]:
     """记一次失败，返回 `(state, 是否刚刚转入 needs_manual)`。
 
@@ -384,6 +480,11 @@ def record_stage_failure(
     同一时间尺度上，两者不会互相打架。
 
     `kind == "nav"` 额外冻结该段到明天。
+
+    `immediate=True` **跳过 N 日规则**，这一次失败就转 needs_manual。只给
+    「等下去也永远不会自动成功」的原因用——当前唯一一个是
+    `NAV_MISSING_REASON`（上游没为该关写导航定义，见 `nav_checker()`）。
+    走的仍是这同一个出口，队列不会出现第二条 needs_manual 路径。
     """
     entry = _stage_entry(state, stage)
     day = today_key(at)
@@ -391,10 +492,12 @@ def record_stage_failure(
         entry["failed_dates"].append(day)
     entry["last_error"] = str(detail)[:400]
     entry["last_failed_at"] = (at or now_beijing()).isoformat()
+    if reason_code:
+        entry["reason_code"] = str(reason_code)[:60]
     if kind == "nav":
         entry["nav_frozen_date"] = day
     threshold = manual_after_days(config or {})
-    if len(entry["failed_dates"]) < threshold:
+    if not immediate and len(entry["failed_dates"]) < threshold:
         return state, False
     if isinstance(state.get("needs_manual"), dict) and state["needs_manual"].get(
         "stage"
@@ -404,7 +507,8 @@ def record_stage_failure(
         "stage": stage,
         "since": (at or now_beijing()).isoformat(),
         "days": list(entry["failed_dates"]),
-        "reason": str(detail)[:400],
+        "reason": str(reason_code or detail)[:400],
+        "detail": str(detail)[:400],
         "message_id": None,
     }
     return state, True
@@ -502,10 +606,17 @@ def plan_round(
     cost_of: Callable[[str], int | None],
     *,
     at: datetime | None = None,
+    nav_of: Callable[[str], tuple[bool, str]] | None = None,
 ) -> dict[str, Any]:
     """从 cursor 起按序排出这一轮打得起的关；**不动 cursor**。
 
-    返回 `{"stages": [...], "spent": int, "unknown_cost": [...], "stop_reason": str}`。
+    返回 `{"stages": [...], "spent": int, "unknown_cost": [...],
+    "missing_nav": [...], "nav_detail": str, "stop_reason": str}`。
+
+    `nav_of`（`nav_checker()` 造的）是**上游导航键闸门**：上游没为某关写导航定义
+    就不排它，`stop_reason="no_nav_definition"`，调用方据此**立刻**走 needs_manual
+    （不等 N 日规则，等也不会自动成功）。这一步排在冻结与理智之前，因为它是永久
+    条件：先算理智再发现导航都没有，只是白算。
 
     理智成本未知的关（`stage_sanity_cost()` 对 EX 返回 `None`，步骤 4 才解）：
     **不排入当轮、不计入理智预算**，也**不前进 cursor**——那不是「这关打完了」，
@@ -517,9 +628,18 @@ def plan_round(
     remaining = max(0, int(budget))
     picked: list[str] = []
     unknown: list[str] = []
+    missing_nav: list[str] = []
+    nav_detail = ""
     stop_reason = "queue_end"
     for index in range(cursor, len(stages)):
         stage = str(stages[index])
+        if nav_of is not None:
+            has_nav, detail = nav_of(stage)
+            if not has_nav:
+                missing_nav.append(stage)
+                nav_detail = detail
+                stop_reason = "no_nav_definition"
+                break
         if is_nav_frozen(state, stage, at):
             stop_reason = "nav_frozen"
             break
@@ -543,6 +663,8 @@ def plan_round(
         "stages": picked,
         "spent": max(0, int(budget)) - remaining,
         "unknown_cost": unknown,
+        "missing_nav": missing_nav,
+        "nav_detail": nav_detail,
         "stop_reason": stop_reason,
     }
 
@@ -632,18 +754,32 @@ def build_manual_card(
     这不是为教学关特设的补丁——任何一关卡住都走它，队列就永远卡不死。
     """
     manual = state.get("needs_manual") or {}
-    days = manual.get("days") if isinstance(manual, dict) else []
+    if not isinstance(manual, dict):
+        manual = {}
+    days = manual.get("days") or []
     day_text = "、".join(str(day) for day in days if day) or "—"
-    reason = str(manual.get("reason") or "") if isinstance(manual, dict) else ""
+    reason_code = str(manual.get("reason") or "")
+    reason = str(manual.get("detail") or "") or reason_code
     custom_id = manual_button_id(stage)
     label = entry_label(stage)
-    embed = {
-        "title": f"🙋 {label} 需要你手动打一次",
-        "description": (
+    if reason_code == NAV_MISSING_REASON:
+        # 这条不是「今天没打成」，是「MAA 根本没为这关写导航定义」——等下去
+        # 永远不会自动成功，所以文案要直接给出唯一的出路。
+        headline = (
+            f"**MAA 未为 {label} 写导航定义**（上游 `tasks/Stages/` 里没有这一关的键），"
+            "队列没法自己导航过去，也不会自己变好。\n"
+            "请在游戏里手动把这一关打过，然后点下面的「已完成」，队列会从下一关继续。\n"
+            "在你点掉之前，队列停在这里，日常会照常刷理智（不会白白溢出）。"
+        )
+    else:
+        headline = (
             f"通关队列在 {label} 卡住了，自动路径拿不到作业或导航不过去。\n"
             "请在游戏里手动把这一关打过，然后点下面的「已完成」，队列会从下一关继续。\n"
             "在你点掉之前，队列停在这里，日常会照常刷理智（不会白白溢出）。"
-        ),
+        )
+    embed = {
+        "title": f"🙋 {label} 需要你手动打一次",
+        "description": headline,
         "color": 0xFEE75C,
         "fields": [
             {"name": "失败日期", "value": day_text[:1024], "inline": False},
@@ -721,6 +857,9 @@ def status_text(state: dict[str, Any] | None) -> str:
     manual = awaiting_manual(state)
     if manual:
         lines.append(f"⏳ 等你手动打完 {entry_label(manual)} 并点「已完成」")
+        info = state.get("needs_manual")
+        if isinstance(info, dict) and info.get("reason") == NAV_MISSING_REASON:
+            lines.append("　原因：MAA 未为该关写导航定义（等下去不会自动变好）")
     if stage and is_nav_frozen(state, stage):
         lines.append("❄️ 今日 nav 失败已冻结，明天再试")
     blocked = blocked_today(state)

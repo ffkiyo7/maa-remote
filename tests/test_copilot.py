@@ -1803,8 +1803,6 @@ class ActivityAutomationTests(unittest.TestCase):
             searches.mkdir()
             runs = root / "runs"
             runs.mkdir()
-            maa_config = root / "maa-config"
-            (maa_config / "tasks").mkdir(parents=True)
             search_path = searches / f"{token}.json"
             search_path.write_text(json.dumps(queued), encoding="utf-8")
             buttons = root / "buttons.json"
@@ -1814,7 +1812,6 @@ class ActivityAutomationTests(unittest.TestCase):
             patches = [
                 patch.object(maa_copilot, "SEARCHES_DIR", searches),
                 patch.object(worker, "RUNS_DIR", runs),
-                patch.object(worker, "MAA_CONFIG_DIR", maa_config),
                 patch.object(worker, "BUTTONS_PATH", buttons),
                 patch.object(worker, "state_lock",
                              return_value=contextlib.nullcontext()),
@@ -1834,9 +1831,7 @@ class ActivityAutomationTests(unittest.TestCase):
                 patch.object(worker, "wait_for_android"),
                 patch.object(worker, "verify_game_installed"),
                 patch.object(worker, "settle_android_runtime"),
-                patch.object(worker.subprocess, "run", return_value=SimpleNamespace(
-                    returncode=0, stdout="Fight Completed", stderr="",
-                )),
+                patch.object(worker, "_navigate_to_stage", return_value=(True, "")),
                 patch.object(worker, "close_everything", return_value=[]),
             ]
             with contextlib.ExitStack() as stack:
@@ -2144,6 +2139,76 @@ class DeployTokenTests(unittest.TestCase):
 
 class ReviewFixTests(unittest.TestCase):
     """Regression tests for REVIEW_PHASE2.md findings (P0/P1/P2)."""
+
+    def test_navigation_config_is_isolated_and_never_clicks_start(self) -> None:
+        import maa_copilot_worker as worker
+        import tomllib
+
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw)
+            resource = source / "resource" / "tasks" / "tasks.json"
+            resource.parent.mkdir(parents=True)
+            resource.write_text('{"ExistingTask": {"action": "Stop"}}')
+            env = {"MAA_CONFIG_DIR": raw, "MAA_LOG_PREFIX": "Never"}
+            with worker._navigation_config("SR-8", env) as nav_env:
+                isolated = Path(nav_env["MAA_CONFIG_DIR"])
+                self.assertNotEqual(isolated, source)
+                task = tomllib.loads((isolated / "tasks/copilot-nav.toml").read_text())
+                self.assertEqual(task["tasks"][1]["params"]["times"], 1)
+                self.assertEqual(task["tasks"][1]["params"]["stage"], "SR-8")
+                overlay = json.loads((isolated / "resource/tasks/tasks.json").read_text())
+                self.assertIn("ExistingTask", overlay)
+                for name in ("FightBegin", "CopilotNavigationReady"):
+                    self.assertEqual(overlay[name]["algorithm"], "OcrDetect")
+                    self.assertEqual(overlay[name]["baseTask"], "BattleStartPre")
+                    self.assertEqual(overlay[name]["action"], "DoNothing")
+                    self.assertEqual(overlay[name]["next"], [])
+                    self.assertEqual(overlay[name]["sub"], [])
+            self.assertFalse(isolated.exists())
+            self.assertEqual(json.loads(resource.read_text()), {"ExistingTask": {"action": "Stop"}})
+            self.assertEqual(env["MAA_CONFIG_DIR"], raw)
+
+    def test_upstream_gate_keeps_supplies_and_main_story_navigation(self) -> None:
+        import maa_clearing
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "tasks/Stages").mkdir(parents=True)
+            (root / "tasks/Stages/Supplies.json").write_text('{"CE-6": {}}')
+            (root / "tasks/tasks.json").write_text('{"Episode1": {}}')
+            supported = maa_clearing.nav_checker([root])
+            self.assertTrue(supported("CE-6")[0])
+            self.assertTrue(supported("1-7")[0])
+            self.assertFalse(supported("CE-99")[0])
+            self.assertFalse(supported("19-7")[0])
+
+    def test_navigation_rejects_empty_fight_success_and_accepts_screen_check(self) -> None:
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            upstream = root / "upstream" / "tasks" / "Stages"
+            upstream.mkdir(parents=True)
+            (upstream / "SR.json").write_text('{"SR-8": {}}')
+            config = {"maa_resource_dir": str(root / "upstream")}
+            env = {"MAA_CONFIG_DIR": str(root / "config")}
+            for output, code, expected in (
+                ("Fight Completed", 0, False),
+                ("Fight Completed\nCustom Completed", 0, True),
+                ("Fight Completed\nCustom Completed", 1, False),
+            ):
+                with self.subTest(output=output, code=code), patch.object(
+                    worker.subprocess, "run", return_value=SimpleNamespace(
+                        returncode=code, stdout=output, stderr="",
+                    ),
+                ):
+                    ok, _ = worker._navigate_to_stage(config, "SR-8", env, root / "nav.log")
+                    self.assertEqual(ok, expected)
+            with patch.object(worker.subprocess, "run") as run:
+                ok, detail = worker._navigate_to_stage(config, "SR-1", env, root / "nav.log")
+                self.assertFalse(ok)
+                self.assertIn("SR-1", detail)
+                run.assert_not_called()
 
     def test_prepare_op_file_unwraps_real_get_response_shape(self) -> None:
         # P0-1: /copilot/get really returns

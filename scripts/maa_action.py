@@ -313,6 +313,11 @@ def start_copilot_search(
             None,
         )
     stage_id, code = resolved
+    import maa_clearing
+
+    supported, detail = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))(code)
+    if not supported:
+        return False, f"MAA 未提供该关导航，无法抄作业：{detail}", None
     worker = SCRIPTS_DIR / "maa_copilot_worker.py"
     if not worker.is_file():
         return False, "maa_copilot_worker.py 尚未部署。", None

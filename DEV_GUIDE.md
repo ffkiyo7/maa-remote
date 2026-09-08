@@ -201,7 +201,7 @@ worker 写执行终态，watcher 统一记 completed。
 
 活动与理智按三个安全点复核：`stages.json` 按 stageId 精确查理智消耗、复刻时按 code 精确兜底；
 按钮点击先现场读取活动，并按最近一次森空岛快照加自然恢复估算当前理智；worker 抢到 `run.lock`
-后、打开模拟器前再次读取活动并强制刷新森空岛理智；导航到编队界面后、真正调用 `maa copilot`
+后、打开模拟器前再次读取活动并强制刷新森空岛理智；导航到关卡详情界面后、真正调用 `maa copilot`
 前还会再做一次相同的实时复核。活动已轮换、消耗未知、API 失败或理智不足都明确拒绝。
 
 确认后的底层状态依次是 `queued → preparing → executing → executed/execution_failed`。`queued` 是
@@ -408,9 +408,9 @@ worker 写执行终态，watcher 统一记 completed。
        └─ Popen(worker run <token> <n> <mode>) 后立即返回
                     worker run（8~15 分钟）
        ├─ run_lock(blocking=False) 抢锁，抢不到恢复确认卡并发「未启动」通知
-       ├─ 渲染 tasks/copilot-nav.toml（StartUp + Fight times=0 导航）——单作业
-       │   copilot 不会自己从主界面导航，必须先停在编队界面（C3 实测结论）
-       ├─ 模拟器 → maa run copilot-nav（导航失败=关卡未解锁/不可达，直接报错）
+       ├─ 渲染 tasks/copilot-nav.toml（StartUp + Fight times=1 + Custom 界面检查，临时配置禁用战斗点击）——单作业
+       │   copilot 不会自己从主界面导航，必须先停在关卡详情界面
+       ├─ 模拟器 → maa run copilot-nav（导航失败=MAA 没为该关写导航定义/不可达，直接报错）
        ├─ maa copilot <uri> --formation --batch -v --raid <mode>
        │   [--ignore-requirements 仅当 ratio < 1.0]
        │   └─ watchdog：每 2s OCR 屏幕，出现「确认要接管作战」弹窗就点确认
@@ -422,9 +422,14 @@ worker 写执行终态，watcher 统一记 completed。
 ### 抄作业的关键事实（C3 实机验证，2026-08-02）
 
 1. **单作业 `maa copilot` 从主界面跑不起来**——任务链没有 StageNavigationTask，
-   必须从编队选择界面开始。解法：先跑 `Fight times=0` 的任务（完整导航链但不开打）
-   把游戏停在编队界面。资源本（CE-6 等）导航固定且快（~15s）；活动本在章节地图里
-   滑动找节点，**关卡未解锁时找不到节点会报错**——这是预期行为，报告会说明。
+   先用 `_navigate_to_stage()` 复用上游 Fight 选关，再交给 Copilot 自动编队。
+   MaaCore v6.17.2 的 `times=0` 会禁用全部子任务，不能导航。当前使用临时
+   `MAA_CONFIG_DIR`（复制现有 profile/cli/用户资源）运行 `Fight(times=1)`，
+   仅覆盖 `FightBegin` 为继承上游 `BattleStartPre` 的 OCR、`DoNothing`、空 sub/next。
+   独立 `Custom(CopilotNavigationReady)` 再识别一次关卡详情界面；退出码 0、
+   `Fight Completed`、`Custom Completed` 缺一不可。临时目录在退出或异常时删除，
+   日常与正式 Copilot 仍使用原配置。没有新增任何关卡选路定义。
+   2026-09-08 已修复并离线验证，游戏导航与战斗留给用户实跑验收。
 2. **代理指挥开关**：点开始行动时代理开着会弹「确认要接管作战吗？」，MaaCore 的
    copilot 链不处理 → 必失败。worker 内置 watchdog（`ocrbox` OCR + ADB tap）在弹窗
    出现时点确认。正常路径（游戏新会话代理默认关）watchdog 不会触发。
@@ -466,9 +471,9 @@ worker 写执行终态，watcher 统一记 completed。
 
 ## 5.6 链路五：通关队列（`maa_clearing.py` + worker 的 `clearing` 子命令）
 
-三期步骤 3。**默认关闭**（`config.clearing_enabled = false`）：它依赖步骤 2 的
-Q3「`Fight(times=0)` 真能停在补出来的那一关的编队界面」，而 Q3 至今**未验**，
-2b 导航定义生成器也还没写。打开之前队列会去打一堆根本没有导航定义的关。
+三期步骤 3。**默认关闭**（`config.clearing_enabled = false`）。不自写导航定义；
+只运行上游支持的关卡，无键立即转人工处理。2026-09-08 已替换失效的
+`Fight(times=0)` 导航方式，真机导航与队列全流程仍待验证。
 
 ```
 maa_action.py clearing start        从 config.activity_stages 推出 AT-1..AT-max 建队列
@@ -517,8 +522,7 @@ worker 自己去抢锁。07:50 的计划卡不行：它距 08:00 只有 10 分�
 只看退出码对抄作业够用（用户看得见战报、可以自己再点一次），但队列的 cursor 一旦
 前进就**永久跳过**这一关，撤退、三星未达、进程正常退出的 Fight Error 都会被算成通关。
 判据依据是 maa-cli 把 MaaCore 的 TaskChain 回调打成 `<链名> Completed/Stopped/Error`
-这条约定（worker 导航段的 `"Fight Completed" not in …` 就建立在同一条上，且 C3
-实测跑通过）。**局限**：`Copilot Completed` 这个具体字符串**没有拿真实 copilot 日志
+这条约定；导航还必须有独立的 `Custom Completed` 界面检查，不能仅凭 Fight 完成。**局限**：`Copilot Completed` 这个具体字符串**没有拿真实 copilot 日志
 核对过**——`runs/` 的 14 天保留期已把 2026-08 那批抄作业日志清掉，当前 `asst.log`
 窗口里也没有任何一次真实作战。所以认不出胜利标记时返回 `unknown` 并**按失败处理**
 （fail-closed，宁可停下来问，也不静默跳关）。第一次真机跑完请照
@@ -750,6 +754,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 34 | EX 段的突袭用队列条目的 `#raid` 后缀表示，突袭紧跟对应普通关；**除了 `maa copilot --raid` 的取值，理智查表 / 导航 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.ex_segment()` / `split_entry()` + `ClearingRaidTests` |
 | 35 | 通关队列派发失败（worker 未部署 / `Popen` 抛错）必须**写 `last_run` 并发 Discord**，不能只写状态（护栏 4）。「功能未启用」「队列不活跃」是正常无操作，不发 | `maa_daily.report_clearing_dispatch_failure()` + `ClearingDispatchNoticeTests` |
 | 36 | EX 关理智只信两处：`stages.json` 真值（优先）与编队界面 OCR 缓存。OCR 读不出（ocrbox 缺失 / 崩溃 / ROI 内无数字 / 两个不同数字）**一律 `None`，不许猜数、不许拿 0 或同活动普通关的值顶替**；`None` 的关不入轮、不进预算、cursor 不动，按「今日堵住」记账。普通关的 `stage_sanity_cost()` 行为不变 | `maa_clearing.sanity_cost_from_ocr()` / `ocr_sanity_cost()` / `resolve_cost()` + `SanityOcrTests` / `ClearingSanityProbeTests` |
+| 37 | 队列**只跑上游 `tasks/Stages/<前缀>.json` 里已有顶层键的关**（前缀 = 关卡名第一个 `-` 之前；突袭条目按去掉 `#raid` 的普通关名查）。本项目**不再自写导航定义**，也**不读、不建** `~/.config/maa-cli/resource/tasks/Stages/`；只读 `maa_copilot._resource_dirs()` 给的上游目录，文件缺失 / 读失败 / JSON 坏 / 顶层不是对象**一律视为无键**（fail-closed，异常摘要进原因）。无键的关**不排入当轮**且**立刻**走 needs_manual（`record_stage_failure(immediate=True)`，**同一个出口**，不等 `clearing_manual_after_days` 的 N 日规则——导航定义不会自己长出来），`clearing.json` 记 `reason: "no_nav_definition"`，卡片写明「MAA 未为该关写导航定义」，同原因只发一次；cursor 不前进，用户点「已完成」后照常前进 | `maa_clearing.nav_checker()` / `read_nav_keys()` / `plan_round(nav_of=…)` + `ClearingNavDefinitionGateTests` |
 
 ---
 
@@ -869,8 +874,10 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
    那次就是剥掉代理后 `github.com` 超时，失败还按 7 天间隔算一次，拖到下一周才重试。
 10. **接管弹窗**：`maa copilot` 不处理「确认要接管作战吗？」，靠 worker 的 ocrbox watchdog；
    手动复现问题时弹窗确认按钮在正文下方约 100px（1920×1080）。
-11. **关卡未解锁**：活动本按顺序解锁，没打前面的关时导航找不到节点、报「导航到编队界面失败」——
-    是预期行为不是 bug；用户应先打前面的关或换资源本/主线。
+11. **MAA 没为该关写导航定义**：上游每个活动只写 4 个左右推荐关的导航定义，
+    `Stages/<前缀>.json` 里没有的关会报「导航到编队界面失败」——是预期行为不是 bug，
+    **原因通常不是"关卡未解锁"**。出路是换上游有导航定义的关、资源本或主线
+    （2026-09-05 决定：不自写导航定义，见 PLAN_CLEARING 步骤 2）。
 12. **动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带 LaunchDaemon
     `/Library/LaunchDaemons/com.now.gg.BlueStacks.cleanup.plist`，`WatchPaths` 盯着
     `/Applications/BlueStacks.app`、`/Applications/BlueAI.app`、

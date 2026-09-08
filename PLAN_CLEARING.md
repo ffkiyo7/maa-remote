@@ -14,16 +14,21 @@
 - [x] ~~步骤 0 — 修掉 watcher 的两条错（`a983ccb`）~~
 - [x] ~~步骤 1 — 挡住部署漂移（`49da169`；「回灌极简版」被实测否掉，留一条观测项）~~
 - [ ] 步骤 2 — 导航定义生成器（2a spike：**Q1/Q2 已实测 ✓**，用已结束的 TO 活动；
-      Q3「真能停在编队界面」需模拟器 + 当期活动，仍待验。2b 生成器等 Q3，未开工）
+      **Q3 ✗**（09-05，SR）：`Fight(times=0)` 在 MaaCore 6.17.1 下 0 秒完成、不导航，
+      失败点是探测手段。**2b 生成器取消**（09-05 用户拍板：不自写导航定义，队列只跑
+      上游 `Stages/*.json` 有键的关，无键的关直接 `needs_manual`）。剩余：换导航姿势
+      （09-08 已改为隔离配置的上游 Fight 导航 + 独立界面检查，未实跑）并重验 Q3）
 - [ ] 步骤 3 — `stage_queue` + 日常让路 + `needs_manual`
-      （**代码已交付 `50f1965`**，单测全覆盖；整条队列由 `config.clearing_enabled`
-      默认 `false` 关着，等 Q3 + 2b。真机三项待下个活动上线验）
-- [ ] 步骤 4 — EX 理智 OCR（**代码已交付**：编队界面截图 → ocrbox → 歧义即 `None`，
+      （**代码已交付 `50f1965`**，四处返工 `971db62`，单测全覆盖；09-05 加导航键闸门：
+      上游 `Stages/*.json` 无键的关不排、立即 `needs_manual`（不变量 #37，随 09-08 导航修复一并提交）。整条队列由
+      `config.clearing_enabled` 默认 `false` 关着，等新导航姿势验过 Q3。真机三项待验）
+- [ ] 步骤 4 — EX 理智 OCR（**代码已交付 `e94542e`**：编队界面截图 → ocrbox → 歧义即 `None`，
       接进队列的探测轮；真机校准 `sanity-probe` 待跑，ROI 默认值未校准）
 - [x] ~~步骤 5 — Depot 对表 + 掉落增量 + 消耗率（`3aa90a8`；交付后发现的 D-1/D-2 已修，`b8b43b4`）~~
 - [ ] 步骤 6 — 计划卡加 farming 选关下拉
-      （**代码已交付**，单测全覆盖；当前必然走冷启动降级——`depot.json` 只有 1 份快照。
-      真机待次日 07:50 计划卡观测）
+      （**代码已交付 `84e6100`**，单测全覆盖；仍走冷启动降级——`consumption_history`
+      至 09-05 仍为空。真机：新下拉已上卡（`buttons.json` 有 `hermes:btn:maa:farming-select`，
+      09-04 07:56 卡片被点「跳过」写回 `plan.json`）；**用该下拉选关 → `plan.json` 更新**尚未验）
 
 ---
 
@@ -550,6 +555,58 @@ Error: Failed to add task 导航到关卡 with params: { ... "stage": "TO-6" ...
 `resource/tasks/Stages/` 空目录已 `rmdir`；全程**未改动** `resource/tasks/tasks.json`。
 `python3 deploy.py --check` → `{"ok": true, "missing": [], "mismatched": []}`；
 仓库与线上 `tasks.json` 逐字节一致。
+
+#### Q3 实测（2026-09-05，当期活动 SideStory「月行水上」，前缀 SR）
+
+**Q3 ✗** —— `Fight(stage=…, times=0)` **不导航**：任务 0 秒就 `Completed`，
+游戏原地停在主页，从没进过编队界面。这不是活动关特有的问题，普通关 `1-7` 同样如此。
+
+前置：`python3 deploy.py --check` → `{"ok": true, "missing": [], "mismatched": []}`；
+上游 `Stages/SR.json` 已有 `SR-5..SR-8` 的键，**没有**建任何覆盖层。
+
+实测命令与原始输出（`sanity-probe` = `_clearing_navigate()` + 截图 + OCR，同一条导航路径）：
+
+```
+$ python3 ~/.hermes/scripts/maa_copilot_worker.py sanity-probe 1-7
+{"ok": true, "stage": "1-7", "stage_id": "main_01-07", "stages_json": 6, "ocr": 44,
+ "detail": "ROI 内无号数字 44", "png": ".../2026-09-05-sanity-probe-1-7.png",
+ "log": ".../2026-09-05-sanity-probe-1-7.log", "kind": "", "cleanup_errors": [], "match": false}
+
+$ python3 ~/.hermes/scripts/maa_copilot_worker.py sanity-probe SR-5
+{"ok": true, "stage": "SR-5", "stage_id": "act54side_05", "stages_json": 12, "ocr": 44,
+ "detail": "ROI 内无号数字 44", "png": ".../2026-09-05-sanity-probe-SR-5.png",
+ "log": ".../2026-09-05-sanity-probe-SR-5.log", "kind": "", "cleanup_errors": [], "match": false}
+```
+
+两场日志里 Fight 段都是**零耗时完成**（`~/.hermes/state/maa/runs/2026-09-05-sanity-probe-SR-5.log`）：
+
+```
+[启动国服] 19:37:38 - 19:38:08 (29s) Completed
+[导航到关卡] 19:38:08 - 19:38:08 (0s) Completed
+StartUp Completed / Fight Start / Fight Completed / AllTasksCompleted
+```
+
+截图佐证：两张 PNG 都是**主页**（`终端 / 编队 / 采购中心 / 公开招募 / 基建`
+六宫格、`理智 120/207`），不是编队界面。两次读到的 `ocr: 44` 是**基建右上角的
+通知红点 `44`** 落在默认 ROI `[0.55,0.70,0.45,0.30]` 里——纯噪声，
+不是理智消耗。`ocrbox` 对截图的全部文本框里也没有任何形如 `-6` / `-12` 的理智数字。
+
+推论：
+
+- **接受 ≠ 导航**（2a 的原话）在真机上被证实：`Stages/*.json` 有键只保证 Fight
+  不被 `Failed to add task` 拒掉，`times=0` 之下 MaaCore **一步都不走**。
+- 因此 **2b 生成器仍然不许写**（硬闸门不放宽），且**步骤 4 的 OCR 校准也被同一个洞卡住**：
+  失败点在导航（`_clearing_navigate()` 的 `times=0` 前提），不在 ROI，
+  调 ROI 只会拟合噪声。ROI 保持默认值未动。
+- 顺带订正一条既有假设：`stages.json` **有** SR 普通关条目（`SR-5` = 12 理智），
+  缺条目的只有 EX。
+- 两场探测都 `medicine=0 / stone=0 / times=0`，理智前后都是 `120/207`，**未消耗理智**；
+  `cleanup_errors: []`，模拟器已收尾。
+
+**09-08 更新**：导航已改为临时配置下的上游 `Fight(times=1)`，只在该进程内
+把 `FightBegin` 改成识别关卡详情界面但不点击，再用独立 Custom 识别复核。
+不自写选关路线，不影响正式 Copilot 或日常配置。已做离线验证，按用户要求不重跑游戏；
+Q3 与 EX 理智 OCR 真机校准仍待验收。
 
 #### 2b 生成器（仅在 2a 三问全过时才做）
 

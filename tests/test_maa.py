@@ -2754,6 +2754,201 @@ class ClearingQueueTests(unittest.TestCase):
             self.assertIsNone(maa_clearing.load_state(path))
 
 
+class ClearingNavDefinitionGateTests(unittest.TestCase):
+    """上游导航键闸门（2026-09-05 范围变更：不再自写导航定义）。
+
+    队列只跑上游 `tasks/Stages/<前缀>.json` 已有顶层键的关；没有键的关等下去
+    永远不会自动成功，所以**立刻**走同一个 `needs_manual` 出口。
+    全部用临时 resource 目录，不碰真实路径。
+    """
+
+    def setUp(self) -> None:
+        self.config = {"clearing_manual_after_days": 2}
+        self.at = datetime(2026, 9, 5, 10, 0, tzinfo=BEIJING)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.resource = Path(self.tmp.name) / "resource"
+        (self.resource / "tasks" / "Stages").mkdir(parents=True)
+
+    def _write_stages(self, prefix: str, payload: str) -> Path:
+        path = self.resource / "tasks" / "Stages" / f"{prefix}.json"
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def _state(self, stages: list[str]) -> dict:
+        return maa_clearing.new_state("k", "标题", "SR", stages, at=self.at)
+
+    # --- 1. 有键的关正常入队 --------------------------------------------
+    def test_stage_with_an_upstream_nav_key_is_scheduled(self) -> None:
+        self._write_stages(
+            "SR", json.dumps({"SR-5": {"next": []}, "SR-6": {"next": []}})
+        )
+        nav_of = maa_clearing.nav_checker([self.resource])
+        state = self._state(["SR-5", "SR-6"])
+        result = maa_clearing.plan_round(
+            state, 100, lambda _entry: 12, at=self.at, nav_of=nav_of
+        )
+        self.assertEqual(result["stages"], ["SR-5", "SR-6"])
+        self.assertEqual(result["missing_nav"], [])
+        self.assertEqual(result["stop_reason"], "queue_end")
+
+    # --- 2. 无键的关：当轮不排、立即 needs_manual、cursor 不动 -----------
+    def test_stage_without_nav_key_goes_manual_immediately_without_advancing(self) -> None:
+        self._write_stages("SR", json.dumps({"SR-5": {}}))
+        nav_of = maa_clearing.nav_checker([self.resource])
+        state = self._state(["SR-9", "SR-5"])
+        result = maa_clearing.plan_round(
+            state, 100, lambda _entry: 12, at=self.at, nav_of=nav_of
+        )
+        self.assertEqual(result["stages"], [])
+        self.assertEqual(result["missing_nav"], ["SR-9"])
+        self.assertEqual(result["stop_reason"], "no_nav_definition")
+        self.assertIn("SR-9", result["nav_detail"])
+
+        # N 日规则默认要 2 个不同日期；导航定义缺失是永久条件，**一次就转**。
+        state, turned = maa_clearing.record_stage_failure(
+            state,
+            result["missing_nav"][0],
+            kind="nav_definition",
+            detail=result["nav_detail"],
+            config=self.config,
+            at=self.at,
+            immediate=True,
+            reason_code=maa_clearing.NAV_MISSING_REASON,
+        )
+        self.assertTrue(turned)
+        self.assertEqual(maa_clearing.awaiting_manual(state), "SR-9")
+        self.assertEqual(state["cursor"], 0)
+        # 原因写进 clearing.json，状态文件能自证「不是打完了」。
+        self.assertEqual(state["needs_manual"]["reason"], "no_nav_definition")
+        self.assertEqual(
+            state["stage_state"]["SR-9"]["reason_code"], "no_nav_definition"
+        )
+        self.assertFalse(maa_clearing.queue_is_active(state, self.at))
+
+        # 卡片文案写明真正的原因与出路。
+        embed, components, entries = maa_clearing.build_manual_card(state, "SR-9")
+        self.assertIn("未为 SR-9 写导航定义", embed["description"])
+        self.assertIn("已完成", embed["description"])
+        custom_id = components[0]["components"][0]["custom_id"]
+        self.assertEqual(entries[custom_id]["args"], ["clearing", "manual-done", "SR-9"])
+
+        # 同原因只发一次；换关 / 换原因才重发。
+        key = f"SR-9|{result['nav_detail']}"
+        self.assertTrue(maa_clearing.should_notify(state, "nav_definition", key))
+        self.assertFalse(maa_clearing.should_notify(state, "nav_definition", key))
+        self.assertTrue(
+            maa_clearing.should_notify(state, "nav_definition", "SR-7|别的原因")
+        )
+        # 第二次撞上同一关也不会重复转（needs_manual 已经指着它）。
+        state, again = maa_clearing.record_stage_failure(
+            state, "SR-9", kind="nav_definition", detail="x",
+            config=self.config, at=self.at, immediate=True,
+            reason_code=maa_clearing.NAV_MISSING_REASON,
+        )
+        self.assertFalse(again)
+
+    # --- 3. 突袭条目按普通关名查 ----------------------------------------
+    def test_raid_entry_is_checked_under_its_plain_stage_name(self) -> None:
+        self._write_stages("SR", json.dumps({"SR-EX-1": {}}))
+        nav_of = maa_clearing.nav_checker([self.resource])
+        self.assertEqual(nav_of("SR-EX-1" + maa_clearing.RAID_SUFFIX)[0], True)
+        self.assertFalse(nav_of("SR-EX-2" + maa_clearing.RAID_SUFFIX)[0])
+        state = self._state(["SR-EX-1", "SR-EX-1#raid"])
+        result = maa_clearing.plan_round(
+            state, 100, lambda _entry: 21, at=self.at, nav_of=nav_of
+        )
+        self.assertEqual(result["stages"], ["SR-EX-1", "SR-EX-1#raid"])
+
+    # --- 4. 文件缺失 / JSON 坏 → 视为无键（fail-closed） ------------------
+    def test_missing_or_broken_stages_file_counts_as_no_key(self) -> None:
+        nav_of = maa_clearing.nav_checker([self.resource])
+        ok, detail = nav_of("SR-5")
+        self.assertFalse(ok)
+        self.assertIn("不存在", detail)
+
+        self._write_stages("SR", "{ 这不是 JSON")
+        broken = maa_clearing.nav_checker([self.resource])
+        ok, detail = broken("SR-5")
+        self.assertFalse(ok)
+        self.assertIn("读不出来", detail)
+
+        self._write_stages("SR", json.dumps(["SR-5"]))
+        not_object = maa_clearing.nav_checker([self.resource])
+        ok, detail = not_object("SR-5")
+        self.assertFalse(ok)
+        self.assertIn("顶层不是对象", detail)
+
+    def test_only_upstream_resource_dirs_are_read(self) -> None:
+        # 只读传进来的上游目录；不读、不建 ~/.config/maa-cli/resource/tasks/Stages/。
+        # 结构断言（注释里正当地提到那个路径，所以不做整文件字符串搜索）：
+        # 模块里没有任何指向 maa-cli 覆盖层的字面量，也从不 mkdir。
+        import ast
+
+        tree = ast.parse(
+            (ROOT / "scripts" / "maa_clearing.py").read_text(encoding="utf-8")
+        )
+        self.assertFalse(
+            [
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "maa-cli" in node.value
+                and "resource" in node.value
+            ]
+        )
+        self.assertFalse(
+            [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and "mkdir" in ast.dump(node.func)
+            ]
+        )
+        maa_clearing.nav_checker([self.resource])("SR-5")
+        self.assertFalse((self.resource / "tasks" / "Stages" / "SR.json").exists())
+
+    def test_prefix_is_the_segment_before_the_first_dash(self) -> None:
+        self.assertEqual(maa_clearing.stage_nav_prefix("SR-5"), "SR")
+        self.assertEqual(maa_clearing.stage_nav_prefix("AT-EX-1"), "AT")
+        self.assertEqual(maa_clearing.stage_nav_prefix(""), "")
+
+    def test_each_prefix_is_read_from_disk_only_once_per_round(self) -> None:
+        path = self._write_stages("SR", json.dumps({"SR-1": {}, "SR-2": {}}))
+        nav_of = maa_clearing.nav_checker([self.resource])
+        self.assertTrue(nav_of("SR-1")[0])
+        path.unlink()  # 缓存过就不再 open，删了也不影响这一轮
+        self.assertTrue(nav_of("SR-2")[0])
+
+    # --- 5. 用户点「已完成」后 cursor 前进 --------------------------------
+    def test_cursor_advances_after_the_user_marks_it_done(self) -> None:
+        self._write_stages("SR", json.dumps({"SR-5": {}}))
+        state = self._state(["SR-9", "SR-5"])
+        state, _turned = maa_clearing.record_stage_failure(
+            state, "SR-9", kind="nav_definition", detail="上游没有 SR-9 的导航定义",
+            config=self.config, at=self.at, immediate=True,
+            reason_code=maa_clearing.NAV_MISSING_REASON,
+        )
+        self.assertEqual(state["cursor"], 0)
+        maa_clearing.advance_cursor(state)
+        self.assertEqual(state["cursor"], 1)
+        self.assertEqual(maa_clearing.awaiting_manual(state), "")
+        self.assertEqual(maa_clearing.current_stage(state), "SR-5")
+        # 前进之后有键的下一关照排。
+        result = maa_clearing.plan_round(
+            state, 100, lambda _entry: 12, at=self.at,
+            nav_of=maa_clearing.nav_checker([self.resource]),
+        )
+        self.assertEqual(result["stages"], ["SR-5"])
+
+    def test_worker_wires_the_gate_into_plan_round(self) -> None:
+        # 闸门必须真的接在派发处，否则单测全绿而线上照打无导航定义的关。
+        source = (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8")
+        self.assertIn("maa_clearing.nav_checker(maa_copilot._resource_dirs(config))", source)
+        self.assertIn("nav_of=nav_of", source)
+        self.assertIn("immediate=True", source)
+
+
 class ClearingDailyYieldTests(unittest.TestCase):
     """日常让路：队列活跃时只摘「刷理智」，剿灭永远保留。"""
 
@@ -3322,8 +3517,7 @@ class ClearingRaidTests(unittest.TestCase):
         ), patch.object(
             maa_copilot_worker, "_run_copilot_with_watchdog", side_effect=fake_watchdog
         ), patch.object(
-            maa_copilot_worker.subprocess, "run",
-            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
         ), patch.object(
             maa_copilot_worker, "atomic_write_text"
         ), tempfile.TemporaryDirectory() as raw:
@@ -3398,8 +3592,7 @@ class ClearingVictoryJudgementTests(unittest.TestCase):
             maa_copilot_worker, "_run_copilot_with_watchdog",
             side_effect=watchdog_with_error,
         ), patch.object(
-            maa_copilot_worker.subprocess, "run",
-            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
         ), patch.object(maa_copilot_worker, "atomic_write_text"):
             log_path = Path(raw) / "clearing.log"
             log_path.write_text("", encoding="utf-8")
@@ -3430,8 +3623,7 @@ class ClearingVictoryJudgementTests(unittest.TestCase):
         ), patch.object(
             maa_copilot_worker, "_run_copilot_with_watchdog", return_value=(0, 0)
         ), patch.object(
-            maa_copilot_worker.subprocess, "run",
-            return_value=SimpleNamespace(returncode=0, stdout="Fight Completed", stderr=""),
+            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
         ), patch.object(maa_copilot_worker, "atomic_write_text"):
             log_path = Path(raw) / "clearing.log"
             log_path.write_text("Copilot Completed\n", encoding="utf-8")
@@ -3763,15 +3955,15 @@ class ClearingSanityProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             log = Path(raw) / "c.log"
             png = Path(raw) / "s.png"
-            with patch.object(w, "_clearing_navigate", return_value=(False, "nav 失败")):
+            with patch.object(w, "_navigate_to_stage", return_value=(False, "nav 失败")):
                 self.assertEqual(w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)[1], "nav")
-            with patch.object(w, "_clearing_navigate", return_value=(True, "")), patch.object(
+            with patch.object(w, "_navigate_to_stage", return_value=(True, "")), patch.object(
                 w, "capture_screenshot", return_value=(False, "adb 挂了")
             ):
                 cost, kind, detail = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
                 self.assertEqual((cost, kind), (None, "ocr"))
                 self.assertIn("adb", detail)
-            with patch.object(w, "_clearing_navigate", return_value=(True, "")), patch.object(
+            with patch.object(w, "_navigate_to_stage", return_value=(True, "")), patch.object(
                 w, "capture_screenshot", return_value=(True, "")
             ), patch.object(maa_clearing, "ocr_sanity_cost", return_value=(21, "ok")):
                 cost, kind, _ = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
