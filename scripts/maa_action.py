@@ -87,17 +87,20 @@ def _today_override() -> dict[str, Any]:
     if not isinstance(current, dict) or current.get("date") != now.date().isoformat():
         current = {"date": now.date().isoformat()}
     # Discard all fields outside the script-level allowlist.
+    # `stage_source` must stay in this list: 计划卡的自动定关用它区分「这个关是自动定的」
+    # 和「用户自己选的」。掉了它，用户点一次「跳过」就会让当天的自动定关被当成手动选择冻住。
     return {
         key: current[key]
-        for key in ("date", "stage", "skip", "source", "updated_at")
+        for key in ("date", "stage", "stage_source", "skip", "source", "updated_at")
         if key in current
     }
 
 
-def _save_override(key: str, value: Any) -> dict[str, Any]:
+def _save_override(key: str, value: Any, **extra: Any) -> dict[str, Any]:
     with state_lock():
         plan = _today_override()
         plan[key] = value
+        plan.update(extra)
         plan["source"] = "discord"
         plan["updated_at"] = now_beijing().isoformat()
         # There is deliberately no stone field in this write path.
@@ -150,7 +153,8 @@ def set_stage(stage: str) -> tuple[bool, str]:
             "或当前活动关。碎石设置永远不受支持。",
         )
     was_running = is_run_locked()
-    plan = _save_override("stage", stage)
+    # 标成 discord：当天的自动定关不再覆盖它（`maa_plan_card.apply_auto_stage()`）。
+    plan = _save_override("stage", stage, stage_source="discord")
     return True, _confirmation(plan, was_running)
 
 
@@ -578,8 +582,8 @@ def _clearing_guard(config: dict[str, Any]) -> str | None:
     if not bool(config.get("clearing_enabled", False)):
         return (
             "通关队列当前是关闭的（`config.clearing_enabled = false`）。"
-            "它要等 PLAN_CLEARING 步骤 2 的 Q3「真能停在编队界面」实测通过、"
-            "并且导航定义生成器（2b）落地之后才允许打开。"
+            "队列只跑上游写了导航定义的关（不变量 #37），没写的关会直接要求你手动打一次；"
+            "打开之前请先确认这个边界可以接受。"
         )
     return None
 

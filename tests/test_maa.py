@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import io
 import json
@@ -3101,7 +3102,14 @@ class FarmingRecommendationTests(unittest.TestCase):
     """PLAN_CLEARING 步骤 6：可用天数排序、冷启动降级、零消耗与短窗口。"""
 
     def setUp(self) -> None:
+        # 指向一个空的资源目录：这组用例测的是**手工表**那条路径，不能让本机
+        # 真实的 stages.json 派生表混进来（单测必须密闭，且不同机器结果要一致）。
+        self._resources = tempfile.TemporaryDirectory()
+        self.addCleanup(self._resources.cleanup)
+        maa_plan_card._STAGE_DROPS_CACHE.clear()
+        self.addCleanup(maa_plan_card._STAGE_DROPS_CACHE.clear)
         self.config = {
+            "maa_resource_dir": self._resources.name,
             "farming_stage_table": {"固源岩组": "1-7", "碳素": "SK-5", "扭转醇": "9-9"},
             "farming_manual_weights": {"固源岩组": 100, "碳素": 60, "扭转醇": 10},
         }
@@ -3267,63 +3275,48 @@ class FarmingRecommendationTests(unittest.TestCase):
         self.assertIn("扭转醇→9-9", result["skipped_closed"])
 
 
-class FarmingSelectTests(unittest.TestCase):
-    """第三个下拉：查表派发、前缀清扫后仍在、不碰既有两个下拉。"""
+class FarmingAutoStageTests(unittest.TestCase):
+    """材料缺口 → 自动定关（2026-09-08 改版）：下拉删掉，映射从上游派生。
+
+    改版前是「第三个下拉，按材料缺口排序让用户选」。删掉的理由：缺口天天变，
+    下拉却只能选关、显示不了缺口，和第一个下拉语义完全重复。现在缺口是**后台
+    固定计算**，结果直接写进当天计划，卡片上说明为什么。
+    """
 
     def setUp(self) -> None:
+        self._resources = tempfile.TemporaryDirectory()
+        self.addCleanup(self._resources.cleanup)
+        maa_plan_card._STAGE_DROPS_CACHE.clear()
+        self.addCleanup(maa_plan_card._STAGE_DROPS_CACHE.clear)
         self.plan = maa_common.normalize_plan({"stage": "1-7"})
         self.config = {
             "channel_id": "1",
             "activity_stages": [],
+            "maa_resource_dir": self._resources.name,
             "farming_stage_table": {"固源岩组": "1-7"},
             "farming_manual_weights": {"固源岩组": 100},
         }
+
+    def _seed_resources(self, stages: list[dict], items: dict[str, str]) -> None:
+        """写一份最小的上游资源：`stages.json` + `item_index.json`。"""
+        root = Path(self._resources.name)
+        (root / "stages.json").write_text(
+            json.dumps(stages, ensure_ascii=False), encoding="utf-8"
+        )
+        (root / "item_index.json").write_text(
+            json.dumps({k: {"name": v} for k, v in items.items()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        maa_plan_card._STAGE_DROPS_CACHE.clear()
 
     def _components(self):
         with patch.object(maa_plan_card, "load_depot_state", return_value={}):
             return maa_plan_card.build_components(self.plan, self.config)
 
-    def test_the_new_select_dispatches_only_through_select_args(self) -> None:
-        _rows, registry = self._components()
-        entry = registry["hermes:btn:maa:farming-select"]
-        self.assertEqual(entry["kind"], "exec")
-        self.assertEqual(entry["script"], "maa_action.py")
-        self.assertNotIn("args", entry)
-        self.assertEqual(
-            list(entry["select_args"].values()), [["plan", "set-stage", "1-7"]]
-        )
-        # 值是不透明的，绝不是关卡名本身（不变量 #8）。
-        for value in entry["select_args"]:
-            self.assertTrue(value.startswith("farming-choice:"))
-
-    def test_the_new_select_writes_the_same_plan_stage_field(self) -> None:
-        # 与既有「刷理智」选关**覆盖同一个字段**：daily.toml 只有一个刷理智
-        # Fight 块，两个字段会立刻产生「谁赢」的歧义。
-        _rows, registry = self._components()
-        stage_args = list(
-            registry["hermes:btn:maa:stage-select"]["select_args"].values()
-        )
-        farming_args = list(
-            registry["hermes:btn:maa:farming-select"]["select_args"].values()
-        )
-        self.assertIn(["plan", "set-stage", "1-7"], stage_args)
-        self.assertEqual(farming_args[0][:2], ["plan", "set-stage"])
-
-    def test_the_new_select_survives_the_0750_prefix_sweep(self) -> None:
-        # 07:50 先删所有 hermes:btn:maa: 前缀再 merge 写回；新下拉在 merge 的
-        # 那一批里，所以清扫之后仍在（不变量 #7、#14）。
-        _rows, registry = self._components()
-        custom_id = "hermes:btn:maa:farming-select"
-        self.assertTrue(custom_id.startswith(maa_plan_card.BUTTON_PREFIX))
-        live = {custom_id: {"stale": True}, "hermes:btn:agent-book:x": {"keep": True}}
-        for key in [k for k in live if k.startswith(maa_plan_card.BUTTON_PREFIX)]:
-            live.pop(key)
-        live.update(registry)
-        self.assertIn(custom_id, live)
-        self.assertIn("hermes:btn:agent-book:x", live)
-
-    def test_the_existing_two_selects_are_untouched(self) -> None:
+    # --- 下拉 3 已经删掉 --------------------------------------------------
+    def test_the_farming_select_is_gone_and_the_other_two_remain(self) -> None:
         rows, registry = self._components()
+        self.assertNotIn("hermes:btn:maa:farming-select", registry)
         self.assertIn("hermes:btn:maa:stage-select", registry)
         self.assertIn("hermes:btn:maa-copilot:stage-select", registry)
         custom_ids = [
@@ -3332,34 +3325,270 @@ class FarmingSelectTests(unittest.TestCase):
             for component in row["components"]
             if component.get("type") == 3
         ]
+        self.assertNotIn("hermes:btn:maa:farming-select", custom_ids)
         self.assertEqual(len(custom_ids), len(set(custom_ids)))
-        self.assertIn("hermes:btn:maa:farming-select", custom_ids)
         self.assertLessEqual(len(rows), 5)
 
-    def test_no_recommendation_means_no_row_and_no_registry_entry(self) -> None:
-        self.config["farming_stage_table"] = {}
-        rows, registry = self._components()
-        self.assertNotIn("hermes:btn:maa:farming-select", registry)
-        self.assertNotIn(
-            "hermes:btn:maa:farming-select",
+    # --- 派生映射：新活动自动跟随 ----------------------------------------
+    def test_activity_stage_labels_carry_their_drop_from_upstream(self) -> None:
+        """新活动上线后不改任何配置，下拉 1 就该显示它掉什么。"""
+        self._seed_resources(
             [
-                component["custom_id"]
-                for row in rows
-                for component in row["components"]
+                {
+                    "code": "SR-8",
+                    "apCost": 21,
+                    "dropInfos": [
+                        {"dropType": "NORMAL_DROP", "itemId": "30043"},
+                        {"dropType": "FURNITURE", "itemId": "furni"},
+                    ],
+                }
             ],
+            {"30043": "异铁组"},
+        )
+        self.config["activity_stages"] = ["SR-8"]
+        labels = {
+            stage: label
+            for label, stage, _desc in maa_plan_card._stage_choices(
+                self.plan, self.config
+            )
+        }
+        self.assertEqual(labels["SR-8"], "SR-8 · 异铁组")
+
+    def test_extra_and_furniture_drops_are_not_treated_as_the_stage_material(self) -> None:
+        """只认 NORMAL_DROP：按副掉落定关，期望产出可能差一个数量级。"""
+        self._seed_resources(
+            [
+                {
+                    "code": "1-7",
+                    "apCost": 6,
+                    "dropInfos": [
+                        {"dropType": "NORMAL_DROP", "itemId": "1"},
+                        {"dropType": "EXTRA_DROP", "itemId": "2"},
+                        {"dropType": "SPECIAL_DROP", "itemId": "3"},
+                        {"dropType": "FURNITURE", "itemId": "furni"},
+                    ],
+                }
+            ],
+            {"1": "固源岩", "2": "赤金", "3": "家具零件"},
+        )
+        self.assertEqual(
+            maa_plan_card.stage_drops(self.config)["1-7"]["materials"], ["固源岩"]
         )
 
-    def test_the_card_says_when_the_recommendation_is_a_guess(self) -> None:
-        result = maa_plan_card.farming_recommendations(
-            self.config, {}, {"1-7"}, None
+    def test_a_material_resolves_to_an_open_stage_not_a_closed_past_activity(self) -> None:
+        """同一材料多关掉时，必须在**今天可选**的关里挑。
+
+        这是派生表最容易出的错：`异铁组` 在很多往期活动关里都掉，全局定死一个
+        就会选中早已关闭的 DH-8，然后在「今天可选」那步被整条丢掉——材料明明
+        有开放的关能刷，却从推荐里消失了。
+        """
+        self._seed_resources(
+            [
+                {"code": "DH-8", "apCost": 18,
+                 "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30043"}]},
+                {"code": "SR-8", "apCost": 21,
+                 "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30043"}]},
+            ],
+            {"30043": "异铁组"},
         )
+        candidates = maa_plan_card.material_stage_candidates(self.config)
+        self.assertEqual(candidates["异铁组"], ["DH-8", "SR-8"])  # 低理智在前
+        depot = {
+            "consumption_history": [
+                {
+                    "from": "2026-09-01T00:00:00+08:00",
+                    "to": "2026-09-29T00:00:00+08:00",
+                    "days": 28,
+                    "items": {"a": {"name": "异铁组", "consumed": 28, "per_day": 1.0}},
+                }
+            ],
+            "items": {"a": {"name": "异铁组", "quantity": 10}},
+        }
+        result = maa_plan_card.farming_recommendations(
+            self.config, depot, {"1-7", "SR-8"},
+            datetime(2026, 9, 30, 8, 0, tzinfo=BEIJING),
+        )
+        picked = {item["material"]: item["stage"] for item in result["items"]}
+        self.assertEqual(picked["异铁组"], "SR-8")
+        self.assertEqual(result["skipped_closed"], [])
+
+    def test_the_manual_table_wins_over_the_derived_one(self) -> None:
+        """手工表覆盖派生表：资源本只有它覆盖得到，且用户写下的不该被悄悄改掉。"""
+        self._seed_resources(
+            [{"code": "2-4", "apCost": 12,
+              "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "9"}]}],
+            {"9": "固源岩组"},
+        )
+        candidates = maa_plan_card.material_stage_candidates(self.config)
+        self.assertEqual(candidates["固源岩组"][0], "1-7")
+
+    def test_unreadable_resources_do_not_take_down_the_card(self) -> None:
+        """D-2 的教训：旁路数据失败只能降级，不能让整张计划卡消失。"""
+        (Path(self._resources.name) / "stages.json").write_text("{ 坏 json", encoding="utf-8")
+        maa_plan_card._STAGE_DROPS_CACHE.clear()
+        self.assertEqual(maa_plan_card.stage_drops(self.config), {})
+        self.assertEqual(
+            maa_plan_card.material_stage_candidates(self.config)["固源岩组"], ["1-7"]
+        )
+
+    # --- 自动定关 --------------------------------------------------------
+    def test_degraded_never_changes_the_stage(self) -> None:
+        """降级期排序依据只是手工权重——拿猜的结果改每天刷什么，正是红线要防的。"""
+        result = maa_plan_card.farming_recommendations(self.config, {}, {"1-7"}, None)
+        self.assertTrue(result["degraded"])
+        stage, why = maa_plan_card.auto_stage(result)
+        self.assertEqual(stage, "")
+        self.assertIn("沿用默认关", why)
+
+    def test_measured_data_picks_the_smallest_days_left(self) -> None:
+        depot = {
+            "consumption_history": [
+                {
+                    "from": "2026-09-01T00:00:00+08:00",
+                    "to": "2026-09-29T00:00:00+08:00",
+                    "days": 28,
+                    "items": {
+                        "a": {"name": "固源岩组", "consumed": 28, "per_day": 1.0},
+                        "b": {"name": "碳素", "consumed": 280, "per_day": 10.0},
+                    },
+                }
+            ],
+            "items": {
+                "a": {"name": "固源岩组", "quantity": 100},   # 约 100 天
+                "b": {"name": "碳素", "quantity": 20},        # 约 2 天
+            },
+        }
+        self.config["farming_stage_table"] = {"固源岩组": "1-7", "碳素": "SK-5"}
+        result = maa_plan_card.farming_recommendations(
+            self.config, depot, {"1-7", "SK-5"},
+            datetime(2026, 9, 30, 8, 0, tzinfo=BEIJING),
+        )
+        stage, why = maa_plan_card.auto_stage(result)
+        self.assertEqual(stage, "SK-5")
+        self.assertIn("碳素", why)
+
+    def test_auto_stage_writes_the_plan_and_never_overwrites_a_manual_pick(self) -> None:
+        result = {"degraded": False, "items": [
+            {"material": "碳素", "stage": "SK-5", "stock": 20, "per_day": 10.0,
+             "days_left": 2.0, "weight": 0, "basis": "measured"},
+        ]}
+        at = datetime(2026, 9, 30, 7, 50, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            with patch.object(maa_plan_card, "PLAN_PATH", plan_path), \
+                 patch.object(maa_common, "PLAN_PATH", plan_path):
+                # 1) 空计划：自动写入，并标明是自动定的
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "SK-5")
+                written = json.loads(plan_path.read_text(encoding="utf-8"))
+                self.assertEqual(written["stage"], "SK-5")
+                self.assertEqual(written["stage_source"], "auto")
+                # 2) 自己写的可以再改（次日重算走的就是这条）
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "SK-5")
+                # 3) 用户手动选过就不许动
+                plan_path.write_text(
+                    json.dumps({"date": at.date().isoformat(), "stage": "CE-6",
+                                "stage_source": "discord"}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "")
+                kept = json.loads(plan_path.read_text(encoding="utf-8"))
+                self.assertEqual(kept["stage"], "CE-6")
+
+    def test_stage_source_survives_the_action_field_allowlist(self) -> None:
+        """点一次「跳过」不能把当天的自动定关冻住——`stage_source` 必须在白名单里。"""
+        at = maa_common.now_beijing()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"date": at.date().isoformat(), "stage": "SK-5",
+                            "stage_source": "auto"}),
+                encoding="utf-8",
+            )
+            with patch.object(maa_action, "PLAN_PATH", plan_path):
+                kept = maa_action._today_override()
+        self.assertEqual(kept["stage_source"], "auto")
+
+    def test_choosing_a_stage_in_discord_marks_it_so_auto_leaves_it_alone(self) -> None:
+        """闸门的另一半：`plan set-stage` 必须真的写下 `stage_source="discord"`。
+
+        `apply_auto_stage()` 只认这个字段。少了这一笔，用户早上选完关，07:50 的
+        自动定关会照样把它改掉——而卡片上还写着用户自己选的那个来源。
+        """
+        result = {"degraded": False, "items": [
+            {"material": "碳素", "stage": "SK-5", "stock": 20, "per_day": 10.0,
+             "days_left": 2.0, "weight": 0, "basis": "measured"},
+        ]}
+        at = maa_common.now_beijing()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            with patch.object(maa_action, "PLAN_PATH", plan_path), \
+                 patch.object(maa_plan_card, "PLAN_PATH", plan_path), \
+                 patch.object(maa_common, "PLAN_PATH", plan_path), \
+                 patch.object(maa_common, "DEFAULTS_PATH", Path(tmp) / "defaults.json"), \
+                 patch.object(maa_action, "load_config", return_value={}), \
+                 patch.object(maa_action, "is_run_locked", return_value=False), \
+                 patch.object(maa_action, "state_lock",
+                              return_value=contextlib.nullcontext()), \
+                 patch.object(maa_plan_card, "state_lock",
+                              return_value=contextlib.nullcontext()):
+                ok, _message = maa_action.set_stage("CE-6")
+                self.assertTrue(ok)
+                written = json.loads(plan_path.read_text(encoding="utf-8"))
+                self.assertEqual(written["stage_source"], "discord")
+                # 自动定关看到 discord 就收手，用户选的关原样留着。
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, at), "")
+                self.assertEqual(
+                    json.loads(plan_path.read_text(encoding="utf-8"))["stage"], "CE-6"
+                )
+                self.assertEqual(maa_plan_card.today_stage_source(at), "discord")
+
+    def test_the_card_says_who_picked_todays_stage(self) -> None:
+        """删掉下拉 3 之后，「这关是自动定的还是我选的」全靠这一行。
+
+        归属只能从 `plan.json` 的 `stage_source` 来：`effective_plan()` 只叠
+        `stage` / `skip`，`normalize_plan()` 会把 `stage_source` 丢掉，
+        所以不能从传进来的 plan 里查它。
+        """
+        farming = {"degraded": False, "items": [], "skipped_no_stage": [],
+                   "skipped_closed": []}
+        auto = maa_plan_card.build_embed(
+            self.plan, self.config, None, farming, "auto"
+        )
+        picked = maa_plan_card.build_embed(
+            self.plan, self.config, None, farming, "discord"
+        )
+        neither = maa_plan_card.build_embed(self.plan, self.config, None, farming)
+
+        def stage_field(embed: dict) -> str:
+            return next(f["value"] for f in embed["fields"] if f["name"] == "刷什么")
+
+        self.assertIn("按材料缺口自动选", stage_field(auto))
+        self.assertIn("你手动选的", stage_field(picked))
+        self.assertEqual(stage_field(neither), "1-7")
+
+    def test_today_stage_source_ignores_yesterdays_plan(self) -> None:
+        at = datetime(2026, 9, 30, 7, 50, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            plan_path.write_text(
+                json.dumps({"date": "2026-09-29", "stage": "SK-5",
+                            "stage_source": "auto"}),
+                encoding="utf-8",
+            )
+            with patch.object(maa_plan_card, "PLAN_PATH", plan_path):
+                self.assertEqual(maa_plan_card.today_stage_source(at), "")
+
+    def test_the_card_says_when_the_recommendation_is_a_guess(self) -> None:
+        """不变量 #32：降级必须**可见**——而且降级期明说今天不自动改关。"""
+        result = maa_plan_card.farming_recommendations(self.config, {}, {"1-7"}, None)
         embed = maa_plan_card.build_embed(self.plan, self.config, None, result)
         names = [field["name"] for field in embed["fields"]]
-        self.assertIn("📦 材料缺口推荐（降级）", names)
+        self.assertIn("📦 材料缺口（降级）", names)
         value = next(
             field["value"] for field in embed["fields"] if field["name"].startswith("📦")
         )
         self.assertIn("降级模式", value)
+        self.assertIn("今天没有自动改关", value)
 
     def test_the_seeded_table_only_names_stages_the_card_can_offer(self) -> None:
         # 种子里不许出现猜的关：每一个都必须是 1-7 或 SUPPLY_STAGES 里的资源本。

@@ -1,6 +1,6 @@
 # 开发指南（基于当前代码实现）
 
-面向要改这套东西的人。[PLAN.md](./PLAN.md) 是设计意图，[README.md](./README.md) 是功能与落地状态，
+面向要改这套东西的人。[PLAN.md](./PLAN.md) 是设计意图，[README.md](../README.md) 是功能与落地状态，
 本文只讲**现状的自动化链路是怎么串起来的、改哪里会影响什么**。
 
 ---
@@ -74,7 +74,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、缺口文案、候选卡片 | 被 action/worker import | — |
 | `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 搜索发卡；`run <token> <n> <mode>` 真执行；`clearing` 跑一轮通关队列 | 仅由 `maa_action.py` / `maa_daily.py` 派发 | 搜索 5~20s；执行 8~15 分钟 |
 | `scripts/maa_clearing.py` | 通关队列领域层（近纯函数）：队列形态、EX 闸门、理智预算、失败记账、needs_manual 卡片 | 被 action/daily/worker import | — |
-| `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度与理智拉取、`link`（stdin 收 token） | 本机终端；worker 懒刷新或执行前强制刷新 | 秒级 |
+| `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度与理智拉取、`link`（stdin 收 token） | 本机终端；每次作业搜索强制刷新、自动作业执行前强制刷新；通关队列 EX 闸门懒刷新 | 秒级 |
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
@@ -132,25 +132,53 @@ adapter 补丁只做「精确查表」，Discord 传回的值**永远不会直�
 多值一律拒。改下拉相关代码时必须保持这个性质（对应测试
 `test_adapter_patch_dispatches_only_registered_select_values`）。
 
-### 第三个下拉：材料缺口推荐（三期步骤 6）
+### 材料缺口 → 自动定关（三期步骤 6，2026-09-08 改版）
 
-`_farming_stage_select()` 与前两个同一个范式（不透明值 + `select_args` 查表），
-`custom_id` 是 `hermes:btn:maa:farming-select`——**故意用 `hermes:btn:maa:` 前缀**：
-它每天 07:50 随卡片重建，清扫之后立刻被同一批 merge 写回，所以「清扫后仍在」。
-（跨天存活的按钮才需要另一个前缀，见 §5.6 的队列。）
+**这里曾经是第三个下拉（`hermes:btn:maa:farming-select`），已删除。** 删的理由：
+材料缺口天天变，而下拉只能选关、显示不了缺口，语义和第一个下拉完全重复——
+用户的原话是「光看下拉也不知道材料缺口，如果下拉只是用来选关，那存在的意义和
+第一个下拉直接重复」。缺口应该是**后台固定计算**的结果，不是让人去挑的选项。
 
-**它写的是同一个 `plan.stage` 字段**，不是新字段。理由：`daily.toml` 只有一个
-「刷理智」Fight 块，两个字段会立刻产生「谁赢」的歧义，而卡片上的「刷什么」也只
-反映得了一个。这个下拉和第一个下拉的区别**只在怎么排选项**（按材料缺口，不是按
-分类），选中的语义完全一样，所以复用 `plan set-stage` 的白名单。
+现在的链路：
+
+```
+stages.json + item_index.json ─┐
+                               ├─ material_stage_candidates() ── 材料 → [候选关]
+config.farming_stage_table ────┘                                      │
+                                                                      ▼
+depot.json ── consumption_rates_window(≥4 周) ── farming_recommendations()
+                                                                      │
+                                          auto_stage() ── 可用天数最小的那个
+                                                                      │
+                            apply_auto_stage() ── 写当天 plan.stage（source=auto）
+```
+
+- **映射以上游派生为主**（不变量 #38）：`stages.json` 每关都有 `dropInfos`，
+  只取 `NORMAL_DROP`。**新活动上线自动跟随**，这是这次改版的主要目的。
+  手工表只补上游没有的（资源本只有 `FURNITURE`）和你想钉死的。
+- **候选必须是有序列表、在当天可选集合里取第一个命中**。全局定死一个关会选中
+  早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。
+- **写的是同一个 `plan.stage` 字段**，不是新字段：`daily.toml` 只有一个「刷理智」
+  Fight 块，两个字段会立刻产生「谁赢」的歧义。
+- **`stage_source` 区分「自动定的」和「你选的」**，且必须留在
+  `maa_action._today_override()` 的字段白名单里——掉了它，点一次「跳过」就会把
+  当天的自动定关当成手动选择冻住。写它的只有两处：`apply_auto_stage()`（`auto`）与
+  `maa_action.set_stage()`（`discord`），两处缺一，闸门就形同虚设。
+  卡片上「这关是谁定的」那行走 `today_stage_source()`——它**直接读 `plan.json`**，
+  因为 `effective_plan()` 只把 `stage` / `skip` 叠进默认计划，`normalize_plan()`
+  会把 `stage_source` 连同其余字段一起丢掉，从它返回的 plan 里查永远是空的。
+- 只在 07:50 算一次：卡片上写的关就是当天两场真正会跑的关。
 
 排序指标只有一个：`可用天数 = 当前库存 / 该材料日均消耗`，升序。三条降级路径：
 
 | 情况 | 处理 |
 |---|---|
-| `consumption_history` 不足 2 次对表（冷启动） | 全部按 `farming_manual_weights` 排，**卡片上标「降级」** |
+| `consumption_history` 不足 2 次对表（冷启动） | 全部按 `farming_manual_weights` 排，**卡片上标「降级」**，且**不自动改关**（那时的排序是猜的） |
 | ≥4 周滚动窗口内消耗为 0 | 可用天数是**未知**不是 ∞ → 退回手工权重，排在实测材料**之后**（当成 0 天会把它顶到第一位，正好反了） |
-| `farming_stage_table` 里没有这个材料 | 不推荐，卡片列出来。**不猜关** |
+| 上游掉落表和 `farming_stage_table` 都没有这个材料 | 不推荐，卡片列出来。**不猜关** |
+
+卡片上的「没关可刷」只报**你确实在消耗的**或**你自己配进手工表的**材料：
+派生表覆盖全游戏几百种材料，全报出来会把真正要看的信息淹掉。
 
 「≥2 次成功对表」在代码里就是 `len(consumption_history) >= 1`：每两次对表之间产生
 一条区间记录，1 次对表只有库存快照、算不出消耗（`maa_depot.has_measured_consumption()`）。
@@ -444,7 +472,10 @@ worker 写执行终态，watcher 统一记 completed。
    `cleared < seq-1`（关卡必锁）两个方向成立；**有警告 = 基本锁着，没警告 = 不知道**，
    绝不能在别处把「没警告」当成「已解锁」的依据（尤其不能拿去 gate 执行按钮）。
    序号超出第一个 zone（act17side 型多 zone 活动）一律静默；警告带森空岛快照时效
-   标注（roster 7 天才懒刷新，进度却天天变）。
+   标注（按本地 `fetched_at` 计算拉取距今天数，不代表游戏进度的上游同步时间）。
+   手动和自动作业搜索均强制刷新 roster（练度与活动进度一起更新），不受
+   `skland_roster_refresh_days` 限制；该配置仍用于通关队列 EX 闸门的懒刷新。
+   手动刷新失败继续使用已有缓存，但候选卡片展示原始错误并明示未取得最新进度；自动搜索刷新失败则终止。
 
 ### 森空岛（`maa_skland.py`）
 
@@ -522,11 +553,11 @@ worker 自己去抢锁。07:50 的计划卡不行：它距 08:00 只有 10 分�
 只看退出码对抄作业够用（用户看得见战报、可以自己再点一次），但队列的 cursor 一旦
 前进就**永久跳过**这一关，撤退、三星未达、进程正常退出的 Fight Error 都会被算成通关。
 判据依据是 maa-cli 把 MaaCore 的 TaskChain 回调打成 `<链名> Completed/Stopped/Error`
-这条约定；导航还必须有独立的 `Custom Completed` 界面检查，不能仅凭 Fight 完成。**局限**：`Copilot Completed` 这个具体字符串**没有拿真实 copilot 日志
-核对过**——`runs/` 的 14 天保留期已把 2026-08 那批抄作业日志清掉，当前 `asst.log`
-窗口里也没有任何一次真实作战。所以认不出胜利标记时返回 `unknown` 并**按失败处理**
-（fail-closed，宁可停下来问，也不静默跳关）。第一次真机跑完请照
-`runs/<date>-clearing.log` 核对，对不上就改 `COPILOT_VICTORY_MARKERS`。
+这条约定；导航还必须有独立的 `Custom Completed` 界面检查，不能仅凭 Fight 完成。
+`Copilot Completed` 这个具体字符串**已于 2026-09-08 用真实日志核对**：SR-8 抄作业的
+`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行就是它（紧跟 `SkillDaemon`、
+`AllTasksCompleted` 之前）。认不出胜利标记时仍返回 `unknown` 并**按失败处理**
+（fail-closed，宁可停下来问，也不静默跳关）；上游改了措辞就改 `COPILOT_VICTORY_MARKERS`。
 
 **`needs_manual` 的 N 按不同日期计**，不按尝试次数计（`clearing_manual_after_days`，
 默认 2）。活动首日 prts.plus 上作业本来就少，按次数计会让每一关当天就触发，
@@ -748,9 +779,10 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 28 | 队列排关前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的关**不入当轮、不进预算、cursor 不前进**（那不是「打完了」，是「算不出来」，前进会把它永久跳过），提示只发一次 | `maa_clearing.sanity_budget()` / `plan_round()` + `ClearingQueueTests` |
 | 29 | EX 开放闸门是**独立于 `zone_progress_warning()`** 的第二条单向规则，两个模块互不 import；森空岛不可用一律 **fail-closed 不入队 EX**，且必须**可见**：写 `clearing.json` 的 `ex_gate_blocked_reason/_since`，并发一次去重后的 Discord 卡片（同原因不刷屏、原因变了重新发）。⚠️ `totalStage == 0` 这条推论**未实地验证**，下个活动上线当天要核对 | `maa_clearing.ex_gate()` / `apply_ex_gate()` + `test_ex_gate_*`（含 AST 结构断言） |
 | 30 | `needs_manual` 的 N 按**不同日期**计（`Asia/Shanghai` 日界），不按尝试次数计；触发后 cursor **不前进**，只有用户点「已完成」才前进。队列按钮用**第三个前缀** `hermes:btn:maa-clearing:`，不进 `hermes:btn:maa:` 的 07:50 清扫（卡片要跨天存活），也不进 `hermes:btn:maa-copilot:` 的 token TTL 清扫（队列没有 token）——不变量 #7/#14 的边界因此一字未改 | `maa_clearing.record_stage_failure()` / `BUTTON_PREFIX` + `test_manual_threshold_counts_distinct_dates_not_attempts` / `test_manual_card_button_uses_its_own_prefix` |
-| 31 | 材料缺口下拉写的是**同一个 `plan.stage`**（不新增字段：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），值仍经 `select_args` 查表（#8），用 `hermes:btn:maa:` 前缀所以 07:50 清扫后随卡片重建仍在（#7/#14）。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则 | `_farming_stage_select()` + `FarmingSelectTests` |
-| 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；`farming_stage_table` 查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
-| 33 | 队列 cursor **只在这一关被判定为通关时**才前进：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串尚未用真实 copilot 日志核对（日志已过 14 天保留期），第一次真机跑完要核对 | `maa_clearing.copilot_outcome()` + `ClearingVictoryJudgementTests` |
+| 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 改版：原第三个下拉已删除——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage()` 写进当天 `plan.stage`（**同一个字段**：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`。**用户手动选过（`stage_source="discord"`）当天就不许再自动改**；`stage_source` 必须留在 `maa_action._today_override()` 的字段白名单里，否则点一次「跳过」就把当天的自动定关冻住。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则。**降级期（无实测消耗）一律不自动改关**——那时的排序只是手工权重，拿猜的结果改每天刷什么正是「不许猜关」要防的事 | `auto_stage()` / `apply_auto_stage()` + `FarmingAutoStageTests` |
+| 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
+| 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基，活动关的材料不靠手工维护。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在「今天真的选得到的关」里取第一个命中——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选排序：手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底（`stages.json` **没有掉率**，这是启发式；排序不确定会让同样的库存今天推 A 明天推 B）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` |
+| 33 | 队列 cursor **只在这一关被判定为通关时**才前进：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行） | `maa_clearing.copilot_outcome()` + `ClearingVictoryJudgementTests` |
 | 34 | EX 段的突袭用队列条目的 `#raid` 后缀表示，突袭紧跟对应普通关；**除了 `maa copilot --raid` 的取值，理智查表 / 导航 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.ex_segment()` / `split_entry()` + `ClearingRaidTests` |
 | 35 | 通关队列派发失败（worker 未部署 / `Popen` 抛错）必须**写 `last_run` 并发 Discord**，不能只写状态（护栏 4）。「功能未启用」「队列不活跃」是正常无操作，不发 | `maa_daily.report_clearing_dispatch_failure()` + `ClearingDispatchNoticeTests` |
 | 36 | EX 关理智只信两处：`stages.json` 真值（优先）与编队界面 OCR 缓存。OCR 读不出（ocrbox 缺失 / 崩溃 / ROI 内无数字 / 两个不同数字）**一律 `None`，不许猜数、不许拿 0 或同活动普通关的值顶替**；`None` 的关不入轮、不进预算、cursor 不动，按「今日堵住」记账。普通关的 `stage_sanity_cost()` 行为不变 | `maa_clearing.sanity_cost_from_ocr()` / `ocr_sanity_cost()` / `resolve_cost()` + `SanityOcrTests` / `ClearingSanityProbeTests` |
@@ -838,6 +870,7 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 战报说「截图不是游戏主页」 | 看 `runs/<date>-<phase>.png` 到底停在哪一页；`last_run.home_verify_detail` 有命中了几个标识。UI 改版导致误杀就调 `HOME_MARKERS` |
 | `返回主界面` 报 Error 但截图确实在主页 | `maa update` 后 QuickSwitch 任务图变了 → 翻 `asst.log` 里 `taskchain":"Custom"` 的 `to_be_recognized`，对照资源 json 看少了哪一项 |
 | 基建在制造站或宿舍停住，截图显示“撤下宿舍锁定位置的干员”或“预设队列中的干员撤下” | 检查 profile 的 `user_resource = true`，以及 `~/.config/maa-cli/resource/tasks/tasks.json` 是否部署；诊断任务应出现 `InfrastDormDoubleConfirmed` 后继续到 `Infrast Completed` |
+| 计划卡红「MAA 上游更新失败」，`last_run.resource_update_detail` 里是 `SecureTransport error: connection closed via error; class=Net (12)` | 失败的是 `maa hot-update`（MaaResource 的 git fetch），不是 `maa update`——判据：detail 里**没有**「MaaCore 更新失败，未更新热更新资源」那一行，说明 core 那步过了。根因见 §11.18：`cli.toml` 的 `backend` 必须是 `git`，`libgit2` 会绕开代理直连 GitHub。手动复现：`MAA_CONFIG_DIR=~/.config/maa-cli maa hot-update --batch -vv` |
 | `deploy.py` 报 “no longer matches baseline” | Hermes 升级动了 adapter → 按 §7 更新补丁串 |
 
 现场排查常用：
@@ -872,6 +905,8 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
    `env -u ALL_PROXY -u HTTPS_PROXY -u HTTP_PROXY ... maa run ...`，否则 in-run hot update
    连代理会报错。计划卡的 `maa update` 相反，要走本机常开代理访问 GitHub——2026-08-16
    那次就是剥掉代理后 `github.com` 超时，失败还按 7 天间隔算一次，拖到下一周才重试。
+   **注意这条只覆盖 `maa update`**：紧跟其后的 `maa hot-update` 是 git fetch，
+   带不带代理由 `cli.toml` 的 `backend` 决定，与环境变量无关，见 §11.18。
 10. **接管弹窗**：`maa copilot` 不处理「确认要接管作战吗？」，靠 worker 的 ocrbox watchdog；
    手动复现问题时弹窗确认按钮在正文下方约 100px（1920×1080）。
 11. **MAA 没为该关写导航定义**：上游每个活动只写 4 个左右推荐关的导航定义，
@@ -994,3 +1029,30 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
     Hermes 静默回退默认配置 → `timezone: Etc/UTC` 失效 → cron 全按本机 `+08:00` 解释，
     每个 job 都提前 8 小时跑。修法见 §7 的锚点说明；判断线上是否中招：
     `hermes cron list` 的 `Next run` 带 `+08:00` 而不是 `+00:00`。
+
+18. **`maa hot-update` 的 libgit2 后端完全无视 `HTTP_PROXY` / `HTTPS_PROXY`**——
+    §11.9 只说对了一半：`maa update` 走 reqwest，认代理；`maa hot-update` 走
+    `cli.toml` 的 `[resource] backend`，而 **libgit2 后端既不读环境变量代理、也没有
+    git config 代理可读**（`MaaResource` 仓库和全局 git config 里都没有 `http.proxy`），
+    于是直连 `github.com/MaaAssistantArknights/MaaResource.git`。本机网络下这条直连
+    时好时坏，坏的时候就是
+    `Error: SecureTransport error: connection closed via error; class=Net (12)`。
+
+    2026-09-07、09-08 连着两天的 07:50 红卡就是这个：`maa-cli 已是最新` + `maa update`
+    静默成功（退出码 0、零输出），只有 hot-update 这一步炸了。**辨认方法**：
+    `check_and_update_upstream()` 在 core 失败时会把「MaaCore 更新失败，未更新热更新资源」
+    写进 detail；detail 里没有这句，失败的就是 hot-update。
+
+    **2026-09-09 实测判据**（把代理指到一个关闭的端口 `127.0.0.1:9`）：
+
+    | backend | 假代理 | 真代理 |
+    |---|---|---|
+    | `libgit2` | 照样 `Already up-to-date`（**说明压根没走代理**） | 成功 |
+    | `git` | 秒失败 `Failed to connect to 127.0.0.1 port 9` | `Already up to date.` |
+
+    **修法**：`config/maa-cli/cli.toml` 的 `backend` 改成 `"git"`（合法取值只有
+    `git` / `libgit2`，填别的 maa-cli 直接 panic）。`git` 后端 shell out 到 `git`
+    二进制，环境变量代理照单全收；`git` 找不到时 maa-cli 会自己回落到 libgit2
+    （字符串 `Failed to execute git, falling back to libgit2 backend`），不会更糟。
+    **改完必须 `python3 deploy.py`**：`cli.toml` 是 `--check` 逐字节守住的 5 个文件之一，
+    不部署就一直 `mismatched`，而且线上跑的仍是旧的 libgit2。
