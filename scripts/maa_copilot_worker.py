@@ -786,6 +786,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                 outcome=verdict,
                 op=int((entry.get("candidate") or {}).get("id") or 0),
                 detail=detail,
+                log_name=log_path.name,
             )
             maa_copilot.save_ledger(ledger)
             results.append(
@@ -863,6 +864,21 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
     return 0 if ok else 1
 
 
+def _log_since(log_path: Path, offset: int) -> str:
+    """从 `offset` 字节读到文件末尾——也就是「这一关自己的那段输出」。
+
+    按**字节偏移**切而不是按标记字符串切：偏移是在标记落盘之后取的，
+    子进程之后往同一个 fd 追加的每一个字节都在它后面，不依赖标记有没有
+    刷出来、也不怕同一个标记在日志里出现两次。
+    """
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(max(0, int(offset)))
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def _fight_one(
     config: dict[str, Any],
     entry: dict[str, Any],
@@ -896,14 +912,17 @@ def _fight_one(
     marker = f"# {now_beijing().isoformat()} copilot {stage} mode={mode} "
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"{marker}id={candidate.get('id')}\n")
+        # **必须 flush 再把句柄交给子进程**（2026-09-09 线上缺陷）：不 flush 的话
+        # 标记还躺在 Python 的缓冲区里，子进程直接往同一个 fd 写，输出先落盘、
+        # 标记要等 `with` 退出才刷出来——排在这一关全部输出**之后**。于是
+        # 「本关输出」切出来是空的，`copilot_outcome()` 一律返回 `unknown`，
+        # 通关永远记不上（`runs/2026-09-09-copilot-fda56c1811ba.log` 第 42 行）。
+        handle.flush()
+        offset = os.fstat(handle.fileno()).st_size
         return_code, _taps = _run_copilot_with_watchdog(
             config, command, handle, log_path, env
         )
-    try:
-        full = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        full = ""
-    this_run = full.rsplit(marker, 1)[-1] if marker in full else full
+    this_run = _log_since(log_path, offset)
     outcome, detail = maa_clearing.copilot_outcome(this_run, return_code)
     if outcome == "won":
         return "won", ""

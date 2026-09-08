@@ -119,6 +119,7 @@ def collect_targets(
     - `not_indexed`：有导航键但本地 Tile-Pos 索引里没有，进去也会被拒；
     - `zone_unopened`：森空岛该活动的 zone `totalStage == 0`（D9）——等热更新，不记失败；
     - `cleared`：记账齐全或 zone 全清（D10）；
+    - `daily_cap`：今天已经打满 `auto_copilot_max_attempts_per_day` 次还没通，明天再说；
     - `backoff`：本轮搜过、练度不满足 / 暂无作业，还没到重试点。
     """
     nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
@@ -143,6 +144,23 @@ def collect_targets(
         )
         if not modes:
             excluded.append({"stage": code, "reason": "cleared", "detail": ""})
+            continue
+        capped = maa_copilot.daily_capped_modes(ledger, code, modes, config, at)
+        if capped:
+            # 退避管的是「多久之后再试」，管不住「一天试几次」：2026-09-09 那两轮
+            # 隔 30 分钟就把同一批关原样重打了一遍。到上限的模式一个都不排，
+            # 整关留到明天——次日 `attempts_today()` 自然归零，不用清任何状态。
+            excluded.append(
+                {
+                    "stage": code,
+                    "reason": "daily_cap",
+                    "detail": "；".join(
+                        f"{maa_clearing.entry_label(maa_clearing.make_entry(code, mode))}"
+                        f" 今天已尝试 {used} 次"
+                        for mode, used in capped
+                    ),
+                }
+            )
             continue
         if maa_clearing.minutes_since_failure(state, code, at) < retry_minutes:
             entry = (state.get("stage_state") or {}).get(code) or {}

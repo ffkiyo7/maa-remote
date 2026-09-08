@@ -4464,16 +4464,47 @@ class LedgerTests(unittest.TestCase):
         ledger, _note = self._ensure("SideStory「墟」复刻|AT")
         self.assertEqual(ledger["stages"], {})
 
-    def test_the_seed_never_overwrites_an_existing_ledger(self) -> None:
+    def test_an_existing_but_unseeded_ledger_still_gets_the_seed(self) -> None:
+        """2026-09-09 线上缺陷：账本被别的活动的 tick 先建出来，种子就再也没跑过。
+
+        `ensure_ledger()` 原来只在 `load_ledger()` 返回 `None` 时才种，而线上
+        02:23「墟」复刻（`|AT`）那一 tick 先建了账，03:00 SR 上线走「归档 + 新开」，
+        `ledger is not None`，种子整个被跳过 → SR-5/6/8 的普通全空、第一轮就重抄。
+        现在按 `seeded` 标记补，`seed_ledger()` 只补空位所以是幂等的。
+        """
         maa_common.atomic_write_json(self.path, {
             "activity_key": SR_KEY,
-            "stages": {"SR-5": {"normal": None, "raid": None, "attempts": []}},
+            "stages": {"SR-5": {"normal": "2026-09-09T01:00:00+08:00", "raid": None,
+                                "attempts": [{"at": "2026-09-09T01:00:00+08:00",
+                                              "mode": "normal", "outcome": "won"}]}},
         })
         ledger, note = self._ensure(SR_KEY)
         self.assertEqual(note, "")
-        # 账本已存在 → 一个字节都不补，SR-5 仍然是「没打过」。
-        self.assertIsNone(ledger["stages"]["SR-5"]["normal"])
-        self.assertNotIn("SR-8", ledger["stages"])
+        # 已有记账原样保留——种子只补空位，绝不覆盖。
+        self.assertEqual(ledger["stages"]["SR-5"]["normal"], "2026-09-09T01:00:00+08:00")
+        self.assertEqual(len(ledger["stages"]["SR-5"]["attempts"]), 1)
+        # 空位补上了。
+        for stage in ("SR-6", "SR-8"):
+            self.assertEqual(ledger["stages"][stage]["normal"], maa_copilot.SEED_AT)
+            self.assertIsNone(ledger["stages"][stage]["raid"])
+        self.assertEqual(json.loads(self.path.read_text("utf-8"))["seeded"], "SR")
+
+    def test_a_ledger_already_seeded_is_left_alone(self) -> None:
+        self._ensure(SR_KEY)
+        ledger, _note = self._ensure(SR_KEY)
+        ledger["stages"]["SR-5"]["normal"] = None
+        maa_common.atomic_write_json(self.path, ledger)
+        again, _note = self._ensure(SR_KEY)
+        # `seeded` 已经是 SR → 一个字节都不再补（用户自己抹掉的记账不会被种回来）。
+        self.assertIsNone(again["stages"]["SR-5"]["normal"])
+
+    def test_the_seed_survives_an_activity_rotation_into_the_seeded_one(self) -> None:
+        """先「墟」复刻建账、再换到 SR：归档 + 新开那条路也必须种。"""
+        self._ensure("SideStory「墟」复刻|AT")
+        ledger, note = self._ensure(SR_KEY)
+        self.assertIn("ledger-", note)
+        for stage in maa_copilot.SEED_CLEARED_NORMAL:
+            self.assertEqual(ledger["stages"][stage]["normal"], maa_copilot.SEED_AT)
 
     def test_a_new_activity_archives_the_old_ledger(self) -> None:
         self._ensure(SR_KEY)
@@ -4500,6 +4531,26 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(pending, ["raid"])
         self.assertEqual(len(ledger["stages"]["SR-5"]["attempts"]), 2)
         self.assertIsNone(ledger["stages"]["SR-5"]["raid"])
+
+    def test_an_unknown_attempt_says_which_log_to_read(self) -> None:
+        # `unknown` 的结论就是「去日志里核对胜利标记」，不写清是哪一份等于让人翻 runs/。
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        maa_copilot.record_copilot_attempt(
+            ledger, "SR-5", "normal", outcome="unknown",
+            detail="退出码 0 但输出里没有 `Copilot Completed`",
+            log_name="2026-09-09-copilot-fda56c1811ba.log",
+        )
+        maa_copilot.record_copilot_attempt(
+            ledger, "SR-6", "normal", outcome="won",
+            log_name="2026-09-09-copilot-fda56c1811ba.log",
+        )
+        attempts = ledger["stages"]
+        self.assertIn(
+            "日志 runs/2026-09-09-copilot-fda56c1811ba.log",
+            attempts["SR-5"]["attempts"][0]["detail"],
+        )
+        # 通关那笔不需要人去翻日志。
+        self.assertNotIn("日志 runs/", attempts["SR-6"]["attempts"][0]["detail"])
 
     def test_both_modes_won_means_cleared(self) -> None:
         ledger = maa_copilot.new_ledger(SR_KEY)
@@ -4644,6 +4695,98 @@ class CopilotTargetSetTests(unittest.TestCase):
         )
         targets, _excluded = self._collect(state=state)
         self.assertIn("SR-5", [target["stage"] for target in targets])
+
+
+class CopilotDailyAttemptCapTests(unittest.TestCase):
+    """当日上限：同一 `(关, 模式)` 打满 `auto_copilot_max_attempts_per_day` 就到明天。
+
+    2026-09-09 03:30 与 04:00 两轮把 SR-5/6/7 原样重打了一遍——记账全是 `unknown`
+    （缺陷 1），30 分钟退避一到就又排进来。退避管「隔多久再试」，管不住「一天几次」。
+    """
+
+    def setUp(self) -> None:
+        self.config = {"activity_search_retry_minutes": 30}
+        self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
+
+    def _ledger(self, *attempts):
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        for mode, outcome, at in attempts:
+            maa_copilot.record_copilot_attempt(
+                ledger, "SR-5", mode, outcome=outcome, at=at
+            )
+        return ledger
+
+    def _collect(self, ledger, at=None):
+        import maa_activity_watch as watch
+
+        with _nav_patch({"SR-5", "SR-6"}):
+            return watch.collect_targets(
+                self.config, {}, "SR", SR_INDEX, ledger, None, at or self.at,
+            )
+
+    def test_two_unknowns_today_take_the_stage_out_until_tomorrow(self) -> None:
+        ledger = self._ledger(
+            ("normal", "unknown", self.at - timedelta(hours=9)),
+            ("normal", "unknown", self.at - timedelta(hours=8)),
+        )
+        targets, excluded = self._collect(ledger)
+        self.assertNotIn("SR-5", [t["stage"] for t in targets])
+        capped = {e["stage"]: e for e in excluded if e["reason"] == "daily_cap"}
+        self.assertIn("SR-5", capped)
+        self.assertIn("今天已尝试 2 次", capped["SR-5"]["detail"])
+        # 同一批里没打过的关照排。
+        self.assertIn("SR-6", [t["stage"] for t in targets])
+        # 次日自动恢复——不用清任何状态，`attempts_today()` 换了日子自然归零。
+        targets, _excluded = self._collect(ledger, at=self.at + timedelta(days=1))
+        self.assertIn("SR-5", [t["stage"] for t in targets])
+
+    def test_one_failure_today_still_leaves_a_try(self) -> None:
+        ledger = self._ledger(("normal", "failed", self.at - timedelta(hours=2)))
+        targets, _excluded = self._collect(ledger)
+        self.assertIn("SR-5", [t["stage"] for t in targets])
+
+    def test_a_win_never_counts_toward_the_cap(self) -> None:
+        # 普通通了、突袭还差：普通那两笔 `won` 不许把这一关的机会吃掉。
+        ledger = self._ledger(
+            ("normal", "won", self.at - timedelta(hours=4)),
+            ("normal", "won", self.at - timedelta(hours=3)),
+            ("raid", "failed", self.at - timedelta(hours=2)),
+        )
+        self.assertEqual(maa_copilot.attempts_today(ledger, "SR-5", "normal", self.at), 0)
+        self.assertEqual(maa_copilot.attempts_today(ledger, "SR-5", "raid", self.at), 1)
+        targets, _excluded = self._collect(ledger)
+        target = next(t for t in targets if t["stage"] == "SR-5")
+        self.assertEqual(target["modes"], ["raid"])
+
+    def test_yesterdays_attempts_do_not_count(self) -> None:
+        ledger = self._ledger(
+            ("normal", "unknown", self.at - timedelta(days=1)),
+            ("normal", "unknown", self.at - timedelta(days=1, hours=1)),
+        )
+        self.assertEqual(maa_copilot.attempts_today(ledger, "SR-5", "normal", self.at), 0)
+        self.assertIn("SR-5", [t["stage"] for t in self._collect(ledger)[0]])
+
+    def test_a_zero_cap_turns_the_rule_off(self) -> None:
+        self.config = {**self.config, "auto_copilot_max_attempts_per_day": 0}
+        ledger = self._ledger(*[
+            ("normal", "unknown", self.at - timedelta(hours=n)) for n in range(1, 6)
+        ])
+        self.assertIn("SR-5", [t["stage"] for t in self._collect(ledger)[0]])
+
+    def test_a_broken_cap_config_falls_back_to_the_default(self) -> None:
+        self.assertEqual(maa_copilot.daily_attempt_cap({}), 2)
+        self.assertEqual(maa_copilot.daily_attempt_cap(None), 2)
+        self.assertEqual(
+            maa_copilot.daily_attempt_cap({"auto_copilot_max_attempts_per_day": "x"}), 2
+        )
+
+    def test_the_cap_is_not_a_runtime_cache_key(self) -> None:
+        # 仓库拥有这个键：线上没有写回它的路径，部署要能把改动带过去（不变量 #25）。
+        seed = json.loads((ROOT / "state" / "config.json").read_text("utf-8"))
+        self.assertEqual(seed["auto_copilot_max_attempts_per_day"], 2)
+        self.assertNotIn(
+            "auto_copilot_max_attempts_per_day", deploy.PRESERVED_RUNTIME_CACHE_KEYS
+        )
 
 
 class CopilotRoundPlanningTests(unittest.TestCase):
@@ -5070,6 +5213,73 @@ class CopilotBatchExecutionTests(unittest.TestCase):
             outcome, detail = worker._fight_one(
                 {"maa_bin": "/bin/maa"}, self._entry("SR-5"), {}, log_path
             )
+        self.assertEqual(outcome, "unknown", detail)
+
+
+class CopilotLogMarkerTests(unittest.TestCase):
+    """标记必须 flush 之后再把句柄交给子进程（不变量 #33 的落点）。
+
+    2026-09-09 线上现象：`runs/2026-09-09-copilot-fda56c1811ba.log` 第 37 行是
+    `Copilot Completed`，标记行却在第 42 行——排在这一关全部输出**之后**。
+    标记没 `flush()` 就把句柄交给子进程，子进程直接往同一个 fd 写、先落盘，
+    标记要等 `with` 退出才刷出来。于是「本关输出」是空的，`copilot_outcome()`
+    一律 `unknown`，通关永远记不上、30 分钟退避一到就重打一遍。
+
+    **这条必须用真实子进程**：任何在 Python 里往同一个 handle 写字符串的桩都会
+    走同一个缓冲区，顺序天然正确，测不出这个 bug。
+    """
+
+    def _fight(self, log_path: Path) -> tuple[str, str]:
+        import maa_copilot_worker as worker
+
+        def watchdog(_config, _command, handle, _log_path, _env):
+            # 真子进程 + 共享 fd：与 `maa copilot` 的写法一致。
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "print('MissionStart')\nprint('Copilot Completed')"],
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+            )
+            return proc.wait(), 0
+
+        with patch.object(worker, "_prepare_op_file", return_value=("maa://1", False)), \
+             patch.object(worker, "_navigate_to_stage", return_value=(True, "")), \
+             patch.object(worker, "_run_copilot_with_watchdog", side_effect=watchdog):
+            return worker._fight_one(
+                {"maa_bin": "/bin/maa"},
+                {"stage": "SR-5", "stage_id": "act54side_05", "mode": "normal",
+                 "candidate": {"id": 101751}},
+                {},
+                log_path,
+            )
+
+    def test_the_marker_lands_before_the_subprocess_output_and_the_win_is_seen(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = Path(raw) / "2026-09-09-copilot-fda56c1811ba.log"
+            log_path.write_text("", encoding="utf-8")
+            outcome, detail = self._fight(log_path)
+            lines = log_path.read_text("utf-8").splitlines()
+        marker = next(i for i, line in enumerate(lines) if line.startswith("# "))
+        completed = next(i for i, line in enumerate(lines) if line == "Copilot Completed")
+        # 标记在前、子进程输出在后——旧写法下这两行是反的。
+        self.assertLess(marker, completed, lines)
+        self.assertEqual(outcome, "won", detail)
+
+    def test_only_this_stages_output_is_judged(self) -> None:
+        """上一关的 `Copilot Completed` 落在偏移之前，切不进这一关。"""
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("Copilot Completed\n", encoding="utf-8")
+            with patch.object(worker, "_prepare_op_file", return_value=("maa://1", False)), \
+                 patch.object(worker, "_navigate_to_stage", return_value=(True, "")), \
+                 patch.object(worker, "_run_copilot_with_watchdog", return_value=(0, 0)):
+                outcome, detail = worker._fight_one(
+                    {"maa_bin": "/bin/maa"},
+                    {"stage": "SR-5", "stage_id": "act54side_05", "mode": "normal",
+                     "candidate": {"id": 1}},
+                    {}, log_path,
+                )
         self.assertEqual(outcome, "unknown", detail)
 
 
@@ -5662,6 +5872,19 @@ class CopilotCardTests(unittest.TestCase):
         self.assertIn("🔁 普通已通、突袭待补", listing)
         self.assertIn("⏳ 排程 14:30", listing)
         # 已通的关照样能选——手动路径允许重打（D14）。
+        self.assertIn("SR-5", [stage for _l, stage, _d in options])
+
+    def test_a_stage_at_its_daily_cap_says_so_but_stays_selectable(self) -> None:
+        at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        for hour in (9, 8):
+            maa_copilot.record_copilot_attempt(
+                ledger, "SR-5", "normal", outcome="unknown", at=at - timedelta(hours=hour)
+            )
+        embed, options = self._view({}, watch={"activity_key": SR_KEY},
+                                    ledger=ledger, at=at)
+        self.assertIn("🚫 今日已尝试 2 次", embed["fields"][0]["value"])
+        # 只挡自动排轮：手动想重打照样能从下拉里选（D14）。
         self.assertIn("SR-5", [stage for _l, stage, _d in options])
 
     def test_a_stage_that_failed_the_op_search_shows_what_is_missing(self) -> None:

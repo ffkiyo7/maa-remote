@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from maa_common import (
+    BEIJING,
     BUTTONS_PATH,
     STATE_DIR,
     atomic_write_json,
@@ -814,9 +815,11 @@ def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> dict[str, A
 
 
 def seed_ledger(ledger: dict[str, Any], activity_key: str) -> dict[str, Any]:
-    """首次建账时把已知已通的关写进去，避免上线第一轮重抄一遍。
+    """把已知已通的关写进账本，避免上线第一轮重抄一遍。
 
-    只认 `SEED_ACTIVITY_PREFIX`；且**只补空位**——已有记账一律不覆盖。
+    只认 `SEED_ACTIVITY_PREFIX`；且**只补空位**——已有记账一律不覆盖，
+    所以重复调用是幂等的。种完打上 `seeded` 标记，`ensure_ledger()` 靠它
+    认出「这本账还没种过」。
     """
     if _activity_prefix(activity_key) != SEED_ACTIVITY_PREFIX:
         return ledger
@@ -841,10 +844,22 @@ def ensure_ledger(
 
     活动 key 变了（新活动 / 复刻）→ 旧账归档到 `ledger-<key>.json` 再新开一份。
     归档而不是删：用户回头想知道上个活动抄到哪了，只有这份记录说得清。
+
+    **种子按 `seeded` 标记补，不按「是不是首次建账」补**（2026-09-09 线上缺陷）：
+    原来只在 `load_ledger()` 返回 `None` 时才种，而账本常常先被**别的活动**的
+    tick 建出来——线上 02:23「墟」复刻（`|AT`）那一 tick 先建了账，03:00 SR 上线
+    走的是「归档 + 新开」这条路，`ledger is not None`，种子一次都没跑，
+    SR-5/6/8 的普通全是空的，第一轮就把它们重抄了一遍。
+    `seed_ledger()` 只补空位、幂等，所以按标记补是安全的。
     """
     target = path or LEDGER_PATH
     ledger = load_ledger(target)
+    prefix = _activity_prefix(activity_key)
     if ledger is not None and ledger.get("activity_key") == str(activity_key or ""):
+        if ledger.get("seeded") != prefix:
+            seed_ledger(ledger, activity_key)
+            if ledger.get("seeded") == prefix:  # 真的种进去了才落盘
+                save_ledger(ledger, target)
         return ledger, ""
     note = ""
     if ledger is not None:
@@ -853,9 +868,7 @@ def ensure_ledger(
         atomic_write_json(archive, ledger)
         os.chmod(archive, 0o600)
         note = f"旧账已归档到 {archive.name}"
-    fresh = new_ledger(activity_key)
-    if ledger is None:
-        seed_ledger(fresh, activity_key)
+    fresh = seed_ledger(new_ledger(activity_key), activity_key)
     save_ledger(fresh, target)
     return fresh, note
 
@@ -880,27 +893,116 @@ def record_copilot_attempt(
     op: int = 0,
     detail: str = "",
     at: datetime | None = None,
+    log_name: str = "",
 ) -> dict[str, Any]:
     """记一次执行。**只有 `won` 才写模式的通关时间戳**。
 
     突袭失败时普通那格照旧保留（它确实打过了），但这一关**不算通关**——
     `ledger_pending_modes()` 会在下一轮只排剩下的 `raid`（D7）。
+
+    `unknown` 的 `detail` 会补上日志文件名（`log_name`，通常是
+    `<date>-copilot-<token>.log`）：这条结论的意思就是「去日志里核对胜利标记」，
+    不写清楚是哪一份日志等于让人从 `runs/` 里一个个翻。
     """
     entry = ledger_stage(ledger, stage)
     moment = (at or now_beijing()).isoformat()
+    text = str(detail or "")
+    if str(outcome) == "unknown" and log_name:
+        text = f"{text[:220]} · 日志 runs/{log_name}".strip(" ·")
     entry["attempts"].append(
         {
             "at": moment,
             "mode": mode,
             "op": int(op or 0),
             "outcome": str(outcome)[:20],
-            "detail": str(detail)[:300],
+            "detail": text[:300],
         }
     )
     del entry["attempts"][:-LEDGER_ATTEMPT_LIMIT]
     if outcome == "won" and mode in ("normal", "raid"):
         entry[mode] = moment
     return ledger
+
+
+DEFAULT_DAILY_ATTEMPT_CAP = 2
+
+
+def _attempt_day(raw: Any) -> str:
+    """`attempts[].at` → `Asia/Shanghai` 自然日；认不出来返回空串（不计数）。"""
+    try:
+        moment = datetime.fromisoformat(str(raw or ""))
+    except (TypeError, ValueError):
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=BEIJING)
+    return moment.astimezone(BEIJING).date().isoformat()
+
+
+def attempts_today(
+    ledger: dict[str, Any] | None,
+    stage: str,
+    mode: str,
+    at: datetime | None = None,
+) -> int:
+    """今天这一 `(关, 模式)` 打过几次但**没通**（`failed` 与 `unknown` 都算）。
+
+    `won` 不计入：通了的模式压根不会再排（`ledger_pending_modes()` 先一步把它
+    摘掉），把它算进上限只会让「普通通了、突袭还差」的关平白少一次机会。
+    日界用 `Asia/Shanghai` 自然日，与 `maa_clearing.today_key()` 同一把尺子。
+    """
+    day = _attempt_day((at or now_beijing()).isoformat())
+    stages = (ledger or {}).get("stages")
+    entry = stages.get(stage) if isinstance(stages, dict) else None
+    attempts = entry.get("attempts") if isinstance(entry, dict) else None
+    if not isinstance(attempts, list):
+        return 0
+    return sum(
+        1
+        for item in attempts
+        if isinstance(item, dict)
+        and str(item.get("mode") or "normal") == str(mode)
+        and str(item.get("outcome") or "") != "won"
+        and _attempt_day(item.get("at")) == day
+    )
+
+
+def daily_attempt_cap(config: dict[str, Any] | None) -> int:
+    """`auto_copilot_max_attempts_per_day`：同一 `(关, 模式)` 当天最多试几次。
+
+    ≤ 0 视为不限制。读不出来退回默认值，绝不抛——它挂在排轮与卡片两条路径上。
+    """
+    try:
+        return int(
+            (config or {}).get(
+                "auto_copilot_max_attempts_per_day", DEFAULT_DAILY_ATTEMPT_CAP
+            )
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_ATTEMPT_CAP
+
+
+def daily_capped_modes(
+    ledger: dict[str, Any] | None,
+    stage: str,
+    modes: Iterable[str],
+    config: dict[str, Any] | None,
+    at: datetime | None = None,
+) -> list[tuple[str, int]]:
+    """今天已经用满次数的 `(模式, 次数)`——排轮据此把整关跳到明天。
+
+    2026-09-09 的教训：缺陷 1 让每一关都记成 `unknown`，30 分钟退避一到就又排
+    进来，03:30 和 04:00 两轮把 SR-5/6/7 原样重打了一遍。退避管的是「多久之后
+    再试」，管不住「一天试几次」，所以要有这条当日上限。
+    """
+    cap = daily_attempt_cap(config)
+    if cap <= 0:
+        return []
+    capped: list[tuple[str, int]] = []
+    for mode in modes:
+        used = attempts_today(ledger, stage, mode, at)
+        if used >= cap:
+            capped.append((str(mode), used))
+    return capped
 
 
 def ledger_pending_modes(

@@ -1119,10 +1119,17 @@ def copilot_card_stages(
             )
             failure = stage_state.get(stage) if isinstance(stage_state, dict) else None
             gaps = list((failure or {}).get("gaps") or []) if isinstance(failure, dict) else []
+            capped = maa_copilot.daily_capped_modes(ledger, stage, pending, config, at)
             if not pending:
                 status, text = "cleared", "✅ 已通"
             elif stage in scheduled:
                 status, text = "scheduled", f"⏳ 排程 {scheduled[stage]}"
+            elif capped:
+                # 当日上限只挡**自动**排轮；这一关照旧留在下拉里，手动想重打就重打（D14）。
+                status, text = (
+                    "daily_cap",
+                    f"🚫 今日已尝试 {max(used for _mode, used in capped)} 次",
+                )
             elif pending == ["raid"]:
                 status, text = "raid_pending", "🔁 普通已通、突袭待补"
             elif gaps:

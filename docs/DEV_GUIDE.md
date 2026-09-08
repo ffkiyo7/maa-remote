@@ -290,7 +290,8 @@ maa activity Official ── activity_snapshot() ── activity_target() ──
    │
    └─ 排新一轮
         collect_targets()  索引里前缀相同的全部关 ∩ 上游导航键
-                           − 已通关(记账 ∪ zone 全清) − 教学关 − zone 未开 − 退避中
+                           − 已通关(记账 ∪ zone 全清) − 教学关 − zone 未开
+                           − 当日已打满(daily_cap) − 退避中
         build_round()      plan_round(条目, 预算, 理智查表) → 现搜作业（≤6 关/tick）
                            排得满 → 现在打；排不满 → 只排第一条 + `sanity_preflight().ready_at`
         写 searches/<token>.json（status=scheduled）→ publish_round() 发「已排程」卡
@@ -307,7 +308,7 @@ maa activity Official ── activity_snapshot() ── activity_target() ──
 | 标题文本出现了、却不是完整一行（被装饰/缩进/换行） | **格式已变** → 抛异常 |
 | 连一个认识的分区都没有 | 同上，抛异常 |
 
-**目标集合的五种排除理由语义不同**（`collect_targets()` 的 `excluded`，卡片分开显示）：
+**目标集合的六种排除理由语义不同**（`collect_targets()` 的 `excluded`，卡片分开显示）：
 
 | 理由 | 含义 | 会不会自己变好 |
 |---|---|---|
@@ -315,7 +316,11 @@ maa activity Official ── activity_snapshot() ── activity_target() ──
 | `not_indexed` | 有导航键但本地 Tile-Pos 索引里没有 | 热更新后会 |
 | `zone_unopened` | 森空岛该活动所有 zone `totalStage == 0`（D9） | 会，**不记失败** |
 | `cleared` | 记账齐全 **或** zone 全清（D10） | — |
+| `daily_cap` | 今天这一 `(关, 模式)` 失败 / `unknown` 已达 `auto_copilot_max_attempts_per_day` | 会，**次日归零** |
 | `backoff` | 搜过、练度不满足 / 暂无作业，还没到 `activity_search_retry_minutes` | 练度或上游变了就会 |
+
+`backoff` 与 `daily_cap` 是两把不同的尺子：前者管「隔多久再试」，后者管「一天试几次」。
+只有前者时会出现 2026-09-09 那样的循环——记账全是 `unknown`，30 分钟一到又重打同一批关。
 
 **目标集合的顺序**：数字关升序 → EX 升序 → S 升序，每关先 `normal` 后 `raid`
 （`maa_copilot.activity_stage_codes()` + `maa_clearing.required_modes()`）。
@@ -624,7 +629,21 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    `/copilot/get/<id>` 取全文、改写 `stage_name` 为 stageId 后经 `file://` 传入。
 8. **prts 的 `content.difficulty` 全为空**（地基事实 F），判不出「这份作业支不支持突袭」。
    所以 D7 定为：活动关一律普通 + 突袭，同一份作业先打普通再打突袭。
-9. **解锁预检是单向的**（`zone_progress_warning`）：森空岛的 zone 进度含剧情关、
+9. **逐关标记必须 `flush()` 之后再把句柄交给子进程**（2026-09-09 线上缺陷）。
+   `_fight_one()` 先往日志写一行 `# <时刻> copilot <关> mode=<模式> id=<作业>`，
+   再把**同一个** handle 当 `stdout` 交给 `maa copilot`。不 flush 的话标记还躺在
+   Python 的缓冲区里，子进程直接往同一个 fd 写、先落盘，标记要等 `with` 退出才刷
+   出来——**排在这一关全部输出之后**。今晨的现象：
+   `runs/2026-09-09-copilot-fda56c1811ba.log` 第 37 行 `Copilot Completed`、
+   第 41 行 `[Copilot] … Completed`，标记行却在第 42 行。于是「本关输出」切出来是
+   空的，`copilot_outcome()` 一律 `unknown`，战报全 ❓、记账一次通关都不记，
+   30 分钟退避一到又把同一批关重打一遍。
+   现在的写法：写完标记 `handle.flush()` → 记下 `os.fstat(handle.fileno()).st_size`
+   → 事后 `_log_since(log_path, offset)` 从这个**字节偏移**读。按偏移切比按标记
+   `rsplit` 稳：偏移是标记落盘之后取的，同一个标记出现两次也不怕。
+   （`maa_roguelike_worker._run_one_exploration()` 本来就对：它把标记写在一个
+   **单独的 `with` 块**里，块退出即 flush，才开第二个 handle 给子进程。）
+10. **解锁预检是单向的**（`zone_progress_warning`）：森空岛的 zone 进度含剧情关、
    `stage_id` 序号只数战斗关——两把尺子。因此只有 `cleared < seq`（突袭必锁）和
    `cleared < seq-1`（关卡必锁）两个方向成立；**有警告 = 基本锁着，没警告 = 不知道**，
    绝不能在别处把「没警告」当成「已解锁」的依据。它现在只用于**抄作业卡上的一行显示**
@@ -650,10 +669,22 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
   ②是 zone 粒度的妥协——代价是用户自己手打过的关可能被再抄一遍，用户已接受。
 - `activity_key` 变了（新活动 / 复刻）→ 旧账**归档**成 `ledger-<安全化的 key>.json` 再新开
   （`ensure_ledger()`）。归档而不是删：回头想知道上个活动抄到哪了只有这份说得清。
-- **种子**（`seed_ledger()`）：首次建账且当期活动前缀是 `SR` 时，把 `SR-5 / SR-6 / SR-8`
+- **种子**（`seed_ledger()`）：当期活动前缀是 `SR` 时，把 `SR-5 / SR-6 / SR-8`
   的**普通**模式写成 `2026-09-08T23:58:00+08:00`（来源：spike A 报告与用户自述——
   SR-5/SR-6 用户自己打过且 spike 又重打了一遍，SR-8 是 09-08 15:17 抄作业通关的），
-  突袭留空。**只补空位、绝不覆盖已有记账**，换活动也绝不写。
+  突袭留空。**只补空位、绝不覆盖已有记账**，换到别的活动绝不写。
+  判据是账本上的 **`seeded` 标记**，不是「是不是首次建账」（2026-09-09 线上缺陷）：
+  原来只在 `load_ledger()` 返回 `None` 时才种，而线上 02:23 上一个活动
+  （「墟」复刻 `|AT`）的 watcher tick 先把账本建了出来，03:00 SR 上线走的是
+  「归档旧账 + 新开一份」，`ledger is not None`，种子一次都没跑——SR-5/6/8 的普通
+  全空，第一轮就把它们重抄了一遍。`seed_ledger()` 只补空位所以幂等，按标记补是安全的。
+- **当日上限**（`auto_copilot_max_attempts_per_day`，默认 2）：同一 `(关, 模式)` 当天
+  失败 / `unknown` 达到这个次数后，当天不再自动排它（`collect_targets()` 的排除理由
+  `daily_cap`，数据取自 `attempts` 里按 `at` 落在今天的记录，`won` 不计入），
+  抄作业卡上显示「🚫 今日已尝试 N 次」，次日 `attempts_today()` 自然归零、无需清状态。
+  它挡的只是**自动**排轮，手动从下拉重打不受限（D14）。
+  来由：今晨 03:30 与 04:00 两轮把 SR-5/6/7 原样重打了一遍——退避
+  （`activity_search_retry_minutes`）管的是「隔多久再试」，管不住「一天试几次」。
 - 记账写在 `save_ledger()`（0600，`atomic_write_json`）；账本坏掉 `load_ledger()` 返回
   `None` 而不是抛——最坏结果是重抄一遍，不会漏抄，也不会带走整轮（D-2 的教训）。
 
@@ -1023,11 +1054,11 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 27 | 理智让路的判据**只有一条**：估算理智 < 默认关 `apCost`。森空岛不可用、关卡不在 `stages.json`、任何异常 → `farming = True`。让路时必须在开跑消息里写明理由（`farming_skip_reason`），不许静默 | `maa_daily.attach_sanity_yield()` + `SanityYieldTests.test_an_unreadable_estimate_farms_as_usual` / `test_a_throwing_probe_never_takes_the_farming_block_away` |
 | 28 | 排轮前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的条目**不入当轮、不进预算**（那不是「打完了」，是「算不出来」） | `maa_clearing.sanity_budget()` / `plan_round()` + `CopilotRoundPlanningTests` |
 | 29 | 「已通关」有**两条独立判据**、是「或」的关系：本地记账所需模式齐全 **或** 森空岛该 zone 全清（D10）。`zone_fully_cleared()` 与 `zone_progress_warning()` **共用 `stage_zone()` 的定位、绝不合并结论**——后者是「只在能证明未解锁时才开口」的单向启发，沉默 ≠ 已解锁，永远不当闸门用 | `maa_copilot.stage_zone()` / `zone_fully_cleared()` / `ledger_pending_modes()` + `LedgerTests.test_zone_helpers_stay_two_separate_rules`（AST 结构断言） |
-| 30 | 记账**只有 `won` 才写模式时间戳**；活动关的所需模式是普通 + 突袭，**突袭失败 → 该关不算通关**，下一轮只排剩下的模式（D7）。`activity_key` 变了要**归档**旧账（`ledger-<key>.json`）而不是删。种子（`SR-5/6/8` 普通）**只在首次建账且前缀是 `SR` 时写，且只补空位** | `maa_copilot.record_copilot_attempt()` / `ensure_ledger()` / `seed_ledger()` + `LedgerTests` |
+| 30 | 记账**只有 `won` 才写模式时间戳**；活动关的所需模式是普通 + 突袭，**突袭失败 → 该关不算通关**，下一轮只排剩下的模式（D7）。`activity_key` 变了要**归档**旧账（`ledger-<key>.json`）而不是删。种子（`SR-5/6/8` 普通）**只在前缀是 `SR` 且账本还没种过（`seeded` 标记）时写，且只补空位**——判据不能是「是不是首次建账」，账本常常被上一个活动的 tick 先建出来（2026-09-09 已实际发生）。同一 `(关, 模式)` 当天失败 / `unknown` 达到 `auto_copilot_max_attempts_per_day`（默认 2）次后当天不再自动排，次日归零 | `maa_copilot.record_copilot_attempt()` / `ensure_ledger()` / `seed_ledger()` / `attempts_today()` / `daily_capped_modes()` + `LedgerTests` / `CopilotDailyAttemptCapTests` |
 | 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 删掉了原第三个下拉——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage(result, phase)` 写进当天**那一场**的 `sessions.<phase>.stage`（**同一个字段**：`daily.toml` 只有一条刷理智链，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`，连带写下 `farming_drops` 与 `farming_fallback_stage`。**用户在某一场手动选过（`stage_source="discord"`）当天那一场就不许再自动改**，另一场不受影响；`stage_source` 必须留在 `maa_common.PLAN_SESSION_FIELDS` 白名单里，否则点一次「跳过」就把那一场的自动定关冻住。排序指标是**稀缺 / 缺口 / 效率三项加权分**（四期步骤 3，权重在 `config.farming_weights`，和为任意值都归一），不许再叠「库存低于 N 就优先」这类例外规则。**降级期照样自动定关**——2026-09-09 改写：三期不敢改是因为那时排序依据只有手工权重；现在候选集受活动 / 当日开放限制（D5），而且外部掉率数据给了效率与稀缺两项兜底，选出来的关是合理的。降级必须在卡片上标出来并列出原因，而且**降级期不写 `drops` 上限**（缺口是猜的，拿它当「刷够就停」会提前收工）| `maa_farming.farming_result()` / `auto_stage()` / `maa_plan_card.apply_auto_stage()` + `FarmingScoreTests.test_cold_start_uses_manual_weights_but_still_picks_a_stage` / `FarmingAutoStageTests.test_degraded_still_picks_a_stage_and_says_so`
 | 32 | 材料推荐的**每一条降级路径都不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**（进 `degraded_reasons`，卡片上列出来）：外部抓取失败退本地缓存、缓存也没有就当空数据；冷启动（`consumption_history` 不足 2 次对表）缺口项退手工权重；≥4 周窗口内零消耗的材料可用量是**未知**、同样退手工权重；`itemValue == null` 的材料不参与缺口计价；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_farming.load_market_data()` / `farming_result()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingScoreTests` / `FarmingFetchTests`
 | 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在候选关集合里取命中的——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选里有掉率数据时按「理智/件」最便宜的挑，没有数据才退回启发式顺序（手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。**没有主掉落的关也留在表里**（`materials: []`）：`maa_farming` 要靠它把关卡代号对到内部 `stageId` 与 `apCost`。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` / `FarmingScoreTests.test_a_priced_material_picks_the_cheapest_open_stage`
-| 33 | 记账**只在这一关被判定为通关时**才写：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行） | `maa_clearing.copilot_outcome()` + `CopilotVictoryJudgementTests` |
+| 33 | 记账**只在这一关被判定为通关时**才写：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行）。判据的输入是「**这一关自己的那段输出**」：逐关标记必须 `flush()` 之后再把日志句柄交给子进程，切片按 flush 后的**字节偏移**（`_log_since()`）而不是按标记 `rsplit`——不 flush 的话标记排在这一关全部输出之后，切出来是空段、一律判成 `unknown`（2026-09-09 线上现象，§5.5 关键事实 9） | `maa_clearing.copilot_outcome()` + `maa_copilot_worker._fight_one()` / `_log_since()` + `CopilotVictoryJudgementTests` / `CopilotLogMarkerTests`（**用真实子进程**共享 fd，Python 侧写字符串的桩测不出来） |
 | 34 | 一轮条目的突袭用 `#raid` 后缀表示，每关先普通后突袭；**除了 `maa copilot --raid` 的取值，理智查表 / 导航键闸门 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.split_entry()` / `make_entry()` / `required_modes()` + `CopilotModeTests` / `CopilotTargetSetTests.test_a_raid_entry_is_gated_under_its_plain_stage_name` |
 | 35 | 一轮里**一关失败继续下一关**，只有 `nav`（上游导航 / 切突袭难度）这类环境失败才停止整轮；两种情况战报都必须**逐关列出结果**。普通没过就跳过同一关的突袭（那关根本没解锁） | `maa_copilot_worker._batch_run_locked()` + `CopilotBatchExecutionTests` |
 | 36 | 一轮里每开新的一关前检查距下一场日常是否还够 `auto_copilot_min_lead_minutes`（默认 40，比 `copilot_blackout_minutes` 宽，因为它要覆盖整关而不只是启动），不够就收尾、剩下的留给下一轮。**「能不能开」的三条闸门（blackout / Depot 窗口 / 时间预算）只有一份实现**，都在 `maa_action.py`：watcher 派发前查一次，worker 每关开始前再查一次 | `maa_action.min_lead_reason()` / `_copilot_blackout_reason()` / `depot_window_reason()` + `CopilotTimeBudgetTests` / `CopilotDispatchGateTests` |
@@ -1140,7 +1171,9 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 新活动上线后没有「已排程」卡 | `hermes cron list` 看“MAA 活动作业监控”；再看 `activity_watch.json`：`status=done` 说明目标集合是空的（看 `excluded` 里每关的理由），`waiting` 说明这一轮排不出条目，`scheduled` 说明排出来了但派发闸门没过 |
 | 「已排程」卡发了但一直不开跑 | `activity_watch.json` 的 `status` 停在 `scheduled`。原因按 `dispatch_blocker()` 的顺序看：还没到 `scheduled_at`（等理智）/ blackout / Depot 窗口 / `run.lock` 被占 / 模拟器在线 |
 | 某关一直不被自动抄 | 抄作业卡的一览就是答案：⛔ 上游无导航（**永远不会变好**，只能手动打或等热更新）、🚫 练度不满足（缺什么写在括号里）、✅ 已通（记账或森空岛 zone 全清）。`copilot/ledger.json` 是记账真值 |
-| 战报里某关 ❓ 未确认 | `copilot_outcome()` 返回 `unknown`：退出码 0 但没有 `Copilot Completed`。**不记通关**，下一轮会重打。上游改措辞了就改 `maa_clearing.COPILOT_VICTORY_MARKERS` |
+| 战报里某关 ❓ 未确认 | `copilot_outcome()` 返回 `unknown`：退出码 0 但没有 `Copilot Completed`。**不记通关**，下一轮会重打。日志文件名写在记账 `attempts[].detail` 里。上游改措辞了就改 `maa_clearing.COPILOT_VICTORY_MARKERS` |
+| 战报全 ❓、记账全 `unknown`，日志里却明明有 `Copilot Completed` | **看标记行 `# <时刻> copilot <关> mode=…` 是不是排在这一关的输出之后**。是的话就是逐关标记没 `flush()` 就把句柄交给了子进程（§5.5 关键事实 9 / 不变量 #33），切出来的「本关输出」是空段。2026-09-09 03:30 那轮就是这样，连带触发了 30 分钟退避后的重打 |
+| 某关今天不再被自动排、卡上写「🚫 今日已尝试 N 次」 | 当日上限命中（`auto_copilot_max_attempts_per_day`，默认 2）。次日自动恢复；想现在就重打，从抄作业卡的下拉手动选它（手动路径不受这条限制）。`copilot/ledger.json` 的 `attempts` 是计数依据 |
 | 突袭那次总是失败 | 先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`。切换任务名验不通就把 `config.copilot_raid_switch_task` 设成空串，自动路径退回只打普通 |
 | 点了「肉鸽停」还在跑 | 这是设计（不变量 #47）：停止只在**局间**生效，当前这一局会打完。要立刻停就点「⏏️ 立即中止」——那一局作废。看 `roguelike.json` 的 `stop_requested_at` 有没有写进去 |
 | 肉鸽开始被拒「上次 X 主题没有干净结束」 | `roguelike.json` 的 `dirty = true`（不变量 #49）。用**同一个主题**跑一局，上游自己会 `Continue → ExitThenAbandon` 收掉残局，干净结束后 `dirty` 清零，就能换主题了 |
