@@ -7,4 +7,13 @@ channel = "Beta"
 # ignores the machine proxy.
 auto_update = false
 warn_on_update_failure = false
-backend = "libgit2"
+# Must be "git" (shell out to the git binary), never "libgit2": the libgit2
+# backend ignores HTTP_PROXY / HTTPS_PROXY completely and dials github.com
+# directly, which from this machine fails intermittently with
+#   Error: SecureTransport error: connection closed via error; class=Net (12)
+# -- that is what turned the 2026-09-07 and 09-08 07:50 plan cards red, while
+# `maa update` (plain HTTPS via reqwest, proxy-aware) succeeded in the same run.
+# Proven 2026-09-09: pointed at a dead proxy (127.0.0.1:9) the libgit2 backend
+# still fetched fine, the git backend failed instantly -- only "git" goes
+# through the proxy. maa-cli falls back to libgit2 by itself if git is missing.
+backend = "git"
