@@ -259,6 +259,35 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 - ⚠️ **突袭切换（`ChangeToRaidDifficulty`）尚未真机验证**：验不过就把
   `config.copilot_raid_switch_task` 设成空串，自动路径退回只打普通，突袭留人工。
 
+### 肉鸽（手动触发）
+
+聊天说「刷肉鸽」→ 一张配置卡（**4 个下拉 + 1 行 3 个按钮，正好 5 行**）→ 点「▶️ 开始」→
+后台持 `run.lock` 循环调上游，**每打完一局发一条进度**，跑完一条汇总战报。
+**肉鸽不消耗理智**，不进理智预算、不影响日常刷图。
+
+- **四个下拉**：主题（傀影 / 水月 / 萨米 / 萨卡兹 / 界园 / **黑流树海**，默认萨卡兹）、
+  模式（刷源石锭 / 刷等级 / 烧水凹开局，萨米追加坍缩范式；默认刷源石锭）、
+  难度（不指定 / MAX / n..0，上限按主题 15 或 18；默认取手册推荐）、
+  分队（按主题 + 模式从 MAA GUI 的字典生成；萨卡兹刷锭默认点刺成锭分队，其余指挥分队）。
+  职业组不占 UI，按主题固定（傀影 `取长补短`，其余 `稳扎稳打`）；开局干员留空让上游按练度选。
+  **换主题会自动重发一张卡**——模式 / 难度 / 分队的选项都随主题变。
+- **执行路线是 `maa run` 任务文件**，不是 `maa roguelike` 子命令：maa-cli 0.7.5 的枚举里
+  没有黑流树海、`mode` 硬限 0..5、两处默认值和 MaaCore 协议相反、傀影的难度参数会被丢掉。
+  任务文件的 `[tasks.params]` 原样透传，一次绕开这些坑（黑流树海因此还能传
+  `blackflow_strategy`：刷等级快速飞三层 / 刷源石锭投完就退 / 刷襁褓动物）。
+- **优雅停止**：`starts_count = 1`，**一局一个子进程**。
+  「⏹️ 本局结束后停止」只写一个标志，worker 在**局间**读它——当前这一局由上游打完、
+  干净停在主题入口页，**进度不丢**。「⏏️ 立即中止」才对子进程 `terminate()`（SIGTERM），
+  **当前这一局作废**。
+- **自动收尾**：源石锭储备满 999（上游自己 `exit_then_stop`）、连续 2 局上游报错、
+  距 08:00 / 22:00 日常不足 25 分钟、进入 Depot 对表窗口（京 04:20–05:00），都不再开新局。
+  单局超过 `roguelike_run_timeout`（默认 1 小时）会被终止。
+- ⚠️ **换主题前先在游戏里把该主题置顶到终端**：上游的自动导航「不保证长期可用」。
+  而且上一局被中止过（`dirty`）时**不许换主题**——上游只在同主题下才会自己放弃残局，
+  跨主题会死循环，所以要先用同一个主题跑一局收尾。
+- ⚠️ **本机从未真机跑过肉鸽**：一局耗时、`starts_count = 1` 的收尾画面能否无缝接下一局、
+  黑流树海走任务文件是否真能跑，都要首跑验证。
+
 ### 安全边界
 
 - `maa_action.py` 是**唯一**状态变更入口。技能文件（`SKILL.md`）明确禁止 LLM 直接写
@@ -370,7 +399,14 @@ maa_action.py copilot card                      # 「抄作业」「有什么关
 maa_action.py copilot find <关卡>               # 「抄 SR-8」——搜到就直接开跑
 maa_action.py copilot status <token>            # 「这轮到哪了」
 maa_action.py copilot cancel <token>            # 「已排程」卡上的「❌ 取消本轮」
+maa_action.py roguelike card                    # 「刷肉鸽」「开肉鸽卡」「打集成战略」
+maa_action.py roguelike stop                    # 「肉鸽停」「打完这局停」
+maa_action.py roguelike abort                   # 「肉鸽立刻停」（当前局作废）
+maa_action.py roguelike status                  # 「肉鸽到哪了」
 ```
+
+肉鸽的 `roguelike set <字段> <值>` 与 `roguelike start` **只由卡片上的下拉和按钮触发**，
+不在 LLM 的清单里：主题 / 模式 / 难度 / 分队只能你自己在卡上点，聊天侧永远只发卡。
 
 **场次参数不能省**：`am` = 早场 08:00，`pm` = 晚场 22:00。你没说是哪一场时它会先问，不会替你挑。
 
@@ -397,6 +433,7 @@ maa_action.py copilot cancel <token>            # 「已排程」卡上的「❌
 | `activity_search_retry_minutes` | `30` | 某关练度不满足 / 暂无作业时的重试间隔 |
 | `auto_copilot_min_lead_minutes` | `40` | 距下一场日常不足这么多分钟就不再开新的一关（比黑名单宽，因为它要覆盖整关） |
 | `copilot_raid_switch_task` | `ChangeToRaidDifficulty` | 从普通难度切到突袭用的上游任务名。**留空 = 跳过切换**，自动路径退回只打普通 |
+| `roguelike_run_timeout` | `3600`（1 小时） | 肉鸽**单局**子进程的上限。超了走 `terminate()`（SIGTERM），不是 SIGKILL，好让 MaaCore 有机会收手。整轮的长度由 blackout / Depot 窗口约束，不在这里叠加 |
 | `annihilation_sanity` | `25` | 排作业理智预算时为每日剿灭预留的理智 |
 | `farming_stage_table` | 见下 | 材料 → 关卡的手工映射 |
 | `farming_manual_weights` | 见下 | 冷启动/零消耗时的手工权重，数值越大越优先 |

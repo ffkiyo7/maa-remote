@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import maa_copilot
+import maa_roguelike
 from maa_common import (
     BUTTONS_PATH,
     LAST_RUN_PATH,
@@ -673,6 +674,225 @@ def copilot_card() -> tuple[bool, str]:
     return True, f"🤖 抄作业卡已发，共 {len(options)} 关可选{warning}。"
 
 
+# ---------------------------------------------------------------------------
+# Roguelike（肉鸽）— 手动触发，卡片选参数，worker 循环跑（四期步骤 4 / D19）
+# ---------------------------------------------------------------------------
+
+def dispatch_roguelike(token: str) -> None:
+    """把一轮肉鸽交给 worker。调用方先把状态原子改成 `running`。"""
+    worker = SCRIPTS_DIR / "maa_roguelike_worker.py"
+    if not worker.is_file():
+        raise RuntimeError("maa_roguelike_worker.py 尚未部署")
+    subprocess.Popen(
+        [sys.executable, str(worker), "run", token],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _send_roguelike_card(config: dict[str, Any], state: dict[str, Any]) -> str:
+    """发一张新的肉鸽卡并收掉上一张，返回给用户看的补充说明。
+
+    顺序与抄作业卡一致（不变量 #14b）：**PATCH 旧卡组件 → 删旧登记 →
+    merge 写新登记 → 发卡 → 记新 message_id**。反过来会出现「旧卡还能点、
+    登记已经指向新卡」的窗口。
+    """
+    channel_id = str(config.get("channel_id", "")).strip()
+    if not channel_id.isdigit():
+        raise RuntimeError("config.json 中尚未配置 Discord channel_id。")
+    embed, rows, entries = maa_roguelike.build_card(state)
+    warning = ""
+    try:
+        retire_discord_components(config, state.get("message_id"))
+    except Exception as exc:
+        warning = f"；上一张卡的按钮收起失败：{type(exc).__name__}: {exc}"
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        for custom_id in [
+            key for key in registry if key.startswith(maa_roguelike.BUTTON_PREFIX)
+        ]:
+            registry.pop(custom_id)
+        registry.update(entries)
+        atomic_write_json(BUTTONS_PATH, registry)
+    message = discord_request(
+        discord_token(),
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {"embeds": [embed], "components": rows, "allowed_mentions": {"parse": []}},
+    )
+    message_id = str(message.get("id", "")) if isinstance(message, dict) else ""
+    pending = state.get("pending")
+    # 只合并这两个字段：worker 可能正在同一份文件里写 `runs` / `dirty`。
+    maa_roguelike.update_state(
+        lambda fresh: fresh.update({"pending": pending, "message_id": message_id})
+    )
+    return warning
+
+
+def roguelike_card() -> tuple[bool, str]:
+    """发一张肉鸽配置卡（4 个下拉 + 1 行按钮，正好 5 行）。"""
+    config = load_config()
+    state = maa_roguelike.load_state()
+    state["pending"] = maa_roguelike.normalize_pending(state.get("pending"))
+    warning = _send_roguelike_card(config, state)
+    choice = maa_roguelike.params_text(maa_roguelike.resolve_params(state["pending"]))
+    return True, f"🎲 肉鸽卡已发：{choice}。选好后点「▶️ 开始」{warning}"
+
+
+def roguelike_set(field: str, value: str) -> tuple[bool, str]:
+    """写一项待开始的选择（值来自登记表 `select_args`，仍然逐项校验）。"""
+    if field not in maa_roguelike.PARAM_FIELDS:
+        return False, f"只支持 {'/'.join(maa_roguelike.PARAM_FIELDS)} 四项。"
+    state = maa_roguelike.load_state()
+    if state.get("status") in maa_roguelike.LIVE_STATUSES and not (
+        maa_roguelike.round_is_stale(state, is_run_locked())
+    ):
+        return False, "肉鸽正在跑，参数要等这一轮停下来再改。"
+    pending = maa_roguelike.normalize_pending(state.get("pending"))
+    theme = pending["theme"]
+    if field == "theme":
+        if not maa_roguelike.valid_theme(value):
+            return False, f"未知的肉鸽主题：{value[:40]!r}。"
+        # 模式 / 难度 / 分队的**选项**都随主题变，所以整份选择重置成新主题的
+        # 默认值，并**重发一张卡**——留着旧卡只会让人从上一主题的分队里挑。
+        state["pending"] = maa_roguelike.default_pending(value)
+        warning = _send_roguelike_card(load_config(), state)
+        choice = maa_roguelike.params_text(
+            maa_roguelike.resolve_params(state["pending"])
+        )
+        return True, (
+            f"🎲 已换成{maa_roguelike.theme_name(value)}，"
+            f"并按该主题重发了一张卡：{choice}。"
+            f"开始前记得在游戏里把这个主题置顶到终端{warning}"
+        )
+    if field == "mode":
+        if not maa_roguelike.valid_mode_token(theme, value):
+            return False, f"{maa_roguelike.theme_name(theme)} 没有这个模式。"
+        pending["mode"] = value
+    elif field == "difficulty":
+        try:
+            number = int(value)
+        except ValueError:
+            return False, f"难度必须是整数，收到 {value[:20]!r}。"
+        if not maa_roguelike.valid_difficulty(theme, number):
+            return False, (
+                f"{maa_roguelike.theme_name(theme)} 的难度上限是 "
+                f"{maa_roguelike.max_difficulty(theme)}。"
+            )
+        pending["difficulty"] = number
+    else:
+        if value not in maa_roguelike.all_squad_values(theme):
+            return False, f"{maa_roguelike.theme_name(theme)} 没有「{value[:20]}」。"
+        pending["squad"] = value
+    normalized = maa_roguelike.normalize_pending(pending)
+    maa_roguelike.update_state(lambda fresh: fresh.update({"pending": normalized}))
+    choice = maa_roguelike.params_text(maa_roguelike.resolve_params(normalized))
+    return True, f"🎲 已记下：{choice}。点「▶️ 开始」才会真的开跑。"
+
+
+def roguelike_start() -> tuple[bool, str]:
+    """派发一轮肉鸽。闸门与抄作业**共用同一份**（不变量 #13）。"""
+    state = maa_roguelike.load_state()
+    stale = maa_roguelike.round_is_stale(state, is_run_locked())
+    if state.get("status") in maa_roguelike.LIVE_STATUSES and not stale:
+        return False, "肉鸽已经在跑了，没有重复启动；要停就点「⏹️」或「⏏️」。"
+    pending = maa_roguelike.normalize_pending(state.get("pending"))
+    conflict = maa_roguelike.dirty_theme_conflict(state, pending["theme"])
+    if conflict:
+        return False, conflict
+    config = load_config()
+    # 肉鸽不耗理智，但它一样要开模拟器、一样持 run.lock，所以照样过这道闸门。
+    blocker = dispatch_blocker(config, "", now_beijing())
+    if blocker:
+        return False, f"{blocker}；肉鸽本轮未排程，日常 / 对表结束后再点「开始」。"
+    params = maa_roguelike.resolve_params(pending)
+    token = _new_search_token()
+    started = {
+        "status": maa_roguelike.RUNNING,
+        "theme": params["theme"],
+        "params": params,
+        "pending": pending,
+        "token": token,
+        "started_at": now_beijing().isoformat(),
+        "runs": [],
+        "stop_requested_at": None,
+        "abort_requested_at": None,
+    }
+    maa_roguelike.update_state(lambda fresh: fresh.update(started))
+    try:
+        dispatch_roguelike(token)
+    except Exception as exc:
+        maa_roguelike.update_state(
+            lambda fresh: fresh.update(
+                {"status": maa_roguelike.IDLE, "token": ""}
+            )
+        )
+        return False, f"肉鸽 worker 派发失败：{type(exc).__name__}: {exc}"
+    recovered = "（上一轮的 worker 已经不在了，这次按新的一轮重开）" if stale else ""
+    return True, (
+        f"▶️ 已派发肉鸽{recovered}：{maa_roguelike.params_text(params)}。"
+        "每打完一局发一条进度；说「肉鸽停」会在本局结束后退出。"
+    )
+
+
+def _request_roguelike_stop(abort: bool) -> tuple[bool, str]:
+    """只写标志位、立刻返回（<20s，不变量 #6）。真正的收手由 worker 做。"""
+    state = maa_roguelike.load_state()
+    if state.get("status") not in maa_roguelike.LIVE_STATUSES:
+        return False, "肉鸽现在没有在跑，没有可以停的东西。"
+    now = now_beijing().isoformat()
+
+    def mark(fresh: dict[str, Any]) -> None:
+        fresh["stop_requested_at"] = fresh.get("stop_requested_at") or now
+        fresh["status"] = maa_roguelike.STOPPING
+        if abort:
+            fresh["abort_requested_at"] = now
+
+    maa_roguelike.update_state(mark)
+    if abort:
+        return True, (
+            "⏏️ 正在中止：当前这一局作废（分数与源石锭都不算），"
+            "模拟器随后会关干净。下次开始必须还是同一个主题，上游才会自己收掉残局。"
+        )
+    return True, (
+        "⏹️ 收到；这一局会打完再退出，进度不丢。"
+        "要立刻停就点「⏏️ 立即中止（会丢当前局）」。"
+    )
+
+
+def roguelike_stop() -> tuple[bool, str]:
+    return _request_roguelike_stop(abort=False)
+
+
+def roguelike_abort() -> tuple[bool, str]:
+    return _request_roguelike_stop(abort=True)
+
+
+def roguelike_status() -> tuple[bool, str]:
+    state = maa_roguelike.load_state()
+    status = str(state.get("status") or maa_roguelike.IDLE)
+    runs = state.get("runs") or []
+    if status == maa_roguelike.IDLE:
+        tail = ""
+        if state.get("dirty"):
+            tail = (
+                f"；上次 {maa_roguelike.theme_name(str(state.get('last_theme') or ''))}"
+                "没有干净结束，下次要用同主题收尾"
+            )
+        return True, f"🎲 肉鸽空闲中（说「刷肉鸽」发配置卡）{tail}。"
+    params = state.get("params") if isinstance(state.get("params"), dict) else {}
+    head = "▶️ 正在跑" if status == maa_roguelike.RUNNING else "⏹️ 已收到停止指令，本局结束后退出"
+    return True, (
+        f"{head}：{maa_roguelike.params_text(params)}\n"
+        f"已完成 {len(runs)} 局：\n{maa_roguelike.run_lines(runs)}"
+    )
+
+
 def copilot_cancel(token: str) -> tuple[bool, str]:
     config = load_config()
     message_id: Any = None
@@ -747,10 +967,23 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return copilot_cancel(argv[2])
     if argv[:2] == ["copilot", "status"] and len(argv) == 3:
         return copilot_status(argv[2])
+    if argv == ["roguelike", "card"]:
+        return roguelike_card()
+    if argv[:2] == ["roguelike", "set"] and len(argv) == 4:
+        return roguelike_set(argv[2], argv[3])
+    if argv == ["roguelike", "start"]:
+        return roguelike_start()
+    if argv == ["roguelike", "stop"]:
+        return roguelike_stop()
+    if argv == ["roguelike", "abort"]:
+        return roguelike_abort()
+    if argv == ["roguelike", "status"]:
+        return roguelike_status()
     return False, (
         "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
         "plan skip-today <on|off> <am|pm>、plan show、run now、log tail、"
-        "copilot card/find/cancel/status。"
+        "copilot card/find/cancel/status、"
+        "roguelike card/set/start/stop/abort/status。"
     )
 
 

@@ -36,6 +36,7 @@
   "skland_roster_refresh_days": 7,
   "auto_copilot_min_lead_minutes": 40,
   "copilot_raid_switch_task": "ChangeToRaidDifficulty",
+  "roguelike_run_timeout": 3600,
   "annihilation_sanity": 25,
   "farming_weights": {
     "scarcity": 0.5,

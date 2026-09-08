@@ -189,7 +189,9 @@ def deploy_scripts() -> None:
         "maa_clearing.py",
         "maa_copilot.py",
         "maa_farming.py",
+        "maa_roguelike.py",
         "maa_copilot_worker.py",
+        "maa_roguelike_worker.py",
         "maa_skland.py",
     ):
         copy_file(ROOT / "scripts" / name, target / name, 0o700)
@@ -644,7 +646,9 @@ def main() -> int:
                 "maa_clearing.py",
                 "maa_copilot.py",
                 "maa_farming.py",
+                "maa_roguelike.py",
                 "maa_copilot_worker.py",
+                "maa_roguelike_worker.py",
                 "maa_skland.py",
                 "ocrbox",
             )

@@ -1,7 +1,7 @@
 ---
 name: maa-operator
-description: "通过受控脚本查看或修改今天早场 / 晚场各自的 MAA 日常计划，支持关卡、跳过、抄作业（选中即执行）和查看中文执行结果。"
-version: 4.0.0
+description: "通过受控脚本查看或修改今天早场 / 晚场各自的 MAA 日常计划，支持关卡、跳过、抄作业（选中即执行）、肉鸽（卡片选参数 + 优雅停止）和查看中文执行结果。"
+version: 4.1.0
 metadata:
   hermes:
     tags: [maa, arknights, games, automation]
@@ -46,6 +46,14 @@ metadata:
    活动已轮换、理智消耗未知、森空岛读取失败或理智不足时脚本会拒绝，必须原样转述。
 10. 活动关一律**普通 + 突袭**都打，两种都过了才算通关；资源本 / 主线只有普通。
    突袭失败这一关就不算通关，下一轮只补突袭。
+11. **肉鸽的四个参数（主题 / 模式 / 难度 / 分队）只能用户在卡上点**。聊天里
+   **绝不**替用户选主题或难度，也不要自己调 `roguelike set` / `roguelike start`——
+   说「刷肉鸽」就发卡（`roguelike card`），让用户在卡上选完自己点「▶️ 开始」。
+   用户说要「换主题」时也只发卡，由他在下拉里点。
+12. 肉鸽**不消耗理智**，不影响日常刷图；但它一样持 `run.lock`、一样开模拟器，
+   所以日常临近 / 仓库对表窗口 / 模拟器在用时脚本会拒绝，原样转述即可。
+   上一轮被「立即中止」过时**换主题会被拒**（上游只在同主题下善后残局），
+   照脚本的话说，不要建议绕过。
 
 ## 唯一允许的命令
 
@@ -63,7 +71,14 @@ python3 ~/.hermes/scripts/maa_action.py copilot card
 python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
 python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
+python3 ~/.hermes/scripts/maa_action.py roguelike card
+python3 ~/.hermes/scripts/maa_action.py roguelike stop
+python3 ~/.hermes/scripts/maa_action.py roguelike abort
+python3 ~/.hermes/scripts/maa_action.py roguelike status
 ```
+
+肉鸽的 `roguelike set <字段> <值>` 与 `roguelike start` **只由卡片上的下拉和按钮触发**，
+不在这张清单里——聊天侧永远只发卡（`roguelike card`），选参数和开跑都由用户自己点。
 
 `copilot cancel <token>` 通常由「已排程」卡上的「❌ 取消本轮」按钮触发；
 token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑的一轮取消不了。
@@ -93,6 +108,13 @@ token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑�
   最终状态只认随后那条战报。
 - 战报里某关 ❌ → 不要建议立刻重试；下一轮 watcher 会按退避自己再试，
   练度不满足的关要等练度或等上游出新作业。
+- “刷肉鸽 / 开肉鸽卡 / 打集成战略 / 换个肉鸽主题” → `roguelike card`（发一张
+  4 个下拉 + 3 个按钮的配置卡；**不要替用户选主题 / 模式 / 难度 / 分队**，
+  也不要替他点「开始」）
+- “肉鸽停 / 打完这局停 / 跑完这把就别跑了” → `roguelike stop`（本局结束后退出，进度不丢）
+- “肉鸽立刻停 / 马上停 / 现在就退” → `roguelike abort`（当前这一局作废，要提醒这一点）
+- “肉鸽到哪了 / 跑了几局了” → `roguelike status`（只读）
+- 换主题前提醒一句：**先在游戏里把那个肉鸽主题置顶到终端**，上游的自动导航不保证长期可用。
 
 一句话同时包含多个明确变更时，逐个调用对应子命令，并在全部执行后简短合并脚本
 确认语。关卡或意图不明确时先问一句，不要猜。正在运行时脚本会明确说明不打断本场、
