@@ -159,32 +159,51 @@ def attach_annihilation(
     return {**plan, "annihilation": should_run_annihilation(plan, at, last_run)}
 
 
-def attach_clearing_yield(
+def attach_sanity_yield(
     plan: dict[str, Any],
     config: dict[str, Any],
     at: datetime | None = None,
 ) -> dict[str, Any]:
-    """队列活跃时把「刷理智」让出来，保留剿灭（PLAN_CLEARING 步骤 3）。
+    """理智不够刷默认关时把「刷理智」让出来，保留剿灭（四期 D11）。
 
-    「活跃」的三条件定义在 `maa_clearing.queue_is_active()`：冻结日与
-    `needs_manual` 等待日都**不算活跃**，那两天日常照常刷理智——否则那天既不打
-    队列、也不刷理智，一整天的理智白白溢出。
+    自动抄作业跑完常常把理智打到个位数，这时候再开一个 Fight 只会空转一次
+    连战识别。判据只有一条：**估算理智 < 默认关的 `apCost`**。
+
+    **估不出来一律照常刷**（森空岛不可用、关卡不在 `stages.json`、状态文件坏掉）——
+    宁可多刷一场，也不能因为读不出数就一整天什么都不打（不变量 #26 的精神）。
     """
-    active = False
     try:
-        import maa_clearing
+        import maa_copilot
 
-        if bool(config.get("clearing_enabled", False)):
-            active = maa_clearing.queue_is_active(maa_clearing.load_state(), at)
+        stage = str(plan.get("stage") or "")
+        index = maa_copilot.load_stage_index(config)
+        resolved = maa_copilot.resolve_copilot_stage(stage, index)
+        cost = (
+            maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+            if resolved
+            else None
+        )
+        roster = maa_copilot.load_roster()
+        snapshot = (roster or {}).get("sanity")
+        sanity = maa_copilot.estimated_sanity(
+            snapshot if isinstance(snapshot, dict) else {}, at
+        )
+        if cost is None or sanity is None or sanity >= cost:
+            return {**plan, "farming": True}
+        return {
+            **plan,
+            "farming": False,
+            "farming_skip_reason": (
+                f"理智 {sanity} 不足以刷 {stage}（需 {cost}），本场跳过刷理智；"
+                "剿灭 / 基建 / 公招 / 商店 / 领奖照常。"
+            ),
+        }
     except Exception as exc:
-        # 探测自己坏了不能顺手把理智也停掉：按「不活跃」处理，日常照常刷。
-        # 宁可多刷一场，也不要因为读状态失败就一整天什么都不打。
         print(
-            f"clearing 队列状态读取失败，按不活跃处理：{type(exc).__name__}: {exc}",
+            f"理智让路判定失败，本场照常刷理智：{type(exc).__name__}: {exc}",
             flush=True,
         )
-        active = False
-    return {**plan, "farming": not active}
+        return {**plan, "farming": True}
 
 
 def annihilation_consumed(lines: list[str]) -> bool:
@@ -209,13 +228,12 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
     """Render the exact immutable plan used for this run; no CloseDown task.
 
     `tasks.fight` is the master switch for both Fight blocks. Below it the two
-    blocks have **independent** switches, because the clearing queue
-    (PLAN_CLEARING 步骤 3) needs to take the farming sanity away while keeping
-    annihilation:
+    blocks have **independent** switches, because理智让路（四期 D11）要在
+    摘掉刷理智的同时保留剿灭：
 
       plan["annihilation"] — 每日剿灭（游戏日一次，由 attach_annihilation 记帐）
-      plan["farming"]      — 刷理智（队列活跃时摘掉；周上限 1800 合成玉的剿灭
-                             是代理卡驱动的，摘掉纯亏，所以它不跟着走）
+      plan["farming"]      — 刷理智（理智不够刷默认关时摘掉；周上限 1800 合成玉的
+                             剿灭是代理卡驱动的，摘掉纯亏，所以它不跟着走）
     """
     tasks = plan.get("tasks", {})
     blocks = [
@@ -250,7 +268,7 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
                 'server = "CN"\n'
                 'client_type = "Official"\n'
             )
-        # Independent switch: the clearing queue removes ONLY this block.
+        # Independent switch: 理智让路 removes ONLY this block.
         # Default True so the deploy seed and isolated renderer tests keep it.
         if plan.get("farming", True):
             blocks.append(
@@ -1495,7 +1513,7 @@ def execute(phase: str) -> int:
         last_run_state = {}
     # 计划按场次求值（四期 D1~D3）：早场改的关不会带到晚场，
     # 手动场 `now` 没有场次覆盖，永远走缺口默认关（D4）。
-    plan = attach_clearing_yield(
+    plan = attach_sanity_yield(
         attach_annihilation(effective_plan(started, phase), started, last_run_state),
         config,
         started,
@@ -1603,7 +1621,14 @@ def execute(phase: str) -> int:
                     "content": (
                         f"🌱 MAA 日常·{PHASE_LABELS[phase]}场开始\n"
                         f"🎯 {plan_stage_label(plan)}"
-                        + ("" if plan.get("farming", True) else "（已让路给通关队列，本场不刷理智）")
+                        + (
+                            ""
+                            if plan.get("farming", True)
+                            else "\n⏭️ " + str(
+                                plan.get("farming_skip_reason")
+                                or "理智不足以刷默认关，本场跳过刷理智。"
+                            )
+                        )
                         + (" · ☄️ 今日剿灭" if plan.get("annihilation") else " · ☄️ 剿灭今日已刷")
                         + f" · 🧪 {medicine_label(plan['medicine'])}"
                     ),
@@ -1787,88 +1812,8 @@ def execute(phase: str) -> int:
         return 0 if ok else 1
 
 
-def dispatch_clearing_round() -> str:
-    """日常收尾后派发一轮通关队列（PLAN_CLEARING 步骤 3 的调度点）。
-
-    为什么挂在这里：队列必须避开 08:00/22:00 的 `copilot_blackout_minutes` 与
-    Depot 的 04:30 窗口，而「日常刚跑完」正好是一天里最确定安全的两个时刻——
-    锁刚放、blackout 刚过、而且让路的那份理智就攒在那里。派发发生在
-    `run_lock` 释放之后，worker 自己去抢锁。
-    """
-    try:
-        import maa_clearing
-
-        config = load_config()
-        if not bool(config.get("clearing_enabled", False)):
-            return ""
-        if not maa_clearing.queue_is_active(maa_clearing.load_state()):
-            return ""
-        worker = SCRIPTS_DIR / "maa_copilot_worker.py"
-        if not worker.is_file():
-            return "maa_copilot_worker.py 尚未部署，通关队列未派发"
-        subprocess.Popen(
-            [sys.executable, str(worker), "clearing"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        return "dispatched"
-    except Exception as exc:
-        return f"通关队列派发失败：{type(exc).__name__}: {exc}"
-
-
-def report_clearing_dispatch_failure(detail: str) -> None:
-    """派发不出去也必须可见：写状态**并**发 Discord（护栏 4）。
-
-    只有真正的异常路径才走这里；「功能没启用」「队列不活跃」是正常无操作，
-    不发（`dispatch_clearing_round()` 对那两种情况返回空串）。
-    """
-    print(detail, flush=True)
-    try:
-        merge_last_run(
-            {
-                "clearing_dispatch_error": detail,
-                "clearing_dispatch_failed_at": now_beijing().isoformat(),
-            }
-        )
-    except Exception as exc:
-        print(f"派发失败状态写入失败：{type(exc).__name__}: {exc}", flush=True)
-    try:
-        config = load_config()
-        discord_request(
-            discord_token(),
-            "POST",
-            f"/channels/{str(config.get('channel_id', ''))}/messages",
-            {
-                "embeds": [
-                    {
-                        "title": "❌ 通关队列未派发",
-                        "description": (
-                            f"{detail}\n"
-                            "本场日常的结论不受影响；队列这一轮没有跑，"
-                            "可以说「现在推一轮队列」手动补，或等下一场日常。"
-                        )[:1500],
-                        "color": 0xED4245,
-                        "timestamp": now_beijing().isoformat(),
-                    }
-                ],
-                "allowed_mentions": {"parse": []},
-            },
-        )
-    except Exception as exc:
-        print(f"派发失败通知发送失败：{type(exc).__name__}: {exc}", flush=True)
-
-
 def main(argv: list[str]) -> int:
-    phase = select_phase(argv)
-    code = execute(phase)
-    detail = dispatch_clearing_round()
-    if detail and detail != "dispatched":
-        # 派发失败不改变本场结论，但绝不静默（护栏 4）。
-        report_clearing_dispatch_failure(detail)
-    return code
+    return execute(select_phase(argv))
 
 
 if __name__ == "__main__":

@@ -2612,582 +2612,6 @@ class EmulatorProbeTests(unittest.TestCase):
 
 
 
-class ClearingQueueTests(unittest.TestCase):
-    """PLAN_CLEARING 步骤 3：队列、闸门、理智预算、needs_manual 出口。"""
-
-    def setUp(self) -> None:
-        self.config = {"clearing_manual_after_days": 2}
-        self.state = maa_clearing.new_state(
-            "标题|AT", "标题", "AT", ["AT-1", "AT-2", "AT-3"],
-            at=datetime(2026, 9, 2, 12, 0, tzinfo=BEIJING),
-        )
-
-    # --- 队列形态 -------------------------------------------------------
-    def test_queue_is_derived_from_the_recommended_stages_max_index(self) -> None:
-        # config.activity_stages 只有 MAA 推荐的 4 关，队列要 AT-1..AT-8。
-        prefix, queue = maa_clearing.queue_from_activity_stages(
-            ["AT-8", "AT-7", "AT-6", "AT-4"]
-        )
-        self.assertEqual(prefix, "AT")
-        self.assertEqual(queue, [f"AT-{index}" for index in range(1, 9)])
-
-    def test_queue_ignores_non_numeric_and_empty_input(self) -> None:
-        self.assertEqual(maa_clearing.queue_from_activity_stages([]), ("", []))
-        self.assertEqual(
-            maa_clearing.queue_from_activity_stages(["AT-EX-3", "垃圾"]), ("", [])
-        )
-
-    # --- EX 闸门 --------------------------------------------------------
-    def test_ex_gate_blocks_while_any_zone_has_zero_total_stage(self) -> None:
-        roster = {
-            "activity_progress": {
-                "act99side": [
-                    {"zoneId": "z1", "clearedStage": 8, "totalStage": 8},
-                    {"zoneId": "z2", "clearedStage": 0, "totalStage": 0},
-                ]
-            }
-        }
-        allowed, reason = maa_clearing.ex_gate(roster)
-        self.assertFalse(allowed)
-        self.assertIn("z2", reason)
-        state, notify, blocked = maa_clearing.apply_ex_gate(self.state, roster, 8)
-        self.assertTrue(notify)
-        self.assertEqual(state["stages"], ["AT-1", "AT-2", "AT-3"])
-        self.assertEqual(state["ex_gate_blocked_reason"], blocked)
-        self.assertTrue(state["ex_gate_blocked_since"])
-
-    def test_ex_gate_opens_only_when_every_zone_is_positive(self) -> None:
-        roster = {
-            "activity_progress": {
-                "act99side": [
-                    {"zoneId": "z1", "clearedStage": 8, "totalStage": 8},
-                    {"zoneId": "z2", "clearedStage": 1, "totalStage": 8},
-                ]
-            }
-        }
-        allowed, _reason = maa_clearing.ex_gate(roster)
-        self.assertTrue(allowed)
-        state, notify, blocked = maa_clearing.apply_ex_gate(self.state, roster, 3)
-        self.assertFalse(notify)
-        self.assertEqual(blocked, "")
-        # 突袭紧跟对应普通关（PLAN_CLEARING 步骤 3 的队列形态）。
-        self.assertEqual(
-            state["stages"],
-            ["AT-1", "AT-2", "AT-3",
-             "AT-EX-1", "AT-EX-1#raid",
-             "AT-EX-2", "AT-EX-2#raid",
-             "AT-EX-3", "AT-EX-3#raid"],
-        )
-        self.assertTrue(state["ex_appended"])
-
-    def test_ex_gate_fails_closed_when_skland_is_unavailable(self) -> None:
-        # 401 / 无数据绝不能当成「全开」：多等一天没有代价，误判会让队列
-        # 去打一个根本没开的段。
-        for roster in (None, {}, {"activity_progress": {}}, {"activity_progress": []}):
-            with self.subTest(roster=roster):
-                allowed, reason = maa_clearing.ex_gate(roster)
-                self.assertFalse(allowed)
-                self.assertTrue(reason)
-
-    def test_ex_gate_fail_closed_is_visible_and_deduplicated(self) -> None:
-        # 护栏 4：不许只是安静地不入队——状态里要能自证，卡片发且只发一次，
-        # 原因变了要重新发。
-        first = {"activity_progress": {"a": [{"zoneId": "z2", "totalStage": 0}]}}
-        state, notify, reason = maa_clearing.apply_ex_gate(self.state, first, 8)
-        self.assertTrue(notify)
-        self.assertTrue(maa_clearing.should_notify(state, "ex_gate", reason))
-        # 同一原因再来一轮：状态还在，但不再发第二张卡。
-        state, notify, reason2 = maa_clearing.apply_ex_gate(state, first, 8)
-        self.assertFalse(notify)
-        self.assertFalse(maa_clearing.should_notify(state, "ex_gate", reason2))
-        self.assertEqual(state["ex_gate_blocked_reason"], reason)
-        # 原因变了（森空岛整个不可用）→ 重新发。
-        state, notify, reason3 = maa_clearing.apply_ex_gate(state, None, 8)
-        self.assertTrue(notify)
-        self.assertNotEqual(reason3, reason)
-        self.assertTrue(maa_clearing.should_notify(state, "ex_gate", reason3))
-
-    def test_ex_gate_is_not_wired_to_zone_progress_warning(self) -> None:
-        # 两条独立的单向规则，合并会把「沉默不代表已解锁」这条性质弄丢。
-        # 结构断言而不是字符串搜索（注释里正当地提到对方）：领域层不 import
-        # maa_copilot，所以它调不到那个启发式；反过来 maa_copilot 也不 import
-        # 队列，所以两条单向规则不可能互相依赖。
-        import ast
-
-        for module in ("maa_clearing", "maa_copilot"):
-            tree = ast.parse(
-                (ROOT / "scripts" / f"{module}.py").read_text(encoding="utf-8")
-            )
-            imported: set[str] = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    imported.update(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imported.add(node.module)
-            other = "maa_copilot" if module == "maa_clearing" else "maa_clearing"
-            self.assertNotIn(other, imported, f"{module} 不该 import {other}")
-        self.assertFalse(
-            [
-                node
-                for node in ast.walk(
-                    ast.parse(
-                        (ROOT / "scripts" / "maa_clearing.py").read_text(
-                            encoding="utf-8"
-                        )
-                    )
-                )
-                if isinstance(node, ast.Call)
-                and "zone_progress_warning" in ast.dump(node.func)
-            ]
-        )
-
-    # --- 理智预算 -------------------------------------------------------
-    def test_sanity_budget_deducts_todays_annihilation_first(self) -> None:
-        # 地基事实 H：剿灭同样吃理智，不先扣就会把可用理智算多。
-        plan = {"annihilation": True, "tasks": {"fight": True}}
-        self.assertEqual(maa_clearing.annihilation_reserve(plan, {}), 25)
-        self.assertEqual(maa_clearing.sanity_budget(100, plan, {}), 75)
-        self.assertEqual(
-            maa_clearing.sanity_budget(100, plan, {"clearing_annihilation_sanity": 40}),
-            60,
-        )
-
-    def test_sanity_budget_reserves_nothing_once_annihilation_is_done(self) -> None:
-        plan = {"annihilation": False, "tasks": {"fight": True}}
-        self.assertEqual(maa_clearing.annihilation_reserve(plan, {}), 0)
-        self.assertEqual(maa_clearing.sanity_budget(100, plan, {}), 100)
-        off = {"annihilation": True, "tasks": {"fight": False}}
-        self.assertEqual(maa_clearing.annihilation_reserve(off, {}), 0)
-
-    def test_sanity_budget_never_goes_negative_or_guesses(self) -> None:
-        plan = {"annihilation": True, "tasks": {"fight": True}}
-        self.assertEqual(maa_clearing.sanity_budget(10, plan, {}), 0)
-        self.assertEqual(maa_clearing.sanity_budget(None, plan, {}), 0)
-
-    # --- 排一轮 ---------------------------------------------------------
-    def test_round_stops_at_the_budget_without_moving_the_cursor(self) -> None:
-        result = maa_clearing.plan_round(self.state, 45, lambda _stage: 20)
-        self.assertEqual(result["stages"], ["AT-1", "AT-2"])
-        self.assertEqual(result["spent"], 40)
-        self.assertEqual(result["stop_reason"], "sanity")
-        self.assertEqual(self.state["cursor"], 0)
-
-    def test_unknown_sanity_cost_stops_the_round_and_freezes_the_cursor(self) -> None:
-        # stage_sanity_cost() 对 EX 返回 None（步骤 4 才解）：不入当轮、
-        # 不进理智预算、cursor 不变——前进会把这关永久跳过。
-        costs = {"AT-1": 18, "AT-2": None, "AT-3": 18}
-        result = maa_clearing.plan_round(self.state, 200, costs.get)
-        self.assertEqual(result["stages"], ["AT-1"])
-        self.assertEqual(result["spent"], 18)
-        self.assertEqual(result["unknown_cost"], ["AT-2"])
-        self.assertEqual(result["stop_reason"], "unknown_cost")
-        self.assertEqual(self.state["cursor"], 0)
-
-    def test_unknown_sanity_cost_notice_is_sent_only_once(self) -> None:
-        self.assertTrue(maa_clearing.should_notify(self.state, "unknown_cost", "AT-2"))
-        self.assertFalse(maa_clearing.should_notify(self.state, "unknown_cost", "AT-2"))
-        self.assertTrue(maa_clearing.should_notify(self.state, "unknown_cost", "AT-3"))
-
-    # --- needs_manual ---------------------------------------------------
-    def test_manual_threshold_counts_distinct_dates_not_attempts(self) -> None:
-        # 活动首日 prts.plus 上作业本来就少；按次数计会让每一关当天就触发
-        # needs_manual，把「永不卡死的出口」变成「每关都要用户手打」。
-        day1 = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        for hour in (9, 13, 18, 23):
-            state, turned = maa_clearing.record_stage_failure(
-                self.state, "AT-1", kind="op", detail="没作业",
-                config=self.config, at=day1.replace(hour=hour),
-            )
-            self.assertFalse(turned, f"同一天第 {hour} 小时就触发了")
-        self.assertEqual(state["stage_state"]["AT-1"]["failed_dates"], ["2026-09-02"])
-        self.assertEqual(maa_clearing.awaiting_manual(state), "")
-
-        day2 = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        state, turned = maa_clearing.record_stage_failure(
-            self.state, "AT-1", kind="op", detail="还是没作业",
-            config=self.config, at=day2,
-        )
-        self.assertTrue(turned)
-        self.assertEqual(maa_clearing.awaiting_manual(state), "AT-1")
-        self.assertEqual(
-            state["stage_state"]["AT-1"]["failed_dates"], ["2026-09-02", "2026-09-03"]
-        )
-        # 已经在等待了就不重复翻牌（卡片不刷屏）。
-        state, turned = maa_clearing.record_stage_failure(
-            self.state, "AT-1", kind="op", detail="x",
-            config=self.config, at=datetime(2026, 9, 4, 9, 0, tzinfo=BEIJING),
-        )
-        self.assertFalse(turned)
-
-    def test_manual_threshold_is_configurable(self) -> None:
-        self.assertEqual(maa_clearing.manual_after_days({}), 2)
-        self.assertEqual(
-            maa_clearing.manual_after_days({"clearing_manual_after_days": 5}), 5
-        )
-        self.assertEqual(
-            maa_clearing.manual_after_days({"clearing_manual_after_days": "x"}), 2
-        )
-
-    def test_needs_manual_holds_the_cursor_until_the_user_clicks(self) -> None:
-        for day in (2, 3):
-            state, _turned = maa_clearing.record_stage_failure(
-                self.state, "AT-1", kind="op", detail="没作业", config=self.config,
-                at=datetime(2026, 9, day, 9, 0, tzinfo=BEIJING),
-            )
-        self.assertEqual(state["cursor"], 0)
-        self.assertEqual(maa_clearing.current_stage(state), "AT-1")
-        maa_clearing.advance_cursor(state)
-        self.assertEqual(state["cursor"], 1)
-        self.assertEqual(maa_clearing.awaiting_manual(state), "")
-        self.assertEqual(maa_clearing.current_stage(state), "AT-2")
-
-    def test_manual_card_button_uses_its_own_prefix(self) -> None:
-        # 不变量 #7/#14 的清扫边界一个字节都不用改：`hermes:btn:maa:` 每天
-        # 07:50 被整段清扫（卡片要跨天存活，用它就死），
-        # `hermes:btn:maa-copilot:` 由 prune_expired_searches 按 token 清理
-        # （队列没有 token）。所以队列用第三个独立前缀。
-        state, _turned = maa_clearing.record_stage_failure(
-            self.state, "AT-1", kind="nav", detail="导航失败", config={"clearing_manual_after_days": 1},
-        )
-        _embed, components, entries = maa_clearing.build_manual_card(state, "AT-1")
-        custom_id = components[0]["components"][0]["custom_id"]
-        self.assertEqual(list(entries), [custom_id])
-        self.assertTrue(custom_id.startswith("hermes:btn:maa-clearing:"))
-        self.assertFalse(custom_id.startswith(maa_plan_card.BUTTON_PREFIX))
-        self.assertFalse(custom_id.startswith(maa_copilot.BUTTON_PREFIX))
-        self.assertEqual(entries[custom_id]["script"], "maa_action.py")
-        self.assertEqual(entries[custom_id]["args"], ["clearing", "manual-done", "AT-1"])
-
-    # --- nav 失败冻结 ---------------------------------------------------
-    def test_nav_failure_freezes_the_stage_for_the_rest_of_the_day(self) -> None:
-        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        state, _turned = maa_clearing.record_stage_failure(
-            self.state, "AT-1", kind="nav", detail="导航失败", config=self.config, at=at
-        )
-        self.assertTrue(maa_clearing.is_nav_frozen(state, "AT-1", at))
-        self.assertEqual(
-            maa_clearing.plan_round(state, 200, lambda _s: 18, at=at)["stages"], []
-        )
-        tomorrow = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        self.assertFalse(maa_clearing.is_nav_frozen(state, "AT-1", tomorrow))
-        self.assertEqual(
-            maa_clearing.plan_round(state, 200, lambda _s: 18, at=tomorrow)["stages"],
-            ["AT-1", "AT-2", "AT-3"],
-        )
-
-    # --- 「队列活跃」的三条件 -------------------------------------------
-    def test_queue_is_active_requires_all_three_conditions(self) -> None:
-        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        self.assertTrue(maa_clearing.queue_is_active(self.state, at))
-        self.assertFalse(maa_clearing.queue_is_active(None, at))
-
-        finished = dict(self.state, cursor=3)
-        self.assertFalse(maa_clearing.queue_is_active(finished, at))
-
-        frozen = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        maa_clearing.record_stage_failure(
-            frozen, "AT-1", kind="nav", detail="x", config=self.config, at=at
-        )
-        self.assertFalse(maa_clearing.queue_is_active(frozen, at))
-
-        waiting = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        maa_clearing.record_stage_failure(
-            waiting, "AT-1", kind="op", detail="x",
-            config={"clearing_manual_after_days": 1}, at=at,
-        )
-        self.assertEqual(maa_clearing.awaiting_manual(waiting), "AT-1")
-        self.assertFalse(maa_clearing.queue_is_active(waiting, at))
-
-    def test_state_round_trips_through_the_atomic_writer(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            path = Path(raw) / "clearing.json"
-            maa_clearing.save_state(self.state, path)
-            self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
-            loaded = maa_clearing.load_state(path)
-            self.assertEqual(loaded["stages"], ["AT-1", "AT-2", "AT-3"])
-            path.write_text("not json", encoding="utf-8")
-            self.assertIsNone(maa_clearing.load_state(path))
-
-
-class ClearingNavDefinitionGateTests(unittest.TestCase):
-    """上游导航键闸门（2026-09-05 范围变更：不再自写导航定义）。
-
-    队列只跑上游 `tasks/Stages/<前缀>.json` 已有顶层键的关；没有键的关等下去
-    永远不会自动成功，所以**立刻**走同一个 `needs_manual` 出口。
-    全部用临时 resource 目录，不碰真实路径。
-    """
-
-    def setUp(self) -> None:
-        self.config = {"clearing_manual_after_days": 2}
-        self.at = datetime(2026, 9, 5, 10, 0, tzinfo=BEIJING)
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.resource = Path(self.tmp.name) / "resource"
-        (self.resource / "tasks" / "Stages").mkdir(parents=True)
-
-    def _write_stages(self, prefix: str, payload: str) -> Path:
-        path = self.resource / "tasks" / "Stages" / f"{prefix}.json"
-        path.write_text(payload, encoding="utf-8")
-        return path
-
-    def _state(self, stages: list[str]) -> dict:
-        return maa_clearing.new_state("k", "标题", "SR", stages, at=self.at)
-
-    # --- 1. 有键的关正常入队 --------------------------------------------
-    def test_stage_with_an_upstream_nav_key_is_scheduled(self) -> None:
-        self._write_stages(
-            "SR", json.dumps({"SR-5": {"next": []}, "SR-6": {"next": []}})
-        )
-        nav_of = maa_clearing.nav_checker([self.resource])
-        state = self._state(["SR-5", "SR-6"])
-        result = maa_clearing.plan_round(
-            state, 100, lambda _entry: 12, at=self.at, nav_of=nav_of
-        )
-        self.assertEqual(result["stages"], ["SR-5", "SR-6"])
-        self.assertEqual(result["missing_nav"], [])
-        self.assertEqual(result["stop_reason"], "queue_end")
-
-    # --- 2. 无键的关：当轮不排、立即 needs_manual、cursor 不动 -----------
-    def test_stage_without_nav_key_goes_manual_immediately_without_advancing(self) -> None:
-        self._write_stages("SR", json.dumps({"SR-5": {}}))
-        nav_of = maa_clearing.nav_checker([self.resource])
-        state = self._state(["SR-9", "SR-5"])
-        result = maa_clearing.plan_round(
-            state, 100, lambda _entry: 12, at=self.at, nav_of=nav_of
-        )
-        self.assertEqual(result["stages"], [])
-        self.assertEqual(result["missing_nav"], ["SR-9"])
-        self.assertEqual(result["stop_reason"], "no_nav_definition")
-        self.assertIn("SR-9", result["nav_detail"])
-
-        # N 日规则默认要 2 个不同日期；导航定义缺失是永久条件，**一次就转**。
-        state, turned = maa_clearing.record_stage_failure(
-            state,
-            result["missing_nav"][0],
-            kind="nav_definition",
-            detail=result["nav_detail"],
-            config=self.config,
-            at=self.at,
-            immediate=True,
-            reason_code=maa_clearing.NAV_MISSING_REASON,
-        )
-        self.assertTrue(turned)
-        self.assertEqual(maa_clearing.awaiting_manual(state), "SR-9")
-        self.assertEqual(state["cursor"], 0)
-        # 原因写进 clearing.json，状态文件能自证「不是打完了」。
-        self.assertEqual(state["needs_manual"]["reason"], "no_nav_definition")
-        self.assertEqual(
-            state["stage_state"]["SR-9"]["reason_code"], "no_nav_definition"
-        )
-        self.assertFalse(maa_clearing.queue_is_active(state, self.at))
-
-        # 卡片文案写明真正的原因与出路。
-        embed, components, entries = maa_clearing.build_manual_card(state, "SR-9")
-        self.assertIn("未为 SR-9 写导航定义", embed["description"])
-        self.assertIn("已完成", embed["description"])
-        custom_id = components[0]["components"][0]["custom_id"]
-        self.assertEqual(entries[custom_id]["args"], ["clearing", "manual-done", "SR-9"])
-
-        # 同原因只发一次；换关 / 换原因才重发。
-        key = f"SR-9|{result['nav_detail']}"
-        self.assertTrue(maa_clearing.should_notify(state, "nav_definition", key))
-        self.assertFalse(maa_clearing.should_notify(state, "nav_definition", key))
-        self.assertTrue(
-            maa_clearing.should_notify(state, "nav_definition", "SR-7|别的原因")
-        )
-        # 第二次撞上同一关也不会重复转（needs_manual 已经指着它）。
-        state, again = maa_clearing.record_stage_failure(
-            state, "SR-9", kind="nav_definition", detail="x",
-            config=self.config, at=self.at, immediate=True,
-            reason_code=maa_clearing.NAV_MISSING_REASON,
-        )
-        self.assertFalse(again)
-
-    # --- 3. 突袭条目按普通关名查 ----------------------------------------
-    def test_raid_entry_is_checked_under_its_plain_stage_name(self) -> None:
-        self._write_stages("SR", json.dumps({"SR-EX-1": {}}))
-        nav_of = maa_clearing.nav_checker([self.resource])
-        self.assertEqual(nav_of("SR-EX-1" + maa_clearing.RAID_SUFFIX)[0], True)
-        self.assertFalse(nav_of("SR-EX-2" + maa_clearing.RAID_SUFFIX)[0])
-        state = self._state(["SR-EX-1", "SR-EX-1#raid"])
-        result = maa_clearing.plan_round(
-            state, 100, lambda _entry: 21, at=self.at, nav_of=nav_of
-        )
-        self.assertEqual(result["stages"], ["SR-EX-1", "SR-EX-1#raid"])
-
-    # --- 4. 文件缺失 / JSON 坏 → 视为无键（fail-closed） ------------------
-    def test_missing_or_broken_stages_file_counts_as_no_key(self) -> None:
-        nav_of = maa_clearing.nav_checker([self.resource])
-        ok, detail = nav_of("SR-5")
-        self.assertFalse(ok)
-        self.assertIn("不存在", detail)
-
-        self._write_stages("SR", "{ 这不是 JSON")
-        broken = maa_clearing.nav_checker([self.resource])
-        ok, detail = broken("SR-5")
-        self.assertFalse(ok)
-        self.assertIn("读不出来", detail)
-
-        self._write_stages("SR", json.dumps(["SR-5"]))
-        not_object = maa_clearing.nav_checker([self.resource])
-        ok, detail = not_object("SR-5")
-        self.assertFalse(ok)
-        self.assertIn("顶层不是对象", detail)
-
-    def test_only_upstream_resource_dirs_are_read(self) -> None:
-        # 只读传进来的上游目录；不读、不建 ~/.config/maa-cli/resource/tasks/Stages/。
-        # 结构断言（注释里正当地提到那个路径，所以不做整文件字符串搜索）：
-        # 模块里没有任何指向 maa-cli 覆盖层的字面量，也从不 mkdir。
-        import ast
-
-        tree = ast.parse(
-            (ROOT / "scripts" / "maa_clearing.py").read_text(encoding="utf-8")
-        )
-        self.assertFalse(
-            [
-                node.value
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Constant)
-                and isinstance(node.value, str)
-                and "maa-cli" in node.value
-                and "resource" in node.value
-            ]
-        )
-        self.assertFalse(
-            [
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and "mkdir" in ast.dump(node.func)
-            ]
-        )
-        maa_clearing.nav_checker([self.resource])("SR-5")
-        self.assertFalse((self.resource / "tasks" / "Stages" / "SR.json").exists())
-
-    def test_prefix_is_the_segment_before_the_first_dash(self) -> None:
-        self.assertEqual(maa_clearing.stage_nav_prefix("SR-5"), "SR")
-        self.assertEqual(maa_clearing.stage_nav_prefix("AT-EX-1"), "AT")
-        self.assertEqual(maa_clearing.stage_nav_prefix(""), "")
-
-    def test_each_prefix_is_read_from_disk_only_once_per_round(self) -> None:
-        path = self._write_stages("SR", json.dumps({"SR-1": {}, "SR-2": {}}))
-        nav_of = maa_clearing.nav_checker([self.resource])
-        self.assertTrue(nav_of("SR-1")[0])
-        path.unlink()  # 缓存过就不再 open，删了也不影响这一轮
-        self.assertTrue(nav_of("SR-2")[0])
-
-    # --- 5. 用户点「已完成」后 cursor 前进 --------------------------------
-    def test_cursor_advances_after_the_user_marks_it_done(self) -> None:
-        self._write_stages("SR", json.dumps({"SR-5": {}}))
-        state = self._state(["SR-9", "SR-5"])
-        state, _turned = maa_clearing.record_stage_failure(
-            state, "SR-9", kind="nav_definition", detail="上游没有 SR-9 的导航定义",
-            config=self.config, at=self.at, immediate=True,
-            reason_code=maa_clearing.NAV_MISSING_REASON,
-        )
-        self.assertEqual(state["cursor"], 0)
-        maa_clearing.advance_cursor(state)
-        self.assertEqual(state["cursor"], 1)
-        self.assertEqual(maa_clearing.awaiting_manual(state), "")
-        self.assertEqual(maa_clearing.current_stage(state), "SR-5")
-        # 前进之后有键的下一关照排。
-        result = maa_clearing.plan_round(
-            state, 100, lambda _entry: 12, at=self.at,
-            nav_of=maa_clearing.nav_checker([self.resource]),
-        )
-        self.assertEqual(result["stages"], ["SR-5"])
-
-    def test_worker_wires_the_gate_into_plan_round(self) -> None:
-        # 闸门必须真的接在派发处，否则单测全绿而线上照打无导航定义的关。
-        source = (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8")
-        self.assertIn("maa_clearing.nav_checker(maa_copilot._resource_dirs(config))", source)
-        self.assertIn("nav_of=nav_of", source)
-        self.assertIn("immediate=True", source)
-
-
-class ClearingDailyYieldTests(unittest.TestCase):
-    """日常让路：队列活跃时只摘「刷理智」，剿灭永远保留。"""
-
-    def setUp(self) -> None:
-        self.plan = maa_common.normalize_plan(
-            {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
-        )
-        self.plan["annihilation"] = True
-        self.config = {
-            "medicine_expire_days": 2,
-            "fight_times": 2147483647,
-            "recruit_times": 4,
-        }
-
-    def test_active_queue_removes_farming_and_keeps_annihilation(self) -> None:
-        rendered = maa_daily.render_daily_toml({**self.plan, "farming": False}, self.config)
-        self.assertIn('name = "每日剿灭"', rendered)
-        self.assertIn('stage = "Annihilation"', rendered)
-        self.assertNotIn('name = "刷理智"', rendered)
-        self.assertNotIn('stage = "CE-6"', rendered)
-        # 让路只动 Fight 的第二个块，其余任务照常。
-        for name in ('name = "基建换班"', 'name = "公开招募"', 'name = "信用商店"',
-                     'name = "领取奖励"', 'name = "返回主界面"'):
-            self.assertIn(name, rendered)
-        self.assertIn("stone = 0", rendered)
-        self.assertIn("medicine = 0", rendered)
-
-    def test_two_independent_switches_cover_all_four_combinations(self) -> None:
-        for annihilation, farming in ((True, True), (True, False), (False, True), (False, False)):
-            with self.subTest(annihilation=annihilation, farming=farming):
-                rendered = maa_daily.render_daily_toml(
-                    {**self.plan, "annihilation": annihilation, "farming": farming},
-                    self.config,
-                )
-                self.assertEqual('name = "每日剿灭"' in rendered, annihilation)
-                self.assertEqual('name = "刷理智"' in rendered, farming)
-
-    def _yield_for(self, state, *, enabled=True):
-        with patch.object(maa_clearing, "load_state", return_value=state):
-            return maa_daily.attach_clearing_yield(
-                self.plan, {"clearing_enabled": enabled},
-                datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING),
-            )
-
-    def test_frozen_day_still_farms(self) -> None:
-        # 队列因冻结无法消耗理智的那天，日常照常刷理智——否则那天既不打队列
-        # 也不刷理智，一整天的理智白白溢出（日常判绿、卡片正常，什么都没打）。
-        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
-        maa_clearing.record_stage_failure(
-            state, "AT-1", kind="nav", detail="x", config={}, at=at
-        )
-        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
-        self.assertIn('name = "刷理智"', rendered)
-        self.assertIn('name = "每日剿灭"', rendered)
-
-    def test_needs_manual_waiting_day_still_farms(self) -> None:
-        at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
-        maa_clearing.record_stage_failure(
-            state, "AT-1", kind="op", detail="x",
-            config={"clearing_manual_after_days": 1}, at=at,
-        )
-        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
-        self.assertIn('name = "刷理智"', rendered)
-        self.assertIn('name = "每日剿灭"', rendered)
-
-    def test_active_queue_day_yields_the_farming_block(self) -> None:
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
-        rendered = maa_daily.render_daily_toml(self._yield_for(state), self.config)
-        self.assertNotIn('name = "刷理智"', rendered)
-        self.assertIn('name = "每日剿灭"', rendered)
-
-    def test_disabled_feature_never_yields(self) -> None:
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        self.assertTrue(self._yield_for(state, enabled=False)["farming"])
-
-    def test_a_broken_queue_read_falls_back_to_farming(self) -> None:
-        # 探测自己坏了不能顺手把理智也停掉：宁可多刷一场。
-        with patch.object(maa_clearing, "load_state", side_effect=OSError("boom")):
-            plan = maa_daily.attach_clearing_yield(self.plan, {"clearing_enabled": True})
-        self.assertTrue(plan["farming"])
-
-
 class LogTailTests(unittest.TestCase):
     """`log tail` 是聊天命令（「最近怎么了 / 看日志」），计划卡上没有对应按钮。
 
@@ -3242,70 +2666,6 @@ class LogTailTests(unittest.TestCase):
         self.assertTrue(extract.call_args.kwargs["ok"])
         self.assertIn("🌟 总体：✅ 成功", message)
         self.assertNotIn("raw cli line", message)
-
-
-class ClearingActionTests(unittest.TestCase):
-    """`maa_action.py` 的新子命令必须进白名单并保持 <20s 的派发姿态。"""
-
-    def test_new_subcommands_are_on_the_dispatch_allowlist(self) -> None:
-        with patch.object(maa_action, "clearing_status", return_value=(True, "s")) as status:
-            self.assertEqual(maa_action.dispatch(["clearing", "status"]), (True, "s"))
-        status.assert_called_once_with()
-        with patch.object(
-            maa_action, "clearing_manual_done", return_value=(True, "m")
-        ) as done:
-            self.assertEqual(
-                maa_action.dispatch(["clearing", "manual-done", "AT-1"]), (True, "m")
-            )
-        done.assert_called_once_with("AT-1")
-        for argv in (["clearing"], ["clearing", "nope"], ["clearing", "manual-done"]):
-            ok, message = maa_action.dispatch(argv)
-            self.assertFalse(ok)
-            self.assertIn("不支持的动作", message)
-
-    def test_clearing_is_refused_while_the_feature_is_off(self) -> None:
-        with patch.object(maa_action, "load_config", return_value={}):
-            ok, message = maa_action.clearing_start()
-        self.assertFalse(ok)
-        self.assertIn("clearing_enabled", message)
-
-    def test_clearing_run_dispatches_and_returns_immediately(self) -> None:
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        with patch.object(
-            maa_action, "load_config", return_value={"clearing_enabled": True}
-        ), patch.object(maa_clearing, "load_state", return_value=state), patch.object(
-            maa_action.subprocess, "Popen"
-        ) as popen, patch.object(
-            maa_action, "_copilot_blackout_reason", return_value=None
-        ), patch.object(maa_action.Path, "is_file", return_value=True):
-            ok, message = maa_action.clearing_run()
-        self.assertTrue(ok, message)
-        self.assertEqual(popen.call_args.args[0][-1], "clearing")
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-
-    def test_clearing_run_respects_the_daily_blackout(self) -> None:
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        with patch.object(
-            maa_action, "load_config", return_value={"clearing_enabled": True}
-        ), patch.object(maa_clearing, "load_state", return_value=state), patch.object(
-            maa_action, "_copilot_blackout_reason", return_value="太靠近 08:00"
-        ), patch.object(maa_action.subprocess, "Popen") as popen:
-            ok, message = maa_action.clearing_run()
-        self.assertFalse(ok)
-        self.assertEqual(message, "太靠近 08:00")
-        popen.assert_not_called()
-
-    def test_the_depot_window_is_kept_clear_of_the_queue(self) -> None:
-        import maa_copilot_worker
-
-        for hour, minute, blocked in (
-            (4, 19, False), (4, 20, True), (4, 30, True), (4, 59, True), (5, 0, False)
-        ):
-            with self.subTest(hour=hour, minute=minute):
-                reason = maa_copilot_worker._depot_window_reason(
-                    datetime(2026, 9, 2, hour, minute, tzinfo=BEIJING)
-                )
-                self.assertEqual(bool(reason), blocked)
 
 
 class FarmingRecommendationTests(unittest.TestCase):
@@ -3866,608 +3226,6 @@ class FarmingAutoStageTests(unittest.TestCase):
             self.assertNotIn(key, deploy.PRESERVED_RUNTIME_CACHE_KEYS)
 
 
-class ClearingUnknownCostBlockTests(unittest.TestCase):
-    """返工 1：理智未知堵死队列时，日常必须把刷理智收回来。"""
-
-    def setUp(self) -> None:
-        self.at = datetime(2026, 9, 2, 9, 0, tzinfo=BEIJING)
-        self.state = maa_clearing.new_state(
-            "k", "t", "AT", ["AT-EX-1"], at=self.at
-        )
-        self.plan = maa_common.normalize_plan(
-            {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
-        )
-        self.plan["annihilation"] = True
-        self.config = {
-            "medicine_expire_days": 2,
-            "fight_times": 2147483647,
-            "recruit_times": 4,
-        }
-
-    def test_blocked_day_is_not_active_so_the_daily_still_farms(self) -> None:
-        # 队列一进 EX 段就排不出关（stage_sanity_cost 对 EX 返回 None）。
-        # 不记这一笔的话 queue_is_active 只看得到「cursor 没到末尾」→ 日常每场
-        # 都摘掉刷理智，而队列一关都打不了，理智整天白白溢出。
-        result = maa_clearing.plan_round(self.state, 200, lambda _s: None, at=self.at)
-        self.assertEqual(result["stages"], [])
-        self.assertEqual(result["stop_reason"], "unknown_cost")
-        self.assertTrue(maa_clearing.queue_is_active(self.state, self.at))
-
-        maa_clearing.mark_blocked(
-            self.state, "unknown_cost", result["unknown_cost"], at=self.at
-        )
-        self.assertFalse(maa_clearing.queue_is_active(self.state, self.at))
-        self.assertEqual(
-            maa_clearing.blocked_today(self.state, self.at), "unknown_cost"
-        )
-
-        with patch.object(maa_clearing, "load_state", return_value=self.state):
-            plan = maa_daily.attach_clearing_yield(
-                self.plan, {"clearing_enabled": True}, self.at
-            )
-        rendered = maa_daily.render_daily_toml(plan, self.config)
-        self.assertIn('name = "刷理智"', rendered)
-        self.assertIn('name = "每日剿灭"', rendered)
-
-    def test_the_block_expires_the_next_day_like_the_nav_freeze(self) -> None:
-        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"], at=self.at)
-        tomorrow = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        self.assertEqual(maa_clearing.blocked_today(self.state, tomorrow), "")
-        self.assertTrue(maa_clearing.queue_is_active(self.state, tomorrow))
-
-    def test_clear_blocked_reopens_the_queue_same_day(self) -> None:
-        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"], at=self.at)
-        maa_clearing.clear_blocked(self.state)
-        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
-        self.assertTrue(maa_clearing.queue_is_active(self.state, self.at))
-
-    def test_status_text_says_why_the_queue_is_parked(self) -> None:
-        maa_clearing.mark_blocked(self.state, "unknown_cost", ["AT-EX-1"])
-        text = maa_clearing.status_text(self.state)
-        self.assertIn("理智消耗算不出来", text)
-        self.assertIn("活跃（日常让路）：否", text)
-
-    def test_a_sanity_shortage_does_not_park_the_queue(self) -> None:
-        # 理智不够是暂时的（等一会儿就有了），不该让日常把刷理智让回去。
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"], at=self.at)
-        result = maa_clearing.plan_round(state, 5, lambda _s: 18, at=self.at)
-        self.assertEqual(result["stop_reason"], "sanity")
-        self.assertEqual(maa_clearing.blocked_today(state, self.at), "")
-        self.assertTrue(maa_clearing.queue_is_active(state, self.at))
-
-
-class ClearingRaidTests(unittest.TestCase):
-    """返工 2：EX 段的突袭要真的排进队列并真的以 raid 模式执行。"""
-
-    def test_ex_segment_alternates_normal_then_raid(self) -> None:
-        self.assertEqual(
-            maa_clearing.ex_segment("AT", 3),
-            [
-                "AT-EX-1", "AT-EX-1#raid",
-                "AT-EX-2", "AT-EX-2#raid",
-                "AT-EX-3", "AT-EX-3#raid",
-            ],
-        )
-        self.assertEqual(maa_clearing.ex_segment("AT", 0), [])
-
-    def test_split_entry_and_label(self) -> None:
-        self.assertEqual(maa_clearing.split_entry("AT-EX-1"), ("AT-EX-1", "normal"))
-        self.assertEqual(
-            maa_clearing.split_entry("AT-EX-1#raid"), ("AT-EX-1", "raid")
-        )
-        self.assertEqual(maa_clearing.entry_label("AT-EX-1"), "AT-EX-1")
-        self.assertEqual(maa_clearing.entry_label("AT-EX-1#raid"), "AT-EX-1（突袭）")
-
-    def test_the_gate_appends_the_full_alternating_segment(self) -> None:
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1"])
-        roster = {"activity_progress": {"a": [{"zoneId": "z", "totalStage": 8,
-                                              "clearedStage": 8}]}}
-        state, _notify, _reason = maa_clearing.apply_ex_gate(state, roster, 2)
-        self.assertEqual(
-            state["stages"],
-            ["AT-1", "AT-EX-1", "AT-EX-1#raid", "AT-EX-2", "AT-EX-2#raid"],
-        )
-
-    def test_cost_lookup_and_navigation_use_the_plain_stage_name(self) -> None:
-        # 突袭是同一个关卡再打一遍：理智查表、导航、作业匹配全按普通关名走，
-        # 只有 --raid 取值不同。
-        seen: list[str] = []
-
-        def cost_of(entry: str) -> int:
-            stage, _mode = maa_clearing.split_entry(entry)
-            seen.append(stage)
-            return 18
-
-        state = maa_clearing.new_state(
-            "k", "t", "AT", ["AT-EX-1", "AT-EX-1#raid"]
-        )
-        result = maa_clearing.plan_round(state, 100, cost_of)
-        self.assertEqual(result["stages"], ["AT-EX-1", "AT-EX-1#raid"])
-        self.assertEqual(seen, ["AT-EX-1", "AT-EX-1"])
-
-    def test_raid_entries_run_with_raid_mode(self) -> None:
-        # maa copilot --help 的取值：normal / raid / both。
-        import maa_copilot_worker
-
-        calls: list[list[str]] = []
-
-        def fake_watchdog(config, command, handle, log_path, env):
-            calls.append(command)
-            return 0, 0
-
-        with patch.object(
-            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
-        ), patch.object(
-            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
-        ), patch.object(
-            maa_copilot_worker, "_run_copilot_with_watchdog", side_effect=fake_watchdog
-        ), patch.object(
-            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
-        ), patch.object(
-            maa_copilot_worker, "atomic_write_text"
-        ), tempfile.TemporaryDirectory() as raw:
-            log_path = Path(raw) / "clearing.log"
-            log_path.write_text("", encoding="utf-8")
-            for mode in ("normal", "raid"):
-                with self.subTest(mode=mode):
-                    calls.clear()
-                    # 让胜利标记出现，否则判据（返工 3）会判失败。真实情况下
-                    # 子进程写的就是这个 handle，所以桩也必须写它——从别的
-                    # 文件句柄追加会和缓冲区打架，顺序反过来。
-                    def watchdog_with_victory(config, command, handle, log_path_, env):
-                        calls.append(command)
-                        handle.write("Copilot Completed\n")
-                        return 0, 0
-
-                    with patch.object(
-                        maa_copilot_worker,
-                        "_run_copilot_with_watchdog",
-                        side_effect=watchdog_with_victory,
-                    ):
-                        ok, kind, _detail = maa_copilot_worker._clearing_fight_stage(
-                            {}, "AT-EX-1", "act_ex_1", None, {}, log_path, mode
-                        )
-                    self.assertTrue(ok, kind)
-                    self.assertEqual(calls[0][calls[0].index("--raid") + 1], mode)
-
-
-class ClearingVictoryJudgementTests(unittest.TestCase):
-    """返工 3：cursor 一前进就永久跳过该关，所以退出码 0 不够。"""
-
-    def test_a_failure_marker_beats_a_zero_exit_code(self) -> None:
-        for marker in maa_clearing.COPILOT_FAILURE_MARKERS:
-            with self.subTest(marker=marker):
-                outcome, detail = maa_clearing.copilot_outcome(
-                    f"MissionStart\n{marker}\n", 0
-                )
-                self.assertEqual(outcome, "failed")
-                self.assertIn(marker, detail)
-
-    def test_a_victory_marker_with_a_zero_exit_code_is_a_win(self) -> None:
-        outcome, detail = maa_clearing.copilot_outcome(
-            "MissionStart\nCopilot Completed\n", 0
-        )
-        self.assertEqual(outcome, "won")
-        self.assertEqual(detail, "")
-
-    def test_no_marker_at_all_is_unknown_not_a_win(self) -> None:
-        # 判据未经真实 copilot 日志核对（runs/ 的 14 天保留期已把 2026-08 那批
-        # 抄作业日志清掉），所以故意 fail-closed：宁可停下来问，也不静默跳关。
-        outcome, detail = maa_clearing.copilot_outcome("MissionStart\n", 0)
-        self.assertEqual(outcome, "unknown")
-        self.assertIn("COPILOT_VICTORY_MARKERS", detail)
-
-    def test_a_nonzero_exit_code_is_always_a_failure(self) -> None:
-        self.assertEqual(
-            maa_clearing.copilot_outcome("Copilot Completed", 1)[0], "failed"
-        )
-
-    def test_zero_exit_with_a_failure_marker_does_not_advance_the_cursor(self) -> None:
-        import maa_copilot_worker
-
-        def watchdog_with_error(config, command, handle, log_path_, env):
-            handle.write("Copilot Error\n")
-            return 0, 0
-
-        with tempfile.TemporaryDirectory() as raw, patch.object(
-            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
-        ), patch.object(
-            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
-        ), patch.object(
-            maa_copilot_worker, "_run_copilot_with_watchdog",
-            side_effect=watchdog_with_error,
-        ), patch.object(
-            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
-        ), patch.object(maa_copilot_worker, "atomic_write_text"):
-            log_path = Path(raw) / "clearing.log"
-            log_path.write_text("", encoding="utf-8")
-            ok, kind, detail = maa_copilot_worker._clearing_fight_stage(
-                {}, "AT-1", "act_1", None, {}, log_path, "normal"
-            )
-        self.assertFalse(ok)
-        self.assertEqual(kind, "op")
-        self.assertIn("Copilot Error", detail)
-
-        # 按 op 失败记账，cursor 不动。
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-2"])
-        state, _turned = maa_clearing.record_stage_failure(
-            state, "AT-1", kind=kind, detail=detail, config={}
-        )
-        self.assertEqual(state["cursor"], 0)
-        self.assertEqual(maa_clearing.current_stage(state), "AT-1")
-        self.assertFalse(maa_clearing.is_nav_frozen(state, "AT-1"))
-
-    def test_an_earlier_run_in_the_same_log_cannot_fake_a_win(self) -> None:
-        # 日志是追加的：上一趟的 `Copilot Completed` 不能把这一趟算成通关。
-        import maa_copilot_worker
-
-        with tempfile.TemporaryDirectory() as raw, patch.object(
-            maa_copilot_worker, "_clearing_pick_op", return_value={"id": 1, "title": "t"}
-        ), patch.object(
-            maa_copilot_worker, "_prepare_op_file", return_value=("maa://1", False)
-        ), patch.object(
-            maa_copilot_worker, "_run_copilot_with_watchdog", return_value=(0, 0)
-        ), patch.object(
-            maa_copilot_worker, "_navigate_to_stage", return_value=(True, ""),
-        ), patch.object(maa_copilot_worker, "atomic_write_text"):
-            log_path = Path(raw) / "clearing.log"
-            log_path.write_text("Copilot Completed\n", encoding="utf-8")
-            ok, _kind, detail = maa_copilot_worker._clearing_fight_stage(
-                {}, "AT-1", "act_1", None, {}, log_path, "normal"
-            )
-        self.assertFalse(ok, detail)
-
-
-class ClearingDispatchNoticeTests(unittest.TestCase):
-    """返工 4：派发失败也要发 Discord，不能只写 last_run（护栏 4）。"""
-
-    def test_a_dispatch_failure_writes_state_and_posts(self) -> None:
-        with patch.object(maa_daily, "merge_last_run") as merge, patch.object(
-            maa_daily, "load_config", return_value={"channel_id": "42"}
-        ), patch.object(maa_daily, "discord_token", return_value="tok"), patch.object(
-            maa_daily, "discord_request"
-        ) as post:
-            maa_daily.report_clearing_dispatch_failure("通关队列派发失败：OSError: boom")
-        self.assertIn("clearing_dispatch_error", merge.call_args.args[0])
-        self.assertEqual(post.call_args.args[2], "/channels/42/messages")
-        embed = post.call_args.args[3]["embeds"][0]
-        self.assertEqual(embed["title"], "❌ 通关队列未派发")
-        self.assertIn("boom", embed["description"])
-
-    def test_normal_no_ops_stay_quiet(self) -> None:
-        # 「功能没启用」「队列不活跃」是正常无操作，不该刷屏。
-        with patch.object(maa_daily, "load_config", return_value={}):
-            self.assertEqual(maa_daily.dispatch_clearing_round(), "")
-        with patch.object(
-            maa_daily, "load_config", return_value={"clearing_enabled": True}
-        ), patch.object(maa_clearing, "load_state", return_value=None):
-            self.assertEqual(maa_daily.dispatch_clearing_round(), "")
-
-    def test_main_reports_a_dispatch_failure_without_changing_the_verdict(self) -> None:
-        with patch.object(maa_daily, "select_phase", return_value="am"), patch.object(
-            maa_daily, "execute", return_value=0
-        ), patch.object(
-            maa_daily, "dispatch_clearing_round", return_value="worker 未部署"
-        ), patch.object(
-            maa_daily, "report_clearing_dispatch_failure"
-        ) as report:
-            self.assertEqual(maa_daily.main(["maa_daily.py"]), 0)
-        report.assert_called_once_with("worker 未部署")
-
-    def test_a_successful_dispatch_reports_nothing(self) -> None:
-        with patch.object(maa_daily, "select_phase", return_value="am"), patch.object(
-            maa_daily, "execute", return_value=0
-        ), patch.object(
-            maa_daily, "dispatch_clearing_round", return_value="dispatched"
-        ), patch.object(
-            maa_daily, "report_clearing_dispatch_failure"
-        ) as report:
-            maa_daily.main(["maa_daily.py"])
-        report.assert_not_called()
-
-
-def _png_bytes(width: int = 1920, height: int = 1080) -> bytes:
-    """只带 IHDR 的最小 PNG 头——`png_size()` 只读前 24 字节。"""
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + (13).to_bytes(4, "big")
-        + b"IHDR"
-        + width.to_bytes(4, "big")
-        + height.to_bytes(4, "big")
-        + b"\x08\x02\x00\x00\x00"
-    )
-
-
-class SanityOcrTests(unittest.TestCase):
-    """步骤 4：编队界面 OCR 读理智，歧义/读不出一律 None，绝不猜数。"""
-
-    SIZE = (1920, 1080)
-
-    def lines(self, text: str):
-        return maa_clearing.parse_ocr_lines(text)
-
-    def test_signed_number_inside_roi_is_the_cost(self) -> None:
-        # 右下角 `-21`；顶部的当前理智 `78/135` 与左侧掉落数量都不在 ROI 里。
-        ocr = "78/135\t[1700,30,100,40]\n固源岩组\t[300,600,120,40]\n3\t[330,650,20,30]\n-21\t[1560,980,60,40]\n开始行动\t[1650,970,200,60]"
-        cost, detail = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
-        self.assertEqual(cost, 21)
-        self.assertIn("带负号", detail)
-
-    def test_signed_beats_bare_and_dash_variants_count_as_signed(self) -> None:
-        for dash in ("-", "−", "–", "—"):
-            with self.subTest(dash=dash):
-                ocr = f"{dash}21\t[1560,980,60,40]\n1\t[1500,1000,20,30]"
-                cost, _ = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
-                self.assertEqual(cost, 21)
-
-    def test_a_single_bare_number_is_accepted_when_the_sign_was_dropped(self) -> None:
-        cost, detail = maa_clearing.sanity_cost_from_ocr(
-            self.lines("21\t[1560,980,60,40]\nx1\t[1400,1000,40,30]"), self.SIZE
-        )
-        self.assertEqual(cost, 21)
-        self.assertIn("无号", detail)
-
-    def test_two_different_numbers_in_roi_are_ambiguous(self) -> None:
-        cost, detail = maa_clearing.sanity_cost_from_ocr(
-            self.lines("21\t[1560,980,60,40]\n30\t[1400,1000,60,40]"), self.SIZE
-        )
-        self.assertIsNone(cost)
-        self.assertIn("歧义", detail)
-
-    def test_numbers_outside_roi_and_non_cost_tokens_are_ignored(self) -> None:
-        ocr = "21\t[100,100,60,40]\n78/135\t[1700,30,100,40]\n+3\t[1560,980,40,40]\n0\t[1560,1000,20,20]\n999\t[1600,1000,40,30]"
-        cost, detail = maa_clearing.sanity_cost_from_ocr(self.lines(ocr), self.SIZE)
-        self.assertIsNone(cost)
-        self.assertIn("没有理智数字", detail)
-
-    def test_roi_comes_from_config_and_falls_back_when_invalid(self) -> None:
-        self.assertEqual(
-            maa_clearing.sanity_ocr_roi({"clearing_sanity_ocr_roi": [0.1, 0.2, 0.3, 0.4]}),
-            (0.1, 0.2, 0.3, 0.4),
-        )
-        for bad in (None, [1, 2], ["a", "b", "c", "d"], [0.5, 0.5, 0.0, 0.5], [2, 0, 1, 1]):
-            with self.subTest(bad=bad):
-                self.assertEqual(
-                    maa_clearing.sanity_ocr_roi({"clearing_sanity_ocr_roi": bad}),
-                    maa_clearing.DEFAULT_SANITY_OCR_ROI,
-                )
-        # 换 ROI 后，原来在 ROI 里的数字会掉出去。
-        cost, _ = maa_clearing.sanity_cost_from_ocr(
-            self.lines("-21\t[1560,980,60,40]"), self.SIZE, (0.0, 0.0, 0.3, 0.3)
-        )
-        self.assertIsNone(cost)
-
-    def test_png_size_reads_ihdr_and_rejects_non_png(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            good = Path(raw) / "a.png"
-            good.write_bytes(_png_bytes(1280, 720))
-            self.assertEqual(maa_clearing.png_size(good), (1280, 720))
-            bad = Path(raw) / "b.png"
-            bad.write_bytes(b"not a png at all, definitely not")
-            self.assertIsNone(maa_clearing.png_size(bad))
-            self.assertIsNone(maa_clearing.png_size(Path(raw) / "missing.png"))
-
-    def test_ocr_sanity_cost_end_to_end_with_a_stubbed_ocrbox(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            png = Path(raw) / "shot.png"
-            png.write_bytes(_png_bytes())
-            ocrbox = Path(raw) / "ocrbox"
-            ocrbox.write_text("#!/bin/sh\n")
-
-            def runner(cmd, **kwargs):
-                self.assertEqual(cmd, [str(ocrbox), str(png)])
-                return SimpleNamespace(
-                    returncode=0, stdout="-21\t[1560,980,60,40]\n开始行动\t[1650,970,200,60]", stderr=""
-                )
-
-            cost, detail = maa_clearing.ocr_sanity_cost(png, {}, ocrbox=ocrbox, runner=runner)
-            self.assertEqual(cost, 21)
-
-    def test_every_failure_path_returns_none_instead_of_a_guess(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            png = Path(raw) / "shot.png"
-            png.write_bytes(_png_bytes())
-            ocrbox = Path(raw) / "ocrbox"
-            ocrbox.write_text("#!/bin/sh\n")
-            # ocrbox 未部署
-            cost, detail = maa_clearing.ocr_sanity_cost(
-                png, {}, ocrbox=Path(raw) / "nope", runner=lambda *a, **k: None
-            )
-            self.assertIsNone(cost)
-            self.assertIn("ocrbox", detail)
-            # 截图不是 PNG
-            junk = Path(raw) / "junk.png"
-            junk.write_bytes(b"garbage garbage garbage garbage")
-            cost, detail = maa_clearing.ocr_sanity_cost(junk, {}, ocrbox=ocrbox, runner=lambda *a, **k: None)
-            self.assertIsNone(cost)
-            # OCR 崩溃 / 非零退出 / 读不出
-            crashes = [
-                lambda *a, **k: (_ for _ in ()).throw(OSError("boom")),
-                lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="ERR"),
-                lambda *a, **k: SimpleNamespace(returncode=0, stdout="开始行动\t[1650,970,200,60]", stderr=""),
-            ]
-            for runner in crashes:
-                cost, detail = maa_clearing.ocr_sanity_cost(png, {}, ocrbox=ocrbox, runner=runner)
-                self.assertIsNone(cost, detail)
-                self.assertNotEqual(cost, 0)
-
-    def test_stages_json_truth_wins_over_the_ocr_cache(self) -> None:
-        # 不碰 `stage_sanity_cost()` 对普通关的既有行为：有真值时以它为准。
-        at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1", "AT-EX-1#raid"], at=at)
-        self.assertIsNone(maa_clearing.cached_sanity_cost(state, "AT-EX-1"))
-        maa_clearing.remember_sanity_cost(state, "AT-EX-1", 30, at=at)
-        self.assertEqual(maa_clearing.cached_sanity_cost(state, "AT-EX-1"), 30)
-        lookup = {"AT-1": 18}.get
-        self.assertEqual(maa_clearing.resolve_cost("AT-1", state, lookup), 18)
-        self.assertEqual(maa_clearing.resolve_cost("AT-EX-1", state, lookup), 30)
-        # 突袭与普通关同价，按普通关名取缓存。
-        self.assertEqual(maa_clearing.resolve_cost("AT-EX-1#raid", state, lookup), 30)
-        self.assertIsNone(maa_clearing.resolve_cost("AT-EX-2", state, lookup))
-        # 排一轮：EX-1 有缓存能排进去，EX-2 仍是 unknown，probe 指向它。
-        result = maa_clearing.plan_round(
-            state, 100, lambda e: maa_clearing.resolve_cost(e, state, lookup), at=at
-        )
-        self.assertEqual(result["stages"], ["AT-1", "AT-EX-1", "AT-EX-1#raid"])
-        self.assertEqual(maa_clearing.probe_candidate(result), "")
-        state["stages"].append("AT-EX-2")
-        result = maa_clearing.plan_round(
-            state, 100, lambda e: maa_clearing.resolve_cost(e, state, lookup), at=at
-        )
-        self.assertEqual(maa_clearing.probe_candidate(result), "AT-EX-2")
-
-    def test_mark_blocked_keeps_the_ocr_detail(self) -> None:
-        at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        state = maa_clearing.new_state("k", "t", "AT", ["AT-EX-1"], at=at)
-        maa_clearing.mark_blocked(state, "unknown_cost", ["AT-EX-1"], at=at, detail="ROI 内没有理智数字")
-        self.assertEqual(state["blocked"]["detail"], "ROI 内没有理智数字")
-        self.assertEqual(maa_clearing.blocked_today(state, at), "unknown_cost")
-
-
-class ClearingSanityProbeTests(unittest.TestCase):
-    """步骤 4 接进 worker：理智未知的关先去编队界面 OCR，读到就缓存并顺手打，读不出才堵。"""
-
-    def setUp(self) -> None:
-        import maa_copilot_worker
-
-        self.worker = maa_copilot_worker
-        self.at = datetime(2026, 9, 3, 9, 0, tzinfo=BEIJING)
-        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-EX-1", "AT-EX-1#raid"], at=self.at)
-        self.saved: list[dict] = []
-        self.notices: list[tuple[str, str]] = []
-        self.fights: list[str] = []
-        self.index = {"codes": {"AT-EX-1": "act_ex_1"}, "stages": {"act_ex_1": "AT-EX-1"}}
-
-    def run_locked(self, probe_result, *, stages=(), remaining=50, fight_ok=True):
-        w = self.worker
-
-        def fake_fight(config, stage, stage_id, roster, env, log_path, mode="normal"):
-            self.fights.append(f"{stage}#{mode}")
-            return (True, "", "t") if fight_ok else (False, "op", "没作业")
-
-        with tempfile.TemporaryDirectory() as raw, patch.object(
-            w, "RUNS_DIR", Path(raw)
-        ), patch.object(w, "require_executable"), patch.object(
-            w, "merge_last_run"
-        ), patch.object(
-            w, "emulator_is_online", return_value=(False, "离线")
-        ), patch.object(w, "open_emulator"), patch.object(
-            w, "wait_for_android"
-        ), patch.object(w, "verify_game_installed"), patch.object(
-            w, "settle_android_runtime"
-        ), patch.object(w, "maa_subprocess_env", return_value={}), patch.object(
-            w, "capture_screenshot", return_value=(True, "")
-        ), patch.object(w, "close_everything", return_value=[]), patch.object(
-            w.maa_copilot, "load_stage_index", return_value=self.index
-        ), patch.object(
-            w, "_clearing_probe_sanity", return_value=probe_result
-        ) as probe, patch.object(
-            w, "_clearing_fight_stage", side_effect=fake_fight
-        ), patch.object(
-            w, "_clearing_notice", side_effect=lambda c, t, b, col: self.notices.append((t, b))
-        ), patch.object(
-            w, "_clearing_post_manual_card"
-        ), patch.object(
-            maa_clearing, "save_state", side_effect=lambda s, path=None: self.saved.append(dict(s)) or s
-        ):
-            code = w._clearing_run_locked(
-                {}, self.state, list(stages), None, self.at, probe="AT-EX-1", remaining=remaining
-            )
-        return code, probe
-
-    def test_a_readable_cost_is_cached_and_the_stage_is_fought_when_affordable(self) -> None:
-        code, probe = self.run_locked((30, "", "ROI 内带负号数字 30"), remaining=50)
-        probe.assert_called_once()
-        self.assertEqual(probe.call_args.args[1], "AT-EX-1")  # 去掉后缀的关名
-        self.assertEqual(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"), 30)
-        self.assertEqual(self.fights, ["AT-EX-1#normal"])
-        self.assertEqual(self.state["cursor"], 1)
-        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
-        self.assertEqual(code, 0)
-        self.assertIn("理智探测", self.notices[-1][1])
-
-    def test_a_readable_cost_above_the_remaining_budget_is_only_cached(self) -> None:
-        code, _ = self.run_locked((30, "", "ok"), remaining=10)
-        self.assertEqual(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"), 30)
-        self.assertEqual(self.fights, [])
-        self.assertEqual(self.state["cursor"], 0)
-        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
-        self.assertEqual(code, 0)
-        self.assertIn("留给下一轮", self.notices[-1][1])
-
-    def test_an_unreadable_cost_blocks_today_without_guessing(self) -> None:
-        code, _ = self.run_locked((None, "ocr", "AT-EX-1 理智 OCR 读不出：ROI 内没有理智数字"))
-        self.assertIsNone(maa_clearing.cached_sanity_cost(self.state, "AT-EX-1"))
-        self.assertEqual(self.fights, [])
-        self.assertEqual(self.state["cursor"], 0)
-        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "unknown_cost")
-        self.assertIn("读不出", self.state["blocked"]["detail"])
-        # 被堵的当天日常照常刷理智（四条件的第 4 条）。
-        self.assertFalse(maa_clearing.queue_is_active(self.state, self.at))
-        self.assertEqual(code, 1)
-
-    def test_a_navigation_failure_during_the_probe_is_booked_as_nav(self) -> None:
-        code, _ = self.run_locked((None, "nav", "AT-EX-1 导航到编队界面失败：x"))
-        self.assertTrue(maa_clearing.is_nav_frozen(self.state, "AT-EX-1", self.at))
-        self.assertEqual(maa_clearing.blocked_today(self.state, self.at), "")
-        self.assertEqual(self.state["cursor"], 0)
-        self.assertEqual(code, 1)
-
-    def test_planned_stages_run_before_the_probe_and_a_failure_skips_it(self) -> None:
-        w = self.worker
-        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1"], at=self.at)
-        self.index = {"codes": {"AT-1": "act_1", "AT-EX-1": "act_ex_1"}, "stages": {}}
-        code, probe = self.run_locked((30, "", "ok"), stages=["AT-1"], remaining=50)
-        self.assertEqual(self.fights, ["AT-1#normal", "AT-EX-1#normal"])
-        self.assertEqual(self.state["cursor"], 2)
-        # 排好的关失败了就不再探测。
-        self.fights.clear()
-        self.state = maa_clearing.new_state("k", "t", "AT", ["AT-1", "AT-EX-1"], at=self.at)
-        code, probe = self.run_locked((30, "", "ok"), stages=["AT-1"], remaining=50, fight_ok=False)
-        probe.assert_not_called()
-        self.assertEqual(self.state["cursor"], 0)
-        self.assertEqual(code, 1)
-
-    def test_the_cache_survives_clearing_the_normal_stage_for_the_raid_entry(self) -> None:
-        # 通关后 advance_cursor 会清掉该关的失败记账，理智缓存必须留给紧跟的突袭。
-        code, _ = self.run_locked((30, "", "ok"), remaining=50)
-        self.assertEqual(self.state["cursor"], 1)
-        self.assertEqual(maa_clearing.current_stage(self.state), "AT-EX-1#raid")
-        self.assertEqual(
-            maa_clearing.resolve_cost("AT-EX-1#raid", self.state, lambda s: None), 30
-        )
-
-    def test_probe_helper_chains_navigate_screenshot_and_ocr(self) -> None:
-        w = self.worker
-        with tempfile.TemporaryDirectory() as raw:
-            log = Path(raw) / "c.log"
-            png = Path(raw) / "s.png"
-            with patch.object(w, "_navigate_to_stage", return_value=(False, "nav 失败")):
-                self.assertEqual(w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)[1], "nav")
-            with patch.object(w, "_navigate_to_stage", return_value=(True, "")), patch.object(
-                w, "capture_screenshot", return_value=(False, "adb 挂了")
-            ):
-                cost, kind, detail = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
-                self.assertEqual((cost, kind), (None, "ocr"))
-                self.assertIn("adb", detail)
-            with patch.object(w, "_navigate_to_stage", return_value=(True, "")), patch.object(
-                w, "capture_screenshot", return_value=(True, "")
-            ), patch.object(maa_clearing, "ocr_sanity_cost", return_value=(21, "ok")):
-                cost, kind, _ = w._clearing_probe_sanity({}, "AT-EX-1", {}, log, png)
-                self.assertEqual((cost, kind), (21, ""))
-                self.assertIn("sanity-ocr AT-EX-1: 21", log.read_text(encoding="utf-8"))
-
-    def test_sanity_probe_is_a_worker_subcommand_but_not_a_discord_command(self) -> None:
-        w = self.worker
-        with patch.object(w, "cmd_sanity_probe", return_value=0) as cmd:
-            self.assertEqual(w.main(["sanity-probe", "1-7"]), 0)
-        cmd.assert_called_once_with("1-7")
-        self.assertEqual(w.main(["sanity-probe"]), 2)
-        # 校准入口只在本机终端跑，不进 Discord 白名单（不变量 #8 的边界不变）。
-        ok, _ = maa_action.dispatch(["sanity-probe", "1-7"])
-        self.assertFalse(ok)
-
-
 class SessionDailyTests(unittest.TestCase):
     """四期 1a：`execute(phase)` 只吃**这一场**的覆盖，`now` 一场都不吃。"""
 
@@ -4733,199 +3491,6 @@ class ActivityDeadlineTests(unittest.TestCase):
         )
 
 
-class CopilotCardTests(unittest.TestCase):
-    """四期 1c：聊天触发的抄作业卡——一览 + 一个下拉，只列上游有导航的关。"""
-
-    def setUp(self) -> None:
-        self.index = {
-            "codes": {"SR-8": "act54side_08", "SR-9": "act54side_09", "1-7": "main_01-07",
-                      "CE-6": "wk_melee_6"},
-            "stages": {"act54side_08": "SR-8", "act54side_09": "SR-9",
-                       "main_01-07": "1-7", "wk_melee_6": "CE-6"},
-        }
-        self.nav_keys = {"SR-8", "1-7", "CE-6"}
-
-    def _view(self, config, at=None):
-        def checker(_dirs):
-            def check(stage):
-                if stage in self.nav_keys:
-                    return True, ""
-                return False, f"上游 tasks/Stages 里没有 {stage} 这个顶层键"
-
-            return check
-
-        with patch.object(
-            maa_copilot, "load_stage_index", return_value=self.index
-        ), patch.object(maa_clearing, "nav_checker", side_effect=checker), patch.object(
-            maa_plan_card,
-            "stage_drops",
-            return_value={"SR-8": {"materials": ["异铁组"], "ap": 21}},
-        ), patch.object(maa_plan_card, "activity_deadline_text", return_value=""):
-            return maa_plan_card.copilot_card_view(config, at)
-
-    def test_the_dropdown_only_offers_stages_upstream_can_navigate(self) -> None:
-        embed, options = self._view({"activity_stages": ["SR-8", "SR-9"]})
-        self.assertEqual([stage for _label, stage, _desc in options], ["SR-8"])
-        listing = embed["fields"][0]["value"]
-        # 一览里两关都在，但没导航的那关标出来了（D8 / 不变量 #37）。
-        self.assertIn("SR-8", listing)
-        self.assertIn("异铁组", listing)
-        self.assertIn("SR-9", listing)
-        self.assertIn("⛔ 上游 tasks/Stages 里没有 SR-9", listing)
-
-    def test_a_stage_missing_from_the_local_index_is_flagged_not_offered(self) -> None:
-        # 有导航键但本地 Tile-Pos 索引里没有 → `copilot find` 必拒，
-        # 与其给个点了必失败的选项，不如在一览里说清原因。
-        with patch.object(
-            maa_copilot, "load_stage_index", return_value={"codes": {}, "stages": {}}
-        ), patch.object(
-            maa_clearing, "nav_checker", side_effect=lambda _d: lambda s: (True, "")
-        ), patch.object(maa_plan_card, "stage_drops", return_value={}), patch.object(
-            maa_plan_card, "activity_deadline_text", return_value=""
-        ):
-            rows, _in_activity = maa_plan_card.copilot_card_stages(
-                {"activity_stages": ["SR-9"]}
-            )
-            _embed, options = maa_plan_card.copilot_card_view(
-                {"activity_stages": ["SR-9"]}
-            )
-        self.assertEqual(rows[0]["reason"], "不在本地关卡索引里")
-        self.assertFalse(rows[0]["nav"])
-        self.assertEqual(options, [])
-
-    def test_without_an_activity_it_degrades_to_supplies_and_main(self) -> None:
-        embed, options = self._view(
-            {"activity_stages": [], "all_supply_stages_open": True},
-            datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
-        )
-        stages = [stage for _label, stage, _desc in options]
-        self.assertIn("1-7", stages)
-        self.assertIn("CE-6", stages)
-        self.assertNotIn("SR-8", stages)
-        self.assertIn("资源本 / 主线", embed["fields"][0]["name"])
-
-    def test_the_select_values_are_opaque_and_resolved_through_the_registry(self) -> None:
-        rows, entries = maa_action._copilot_card_components(
-            [("SR-8 · 异铁组", "SR-8", "主掉落 异铁组")]
-        )
-        custom_id = "hermes:btn:maa-copilot:card:stage-select"
-        self.assertEqual(rows[0]["components"][0]["custom_id"], custom_id)
-        option = rows[0]["components"][0]["options"][0]
-        self.assertEqual(option["value"], "choice:0")
-        self.assertNotIn("SR-8", option["value"])
-        self.assertEqual(
-            entries[custom_id]["select_args"]["choice:0"],
-            ["copilot", "find", "SR-8"],
-        )
-
-    def test_no_navigable_stage_means_no_control_at_all(self) -> None:
-        # Discord 拒绝零选项的下拉；一览还是要发，不能静默什么都不做。
-        rows, entries = maa_action._copilot_card_components([])
-        self.assertEqual(rows, [])
-        self.assertEqual(entries, {})
-
-    def _send_card(self, options, registry_seed, card_state):
-        posted: list[dict] = []
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            buttons = root / "buttons.json"
-            card_path = root / "card.json"
-            maa_common.atomic_write_json(buttons, registry_seed)
-            if card_state is not None:
-                maa_common.atomic_write_json(card_path, card_state)
-            with patch.object(
-                maa_action, "load_config", return_value={"channel_id": "123"}
-            ), patch.object(
-                maa_plan_card, "copilot_card_view", return_value=({"title": "t"}, options)
-            ), patch.object(maa_copilot, "CARD_PATH", card_path), patch.object(
-                maa_copilot, "ensure_private_dirs"
-            ), patch.object(maa_action, "BUTTONS_PATH", buttons), patch.object(
-                maa_action, "state_lock", return_value=contextlib.nullcontext()
-            ), patch.object(
-                maa_action, "retire_discord_components"
-            ) as retire, patch.object(
-                maa_action, "discord_token", return_value="token"
-            ), patch.object(
-                maa_action,
-                "discord_request",
-                side_effect=lambda *a, **k: posted.append(a) or {"id": "999"},
-            ):
-                ok, message = maa_action.copilot_card()
-            return SimpleNamespace(
-                ok=ok,
-                message=message,
-                retire=retire,
-                posted=posted,
-                registry=json.loads(buttons.read_text(encoding="utf-8")),
-                card=json.loads(card_path.read_text(encoding="utf-8")),
-            )
-
-    def test_a_new_card_retires_the_previous_one_and_its_registry_entry(self) -> None:
-        stale = "hermes:btn:maa-copilot:card:stage-select"
-        result = self._send_card(
-            [("SR-8", "SR-8", "d")],
-            {stale: {"select_args": {"choice:0": ["copilot", "find", "OLD-1"]}},
-             "hermes:btn:agent-book:x": {}},
-            {"message_id": "555"},
-        )
-        self.assertTrue(result.ok)
-        # 旧卡组件先 PATCH 空。
-        self.assertEqual(result.retire.call_args.args[1], "555")
-        # 旧登记被替换成新的，别人的键没动。
-        self.assertEqual(
-            result.registry[stale]["select_args"]["choice:0"],
-            ["copilot", "find", "SR-8"],
-        )
-        self.assertIn("hermes:btn:agent-book:x", result.registry)
-        self.assertEqual(result.card["message_id"], "999")
-
-    def test_a_card_without_options_leaves_no_stale_registry_entry(self) -> None:
-        stale = "hermes:btn:maa-copilot:card:stage-select"
-        result = self._send_card([], {stale: {}}, {"message_id": "555"})
-        self.assertTrue(result.ok)
-        self.assertNotIn(stale, result.registry)
-        self.assertIn("没有上游写了导航定义的关", result.message)
-
-    def test_the_card_prefix_survives_both_sweeps(self) -> None:
-        """它既不进 07:50 的 `hermes:btn:maa:` 清扫，也不被搜索 TTL 清扫误删。"""
-        card_key = f"{maa_copilot.CARD_BUTTON_PREFIX}stage-select"
-        self.assertFalse(card_key.startswith(maa_plan_card.BUTTON_PREFIX))
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            buttons = root / "buttons.json"
-            searches = root / "searches"
-            searches.mkdir()
-            maa_common.atomic_write_json(
-                buttons, {"hermes:btn:maa:am:stage-select": {}, card_key: {}}
-            )
-            with patch.object(maa_common, "BUTTONS_PATH", buttons):
-                maa_common.prune_button_registry(maa_plan_card.BUTTON_PREFIX)
-            registry = json.loads(buttons.read_text(encoding="utf-8"))
-            self.assertNotIn("hermes:btn:maa:am:stage-select", registry)
-            self.assertIn(card_key, registry)
-
-            # `prune_expired_searches()` 只按 searches/<token>.json 里的 token 清，
-            # 而 `card` 不是 12 位 hex，也不放在那个目录里。
-            (searches / "aaaaaaaaaaaa.json").write_text(
-                json.dumps({"expires_at": "2020-01-01T00:00:00+08:00"}),
-                encoding="utf-8",
-            )
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), patch.object(
-                maa_copilot, "ensure_private_dirs"
-            ):
-                maa_copilot.prune_expired_searches(registry)
-            self.assertIn(card_key, registry)
-            self.assertNotIn(
-                maa_copilot.CARD_PATH.parent / "card.json", list(searches.glob("*.json"))
-            )
-
-    def test_the_card_state_file_is_not_inside_the_searches_directory(self) -> None:
-        # 放进去会被 `prune_expired_searches()` 当成一次搜索删掉，
-        # 顺手把 `hermes:btn:maa-copilot:card:` 的登记也清了。
-        self.assertNotEqual(maa_copilot.CARD_PATH.parent, maa_copilot.SEARCHES_DIR)
-        self.assertFalse(maa_copilot.SEARCH_TOKEN_RE.fullmatch("card"))
-
-
 class EmulatorProbeSharedTests(unittest.TestCase):
     """四期 1d：一份探测实现，四条自动链路共用（D18 / 不变量 #24）。"""
 
@@ -4940,19 +3505,18 @@ class EmulatorProbeSharedTests(unittest.TestCase):
         source = (ROOT / "scripts" / "maa_daily.py").read_text(encoding="utf-8")
         self.assertNotIn("def emulator_is_online", source)
 
-    def test_a_busy_emulator_stops_the_copilot_worker_before_it_opens_anything(self) -> None:
+    def test_a_busy_emulator_stops_the_copilot_round_before_it_opens_anything(self) -> None:
         import maa_copilot_worker as worker
 
         token = "a" * 12
-        candidate = {"id": 7, "ratio": 1.0}
         queued = {
             "token": token,
             "status": "queued",
-            "stage": "SR-8",
-            "stage_id": "act54side_08",
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [candidate],
+            "activity_key": "SideStory「月行水上」|SR",
+            "entries": [
+                {"stage": "SR-5", "stage_id": "act54side_05", "mode": "normal",
+                 "candidate": {"id": 7}, "sanity_cost": 12}
+            ],
         }
         with tempfile.TemporaryDirectory() as raw:
             searches = Path(raw) / "searches"
@@ -4960,6 +3524,7 @@ class EmulatorProbeSharedTests(unittest.TestCase):
             (searches / f"{token}.json").write_text(
                 json.dumps(queued), encoding="utf-8"
             )
+            notices: list[tuple[str, str]] = []
             with patch.object(maa_copilot, "SEARCHES_DIR", searches), patch.object(
                 worker, "state_lock", return_value=contextlib.nullcontext()
             ), patch.object(
@@ -4967,47 +3532,22 @@ class EmulatorProbeSharedTests(unittest.TestCase):
             ), patch.object(
                 worker, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
             ), patch.object(
-                worker, "discord_token", return_value="token"
-            ), patch.object(worker, "discord_request") as request, patch.object(
-                worker, "merge_last_run"
-            ) as merge, patch.object(
-                worker, "_require_auto_run_preflight"
-            ) as preflight, patch.object(
-                worker, "open_emulator"
-            ) as open_emulator:
-                code = worker._run_locked(queued, candidate, 1, "normal")
+                worker, "_notice",
+                side_effect=lambda c, t, b, col: notices.append((t, b)),
+            ), patch.object(worker, "merge_last_run") as merge, patch.object(
+                worker, "_fight_one"
+            ) as fight, patch.object(worker, "open_emulator") as open_emulator:
+                code = worker._batch_run_locked(queued)
             restored = json.loads((searches / f"{token}.json").read_text("utf-8"))
         self.assertEqual(code, 0)
         open_emulator.assert_not_called()
-        preflight.assert_not_called()
-        # 卡恢复成可点，跳过必须可见（护栏 4）。
-        self.assertEqual(restored["status"], "done")
-        body = request.call_args.args[3]["embeds"][0]["description"]
-        self.assertIn("模拟器正在使用", body)
-        self.assertIn("BlueStacks 进程在跑", body)
+        fight.assert_not_called()
+        # 这一轮放回排程，watcher 下一 tick 再试；跳过必须可见（护栏 4）。
+        self.assertEqual(restored["status"], "scheduled")
+        self.assertIn("模拟器正在使用", notices[0][1])
+        self.assertIn("BlueStacks 进程在跑", notices[0][1])
         self.assertEqual(merge.call_args.args[0]["skip_reason"], "emulator_busy")
 
-    def test_a_busy_emulator_stops_the_clearing_round_before_it_opens_anything(self) -> None:
-        import maa_copilot_worker as worker
-
-        notices: list[tuple[str, str]] = []
-        with patch.object(
-            worker, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
-        ), patch.object(
-            worker,
-            "_clearing_notice",
-            side_effect=lambda c, t, b, col: notices.append((t, b)),
-        ), patch.object(worker, "open_emulator") as open_emulator, patch.object(
-            worker.maa_copilot, "load_stage_index", return_value={"codes": {}}
-        ):
-            code = worker._clearing_run_locked(
-                {}, maa_clearing.new_state("k", "t", "AT", ["AT-1"]), ["AT-1"], None,
-                datetime(2026, 9, 9, 9, 0, tzinfo=BEIJING),
-            )
-        self.assertEqual(code, 0)
-        open_emulator.assert_not_called()
-        self.assertIn("未启动", notices[0][0])
-        self.assertIn("模拟器正在使用", notices[0][1])
 
     def test_a_busy_emulator_leaves_the_depot_snapshot_untouched(self) -> None:
         at = datetime(2026, 9, 9, 4, 30, tzinfo=BEIJING)
@@ -5085,3 +3625,1576 @@ class EmulatorProbeSharedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 四期步骤 2：作业链统一
+# ---------------------------------------------------------------------------
+
+SR_INDEX = {
+    "codes": {
+        "SR-1": "act54side_01",
+        "SR-2": "act54side_02",
+        "SR-5": "act54side_05",
+        "SR-6": "act54side_06",
+        "SR-8": "act54side_08",
+        "SR-EX-1": "act54side_ex01",
+        "SR-S-1": "act54side_s01",
+        "SR-TR-1": "act54side_tr01",
+        "1-7": "main_01-07",
+        "CE-6": "wk_melee_6",
+    },
+    "stages": {
+        "act54side_01": "SR-1",
+        "act54side_02": "SR-2",
+        "act54side_05": "SR-5",
+        "act54side_06": "SR-6",
+        "act54side_08": "SR-8",
+        "act54side_ex01": "SR-EX-1",
+        "act54side_s01": "SR-S-1",
+        "act54side_tr01": "SR-TR-1",
+        "main_01-07": "1-7",
+        "wk_melee_6": "CE-6",
+    },
+}
+SR_KEY = "SideStory「月行水上」|SR"
+
+
+def _nav_patch(keys):
+    """把 `maa_clearing.nav_checker` 换成一张固定的导航键表。"""
+    def factory(_dirs):
+        def check(entry):
+            stage, _mode = maa_clearing.split_entry(entry)
+            if stage in keys:
+                return True, ""
+            return False, f"上游 tasks/Stages/SR.json 里没有 {stage} 这个顶层键"
+        return check
+    return patch.object(maa_clearing, "nav_checker", side_effect=factory)
+
+
+def _zone(cleared: int, total: int, act: str = "act54side") -> dict:
+    return {"activity_progress": {act: [
+        {"zoneId": f"{act}_zone1", "clearedStage": cleared, "totalStage": total}
+    ]}}
+
+
+class CopilotModeTests(unittest.TestCase):
+    """D7：活动关一律普通 + 突袭；资源本 / 主线只有普通。"""
+
+    def test_activity_stages_need_both_modes(self) -> None:
+        for stage in ("SR-1", "SR-8", "SR-EX-1", "SR-S-1"):
+            with self.subTest(stage=stage):
+                self.assertEqual(
+                    maa_clearing.required_modes(stage, "SR"), ("normal", "raid")
+                )
+
+    def test_supplies_and_main_have_no_raid(self) -> None:
+        for stage in ("CE-6", "1-7", "AP-5"):
+            with self.subTest(stage=stage):
+                self.assertEqual(maa_clearing.required_modes(stage, "SR"), ("normal",))
+
+    def test_no_activity_means_normal_only(self) -> None:
+        self.assertEqual(maa_clearing.required_modes("SR-8", ""), ("normal",))
+
+    def test_entry_round_trip_keeps_the_raid_suffix(self) -> None:
+        self.assertEqual(maa_clearing.make_entry("SR-5", "raid"), "SR-5#raid")
+        self.assertEqual(maa_clearing.make_entry("SR-5", "normal"), "SR-5")
+        self.assertEqual(maa_clearing.split_entry("SR-5#raid"), ("SR-5", "raid"))
+        self.assertEqual(maa_clearing.entry_label("SR-5#raid"), "SR-5（突袭）")
+
+
+class LedgerTests(unittest.TestCase):
+    """2a：本地记账。通关 = 所需模式全部有 `Copilot Completed`。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "ledger.json"
+        self.addCleanup(self._tmp.cleanup)
+
+    def _ensure(self, key):
+        with patch.object(maa_copilot, "LEDGER_PATH", self.path), patch.object(
+            maa_copilot, "ensure_private_dirs"
+        ):
+            return maa_copilot.ensure_ledger(key, path=self.path)
+
+    def test_the_seed_only_lands_on_a_fresh_ledger_for_the_seeded_activity(self) -> None:
+        ledger, note = self._ensure(SR_KEY)
+        self.assertEqual(note, "")
+        for stage in maa_copilot.SEED_CLEARED_NORMAL:
+            self.assertEqual(ledger["stages"][stage]["normal"], maa_copilot.SEED_AT)
+            # 突袭留空：spike A 一次都没打过（Q3 未验）。
+            self.assertIsNone(ledger["stages"][stage]["raid"])
+        self.assertEqual(json.loads(self.path.read_text("utf-8"))["seeded"], "SR")
+
+    def test_another_activity_is_never_seeded(self) -> None:
+        ledger, _note = self._ensure("SideStory「墟」复刻|AT")
+        self.assertEqual(ledger["stages"], {})
+
+    def test_the_seed_never_overwrites_an_existing_ledger(self) -> None:
+        maa_common.atomic_write_json(self.path, {
+            "activity_key": SR_KEY,
+            "stages": {"SR-5": {"normal": None, "raid": None, "attempts": []}},
+        })
+        ledger, note = self._ensure(SR_KEY)
+        self.assertEqual(note, "")
+        # 账本已存在 → 一个字节都不补，SR-5 仍然是「没打过」。
+        self.assertIsNone(ledger["stages"]["SR-5"]["normal"])
+        self.assertNotIn("SR-8", ledger["stages"])
+
+    def test_a_new_activity_archives_the_old_ledger(self) -> None:
+        self._ensure(SR_KEY)
+        ledger, note = self._ensure("SideStory「墟」复刻|AT")
+        archive = self.path.parent / "ledger-SideStory-SR.json"
+        self.assertTrue(archive.is_file(), sorted(p.name for p in self.path.parent.iterdir()))
+        self.assertIn("ledger-", note)
+        self.assertEqual(json.loads(archive.read_text("utf-8"))["activity_key"], SR_KEY)
+        self.assertEqual(ledger["stages"], {})
+
+    def test_a_broken_ledger_reads_as_absent_instead_of_raising(self) -> None:
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(maa_copilot.load_ledger(self.path))
+
+    def test_raid_failure_means_the_stage_is_not_cleared(self) -> None:
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        maa_copilot.record_copilot_attempt(ledger, "SR-5", "normal", outcome="won", op=1)
+        maa_copilot.record_copilot_attempt(
+            ledger, "SR-5", "raid", outcome="failed", op=1, detail="Copilot Error"
+        )
+        pending = maa_copilot.ledger_pending_modes(
+            ledger, None, "SR-5", "act54side_05", ("normal", "raid")
+        )
+        self.assertEqual(pending, ["raid"])
+        self.assertEqual(len(ledger["stages"]["SR-5"]["attempts"]), 2)
+        self.assertIsNone(ledger["stages"]["SR-5"]["raid"])
+
+    def test_both_modes_won_means_cleared(self) -> None:
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        for mode in ("normal", "raid"):
+            maa_copilot.record_copilot_attempt(ledger, "SR-5", mode, outcome="won")
+        self.assertEqual(
+            maa_copilot.ledger_pending_modes(
+                ledger, None, "SR-5", "act54side_05", ("normal", "raid")
+            ),
+            [],
+        )
+
+    def test_a_fully_cleared_zone_counts_as_cleared_without_any_ledger(self) -> None:
+        # D10：森空岛只有 zone 粒度，用户手打过的关靠它认出来。
+        roster = _zone(11, 11)
+        self.assertTrue(maa_copilot.zone_fully_cleared(roster, "act54side_05"))
+        self.assertEqual(
+            maa_copilot.ledger_pending_modes(
+                {}, roster, "SR-5", "act54side_05", ("normal", "raid")
+            ),
+            [],
+        )
+
+    def test_a_partially_cleared_zone_does_not_clear_anything(self) -> None:
+        roster = _zone(3, 11)
+        self.assertFalse(maa_copilot.zone_fully_cleared(roster, "act54side_05"))
+        self.assertEqual(
+            maa_copilot.ledger_pending_modes(
+                {}, roster, "SR-5", "act54side_05", ("normal", "raid")
+            ),
+            ["normal", "raid"],
+        )
+
+    def test_zone_helpers_stay_two_separate_rules(self) -> None:
+        """`zone_fully_cleared` 与 `zone_progress_warning` 共用定位、不共用结论。"""
+        import ast
+
+        source = (ROOT / "scripts" / "maa_copilot.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for name in ("zone_fully_cleared", "zone_progress_warning"):
+            node = next(
+                item for item in tree.body
+                if isinstance(item, ast.FunctionDef) and item.name == name
+            )
+            calls = {
+                child.func.id
+                for child in ast.walk(node)
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+            }
+            self.assertIn("stage_zone", calls, name)
+            # 两条规则互不调用。
+            self.assertNotIn("zone_fully_cleared", calls - {name})
+            self.assertNotIn("zone_progress_warning", calls - {name})
+
+
+class CopilotTargetSetTests(unittest.TestCase):
+    """2b：目标集合与顺序。不变量 #37 的导航键闸门落在这里。"""
+
+    def setUp(self) -> None:
+        self.config = {"activity_search_retry_minutes": 30}
+        self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
+
+    def _collect(self, *, ledger=None, roster=None, state=None,
+                 keys=("SR-1", "SR-2", "SR-5", "SR-6", "SR-8", "SR-EX-1", "SR-S-1",
+                       "SR-TR-1")):
+        import maa_activity_watch as watch
+
+        with _nav_patch(set(keys)):
+            return watch.collect_targets(
+                self.config, state if state is not None else {}, "SR",
+                SR_INDEX, ledger or {}, roster, self.at,
+            )
+
+    def test_the_order_is_numbered_then_ex_then_s_normal_before_raid(self) -> None:
+        import maa_activity_watch as watch
+
+        targets, _excluded = self._collect()
+        self.assertEqual(
+            [target["stage"] for target in targets],
+            ["SR-1", "SR-2", "SR-5", "SR-6", "SR-8", "SR-EX-1", "SR-S-1"],
+        )
+        entries = watch._entry_list(targets[:2])
+        self.assertEqual(entries, ["SR-1", "SR-1#raid", "SR-2", "SR-2#raid"])
+
+    def test_a_stage_without_an_upstream_nav_key_never_enters_the_set(self) -> None:
+        # 不变量 #37：本地索引里有、上游 `tasks/Stages/SR.json` 里没有 → 不排。
+        targets, excluded = self._collect(keys={"SR-1", "SR-2"})
+        self.assertEqual([t["stage"] for t in targets], ["SR-1", "SR-2"])
+        missing = {e["stage"]: e for e in excluded if e["reason"] == "no_nav"}
+        self.assertIn("SR-8", missing)
+        self.assertIn("没有 SR-8 这个顶层键", missing["SR-8"]["detail"])
+
+    def test_a_raid_entry_is_gated_under_its_plain_stage_name(self) -> None:
+        with _nav_patch({"SR-5"}):
+            check = maa_clearing.nav_checker([])
+        self.assertEqual(check("SR-5#raid"), (True, ""))
+        self.assertFalse(check("SR-6#raid")[0])
+
+    def test_tutorial_stages_never_enter_the_set(self) -> None:
+        targets, _excluded = self._collect()
+        self.assertNotIn("SR-TR-1", [target["stage"] for target in targets])
+        self.assertNotIn("SR-TR-1", maa_copilot.activity_stage_codes(SR_INDEX, "SR"))
+
+    def test_a_stage_with_a_complete_ledger_never_enters_the_set(self) -> None:
+        ledger = {"stages": {"SR-5": {"normal": "t", "raid": "t"}}}
+        targets, excluded = self._collect(ledger=ledger)
+        self.assertNotIn("SR-5", [target["stage"] for target in targets])
+        self.assertIn("SR-5", [e["stage"] for e in excluded if e["reason"] == "cleared"])
+
+    def test_a_half_cleared_stage_comes_back_with_only_the_missing_mode(self) -> None:
+        ledger = {"stages": {"SR-5": {"normal": "t", "raid": None}}}
+        targets, _excluded = self._collect(ledger=ledger)
+        target = next(t for t in targets if t["stage"] == "SR-5")
+        self.assertEqual(target["modes"], ["raid"])
+
+    def test_a_fully_cleared_zone_removes_every_stage_in_it(self) -> None:
+        targets, excluded = self._collect(roster=_zone(11, 11))
+        self.assertEqual([t["stage"] for t in targets], ["SR-EX-1", "SR-S-1"])
+        self.assertIn("SR-5", [e["stage"] for e in excluded if e["reason"] == "cleared"])
+
+    def test_an_unopened_zone_is_skipped_without_being_marked_failed(self) -> None:
+        # D9：`totalStage == 0` 是「还没开」，等热更新，绝不记成搜索失败。
+        state: dict = {}
+        targets, excluded = self._collect(roster=_zone(0, 0), state=state)
+        skipped = [e["stage"] for e in excluded if e["reason"] == "zone_unopened"]
+        self.assertIn("SR-1", skipped)
+        self.assertNotIn("SR-1", [target["stage"] for target in targets])
+        self.assertEqual(state.get("stage_state", {}), {})
+
+    def test_a_recently_failed_stage_backs_off_until_the_retry_window(self) -> None:
+        state: dict = {}
+        maa_clearing.record_stage_failure(
+            state, "SR-5", kind="op", detail="SR-5 暂无完全满足当前干员练度的作业",
+            at=self.at - timedelta(minutes=10), gaps=["史尔特尔 专精3（你技能7）"],
+        )
+        targets, excluded = self._collect(state=state)
+        self.assertNotIn("SR-5", [target["stage"] for target in targets])
+        self.assertIn("SR-5", [e["stage"] for e in excluded if e["reason"] == "backoff"])
+        # 过了退避窗口就回来。
+        maa_clearing.record_stage_failure(
+            state, "SR-5", kind="op", detail="x", at=self.at - timedelta(minutes=31)
+        )
+        targets, _excluded = self._collect(state=state)
+        self.assertIn("SR-5", [target["stage"] for target in targets])
+
+
+class CopilotRoundPlanningTests(unittest.TestCase):
+    """2c：理智预算、排轮、`scheduled_at`。"""
+
+    def setUp(self) -> None:
+        self.plan = {"annihilation": True, "tasks": {"fight": True}}
+
+    def test_the_budget_deducts_todays_annihilation_first(self) -> None:
+        self.assertEqual(maa_clearing.sanity_budget(100, self.plan, {}), 75)
+        self.assertEqual(
+            maa_clearing.sanity_budget(100, {**self.plan, "annihilation": False}, {}), 100
+        )
+        self.assertEqual(
+            maa_clearing.sanity_budget(100, self.plan, {"annihilation_sanity": 40}), 60
+        )
+
+    def test_unknown_sanity_is_a_zero_budget_not_a_guess(self) -> None:
+        self.assertEqual(maa_clearing.sanity_budget(None, self.plan, {}), 0)
+        self.assertEqual(maa_clearing.sanity_budget("x", self.plan, {}), 0)
+        self.assertEqual(maa_clearing.sanity_budget(10, self.plan, {}), 0)
+
+    def test_plan_round_stops_at_the_budget(self) -> None:
+        result = maa_clearing.plan_round(
+            ["SR-5", "SR-5#raid", "SR-6", "SR-6#raid"], 30, lambda entry: 12
+        )
+        self.assertEqual(result["entries"], ["SR-5", "SR-5#raid"])
+        self.assertEqual(result["spent"], 24)
+        self.assertEqual(result["stop_reason"], "sanity")
+
+    def test_plan_round_never_guesses_an_unknown_cost(self) -> None:
+        result = maa_clearing.plan_round(
+            ["SR-5", "SR-EX-1"], 200, lambda entry: None if "EX" in entry else 12
+        )
+        self.assertEqual(result["entries"], ["SR-5"])
+        self.assertEqual(result["unknown_cost"], ["SR-EX-1"])
+        self.assertEqual(result["stop_reason"], "unknown_cost")
+
+    def _round(self, targets, budget, sanity, roster=None, state=None):
+        import maa_activity_watch as watch
+
+        with patch.object(watch, "round_budget", return_value=(budget, sanity)), \
+             patch.object(maa_copilot, "stage_sanity_cost", return_value=12), \
+             patch.object(
+                 maa_copilot, "pick_perfect_candidate",
+                 return_value=({"id": 1, "title": "稳定作业"}, "", []),
+             ):
+            return watch.build_round(
+                {}, state if state is not None else {}, targets, SR_INDEX, roster,
+                datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+            )
+
+    def test_a_full_budget_schedules_the_whole_prefix_right_now(self) -> None:
+        targets = [
+            {"stage": "SR-5", "stage_id": "act54side_05", "modes": ["normal", "raid"]},
+            {"stage": "SR-6", "stage_id": "act54side_06", "modes": ["normal", "raid"]},
+        ]
+        entries, scheduled_at, note = self._round(targets, 30, 55)
+        self.assertEqual(
+            [(entry["stage"], entry["mode"]) for entry in entries],
+            [("SR-5", "normal"), ("SR-5", "raid")],
+        )
+        self.assertEqual(note, "")
+        self.assertEqual(scheduled_at, "2026-09-09T12:00:00+08:00")
+
+    def test_an_empty_budget_schedules_one_entry_at_its_ready_at(self) -> None:
+        # 排不满 → `scheduled_at` = 下一条目的 `ready_at`（`sanity_preflight()`）。
+        now = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
+        roster = {"sanity": {
+            "current": 6, "max": 135,
+            "server_current_at": int(now.timestamp()),
+            "last_ap_add_at": int(now.timestamp()),
+        }}
+        targets = [{"stage": "SR-5", "stage_id": "act54side_05", "modes": ["normal"]}]
+        entries, scheduled_at, note = self._round(targets, 0, 6, roster=roster)
+        self.assertEqual(len(entries), 1)
+        ready = datetime.fromisoformat(scheduled_at)
+        # 差 6 点理智，每点 6 分钟 → 36 分钟后。
+        self.assertEqual(int((ready - now).total_seconds() / 60), 36)
+        self.assertIn("不足以打 SR-5", note)
+
+    def test_a_stage_without_a_perfect_op_is_dropped_and_recorded(self) -> None:
+        import maa_activity_watch as watch
+
+        state: dict = {}
+        targets = [
+            {"stage": "SR-5", "stage_id": "act54side_05", "modes": ["normal"]},
+            {"stage": "SR-6", "stage_id": "act54side_06", "modes": ["normal"]},
+        ]
+
+        def pick(stage, _stage_id, _config, _roster):
+            if stage == "SR-5":
+                return None, "SR-5 暂无完全满足当前干员练度的作业", ["史尔特尔 专精3"]
+            return {"id": 2, "title": "t"}, "", []
+
+        with patch.object(watch, "round_budget", return_value=(100, 100)), \
+             patch.object(maa_copilot, "stage_sanity_cost", return_value=12), \
+             patch.object(maa_copilot, "pick_perfect_candidate", side_effect=pick):
+            entries, _scheduled_at, _note = watch.build_round(
+                {}, state, targets, SR_INDEX, None,
+                datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+            )
+        self.assertEqual([entry["stage"] for entry in entries], ["SR-6"])
+        self.assertEqual(state["stage_state"]["SR-5"]["gaps"], ["史尔特尔 专精3"])
+        self.assertNotIn("SR-6", state.get("stage_state", {}))
+
+
+class CopilotDispatchGateTests(unittest.TestCase):
+    """2c：派发闸门——到点 + 不在 blackout + 锁空闲 + 模拟器离线。"""
+
+    def setUp(self) -> None:
+        self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
+
+    def _blocker(self, scheduled_at="", *, blackout=None, depot=None,
+                 locked=False, online=(False, "")):
+        with patch.object(maa_action, "_copilot_blackout_reason", return_value=blackout), \
+             patch.object(maa_action, "depot_window_reason", return_value=depot), \
+             patch.object(maa_action, "is_run_locked", return_value=locked), \
+             patch.object(maa_action, "emulator_is_online", return_value=online):
+            return maa_action.dispatch_blocker({}, scheduled_at, self.at)
+
+    def test_the_gate_has_exactly_one_implementation(self) -> None:
+        """不变量 #13：闸门只许住在 `maa_action.py`，watcher 只是调用方。"""
+        import maa_activity_watch as watch
+
+        source = (ROOT / "scripts" / "maa_activity_watch.py").read_text(encoding="utf-8")
+        self.assertNotIn("def dispatch_blocker", source)
+        self.assertIn("maa_action.dispatch_blocker", source)
+        self.assertFalse(hasattr(watch, "dispatch_blocker"))
+        self.assertTrue(callable(maa_action.dispatch_blocker))
+        # 三处调用点各查一次同一份闸门（手动两处 + 自动一处）。
+        action_source = (ROOT / "scripts" / "maa_action.py").read_text(encoding="utf-8")
+        worker_source = (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8")
+        self.assertIn("dispatch_blocker(config, \"\", now_beijing())", action_source)
+        self.assertIn("maa_action.dispatch_blocker(config, \"\", now_beijing())",
+                      worker_source)
+
+    def test_all_clear_dispatches(self) -> None:
+        self.assertEqual(self._blocker(), "")
+
+    def test_every_blocker_is_visible(self) -> None:
+        cases = [
+            ({"scheduled_at": (self.at + timedelta(minutes=30)).isoformat()}, "等理智恢复"),
+            ({"blackout": "距 08:00 日常场次不足 25 分钟"}, "08:00"),
+            ({"depot": "处于 Depot 对表窗口"}, "Depot"),
+            ({"locked": True}, "run.lock"),
+            ({"online": (True, "BlueStacks 进程在跑")}, "模拟器正在使用"),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self._blocker(**kwargs))
+
+    def test_the_depot_window_is_kept_clear(self) -> None:
+        for hour, minute, blocked in (
+            (4, 19, False), (4, 20, True), (4, 30, True), (4, 59, True), (5, 0, False)
+        ):
+            with self.subTest(hour=hour, minute=minute):
+                reason = maa_action.depot_window_reason(
+                    datetime(2026, 9, 2, hour, minute, tzinfo=BEIJING)
+                )
+                self.assertEqual(bool(reason), blocked)
+
+    def test_dispatch_flips_the_state_to_queued_and_spawns_the_worker(self) -> None:
+        import maa_activity_watch as watch
+
+        token = "a" * 12
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            (searches / f"{token}.json").write_text(
+                json.dumps({"token": token, "status": "scheduled", "entries": []}),
+                encoding="utf-8",
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(watch, "state_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(maa_action, "dispatch_blocker", return_value=""), \
+                 patch.object(maa_action, "dispatch_batch") as dispatch:
+                status = watch._dispatch({}, token, {}, self.at)
+            state = json.loads((searches / f"{token}.json").read_text("utf-8"))
+        self.assertEqual(status, "dispatched")
+        self.assertEqual(state["status"], "queued")
+        self.assertTrue(state["execution_requested_at"])
+        dispatch.assert_called_once_with(token)
+
+    def test_a_blocked_round_stays_scheduled_and_is_never_dispatched(self) -> None:
+        import maa_activity_watch as watch
+
+        with patch.object(maa_action, "dispatch_blocker", return_value="run.lock 被占"), \
+             patch.object(maa_action, "dispatch_batch") as dispatch:
+            status = watch._dispatch({}, "a" * 12, {}, self.at)
+        self.assertEqual(status, "scheduled")
+        dispatch.assert_not_called()
+
+    def test_the_dispatcher_argv_is_exactly_run_batch(self) -> None:
+        with patch.object(maa_action.subprocess, "Popen") as popen, patch.object(
+            maa_action.Path, "is_file", return_value=True
+        ):
+            maa_action.dispatch_batch("b" * 12)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[-2:], ["run-batch", "b" * 12])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+
+class CopilotTimeBudgetTests(unittest.TestCase):
+    """2c：距下一场日常不足 `auto_copilot_min_lead_minutes` 就不开新关。"""
+
+    def test_a_near_daily_run_stops_the_round(self) -> None:
+        for at in (datetime(2026, 9, 9, 7, 30, tzinfo=BEIJING),
+                   datetime(2026, 9, 9, 21, 25, tzinfo=BEIJING)):
+            with self.subTest(at=at):
+                self.assertIsNotNone(maa_action.min_lead_reason({}, at))
+
+    def test_a_far_daily_run_lets_the_round_continue(self) -> None:
+        self.assertIsNone(
+            maa_action.min_lead_reason({}, datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING))
+        )
+
+    def test_the_lead_is_configurable_and_zero_disables_it(self) -> None:
+        at = datetime(2026, 9, 9, 7, 30, tzinfo=BEIJING)
+        self.assertIsNone(
+            maa_action.min_lead_reason({"auto_copilot_min_lead_minutes": 0}, at)
+        )
+        self.assertIsNotNone(
+            maa_action.min_lead_reason({"auto_copilot_min_lead_minutes": 120}, at)
+        )
+        # 它比 blackout 宽：blackout 只管「能不能开这一轮」。
+        self.assertGreater(maa_action.DEFAULT_MIN_LEAD_MINUTES, 25)
+
+    def test_the_watcher_gate_and_the_worker_share_the_same_lead(self) -> None:
+        # 派发前查一次（省得派出去立刻收尾），每关开始前再查一次，同一个函数。
+        import maa_activity_watch as watch
+        import maa_copilot_worker as worker
+
+        # watcher 经 `maa_action.dispatch_blocker()` 查（闸门只有一份，见 #13）。
+        self.assertIn("maa_action.dispatch_blocker",
+                      (ROOT / "scripts" / "maa_activity_watch.py").read_text(encoding="utf-8"))
+        self.assertIn("maa_action.min_lead_reason",
+                      (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8"))
+        self.assertFalse(hasattr(worker, "min_lead_reason"))
+        self.assertTrue(hasattr(watch.maa_action, "min_lead_reason"))
+        self.assertIn("min_lead_reason",
+                      (ROOT / "scripts" / "maa_action.py").read_text(encoding="utf-8"))
+
+
+class CopilotBatchExecutionTests(unittest.TestCase):
+    """2d：一条执行链——串行连抄、逐关记账、失败分级。"""
+
+    def _entry(self, stage, mode="normal", stage_id=None, cost=12):
+        return {
+            "stage": stage,
+            "stage_id": stage_id or SR_INDEX["codes"][stage],
+            "mode": mode,
+            "candidate": {"id": 1, "title": "稳定作业"},
+            "sanity_cost": cost,
+        }
+
+    def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None):
+        import maa_copilot_worker as worker
+
+        token = "a" * 12
+        ledger = maa_copilot.new_ledger(activity_key)
+        reports: list[dict] = []
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            state = {
+                "token": token, "status": "queued", "activity_key": activity_key,
+                "entries": entries, "message_id": "999",
+            }
+            (searches / f"{token}.json").write_text(json.dumps(state), encoding="utf-8")
+            patches = [
+                patch.object(maa_copilot, "SEARCHES_DIR", searches),
+                patch.object(worker, "RUNS_DIR", Path(raw)),
+                patch.object(worker, "state_lock", return_value=contextlib.nullcontext()),
+                patch.object(worker, "load_config", return_value={"channel_id": "1"}),
+                patch.object(worker, "emulator_is_online", return_value=(False, "")),
+                patch.object(worker, "_retire_round_controls"),
+                patch.object(worker, "_notice"),
+                patch.object(worker, "require_executable"),
+                patch.object(worker, "open_emulator"),
+                patch.object(worker, "wait_for_android"),
+                patch.object(worker, "verify_game_installed"),
+                patch.object(worker, "settle_android_runtime"),
+                patch.object(worker, "maa_subprocess_env", return_value={}),
+                patch.object(worker, "capture_screenshot", return_value=(True, "")),
+                patch.object(worker, "close_everything", return_value=[]),
+                patch.object(worker, "merge_last_run"),
+                patch.object(worker, "cleanup_run_files"),
+                patch.object(maa_action, "min_lead_reason", return_value=lead),
+                patch.object(worker, "_recheck_before_stage", return_value=(True, "")),
+                patch.object(maa_copilot, "ensure_ledger", return_value=(ledger, "")),
+                patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l),
+                patch.object(worker, "_fight_one", side_effect=fight),
+                patch.object(
+                    worker, "_post_report",
+                    side_effect=lambda config, embed, png: reports.append(embed),
+                ),
+            ]
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = worker._batch_run_locked(json.loads(
+                        (searches / f"{token}.json").read_text("utf-8")
+                    ))
+            final = json.loads((searches / f"{token}.json").read_text("utf-8"))
+        return SimpleNamespace(
+            code=code, ledger=ledger, report=reports[0], state=final,
+            results=reports[0]["fields"][0]["value"],
+        )
+
+    def test_a_clean_round_records_every_mode_and_reports_each_stage(self) -> None:
+        entries = [self._entry("SR-5"), self._entry("SR-5", "raid"), self._entry("SR-6")]
+        result = self._run(entries, lambda *a: ("won", ""))
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.state["status"], "executed")
+        self.assertEqual(
+            maa_copilot.ledger_pending_modes(
+                result.ledger, None, "SR-5", "act54side_05", ("normal", "raid")
+            ),
+            [],
+        )
+        for label in ("SR-5", "SR-5（突袭）", "SR-6"):
+            self.assertIn(label, result.results)
+        self.assertIn("3/3 通过", result.report["title"])
+
+    def test_one_failed_stage_does_not_stop_the_next_one(self) -> None:
+        entries = [self._entry("SR-5"), self._entry("SR-6"), self._entry("SR-8")]
+        calls: list[str] = []
+
+        def fight(_config, entry, _env, _log):
+            calls.append(entry["stage"])
+            if entry["stage"] == "SR-5":
+                return "failed", "输出含失败标记：Copilot Error"
+            return "won", ""
+
+        result = self._run(entries, fight)
+        self.assertEqual(calls, ["SR-5", "SR-6", "SR-8"])
+        self.assertEqual(result.code, 1)
+        self.assertEqual(result.state["status"], "execution_failed")
+        self.assertIn("❌ `SR-5`", result.results)
+        self.assertIn("✅ `SR-6`", result.results)
+        self.assertIn("✅ `SR-8`", result.results)
+
+    def test_a_navigation_failure_stops_the_whole_round(self) -> None:
+        entries = [self._entry("SR-5"), self._entry("SR-6")]
+        calls: list[str] = []
+
+        def fight(_config, entry, _env, _log):
+            calls.append(entry["stage"])
+            return "nav", "SR-5 导航或关卡界面检查失败：…"
+
+        result = self._run(entries, fight)
+        self.assertEqual(calls, ["SR-5"])
+        self.assertEqual(result.code, 1)
+        self.assertIn("❌ `SR-5`", result.results)
+        stop = next(f for f in result.report["fields"] if f["name"] == "停在")
+        self.assertIn("导航", stop["value"])
+
+    def test_a_failed_normal_skips_its_own_raid_but_keeps_the_next_stage(self) -> None:
+        entries = [self._entry("SR-5"), self._entry("SR-5", "raid"), self._entry("SR-6")]
+        calls: list[tuple[str, str]] = []
+
+        def fight(_config, entry, _env, _log):
+            calls.append((entry["stage"], entry["mode"]))
+            if entry["stage"] == "SR-5":
+                return "failed", "Copilot Error"
+            return "won", ""
+
+        result = self._run(entries, fight)
+        self.assertEqual(calls, [("SR-5", "normal"), ("SR-6", "normal")])
+        self.assertIn("⏭️ `SR-5（突袭）`", result.results)
+
+    def test_the_time_budget_stops_the_round_before_the_first_stage(self) -> None:
+        entries = [self._entry("SR-5"), self._entry("SR-6")]
+        calls: list[str] = []
+
+        def fight(_config, entry, _env, _log):
+            calls.append(entry["stage"])
+            return "won", ""
+
+        result = self._run(entries, fight, lead="距 22:00 日常场次不足 40 分钟")
+        self.assertEqual(calls, [])
+        stop = next(f for f in result.report["fields"] if f["name"] == "停在")
+        self.assertIn("40 分钟", stop["value"])
+
+    def test_the_copilot_argv_never_carries_a_downgrade_flag(self) -> None:
+        import maa_copilot_worker as worker
+
+        commands: list[list[str]] = []
+
+        def watchdog(_config, command, handle, _log_path, _env):
+            commands.append(command)
+            handle.write("Copilot Completed\n")
+            return 0, 0
+
+        with tempfile.TemporaryDirectory() as raw, \
+             patch.object(worker, "_prepare_op_file", return_value=("maa://1", False)), \
+             patch.object(worker, "_navigate_to_stage", return_value=(True, "")), \
+             patch.object(worker, "switch_to_raid", return_value=(True, "")), \
+             patch.object(worker, "_run_copilot_with_watchdog", side_effect=watchdog):
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("", encoding="utf-8")
+            outcome, _detail = worker._fight_one(
+                {"maa_bin": "/bin/maa"}, self._entry("SR-5", "raid"), {}, log_path
+            )
+        self.assertEqual(outcome, "won")
+        self.assertEqual(
+            commands[0],
+            ["/bin/maa", "copilot", "maa://1", "--formation", "--batch", "-v",
+             "--raid", "raid"],
+        )
+
+    def test_an_earlier_run_in_the_same_log_cannot_fake_a_win(self) -> None:
+        # 日志是追加的：上一趟的 `Copilot Completed` 不能把这一趟算成通关。
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw, \
+             patch.object(worker, "_prepare_op_file", return_value=("maa://1", False)), \
+             patch.object(worker, "_navigate_to_stage", return_value=(True, "")), \
+             patch.object(worker, "_run_copilot_with_watchdog", return_value=(0, 0)):
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("Copilot Completed\n", encoding="utf-8")
+            outcome, detail = worker._fight_one(
+                {"maa_bin": "/bin/maa"}, self._entry("SR-5"), {}, log_path
+            )
+        self.assertEqual(outcome, "unknown", detail)
+
+
+class CopilotRaidSwitchTests(unittest.TestCase):
+    """突袭切换：⚠️ 真机未验，因此必须是一个可以一键关掉的配置开关。"""
+
+    def test_the_switch_task_runs_a_custom_task_in_an_isolated_config(self) -> None:
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "config"
+            (source / "resource" / "tasks").mkdir(parents=True)
+            (source / "resource" / "tasks" / "tasks.json").write_text("{}", encoding="utf-8")
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("", encoding="utf-8")
+            written: dict[str, str] = {}
+            with patch.object(
+                worker.subprocess, "run",
+                return_value=SimpleNamespace(returncode=0, stdout="Custom Completed", stderr=""),
+            ) as run, patch.object(
+                worker, "atomic_write_text",
+                side_effect=lambda path, body: written.__setitem__(Path(path).name, body),
+            ):
+                ok, detail = worker.switch_to_raid(
+                    {"maa_bin": "/bin/maa"}, "SR-5",
+                    {"MAA_CONFIG_DIR": str(source)}, log_path,
+                )
+        self.assertTrue(ok, detail)
+        self.assertIn("ChangeToRaidDifficulty", written["copilot-raid.toml"])
+        self.assertEqual(run.call_args.args[0][:3], ["/bin/maa", "run", "copilot-raid"])
+        # 只读上游、只写临时目录（不变量 #37）。
+        self.assertNotEqual(run.call_args.kwargs["env"]["MAA_CONFIG_DIR"], str(source))
+
+    def test_an_empty_switch_task_skips_the_step_entirely(self) -> None:
+        import maa_copilot_worker as worker
+
+        with patch.object(worker.subprocess, "run") as run:
+            ok, detail = worker.switch_to_raid(
+                {"copilot_raid_switch_task": ""}, "SR-5", {}, Path("/nonexistent")
+            )
+        self.assertTrue(ok)
+        self.assertIn("跳过", detail)
+        run.assert_not_called()
+
+    def test_a_failed_switch_is_a_navigation_class_failure(self) -> None:
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw, patch.object(
+            worker, "_prepare_op_file", return_value=("maa://1", False)
+        ), patch.object(
+            worker, "_navigate_to_stage", return_value=(True, "")
+        ), patch.object(
+            worker, "switch_to_raid", return_value=(False, "SR-5 切换突袭难度失败：…")
+        ), patch.object(worker, "_run_copilot_with_watchdog") as watchdog:
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("", encoding="utf-8")
+            outcome, detail = worker._fight_one(
+                {}, {"stage": "SR-5", "stage_id": "act54side_05", "mode": "raid",
+                     "candidate": {"id": 1}},
+                {}, log_path,
+            )
+        self.assertEqual(outcome, "nav")
+        self.assertIn("切换突袭难度失败", detail)
+        watchdog.assert_not_called()
+
+
+class CopilotVictoryJudgementTests(unittest.TestCase):
+    """记账只在这一关被判定为通关时才写：退出码 0 不够（不变量 #33）。"""
+
+    def test_a_failure_marker_beats_a_zero_exit_code(self) -> None:
+        for marker in maa_clearing.COPILOT_FAILURE_MARKERS:
+            with self.subTest(marker=marker):
+                outcome, detail = maa_clearing.copilot_outcome(
+                    f"MissionStart\n{marker}\n", 0
+                )
+                self.assertEqual(outcome, "failed")
+                self.assertIn(marker, detail)
+
+    def test_a_victory_marker_with_a_zero_exit_code_is_a_win(self) -> None:
+        outcome, detail = maa_clearing.copilot_outcome(
+            "MissionStart\nCopilot Completed\n", 0
+        )
+        self.assertEqual(outcome, "won")
+        self.assertEqual(detail, "")
+
+    def test_no_marker_at_all_is_unknown_not_a_win(self) -> None:
+        outcome, detail = maa_clearing.copilot_outcome("MissionStart\n", 0)
+        self.assertEqual(outcome, "unknown")
+        self.assertIn("COPILOT_VICTORY_MARKERS", detail)
+
+    def test_a_nonzero_exit_code_is_always_a_failure(self) -> None:
+        self.assertEqual(
+            maa_clearing.copilot_outcome("Copilot Completed", 1)[0], "failed"
+        )
+
+    def test_an_unknown_outcome_is_never_recorded_as_cleared(self) -> None:
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        maa_copilot.record_copilot_attempt(
+            ledger, "SR-5", "normal", outcome="unknown", detail="no marker"
+        )
+        self.assertIsNone(ledger["stages"]["SR-5"]["normal"])
+
+
+class SanityYieldTests(unittest.TestCase):
+    """D11：理智不够刷默认关时让路，估不出一律照常刷。"""
+
+    def setUp(self) -> None:
+        self.plan = maa_common.normalize_plan(
+            {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
+        )
+        self.plan["annihilation"] = True
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+        self.at = datetime(2026, 9, 9, 22, 0, tzinfo=BEIJING)
+
+    def _yield(self, *, sanity, cost=18):
+        roster = None if sanity is None else {"sanity": {
+            "current": sanity, "max": 135,
+            "server_current_at": int(self.at.timestamp()),
+            "last_ap_add_at": int(self.at.timestamp()),
+        }}
+        with patch.object(
+            maa_copilot, "load_stage_index",
+            return_value={"codes": {"CE-6": "wk_melee_6"},
+                          "stages": {"wk_melee_6": "CE-6"}},
+        ), patch.object(maa_copilot, "stage_sanity_cost", return_value=cost), \
+             patch.object(maa_copilot, "load_roster", return_value=roster):
+            return maa_daily.attach_sanity_yield(self.plan, self.config, self.at)
+
+    def test_not_enough_sanity_drops_farming_and_keeps_annihilation(self) -> None:
+        plan = self._yield(sanity=7)
+        self.assertFalse(plan["farming"])
+        self.assertIn("理智 7 不足以刷 CE-6", plan["farming_skip_reason"])
+        rendered = maa_daily.render_daily_toml(plan, self.config)
+        self.assertNotIn('name = "刷理智"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+        for name in ('name = "基建换班"', 'name = "公开招募"', 'name = "信用商店"',
+                     'name = "领取奖励"', 'name = "返回主界面"'):
+            self.assertIn(name, rendered)
+
+    def test_enough_sanity_farms_as_usual(self) -> None:
+        plan = self._yield(sanity=60)
+        self.assertTrue(plan["farming"])
+        self.assertIn('name = "刷理智"', maa_daily.render_daily_toml(plan, self.config))
+
+    def test_an_unreadable_estimate_farms_as_usual(self) -> None:
+        # 森空岛不可用 / 关卡理智未知 → 宁可多刷一场（不变量 #26 的精神）。
+        self.assertTrue(self._yield(sanity=None)["farming"])
+        self.assertTrue(self._yield(sanity=7, cost=None)["farming"])
+
+    def test_a_throwing_probe_never_takes_the_farming_block_away(self) -> None:
+        with patch.object(maa_copilot, "load_stage_index", side_effect=OSError("boom")):
+            with contextlib.redirect_stdout(io.StringIO()):
+                plan = maa_daily.attach_sanity_yield(self.plan, self.config, self.at)
+        self.assertTrue(plan["farming"])
+
+    def test_two_independent_switches_cover_all_four_combinations(self) -> None:
+        for annihilation, farming in ((True, True), (True, False),
+                                      (False, True), (False, False)):
+            with self.subTest(annihilation=annihilation, farming=farming):
+                rendered = maa_daily.render_daily_toml(
+                    {**self.plan, "annihilation": annihilation, "farming": farming},
+                    self.config,
+                )
+                self.assertEqual('name = "每日剿灭"' in rendered, annihilation)
+                self.assertEqual('name = "刷理智"' in rendered, farming)
+
+    def test_the_daily_no_longer_dispatches_a_clearing_round(self) -> None:
+        self.assertFalse(hasattr(maa_daily, "dispatch_clearing_round"))
+        self.assertFalse(hasattr(maa_daily, "report_clearing_dispatch_failure"))
+        self.assertFalse(hasattr(maa_daily, "attach_clearing_yield"))
+
+
+class ManualCopilotPathTests(unittest.TestCase):
+    """2e：手动路径——选关即执行，不降级。"""
+
+    def _start(self, stage, watch_state, *, blocker=""):
+        with tempfile.TemporaryDirectory() as raw:
+            watch = Path(raw) / "activity_watch.json"
+            maa_common.atomic_write_json(watch, watch_state)
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            with patch.object(maa_action, "WATCH_PATH", watch), \
+                 patch.object(maa_action, "load_config", return_value={}), \
+                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "ensure_private_dirs"), \
+                 patch.object(maa_action, "dispatch_blocker", return_value=blocker), \
+                 patch.object(
+                     maa_action, "valid_copilot_stage",
+                     return_value=(SR_INDEX["codes"][stage], stage),
+                 ), \
+                 _nav_patch({"SR-8", "CE-6"}), \
+                 patch.object(maa_action.Path, "is_file", return_value=True), \
+                 patch.object(maa_action.subprocess, "Popen") as popen:
+                ok, message, token = maa_action.start_copilot_search(stage)
+            written = sorted(path.name for path in searches.glob("*.json"))
+            state = (
+                json.loads((searches / f"{token}.json").read_text("utf-8"))
+                if token
+                else {}
+            )
+        return SimpleNamespace(
+            ok=ok, message=message, state=state, popen=popen, written=written,
+        )
+
+    def test_an_activity_stage_expands_to_both_modes(self) -> None:
+        result = self._start("SR-8", {"activity_key": SR_KEY})
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(result.state["modes"], ["normal", "raid"])
+        self.assertEqual(result.state["activity_key"], SR_KEY)
+        self.assertIn("普通 + 突袭", result.message)
+        self.assertEqual(result.popen.call_args.args[0][-2:], ["search", result.state["token"]])
+
+    def test_a_supply_stage_only_gets_the_normal_mode(self) -> None:
+        result = self._start("CE-6", {"activity_key": SR_KEY})
+        self.assertEqual(result.state["modes"], ["normal"])
+        # 非活动关不参与活动复核，`activity_key` 留空。
+        self.assertEqual(result.state["activity_key"], "")
+
+    def test_a_blacked_out_manual_pick_writes_nothing_and_spawns_nothing(self) -> None:
+        """不变量 #13 的手动落点：07:50 说「抄 SR-8」当场拒绝，且不排程。"""
+        result = self._start(
+            "SR-8", {"activity_key": SR_KEY},
+            blocker="距 08:00 日常场次不足 25 分钟，为避免互斥抢占，请在日常结束后再抄作业。",
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("距 08:00 日常场次不足 25 分钟", result.message)
+        self.assertIn("请日常 / 对表结束后再点", result.message)
+        # 什么都不写、不派 worker：手动轮没人替它重试，排下去只会烂在 searches/。
+        self.assertEqual(result.written, [])
+        result.popen.assert_not_called()
+
+    def test_the_manual_gate_is_the_shared_one_and_runs_before_the_state_file(self) -> None:
+        # 三条时间闸门 + run.lock + 模拟器，一条都不能少（复用 dispatch_blocker）。
+        for blocker in ("处于 Depot 对表窗口（北京时间 04:20–05:00）",
+                        "距 22:00 日常场次不足 40 分钟",
+                        "另一场 MAA 正在运行（run.lock 被占）",
+                        "模拟器正在使用：BlueStacks 进程在跑"):
+            with self.subTest(blocker=blocker):
+                result = self._start("SR-8", {"activity_key": SR_KEY}, blocker=blocker)
+                self.assertFalse(result.ok)
+                self.assertIn(blocker, result.message)
+                self.assertEqual(result.written, [])
+
+    def test_a_stage_without_upstream_navigation_is_refused_before_any_work(self) -> None:
+        with patch.object(maa_action, "load_config", return_value={}), \
+             patch.object(
+                 maa_action, "valid_copilot_stage", return_value=("act54side_09", "SR-9")
+             ), _nav_patch({"SR-8"}), patch.object(
+                 maa_action.subprocess, "Popen"
+             ) as popen:
+            ok, message, token = maa_action.start_copilot_search("SR-9")
+        self.assertFalse(ok)
+        self.assertIsNone(token)
+        self.assertIn("MAA 未提供该关导航", message)
+        popen.assert_not_called()
+
+    def _search(self, *, blocker=""):
+        import maa_copilot_worker as worker
+        import maa_skland
+
+        token = "a" * 12
+        published: list[dict] = []
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            (searches / f"{token}.json").write_text(
+                json.dumps({
+                    "token": token, "status": "pending", "stage": "SR-8",
+                    "stage_id": "act54side_08", "modes": ["normal", "raid"],
+                    "activity_key": SR_KEY,
+                }),
+                encoding="utf-8",
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "SEARCH_LOCK_PATH", Path(raw) / "s.lock"), \
+                 patch.object(maa_copilot, "prune_expired_searches", return_value=0), \
+                 patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
+                 patch.object(worker, "state_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(maa_copilot, "load_stage_index",
+                              return_value={"stages": {"act54side_08": "SR-8"}}), \
+                 patch.object(maa_copilot, "stage_sanity_cost", return_value=21), \
+                 patch.object(maa_copilot, "load_roster", return_value=None), \
+                 patch.object(maa_skland, "refresh_roster", return_value={}), \
+                 patch.object(
+                     maa_copilot, "pick_perfect_candidate",
+                     return_value=({"id": 5, "title": "稳定作业"}, "", []),
+                 ), \
+                 patch.object(maa_action, "dispatch_blocker", return_value=blocker), \
+                 patch.object(
+                     maa_action, "publish_round",
+                     side_effect=lambda *a, **kw: (published.append(kw), "777")[1],
+                 ), \
+                 patch.object(maa_action, "dispatch_batch") as dispatch:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = worker.cmd_search(token)
+            state = json.loads((searches / f"{token}.json").read_text("utf-8"))
+        return SimpleNamespace(
+            rc=rc, state=state, dispatch=dispatch, token=token,
+            note=str(published[0].get("note") or "") if published else "",
+        )
+
+    def test_the_search_worker_queues_and_dispatches_the_round(self) -> None:
+        result = self._search()
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(result.state["status"], "queued")
+        self.assertEqual(
+            [(entry["stage"], entry["mode"]) for entry in result.state["entries"]],
+            [("SR-8", "normal"), ("SR-8", "raid")],
+        )
+        self.assertEqual(result.state["entries"][0]["sanity_cost"], 21)
+        self.assertEqual(result.state["message_id"], "777")
+        self.assertEqual(result.note, "手动选关，选中即执行。")
+        result.dispatch.assert_called_once_with(result.token)
+
+    def test_a_search_that_runs_into_the_blackout_is_never_dispatched(self) -> None:
+        """搜索跑了 20s 刚好跨进 blackout：卡照发，但状态停在 `scheduled`。"""
+        reason = "距 08:00 日常场次不足 25 分钟，为避免互斥抢占，请在日常结束后再抄作业。"
+        result = self._search(blocker=reason)
+        self.assertEqual(result.rc, 0)
+        self.assertEqual(result.state["status"], "scheduled")
+        self.assertEqual(result.state["last_prepare_error"], reason)
+        # 手动轮不自动重试；卡上说清「未启动」和出路，❌ 按钮仍然能点。
+        self.assertIn(f"本轮未启动：{reason}", result.note)
+        self.assertIn("重新选关", result.note)
+        self.assertIn("scheduled", maa_copilot.CANCELABLE_STATUSES)
+        self.assertNotIn("execution_requested_at", result.state)
+        result.dispatch.assert_not_called()
+
+    def test_the_run_batch_worker_refuses_to_touch_the_device_in_a_blackout(self) -> None:
+        """最后一道防线：抢到锁了也不开机，状态回 `scheduled`（第 4 点）。"""
+        import maa_copilot_worker as worker
+
+        token = "a" * 12
+        for gate in ("_copilot_blackout_reason", "depot_window_reason", "min_lead_reason"):
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as raw:
+                searches = Path(raw) / "searches"
+                searches.mkdir()
+                (searches / f"{token}.json").write_text(
+                    json.dumps({
+                        "token": token, "status": "queued", "message_id": "9",
+                        "entries": [{"stage": "SR-8", "mode": "normal"}],
+                    }),
+                    encoding="utf-8",
+                )
+                gates = {
+                    "_copilot_blackout_reason": None,
+                    "depot_window_reason": None,
+                    "min_lead_reason": None,
+                    gate: "闸门拦下了",
+                }
+                notices: list[str] = []
+                with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                     patch.object(worker, "state_lock",
+                                  return_value=contextlib.nullcontext()), \
+                     patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
+                     patch.object(worker, "run_lock",
+                                  return_value=contextlib.nullcontext(True)), \
+                     patch.object(worker, "open_emulator") as open_emulator, \
+                     patch.object(worker, "emulator_is_online",
+                                  return_value=(False, "")) as probe, \
+                     patch.object(worker, "_notice",
+                                  side_effect=lambda c, t, b, k: notices.append(b)), \
+                     patch.object(worker, "_batch_run_locked") as run_locked, \
+                     patch.object(maa_action, "_copilot_blackout_reason",
+                                  return_value=gates["_copilot_blackout_reason"]), \
+                     patch.object(maa_action, "depot_window_reason",
+                                  return_value=gates["depot_window_reason"]), \
+                     patch.object(maa_action, "min_lead_reason",
+                                  return_value=gates["min_lead_reason"]):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        rc = worker.cmd_run_batch(token)
+                state = json.loads((searches / f"{token}.json").read_text("utf-8"))
+                self.assertEqual(rc, 1)
+                self.assertEqual(state["status"], "scheduled")
+                self.assertEqual(state["last_prepare_error"], "本轮未启动：闸门拦下了")
+                open_emulator.assert_not_called()
+                probe.assert_not_called()
+                run_locked.assert_not_called()
+                self.assertTrue(any("闸门拦下了" in body for body in notices))
+
+    def test_a_clear_run_batch_still_reaches_the_locked_body(self) -> None:
+        import maa_copilot_worker as worker
+
+        token = "a" * 12
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir()
+            (searches / f"{token}.json").write_text(
+                json.dumps({
+                    "token": token, "status": "queued",
+                    "entries": [{"stage": "SR-8", "mode": "normal"}],
+                }),
+                encoding="utf-8",
+            )
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(worker, "load_config", return_value={}), \
+                 patch.object(worker, "run_lock",
+                              return_value=contextlib.nullcontext(True)), \
+                 patch.object(maa_action, "_copilot_blackout_reason", return_value=None), \
+                 patch.object(maa_action, "depot_window_reason", return_value=None), \
+                 patch.object(maa_action, "min_lead_reason", return_value=None), \
+                 patch.object(worker, "_batch_run_locked", return_value=0) as run_locked:
+                rc = worker.cmd_run_batch(token)
+        self.assertEqual(rc, 0)
+        run_locked.assert_called_once()
+
+    def test_only_a_perfect_op_is_ever_accepted(self) -> None:
+        # `ratio < 1.0` 或有软 / 硬缺口的作业一律不入候选（D12）。
+        items = [
+            {"id": 1, "ratio": 0.9, "gaps": ["史尔特尔（未拥有）"], "soft_gaps": []},
+            {"id": 2, "ratio": 1.0, "gaps": [], "soft_gaps": ["莫斯提马 模组1"]},
+            {"id": 3, "ratio": 1.0, "gaps": [], "soft_gaps": []},
+        ]
+        with patch.object(maa_copilot, "search_copilots", return_value=items) as search:
+            candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
+                "SR-8", "act54side_08", {}, None
+            )
+        self.assertEqual(candidate["id"], 3)
+        self.assertEqual((reason, gaps), ("", []))
+        self.assertFalse(search.call_args.kwargs["use_cache"])
+        self.assertEqual(search.call_args.kwargs["limit"], 1000)
+
+        with patch.object(maa_copilot, "search_copilots", return_value=items[:2]):
+            candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
+                "SR-8", "act54side_08", {}, None
+            )
+        self.assertIsNone(candidate)
+        self.assertIn("练度", reason)
+        self.assertIn("史尔特尔（未拥有）", gaps)
+
+
+class CopilotDowngradeGuardTests(unittest.TestCase):
+    """不变量 #15（收紧）：三个降级开关一个都不许出现在任何脚本里。"""
+
+    def test_no_script_ever_mentions_a_downgrade_flag(self) -> None:
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for flag in ("--ignore-requirements", "--use-sanity-potion",
+                         "--support-unit", "support_unit_usage", "support_unit_name"):
+                with self.subTest(path=path.name, flag=flag):
+                    self.assertNotIn(flag, source)
+
+    def test_the_clearing_queue_is_gone_from_every_surface(self) -> None:
+        needles = ("clearing_enabled", "needs_manual", "ex_gate", "sanity-probe",
+                   "maa-clearing")
+        targets = [
+            *sorted((ROOT / "scripts").glob("*.py")),
+            ROOT / "state" / "config.json",
+            ROOT / "skills" / "games" / "maa-operator" / "SKILL.md",
+            ROOT / "README.md",
+            ROOT / "docs" / "DEV_GUIDE.md",
+            ROOT / "docs" / "DISCORD_GUIDE.md",
+        ]
+        for path in targets:
+            source = path.read_text(encoding="utf-8")
+            for needle in needles:
+                with self.subTest(path=path.name, needle=needle):
+                    self.assertNotIn(needle, source)
+
+
+class DeployPromptPatchTests(unittest.TestCase):
+    """步骤 1 部署踩到的坑：Hermes 会把提示词重排成无引号、折行的 plain scalar。"""
+
+    OLD = deploy.OLD_MAA_CHANNEL_PROMPTS[1]
+
+    def _document(self, body: str) -> str:
+        return (
+            "timezone: Etc/UTC\n"
+            "platforms:\n"
+            "  discord:\n"
+            "    channels:\n"
+            "      - id: '123'\n"
+            "        skills:\n"
+            "          - maa-operator\n"
+            "    channel_prompts:\n"
+            f"{body}"
+            "      '456': '别的频道'\n"
+        )
+
+    def test_a_reflowed_two_line_prompt_is_replaced_in_place(self) -> None:
+        # 实例：Hermes 把这一条重排成无引号、在 `maa-operator` 后折行的 plain scalar。
+        head, _space, tail = self.OLD.rpartition(" ")
+        text = self._document(f"      '123': {head}\n        {tail}\n")
+        patched = deploy.patch_config_yaml_text(text, "123")
+        document = deploy.parse_yaml(patched)
+        prompts = document["platforms"]["discord"]["channel_prompts"]
+        self.assertEqual(prompts["123"], deploy.MAA_CHANNEL_PROMPT)
+        self.assertEqual(prompts["456"], "别的频道")
+        self.assertEqual(document["timezone"], "Etc/UTC")
+        # 折行的续行整条被吃掉，旧文案一个字都不留。
+        self.assertNotIn("只处理今天的关卡", patched)
+        self.assertEqual(len(patched.splitlines()), len(text.splitlines()) - 1)
+
+    def test_a_single_quoted_prompt_is_still_replaced(self) -> None:
+        text = self._document(f"      '123': '{self.OLD}'\n")
+        patched = deploy.patch_config_yaml_text(text, "123")
+        prompts = deploy.parse_yaml(patched)["platforms"]["discord"]["channel_prompts"]
+        self.assertEqual(prompts["123"], deploy.MAA_CHANNEL_PROMPT)
+
+    def test_an_already_current_prompt_is_left_alone(self) -> None:
+        text = self._document(f"      '123': '{deploy.MAA_CHANNEL_PROMPT}'\n")
+        self.assertEqual(deploy.patch_config_yaml_text(text, "123"), text)
+
+    def test_an_unexpected_prompt_still_refuses_to_deploy(self) -> None:
+        text = self._document("      '123': 别人手工写的文案\n")
+        with self.assertRaises(RuntimeError) as caught:
+            deploy.patch_config_yaml_text(text, "123")
+        self.assertIn("非预期文案", str(caught.exception))
+
+    def test_a_missing_prompt_is_inserted(self) -> None:
+        text = self._document("")
+        patched = deploy.patch_config_yaml_text(text, "123")
+        prompts = deploy.parse_yaml(patched)["platforms"]["discord"]["channel_prompts"]
+        self.assertEqual(prompts["123"], deploy.MAA_CHANNEL_PROMPT)
+
+    def test_retired_clearing_keys_are_swept_from_the_live_config(self) -> None:
+        self.assertIn("clearing_enabled", deploy.RETIRED_CONFIG_KEYS)
+        self.assertEqual(len(deploy.RETIRED_CONFIG_KEYS), 5)
+        repo = json.loads((ROOT / "state" / "config.json").read_text("utf-8"))
+        for key in deploy.RETIRED_CONFIG_KEYS:
+            self.assertNotIn(key, repo)
+        for key in ("auto_copilot_min_lead_minutes", "copilot_raid_switch_task",
+                    "annihilation_sanity"):
+            self.assertIn(key, repo)
+
+
+class CopilotCardTests(unittest.TestCase):
+    """2e：抄作业卡——候选集 = 自动路径的目标集合（含已通关的关，供重打）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.watch = self.root / "activity_watch.json"
+        self.searches = self.root / "searches"
+        self.searches.mkdir()
+        self.nav_keys = {"SR-1", "SR-5", "SR-8", "1-7", "CE-6"}
+
+    def _view(self, config, *, watch=None, ledger=None, roster=None, at=None):
+        maa_common.atomic_write_json(self.watch, watch or {})
+        with patch.object(maa_plan_card, "WATCH_PATH", self.watch), \
+             patch.object(maa_copilot, "SEARCHES_DIR", self.searches), \
+             patch.object(maa_copilot, "load_stage_index", return_value=SR_INDEX), \
+             patch.object(maa_copilot, "load_ledger", return_value=ledger), \
+             patch.object(maa_copilot, "load_roster", return_value=roster), \
+             _nav_patch(self.nav_keys), \
+             patch.object(
+                 maa_plan_card, "stage_drops",
+                 return_value={"SR-8": {"materials": ["异铁组"], "ap": 21}},
+             ), \
+             patch.object(maa_plan_card, "activity_deadline_text", return_value=""):
+            return maa_plan_card.copilot_card_view(config, at)
+
+    def test_the_candidate_set_is_the_whole_activity_not_just_the_recommended_stages(self) -> None:
+        # `maa activity` 只推荐 4 关，目标集合是本地索引里整个前缀（2b）。
+        _embed, options = self._view({"activity_stages": ["SR-8"]},
+                                     watch={"activity_key": SR_KEY})
+        self.assertEqual([stage for _l, stage, _d in options], ["SR-1", "SR-5", "SR-8"])
+
+    def test_stages_without_upstream_navigation_are_listed_but_never_offered(self) -> None:
+        embed, options = self._view({}, watch={"activity_key": SR_KEY})
+        listing = embed["fields"][0]["value"]
+        self.assertIn("SR-2", listing)
+        self.assertIn("⛔", listing)
+        self.assertNotIn("SR-2", [stage for _l, stage, _d in options])
+
+    def test_each_stage_shows_its_own_progress(self) -> None:
+        maa_common.atomic_write_json(
+            self.searches / f"{'a' * 12}.json",
+            {
+                "status": "scheduled",
+                "scheduled_at": "2026-09-09T14:30:00+08:00",
+                "entries": [{"stage": "SR-1", "mode": "normal"}],
+            },
+        )
+        ledger = {"stages": {
+            "SR-5": {"normal": "t", "raid": "t"},
+            "SR-8": {"normal": "t", "raid": None},
+        }}
+        embed, options = self._view(
+            {}, watch={"activity_key": SR_KEY, "batch_token": "a" * 12},
+            ledger=ledger,
+        )
+        listing = embed["fields"][0]["value"]
+        self.assertIn("`SR-5` · ✅ 已通", listing)
+        self.assertIn("🔁 普通已通、突袭待补", listing)
+        self.assertIn("⏳ 排程 14:30", listing)
+        # 已通的关照样能选——手动路径允许重打（D14）。
+        self.assertIn("SR-5", [stage for _l, stage, _d in options])
+
+    def test_a_stage_that_failed_the_op_search_shows_what_is_missing(self) -> None:
+        watch = {"activity_key": SR_KEY, "stage_state": {}}
+        maa_clearing.record_stage_failure(
+            watch, "SR-8", kind="op", detail="SR-8 暂无完全满足当前干员练度的作业",
+            gaps=["史尔特尔 专精3（你技能7）"],
+        )
+        embed, _options = self._view({}, watch=watch)
+        self.assertIn("🚫 练度不满足（缺：史尔特尔 专精3（你技能7））",
+                      embed["fields"][0]["value"])
+
+    def test_without_an_activity_it_degrades_to_supplies_and_main(self) -> None:
+        embed, options = self._view(
+            {"all_supply_stages_open": True}, watch={},
+            at=datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING),
+        )
+        stages = [stage for _label, stage, _desc in options]
+        self.assertIn("1-7", stages)
+        self.assertIn("CE-6", stages)
+        self.assertNotIn("SR-8", stages)
+        self.assertIn("资源本 / 主线", embed["fields"][0]["name"])
+
+    def test_the_select_values_are_opaque_and_resolved_through_the_registry(self) -> None:
+        rows, entries = maa_action._copilot_card_components(
+            [("SR-8 · 异铁组", "SR-8", "🕐 待抄")]
+        )
+        custom_id = "hermes:btn:maa-copilot:card:stage-select"
+        self.assertEqual(rows[0]["components"][0]["custom_id"], custom_id)
+        option = rows[0]["components"][0]["options"][0]
+        self.assertEqual(option["value"], "choice:0")
+        self.assertNotIn("SR-8", option["value"])
+        self.assertEqual(
+            entries[custom_id]["select_args"]["choice:0"],
+            ["copilot", "find", "SR-8"],
+        )
+
+    def test_no_navigable_stage_means_no_control_at_all(self) -> None:
+        rows, entries = maa_action._copilot_card_components([])
+        self.assertEqual(rows, [])
+        self.assertEqual(entries, {})
+
+    def _send_card(self, options, registry_seed, card_state):
+        posted: list[tuple] = []
+        buttons = self.root / "buttons.json"
+        card_path = self.root / "card.json"
+        maa_common.atomic_write_json(buttons, registry_seed)
+        if card_state is not None:
+            maa_common.atomic_write_json(card_path, card_state)
+        with patch.object(
+            maa_action, "load_config", return_value={"channel_id": "123"}
+        ), patch.object(
+            maa_plan_card, "copilot_card_view", return_value=({"title": "t"}, options)
+        ), patch.object(maa_copilot, "CARD_PATH", card_path), patch.object(
+            maa_copilot, "ensure_private_dirs"
+        ), patch.object(maa_action, "BUTTONS_PATH", buttons), patch.object(
+            maa_action, "state_lock", return_value=contextlib.nullcontext()
+        ), patch.object(maa_action, "retire_discord_components") as retire, patch.object(
+            maa_action, "discord_token", return_value="token"
+        ), patch.object(
+            maa_action, "discord_request",
+            side_effect=lambda *a, **k: posted.append(a) or {"id": "999"},
+        ):
+            ok, message = maa_action.copilot_card()
+        return SimpleNamespace(
+            ok=ok, message=message, retire=retire, posted=posted,
+            registry=json.loads(buttons.read_text(encoding="utf-8")),
+            card=json.loads(card_path.read_text(encoding="utf-8")),
+        )
+
+    def test_a_new_card_retires_the_previous_one_and_its_registry_entry(self) -> None:
+        stale = "hermes:btn:maa-copilot:card:stage-select"
+        result = self._send_card(
+            [("SR-8", "SR-8", "d")],
+            {stale: {"select_args": {"choice:0": ["copilot", "find", "OLD-1"]}},
+             "hermes:btn:agent-book:x": {}},
+            {"message_id": "555"},
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.retire.call_args.args[1], "555")
+        self.assertEqual(
+            result.registry[stale]["select_args"]["choice:0"],
+            ["copilot", "find", "SR-8"],
+        )
+        self.assertIn("hermes:btn:agent-book:x", result.registry)
+        self.assertEqual(result.card["message_id"], "999")
+
+    def test_a_card_without_options_leaves_no_stale_registry_entry(self) -> None:
+        stale = "hermes:btn:maa-copilot:card:stage-select"
+        result = self._send_card([], {stale: {}}, {"message_id": "555"})
+        self.assertTrue(result.ok)
+        self.assertNotIn(stale, result.registry)
+        self.assertIn("没有上游写了导航定义的关", result.message)
+
+    def test_the_card_prefix_survives_both_sweeps(self) -> None:
+        """它既不进 07:50 的 `hermes:btn:maa:` 清扫，也不被搜索 TTL 清扫误删。"""
+        card_key = f"{maa_copilot.CARD_BUTTON_PREFIX}stage-select"
+        self.assertFalse(card_key.startswith(maa_plan_card.BUTTON_PREFIX))
+        buttons = self.root / "sweep-buttons.json"
+        maa_common.atomic_write_json(
+            buttons, {"hermes:btn:maa:am:stage-select": {}, card_key: {}}
+        )
+        with patch.object(maa_common, "BUTTONS_PATH", buttons):
+            maa_common.prune_button_registry(maa_plan_card.BUTTON_PREFIX)
+        registry = json.loads(buttons.read_text(encoding="utf-8"))
+        self.assertNotIn("hermes:btn:maa:am:stage-select", registry)
+        self.assertIn(card_key, registry)
+        (self.searches / f"{'d' * 12}.json").write_text(
+            json.dumps({"expires_at": "2020-01-01T00:00:00+08:00"}), encoding="utf-8"
+        )
+        with patch.object(maa_copilot, "SEARCHES_DIR", self.searches), patch.object(
+            maa_copilot, "ensure_private_dirs"
+        ):
+            maa_copilot.prune_expired_searches(registry)
+        self.assertIn(card_key, registry)
+
+    def test_the_card_state_file_is_not_inside_the_searches_directory(self) -> None:
+        self.assertNotEqual(maa_copilot.CARD_PATH.parent, maa_copilot.SEARCHES_DIR)
+        self.assertFalse(maa_copilot.SEARCH_TOKEN_RE.fullmatch("card"))
+
+
+class ActivityWatchTickTests(unittest.TestCase):
+    """watcher 一 tick 的整链：轮换 → 排轮 → 发已排程卡 → 派发。"""
+
+    SNAPSHOT = {
+        "stages": ["SR-8", "SR-7"],
+        "events": [{"title": "SideStory「月行水上」", "stages": ["SR-8", "SR-7"]}],
+        "all_supply_stages_open": False,
+    }
+
+    def _tick(self, state, *, snapshot=None, entries=None, targets=None,
+              blocker="", notify=None, seed_rounds=None):
+        import maa_activity_watch as watch
+
+        dispatch = unittest.mock.MagicMock()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            watch_path = root / "activity_watch.json"
+            searches = root / "searches"
+            searches.mkdir()
+            for token, round_state in (seed_rounds or {}).items():
+                maa_common.atomic_write_json(searches / f"{token}.json", round_state)
+            maa_common.atomic_write_json(watch_path, state)
+            ledger = maa_copilot.new_ledger(SR_KEY)
+            patches = [
+                patch.object(watch, "WATCH_PATH", watch_path),
+                patch.object(maa_copilot, "SEARCHES_DIR", searches),
+                patch.object(watch, "load_config", return_value={"channel_id": "1"}),
+                patch.object(watch, "state_lock", return_value=contextlib.nullcontext()),
+                patch.object(maa_plan_card, "query_activity_snapshot",
+                             return_value=snapshot if snapshot is not None else self.SNAPSHOT),
+                patch.object(maa_plan_card, "persist_activity_snapshot"),
+                patch.object(watch, "_notify",
+                             side_effect=notify or (lambda *a, **k: None)),
+                patch.object(maa_copilot, "ensure_ledger", return_value=(ledger, "")),
+                patch.object(maa_copilot, "load_stage_index", return_value=SR_INDEX),
+                patch.object(maa_copilot, "load_roster", return_value=None),
+                patch.object(maa_copilot, "ensure_private_dirs"),
+                patch.object(
+                    watch, "collect_targets",
+                    return_value=(targets if targets is not None else [], []),
+                ),
+                patch.object(
+                    watch, "build_round",
+                    return_value=(entries or [], "2026-09-09T12:00:00+08:00", ""),
+                ),
+                patch.object(maa_action, "dispatch_blocker", return_value=blocker),
+                patch.object(maa_action, "publish_round", return_value="888"),
+                patch.object(maa_action, "dispatch_batch", dispatch),
+            ]
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                import maa_skland
+
+                stack.enter_context(
+                    patch.object(maa_skland, "refresh_roster", return_value={})
+                )
+                result = watch.run_once()
+                rounds = [
+                    json.loads(path.read_text(encoding="utf-8"))
+                    for path in sorted(searches.glob("*.json"))
+                ]
+        return SimpleNamespace(state=result, rounds=rounds, dispatch=dispatch)
+
+    def test_a_new_activity_resets_the_watch_state_and_announces_itself(self) -> None:
+        notices: list[str] = []
+        result = self._tick(
+            {"activity_key": "旧活动|AT", "stage_state": {"AT-1": {}}},
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(result.state["activity_key"], SR_KEY)
+        self.assertEqual(result.state["prefix"], "SR")
+        self.assertEqual(result.state["stage_state"], {})
+        self.assertTrue(any("已上线" in title for title in notices))
+
+    def test_nothing_left_to_do_parks_the_watcher(self) -> None:
+        result = self._tick({"activity_key": SR_KEY, "prefix": "SR"}, targets=[])
+        self.assertEqual(result.state["status"], "done")
+        self.assertEqual(result.rounds, [])
+
+    def test_a_planned_round_is_written_published_and_dispatched(self) -> None:
+        entries = [{"stage": "SR-1", "stage_id": "act54side_01", "mode": "normal",
+                    "candidate": {"id": 1}, "sanity_cost": 12}]
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR"},
+            targets=[{"stage": "SR-1", "stage_id": "act54side_01", "modes": ["normal"]}],
+            entries=entries,
+        )
+        self.assertEqual(result.state["status"], "dispatched")
+        self.assertEqual(len(result.rounds), 1)
+        self.assertEqual(result.rounds[0]["source"], "activity-watch")
+        self.assertEqual(result.rounds[0]["activity_key"], SR_KEY)
+        self.assertEqual(result.rounds[0]["message_id"], "888")
+        self.assertEqual(result.rounds[0]["entries"], entries)
+
+    def test_a_blocked_round_is_written_but_left_scheduled(self) -> None:
+        entries = [{"stage": "SR-1", "stage_id": "act54side_01", "mode": "normal",
+                    "candidate": {"id": 1}, "sanity_cost": 12}]
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR"},
+            targets=[{"stage": "SR-1", "stage_id": "act54side_01", "modes": ["normal"]}],
+            entries=entries,
+            blocker="run.lock 被占",
+        )
+        self.assertEqual(result.state["status"], "scheduled")
+        self.assertEqual(result.rounds[0]["status"], "scheduled")
+
+    def test_the_watcher_never_adopts_a_manual_scheduled_round(self) -> None:
+        """手动轮被闸门挡下停在 `scheduled`，watcher 不许替它重试（第 3 点）。
+
+        watcher 只跟踪它自己写进 `state["batch_token"]` 的那个 token，
+        `source == "discord"` 的轮子对它是不存在的。
+        """
+        manual = "f" * 12
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR"},
+            targets=[],
+            seed_rounds={
+                manual: {
+                    "token": manual,
+                    "status": "scheduled",
+                    "source": "discord",
+                    "stage": "SR-8",
+                    "entries": [{"stage": "SR-8", "mode": "normal"}],
+                    "last_prepare_error": "距 08:00 日常场次不足 25 分钟",
+                }
+            },
+        )
+        # 没有 batch_token → watcher 连看都不看它，更不会派发。
+        self.assertNotIn("batch_token", result.state)
+        result.dispatch.assert_not_called()
+        self.assertEqual(len(result.rounds), 1)
+        self.assertEqual(result.rounds[0]["status"], "scheduled")
+        self.assertEqual(result.rounds[0]["source"], "discord")
+        self.assertNotIn("execution_requested_at", result.rounds[0])
+
+    def test_the_activity_ending_needs_two_empty_snapshots(self) -> None:
+        empty = {"stages": [], "events": [], "all_supply_stages_open": False}
+        first = self._tick({"activity_key": SR_KEY}, snapshot=empty)
+        self.assertEqual(first.state["empty_observations"], 1)
+        self.assertEqual(first.state["activity_key"], SR_KEY)
+        notices: list[str] = []
+        second = self._tick(
+            {"activity_key": SR_KEY, "empty_observations": 1}, snapshot=empty,
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(second.state["status"], "idle")
+        self.assertEqual(second.state["activity_key"], "")
+        self.assertTrue(any("活动已结束" in title for title in notices))

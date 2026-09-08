@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,16 @@ PRESERVED_RUNTIME_CACHE_KEYS = (
     "maa_core_version",
     "maa_cli_version",
     "activity_stages",
+)
+
+# 已经没有代码再读的配置键。`deploy_state()` 每次部署顺手删掉它们——
+# config.json 是逐键 merge 的，不删就会永远留在线上（四期步骤 2 拆掉通关队列）。
+RETIRED_CONFIG_KEYS = (
+    "clearing_enabled",
+    "clearing_manual_after_days",
+    "clearing_annihilation_sanity",
+    "clearing_ex_stage_count",
+    "clearing_sanity_ocr_roi",
 )
 
 MAA_CONFIG_RELATIVE_PATHS = (
@@ -243,7 +254,8 @@ def deploy_state(channel_id: str) -> None:
     }
     current_config.update(desired_config)
     current_config.update(preserved_runtime_caches)
-    current_config.pop("resource_update_interval_days", None)
+    for retired in ("resource_update_interval_days", *RETIRED_CONFIG_KEYS):
+        current_config.pop(retired, None)
     write_json(target / "config.json", current_config)
 
     for name in ("defaults.json", "plan.json", "last_run.json"):
@@ -515,18 +527,12 @@ def patch_config_yaml_text(text: str, channel_id: str) -> str:
         entry = f"'{channel_id}': '{MAA_CHANNEL_PROMPT}'"
         if current is None:
             text = _insert_channel_prompt(text, entry)
+        elif current in OLD_MAA_CHANNEL_PROMPTS:
+            text = _replace_channel_prompt(text, channel_id, entry)
         else:
-            replaced = False
-            for old in OLD_MAA_CHANNEL_PROMPTS:
-                old_entry = f"      '{channel_id}': '{old}'\n"
-                if old_entry in text:
-                    text = text.replace(old_entry, f"      {entry}\n")
-                    replaced = True
-                    break
-            if not replaced:
-                raise RuntimeError(
-                    f"channel_prompts['{channel_id}'] 已有非预期文案，请手工确认后再部署：{current!r}"
-                )
+            raise RuntimeError(
+                f"channel_prompts['{channel_id}'] 已有非预期文案，请手工确认后再部署：{current!r}"
+            )
 
     try:
         after = parse_yaml(text)
@@ -545,6 +551,49 @@ def patch_config_yaml_text(text: str, channel_id: str) -> str:
             "补丁后 platforms.discord.channel_prompts 未落到预期文案，已放弃写盘"
         )
     return text
+
+
+def _prompt_key_pattern(channel_id: str) -> re.Pattern[str]:
+    """`channel_prompts` 里这一条的键行：带单引号、双引号或裸写都算。"""
+    quoted = re.escape(channel_id)
+    return re.compile(
+        rf"^(?P<indent>\s*)(?:'{quoted}'|\"{quoted}\"|{quoted})\s*:"
+    )
+
+
+def _replace_channel_prompt(text: str, channel_id: str, entry: str) -> str:
+    """把这一条**整条**（含续行）换成新的单行带引号条目。
+
+    不能按「单行带引号」整行匹配：Hermes 会把条目重排成**无引号、折成两行**的
+    plain scalar，例如
+
+        '123': 你是 MAA 长草助手。只处理今天的关卡、跳过和最近结果；所有读取与变更
+          必须遵守 maa-operator 技能……
+
+    这时旧写法找不到那一行，就会误判成「已有非预期文案」而拒绝部署
+    （2026-09-09 步骤 1 部署时实际踩到）。所以定位键行之后，把**缩进更深的续行**
+    一起吃掉再替换。是否需要替换由**解析后的值**判断（调用方比对
+    `OLD_MAA_CHANNEL_PROMPTS`），不比文本。
+    """
+    lines = text.splitlines(keepends=True)
+    pattern = _prompt_key_pattern(channel_id)
+    hits = [index for index, line in enumerate(lines) if pattern.match(line)]
+    if len(hits) != 1:
+        raise RuntimeError(
+            f"config.yaml 里 channel_prompts['{channel_id}'] 的条目定位不唯一（{len(hits)} 处）"
+        )
+    start = hits[0]
+    indent = len(lines[start]) - len(lines[start].lstrip(" "))
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if not line.strip():
+            break
+        if len(line) - len(line.lstrip(" ")) <= indent:
+            break
+        end += 1
+    lines[start:end] = [" " * indent + entry + "\n"]
+    return "".join(lines)
 
 
 def _insert_channel_prompt(text: str, entry: str) -> str:

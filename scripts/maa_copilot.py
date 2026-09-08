@@ -17,7 +17,7 @@ import re
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from maa_common import (
     BUTTONS_PATH,
@@ -683,8 +683,249 @@ def execution_uri(
     return f"file://{PREPARED_DIR}/{cand_id}.json", True
 
 
+def pick_perfect_candidate(
+    stage: str,
+    stage_id: str,
+    config: dict[str, Any],
+    roster: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str, list[str]]:
+    """这一关唯一的作业筛选口径：`ratio == 1.0` 且**无软硬缺口**（D12 / 不变量 #18）。
+
+    返回 `(候选 | None, 说不到的原因, 最接近那份作业还缺什么)`。
+    永不降级到助战、永不忽略练度要求——借了助战之后这关不能开代理，
+    以后日常刷到它会执行不了。缓存一律绕过（`use_cache=False`）：新活动首日
+    prts 上的作业每小时都在长，读 12 小时前的缓存等于永远搜不到。
+    """
+    candidates = search_copilots(
+        stage_id, stage, config, roster, limit=1000, use_cache=False
+    )
+    for candidate in candidates:
+        if (
+            candidate.get("ratio") == 1.0
+            and not candidate.get("gaps")
+            and not candidate.get("soft_gaps")
+        ):
+            return candidate, "", []
+    if not candidates:
+        return None, f"{stage} 在 prts.plus 上暂时没有作业", []
+    best = candidates[0]
+    gaps = list(best.get("gaps") or []) + list(best.get("soft_gaps") or [])
+    return None, f"{stage} 暂无完全满足当前干员练度的作业", gaps[:6]
+
+
 # ---------------------------------------------------------------------------
-# Text rendering (candidate cards)
+# 目标集合（四期 2b）：当期活动前缀在本地索引里的全部关，按打的顺序排好
+# ---------------------------------------------------------------------------
+
+# 教学关不打（上游导航链也不走它）。
+TUTORIAL_MARKER = "-TR-"
+_NUMBERED_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9]{1,8})-(?P<seq>\d{1,2})$")
+_EX_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9]{1,8})-EX-(?P<seq>\d{1,2})$")
+_S_RE = re.compile(r"^(?P<prefix>[A-Za-z0-9]{1,8})-S-(?P<seq>\d{1,2})$")
+
+
+def activity_stage_codes(index: dict[str, Any], prefix: str) -> list[str]:
+    """本地 Tile-Pos 索引里属于 `prefix` 的全部关，按**数字 → EX → S** 升序。
+
+    索引（`stage_index.json`）是唯一的关卡全集来源：`maa activity` 只给上游
+    推荐的那 4 关，而目标集合要的是整个活动（`SR-1..8`、将来的 `XX-EX-n` /
+    `XX-S-n`）。教学关（`-TR-`）排除；认不出形状的关排在最后（字典序），
+    这样上游哪天多出一种关名也不会被静默丢掉。
+    """
+    prefix = str(prefix or "")
+    if not prefix:
+        return []
+    codes = index.get("codes")
+    if not isinstance(codes, dict):
+        return []
+    ranked: list[tuple[int, int, str]] = []
+    for raw in codes:
+        code = str(raw)
+        if TUTORIAL_MARKER in code:
+            continue
+        for group, pattern in ((0, _NUMBERED_RE), (1, _EX_RE), (2, _S_RE)):
+            match = pattern.match(code)
+            if match and match.group("prefix") == prefix:
+                ranked.append((group, int(match.group("seq")), code))
+                break
+        else:
+            if code.split("-", 1)[0] == prefix and code != prefix:
+                ranked.append((3, 0, code))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [code for _group, _seq, code in ranked]
+
+
+# ---------------------------------------------------------------------------
+# 本地作业记账（四期 2a）：`copilot/ledger.json`
+# ---------------------------------------------------------------------------
+
+LEDGER_PATH = COPILOT_DIR / "ledger.json"
+LEDGER_SCHEMA_VERSION = 1
+LEDGER_ATTEMPT_LIMIT = 40
+
+# 记账种子（来源：spike A 报告 `docs/spikes/copilot-list-2026-09-08.md` 与用户自述）。
+# SR-5 / SR-6 用户此前自己打过，09-08 23:40 的 spike 又重打了一遍；SR-8 是 09-08
+# 15:17 由抄作业通关的。三关的**突袭都没打过**，留空。只在**首次建账**且当期活动
+# 前缀就是 `SR` 时写——换了活动、或账本已经存在，一律不写。
+SEED_ACTIVITY_PREFIX = "SR"
+SEED_CLEARED_NORMAL = ("SR-5", "SR-6", "SR-8")
+SEED_AT = "2026-09-08T23:58:00+08:00"
+
+
+def _safe_key(value: str) -> str:
+    """活动 key → 能当文件名的一段（归档账本用）。"""
+    cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", str(value or "")).strip("-")
+    return (cleaned or "unknown")[:80]
+
+
+def new_ledger(activity_key: str) -> dict[str, Any]:
+    return {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "activity_key": str(activity_key or "")[:200],
+        "stages": {},
+        "updated_at": now_beijing().isoformat(),
+    }
+
+
+def load_ledger(path: Path | None = None) -> dict[str, Any] | None:
+    """读记账；文件不存在、坏掉或结构不对都返回 None（= 还没建账）。
+
+    坏文件不抛异常是刻意的：记账挂在 watcher 与卡片两条只读路径上，
+    一个坏掉的账本绝不能把整轮带走（D-2 的教训）。返回 None 的后果是
+    「什么都没通关」→ 最多重抄一遍，不会漏抄。
+    """
+    try:
+        state = load_json(path or LEDGER_PATH, None)
+    except (ValueError, OSError):
+        return None
+    if not isinstance(state, dict) or not isinstance(state.get("stages"), dict):
+        return None
+    return state
+
+
+def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    target = path or LEDGER_PATH
+    ledger["schema_version"] = LEDGER_SCHEMA_VERSION
+    ledger["updated_at"] = now_beijing().isoformat()
+    ensure_private_dirs()
+    atomic_write_json(target, ledger)
+    os.chmod(target, 0o600)
+    return ledger
+
+
+def seed_ledger(ledger: dict[str, Any], activity_key: str) -> dict[str, Any]:
+    """首次建账时把已知已通的关写进去，避免上线第一轮重抄一遍。
+
+    只认 `SEED_ACTIVITY_PREFIX`；且**只补空位**——已有记账一律不覆盖。
+    """
+    if _activity_prefix(activity_key) != SEED_ACTIVITY_PREFIX:
+        return ledger
+    stages = ledger.setdefault("stages", {})
+    for stage in SEED_CLEARED_NORMAL:
+        entry = stages.setdefault(stage, {"normal": None, "raid": None, "attempts": []})
+        if not entry.get("normal"):
+            entry["normal"] = SEED_AT
+    ledger["seeded"] = SEED_ACTIVITY_PREFIX
+    return ledger
+
+
+def _activity_prefix(activity_key: str) -> str:
+    """`SideStory「月行水上」|SR` → `SR`（key 由 `activity_target()` 造）。"""
+    return str(activity_key or "").rpartition("|")[2]
+
+
+def ensure_ledger(
+    activity_key: str, *, path: Path | None = None
+) -> tuple[dict[str, Any], str]:
+    """拿到当期活动的账本，返回 `(ledger, 变更说明)`。
+
+    活动 key 变了（新活动 / 复刻）→ 旧账归档到 `ledger-<key>.json` 再新开一份。
+    归档而不是删：用户回头想知道上个活动抄到哪了，只有这份记录说得清。
+    """
+    target = path or LEDGER_PATH
+    ledger = load_ledger(target)
+    if ledger is not None and ledger.get("activity_key") == str(activity_key or ""):
+        return ledger, ""
+    note = ""
+    if ledger is not None:
+        archive = target.parent / f"ledger-{_safe_key(ledger.get('activity_key'))}.json"
+        ensure_private_dirs()
+        atomic_write_json(archive, ledger)
+        os.chmod(archive, 0o600)
+        note = f"旧账已归档到 {archive.name}"
+    fresh = new_ledger(activity_key)
+    if ledger is None:
+        seed_ledger(fresh, activity_key)
+    save_ledger(fresh, target)
+    return fresh, note
+
+
+def ledger_stage(ledger: dict[str, Any], stage: str) -> dict[str, Any]:
+    stages = ledger.setdefault("stages", {})
+    entry = stages.get(stage)
+    if not isinstance(entry, dict):
+        entry = {"normal": None, "raid": None, "attempts": [], "skipped_reason": ""}
+        stages[stage] = entry
+    if not isinstance(entry.get("attempts"), list):
+        entry["attempts"] = []
+    return entry
+
+
+def record_copilot_attempt(
+    ledger: dict[str, Any],
+    stage: str,
+    mode: str,
+    *,
+    outcome: str,
+    op: int = 0,
+    detail: str = "",
+    at: datetime | None = None,
+) -> dict[str, Any]:
+    """记一次执行。**只有 `won` 才写模式的通关时间戳**。
+
+    突袭失败时普通那格照旧保留（它确实打过了），但这一关**不算通关**——
+    `ledger_pending_modes()` 会在下一轮只排剩下的 `raid`（D7）。
+    """
+    entry = ledger_stage(ledger, stage)
+    moment = (at or now_beijing()).isoformat()
+    entry["attempts"].append(
+        {
+            "at": moment,
+            "mode": mode,
+            "op": int(op or 0),
+            "outcome": str(outcome)[:20],
+            "detail": str(detail)[:300],
+        }
+    )
+    del entry["attempts"][:-LEDGER_ATTEMPT_LIMIT]
+    if outcome == "won" and mode in ("normal", "raid"):
+        entry[mode] = moment
+    return ledger
+
+
+def ledger_pending_modes(
+    ledger: dict[str, Any] | None,
+    roster: dict[str, Any] | None,
+    stage: str,
+    stage_id: str,
+    modes: Iterable[str],
+) -> list[str]:
+    """这一关还差哪些模式（D10 的两条「已通关」判据合并在这里）。
+
+    ① 本地记账里该模式有时间戳 → 那个模式过了；
+    ② 森空岛该关所属 zone 全清 → 整关都当过了（zone 粒度的妥协）。
+    两条是**或**的关系：记账是精确但可能缺（上线前打的），zone 是粗但覆盖历史。
+    """
+    if zone_fully_cleared(roster, stage_id):
+        return []
+    stages = (ledger or {}).get("stages")
+    entry = stages.get(stage) if isinstance(stages, dict) else None
+    done = entry if isinstance(entry, dict) else {}
+    return [mode for mode in modes if not done.get(mode)]
+
+
+# ---------------------------------------------------------------------------
+# Text rendering (cards)
 # ---------------------------------------------------------------------------
 
 BUTTON_PREFIX = "hermes:btn:maa-copilot:"
@@ -697,6 +938,12 @@ CARD_BUTTON_PREFIX = f"{BUTTON_PREFIX}card:"
 # 刻意**不放在 `SEARCHES_DIR`** 下——那个目录里的每个 `*.json` 都会被
 # `prune_expired_searches()` 当成一次搜索删掉。
 CARD_PATH = COPILOT_DIR / "card.json"
+
+# 还能取消的状态：`scheduled`（排好没派）与 `queued`（派了没抢到锁）。
+# `executing` 起就可能已经消耗理智，取消没有意义也不安全。
+CANCELABLE_STATUSES = frozenset({"pending", "running", "failed", "scheduled", "queued"})
+# 一轮「还没跑完」的状态：卡片按它判「这关是不是已经排进这一轮了」。
+LIVE_ROUND_STATUSES = frozenset({"scheduled", "queued", "executing"})
 
 
 def ensure_private_dirs() -> None:
@@ -731,14 +978,7 @@ def supersede_search(token: str) -> tuple[bool, Any]:
     path = SEARCHES_DIR / f"{token}.json"
     with state_lock():
         state = load_json(path, None)
-        if not isinstance(state, dict) or state.get("status") not in {
-            "pending",
-            "running",
-            "failed",
-            "done",
-            "queued",
-            "preparing",
-        }:
+        if not isinstance(state, dict) or state.get("status") not in CANCELABLE_STATUSES:
             return False, None
         registry = load_json(BUTTONS_PATH, {})
         if not isinstance(registry, dict):
@@ -751,15 +991,15 @@ def supersede_search(token: str) -> tuple[bool, Any]:
         return True, state.get("message_id")
 
 
-def recover_stale_prebattle_dispatch(
-    token: str, state: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Restore a confirmation card when its worker died before battle start."""
-    if state.get("status") not in {"queued", "preparing"}:
+def recover_stale_dispatch(token: str, state: dict[str, Any]) -> dict[str, Any] | None:
+    """派出去的 worker 在碰模拟器之前就失联时，把这一轮放回 `scheduled`。
+
+    只处理 `queued`（动作脚本已原子接单、worker 还没抢到锁）这一种；`executing`
+    起就可能已经消耗理智，绝不自动重排。
+    """
+    if state.get("status") != "queued":
         return None
-    started = state.get("preparation_started_at") or state.get(
-        "execution_requested_at"
-    )
+    started = state.get("execution_requested_at")
     try:
         age = now_beijing() - datetime.fromisoformat(str(started))
     except (TypeError, ValueError) as exc:
@@ -770,30 +1010,16 @@ def recover_stale_prebattle_dispatch(
     path = SEARCHES_DIR / f"{token}.json"
     with state_lock():
         fresh = load_json(path, None)
-        fresh_started = (
-            fresh.get("preparation_started_at")
-            or fresh.get("execution_requested_at")
-            if isinstance(fresh, dict)
-            else None
-        )
         if (
             not isinstance(fresh, dict)
-            or fresh.get("status") not in {"queued", "preparing"}
-            or fresh_started != started
+            or fresh.get("status") != "queued"
+            or fresh.get("execution_requested_at") != started
         ):
             return None
-        fresh["status"] = "done"
-        fresh["last_prepare_error"] = (
-            "执行进程在启动模拟器前失联；已恢复确认按钮，可再次执行。"
-        )
+        fresh["status"] = "scheduled"
+        fresh["last_prepare_error"] = "执行进程在启动模拟器前失联；本轮已放回排程。"
         fresh["last_prepare_failed_at"] = now_beijing().isoformat()
-        for key in (
-            "requested_index",
-            "requested_mode",
-            "execution_requested_at",
-            "preparation_started_at",
-        ):
-            fresh.pop(key, None)
+        fresh.pop("execution_requested_at", None)
         atomic_write_json(path, fresh)
         return fresh
 
@@ -828,10 +1054,92 @@ def prune_expired_searches(registry: dict[str, Any] | None = None) -> int:
     return len(expired)
 
 
+# 森空岛 zone 定位用的 stage_id 形状：`act54side_05` → (`act54side`, 5)。
+# EX / 剧情关（`act5d0_ex01`、`act53side_sp01`）永远匹配不上，落到 None。
+STAGE_SERIAL_RE = re.compile(r"^([A-Za-z0-9]+?)_(\d+)$")
+
+
+def stage_zone(
+    roster: dict[str, Any] | None, stage_id: str
+) -> tuple[dict[str, Any], int] | None:
+    """定位这一关在森空岛里的 zone：`(zone, 关卡序号)`，定位不到返回 None。
+
+    只做**定位**，不下任何结论。`zone_progress_warning()`（只在能证明未解锁时
+    开口的单向启发）与 `zone_fully_cleared()`（D10 的 zone 全清判据）共用这段
+    解析，但**两条规则本身不合并**——把「沉默 ≠ 已解锁」和「全清 = 通关」混在
+    一起会立刻弄丢前者的性质（三期不变量 #29 的精神）。
+
+    只认第一个 `totalStage > 0` 的 zone：把全局战斗关序号映射到 zone 内的
+    cleared 计数在跨 zone 时本来就不成立（剧情关污染边界）。
+    """
+    if not isinstance(roster, dict):
+        return None
+    progress = roster.get("activity_progress")
+    if not isinstance(progress, dict):
+        return None
+    match = STAGE_SERIAL_RE.match(str(stage_id or ""))
+    if not match:
+        return None
+    act_id, seq = match.group(1), int(match.group(2))
+    zones = progress.get(act_id)
+    if not isinstance(zones, list) or not zones:
+        return None
+    target = next(
+        (
+            zone
+            for zone in zones
+            if isinstance(zone, dict) and int(zone.get("totalStage") or 0) > 0
+        ),
+        None,
+    )
+    if target is None:
+        return None
+    return target, seq
+
+
+def zone_fully_cleared(roster: dict[str, Any] | None, stage_id: str) -> bool:
+    """森空岛该关所属 zone 是否 `clearedStage == totalStage`（D10）。
+
+    这是「已通关」的第二条判据（第一条是本地记账）。森空岛只有 zone 粒度，
+    所以代价是**用户自己手打过的关可能被再抄一遍**——用户已接受（D10）。
+    定位不到 zone（EX / 剧情关、活动不在进度里）一律 False，交给本地记账。
+    """
+    found = stage_zone(roster, stage_id)
+    if found is None:
+        return False
+    zone, _seq = found
+    total = int(zone.get("totalStage") or 0)
+    return total > 0 and int(zone.get("clearedStage") or 0) >= total
+
+
+def zone_is_unopened(roster: dict[str, Any] | None, stage_id: str) -> bool:
+    """该关所属活动的 zone 是否**全部** `totalStage == 0`（D9：活动尚未全开）。
+
+    真为真时该关先不排，下一轮再看；**不记失败**（等下去会自己变好）。
+    森空岛不可用、活动不在进度里一律返回 False——多排一关的代价远小于
+    「森空岛一坏就整个活动不抄」。
+    """
+    if not isinstance(roster, dict):
+        return False
+    progress = roster.get("activity_progress")
+    if not isinstance(progress, dict):
+        return False
+    match = STAGE_SERIAL_RE.match(str(stage_id or ""))
+    if not match:
+        return False
+    zones = progress.get(match.group(1))
+    if not isinstance(zones, list) or not zones:
+        return False
+    return all(
+        isinstance(zone, dict) and int(zone.get("totalStage") or 0) == 0
+        for zone in zones
+    )
+
+
 def zone_progress_warning(
     stage_label: str, stage_id: str, roster: dict[str, Any] | None
 ) -> str | None:
-    """One-line preflight warning for the candidate card.
+    """One-line preflight warning for a stage.
 
     ONE-WAY heuristic: skland's zone progress counts EVERY stage including
     story stages (clearedStage/totalStage), while stage_id's trailing number
@@ -846,32 +1154,11 @@ def zone_progress_warning(
     Numbered stages spilling past the first zone (act17side) stay silent:
     a wrong "not unlocked" on a fully cleared zone is worse than silence.
     """
-    if not isinstance(roster, dict):
+    found = stage_zone(roster, stage_id)
+    if found is None:
         return None
-    progress = roster.get("activity_progress")
-    if not isinstance(progress, dict):
-        return None
-    match = re.match(r"^([A-Za-z0-9]+?)_(\d+)$", stage_id)
-    if not match:
-        # story/EX/ST stages (act5d0_ex01, act53side_sp01) never match either
-        return None
-    act_id, seq = match.group(1), int(match.group(2))
-    zones = progress.get(act_id)
-    if not isinstance(zones, list) or not zones:
-        return None
-    # Only the first zone with stages counts: mapping a global battle-stage
-    # number onto a zone-local cleared count is unsound across zones (story
-    # stages pollute the boundaries), so anything past it stays silent.
-    target = next(
-        (
-            z
-            for z in zones
-            if isinstance(z, dict) and int(z.get("totalStage") or 0) > 0
-        ),
-        None,
-    )
-    if target is None:
-        return None
+    target, seq = found
+    act_id = STAGE_SERIAL_RE.match(str(stage_id or "")).group(1)  # type: ignore[union-attr]
     total = int(target.get("totalStage") or 0)
     if seq > total:
         return None
@@ -901,136 +1188,84 @@ def zone_progress_warning(
     )
 
 
-def build_candidate_card(
+def entry_lines(entries: list[dict[str, Any]]) -> list[str]:
+    """把一轮的条目渲染成人话（已排程卡 / 战报共用）。"""
+    lines: list[str] = []
+    for entry in entries:
+        candidate = entry.get("candidate") or {}
+        mode_label = "突袭" if entry.get("mode") == "raid" else "普通"
+        cost = entry.get("sanity_cost")
+        cost_text = f" · {cost} 理智" if isinstance(cost, int) and cost > 0 else ""
+        lines.append(
+            f"`{entry.get('stage', '')}`（{mode_label}）{cost_text} · "
+            f"{str(candidate.get('title') or '')[:40]}"
+        )
+    return lines
+
+
+def build_scheduled_card(
     token: str,
-    candidates: list[dict[str, Any]],
-    roster_ok: bool,
-    stage_label: str,
-    roster_hint: str = "",
-    stage_id: str = "",
-    roster: dict[str, Any] | None = None,
-    auto_confirm: bool = False,
-    activity_title: str = "",
-    sanity_text: str = "",
+    entries: list[dict[str, Any]],
+    *,
+    title: str,
+    scheduled_at: str = "",
+    note: str = "",
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Embed + components + registry entries for a candidate card."""
-    shown_candidates = candidates[:1] if auto_confirm else candidates
-    description = search_summary(stage_label, shown_candidates, roster_ok)
-    if roster_hint:
-        description += f"\n{roster_hint}"
-    if sanity_text:
-        description += f"\n{sanity_text}"
-    if stage_id:
-        zone_warning = zone_progress_warning(stage_label, stage_id, roster)
-        if zone_warning:
-            description += f"\n{zone_warning}"
+    """「已排程」卡：一轮要打的 `(关, 模式)` 清单 + **唯一**一个「取消本轮」按钮。
+
+    候选卡的 ▶️ / 🔥 / 🔄 三种按钮在四期步骤 2 全部删除（D6）：选关即执行，
+    执行方式由记账与理智预算决定，没有可供用户挑选的候选。
+    """
+    total = sum(
+        int(entry.get("sanity_cost") or 0)
+        for entry in entries
+        if isinstance(entry.get("sanity_cost"), int)
+    )
+    fields: list[dict[str, Any]] = [
+        {
+            "name": "本轮清单",
+            "value": ("\n".join(entry_lines(entries)) or "—")[:1024],
+            "inline": False,
+        },
+        {"name": "预计理智", "value": f"{total}", "inline": True},
+    ]
+    when = "现在"
+    try:
+        when = f"{datetime.fromisoformat(scheduled_at):%m-%d %H:%M}"
+    except (TypeError, ValueError):
+        pass
+    fields.append({"name": "预计开始", "value": when, "inline": True})
+    if note:
+        fields.append({"name": "说明", "value": note[:1024], "inline": False})
     embed = {
-        "title": (
-            f"🆕 {activity_title or '新活动'}：确认执行 {stage_label}"
-            if auto_confirm
-            else f"🤖 {stage_label} 抄作业候选"
-        )[:256],
-        "description": description[:4000],
+        "title": title[:256],
+        "description": "跑完会发一条多关战报；不使用助战、不忽略练度要求、不吃药不碎石。",
         "color": 0x5865F2,
+        "fields": fields,
         "timestamp": now_beijing().isoformat(),
     }
-    buttons: list[dict[str, Any]] = []
-    registry: dict[str, dict[str, Any]] = {}
-    if auto_confirm:
-        confirm_id = f"{BUTTON_PREFIX}{token}:confirm"
-        buttons.append(
-            {
-                "type": 2,
-                "style": 3,
-                "label": "✅ 确认执行（普通）",
-                "custom_id": confirm_id,
-            }
-        )
-        registry[confirm_id] = {
-            "kind": "exec",
-            "script": "maa_action.py",
-            "args": ["copilot", "pick", token, "1", "normal"],
+    cancel_id = f"{BUTTON_PREFIX}{token}:cancel"
+    components = [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "❌ 取消本轮",
+                    "custom_id": cancel_id,
+                }
+            ],
         }
-        cancel_id = f"{BUTTON_PREFIX}{token}:cancel"
-        buttons.append(
-            {"type": 2, "style": 2, "label": "❌ 取消", "custom_id": cancel_id}
-        )
-        registry[cancel_id] = {
+    ]
+    registry = {
+        cancel_id: {
             "kind": "exec",
             "script": "maa_action.py",
             "args": ["copilot", "cancel", token],
         }
-        embed["footer"] = {"text": "普通模式 · 不使用理智药或源石"}
-        return embed, [{"type": 1, "components": buttons}], registry
-    for index, _candidate in enumerate(candidates[:3], start=1):
-        custom_id = f"{BUTTON_PREFIX}{token}:{index}"
-        buttons.append(
-            {"type": 2, "style": 3, "label": f"▶️ {index}", "custom_id": custom_id}
-        )
-        registry[custom_id] = {
-            "kind": "exec",
-            "script": "maa_action.py",
-            "args": ["copilot", "pick", token, str(index), "normal"],
-        }
-        raid_id = f"{BUTTON_PREFIX}{token}:raid-{index}"
-        buttons.append(
-            {"type": 2, "style": 4, "label": f"🔥 {index}", "custom_id": raid_id}
-        )
-        registry[raid_id] = {
-            "kind": "exec",
-            "script": "maa_action.py",
-            "args": ["copilot", "pick", token, str(index), "raid"],
-        }
-    cancel_id = f"{BUTTON_PREFIX}{token}:cancel"
-    buttons.append({"type": 2, "style": 2, "label": "❌ 取消", "custom_id": cancel_id})
-    registry[cancel_id] = {
-        "kind": "exec",
-        "script": "maa_action.py",
-        "args": ["copilot", "cancel", token],
     }
-    again_id = f"{BUTTON_PREFIX}{token}:again"
-    buttons.append({"type": 2, "style": 2, "label": "🔄 换一批", "custom_id": again_id})
-    registry[again_id] = {
-        "kind": "exec",
-        "script": "maa_action.py",
-        "args": ["copilot", "again", token],
-    }
-    components = [{"type": 1, "components": buttons[:5]}]
-    if len(buttons) > 5:
-        components.append({"type": 1, "components": buttons[5:10]})
     return embed, components, registry
-
-
-def ratio_label(ratio: float | None, roster_ok: bool) -> str:
-    if ratio is None:
-        return "未接入森空岛，练度未校验" if not roster_ok else "练度未知"
-    return f"满足 {ratio * 100:.0f}%"
-
-
-def candidate_lines(candidates: list[dict[str, Any]], roster_ok: bool) -> list[str]:
-    lines: list[str] = []
-    for index, cand in enumerate(candidates, start=1):
-        ratio = cand["ratio"]
-        slots = max(int(cand.get("slots") or 0), 1)
-        gaps = cand.get("gaps") or []
-        soft = cand.get("soft_gaps") or []
-        head = f"{index}. **{cand['title']}** — {cand['uploader']}"
-        if ratio is not None:
-            satisfied = min(int(round(ratio * slots)), slots)
-            if ratio >= 1:
-                head += f" · ✅ 满足 {slots}/{slots}"
-            else:
-                head += f" · ⚠️ 满足 {satisfied}/{slots}"
-        else:
-            head += " · " + ratio_label(None, roster_ok)
-        lines.append(head)
-        if gaps:
-            lines.append(f"   ⚠️ 缺：{'；'.join(gaps[:3])}")
-        if soft:
-            lines.append(f"   · {'；'.join(soft[:2])}")
-        if cand.get("minimum_required"):
-            lines.append(f"   · 需 MaaCore {cand['minimum_required']}")
-    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1144,14 +1379,3 @@ def roster_age_hint(roster: dict[str, Any]) -> str:
     return f"（森空岛数据 {days} 天前）" if days and days > 0 else ""
 
 
-def search_summary(
-    stage_label: str,
-    candidates: list[dict[str, Any]],
-    roster_ok: bool,
-) -> str:
-    if not candidates:
-        return f"🔍 没找到 {stage_label} 的可执行作业。"
-    lines = [f"🔍 {stage_label} 的作业候选："] + candidate_lines(candidates, roster_ok)
-    if not roster_ok:
-        lines.append("（未接入森空岛，练度未校验，按热度排序）")
-    return "\n".join(lines)

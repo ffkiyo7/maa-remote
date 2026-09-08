@@ -34,6 +34,9 @@ CONFIG_PATH = STATE_DIR / "config.json"
 DEFAULTS_PATH = STATE_DIR / "defaults.json"
 PLAN_PATH = STATE_DIR / "plan.json"
 LAST_RUN_PATH = STATE_DIR / "last_run.json"
+# 活动 watcher 的粗状态（当期活动、每关退避记账、本轮 token）。三个模块都读它，
+# 路径只在这里定义一次。
+WATCH_PATH = STATE_DIR / "activity_watch.json"
 RUN_LOCK_PATH = STATE_DIR / "run.lock"
 LAST_RUN_LOCK_PATH = STATE_DIR / "last_run.lock"
 
@@ -581,7 +584,7 @@ def emulator_is_online(config: dict[str, Any]) -> tuple[bool, str]:
     """模拟器是不是已经开着——也就是「用户此刻在玩」？
 
     在**每一条自动链路**抢到 `run.lock` 之后、`open_emulator()` 之前调用
-    （日常 am/pm、抄作业 worker、通关队列、Depot）。动机是 `PLAN_NAV_GATE.md`
+    （日常 am/pm、抄作业 `run-batch`、Depot）。动机是 `PLAN_NAV_GATE.md`
     结论 3：任何失败路径都会 `close_everything()` 直接退掉 BlueStacks，
     等于把正在玩的用户踢出游戏。用户的决定是「先探，不改清理逻辑」。
 

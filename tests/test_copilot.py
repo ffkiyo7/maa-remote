@@ -738,33 +738,43 @@ class ExecutionUriTests(unittest.TestCase):
 
 
 class ButtonRegistryTests(unittest.TestCase):
-    def test_auto_activity_card_only_offers_confirm_and_cancel(self) -> None:
-        candidate = {
-            "id": 1,
-            "title": "稳定作业",
-            "uploader": "doctor",
-            "ratio": 1.0,
-            "slots": 1,
-            "gaps": [],
-            "soft_gaps": [],
-            "minimum_required": "",
-        }
-        _embed, components, registry = maa_copilot.build_candidate_card(
-            "a" * 12,
-            [candidate],
-            True,
-            "AT-8",
-            auto_confirm=True,
-            activity_title="SideStory「墟」复刻",
-            sanity_text="🧠 理智够用",
+    def test_the_scheduled_card_carries_exactly_one_cancel_button(self) -> None:
+        # 四期 D6：候选卡的 ▶️ / 🔥 / 🔄 三种按钮全部删除，选关即执行。
+        entries = [
+            {"stage": "SR-5", "mode": "normal", "sanity_cost": 12,
+             "candidate": {"id": 1, "title": "稳定作业"}},
+            {"stage": "SR-5", "mode": "raid", "sanity_cost": 12,
+             "candidate": {"id": 1, "title": "稳定作业"}},
+        ]
+        embed, components, registry = maa_copilot.build_scheduled_card(
+            "a" * 12, entries, title="🤖 自动作业已排程",
+            scheduled_at="2026-09-09T02:10:00+08:00",
         )
         buttons = components[0]["components"]
-        self.assertEqual([button["label"] for button in buttons], ["✅ 确认执行（普通）", "❌ 取消"])
-        confirm = registry[f"hermes:btn:maa-copilot:{'a' * 12}:confirm"]
-        self.assertEqual(
-            confirm["args"], ["copilot", "pick", "a" * 12, "1", "normal"]
+        self.assertEqual([button["label"] for button in buttons], ["❌ 取消本轮"])
+        cancel = registry[f"hermes:btn:maa-copilot:{'a' * 12}:cancel"]
+        self.assertEqual(cancel["args"], ["copilot", "cancel", "a" * 12])
+        self.assertEqual(len(registry), 1)
+        # 登记表里再也不会出现候选按钮的键。
+        self.assertFalse(
+            any(":raid-" in key or key.endswith(":again") or key.endswith(":confirm")
+                for key in registry)
         )
-        self.assertFalse(any("raid" in key or "again" in key for key in registry))
+        listed = embed["fields"][0]["value"]
+        self.assertIn("SR-5", listed)
+        self.assertIn("突袭", listed)
+        self.assertEqual(embed["fields"][1]["value"], "24")
+
+    def test_no_module_still_builds_candidate_buttons(self) -> None:
+        """候选卡整套（`build_candidate_card` / `copilot pick|again`）必须已删干净。"""
+        self.assertFalse(hasattr(maa_copilot, "build_candidate_card"))
+        self.assertFalse(hasattr(maa_action, "copilot_pick"))
+        self.assertFalse(hasattr(maa_action, "copilot_again"))
+        for argv in (["copilot", "pick", "a" * 12, "1", "normal"],
+                     ["copilot", "again", "a" * 12]):
+            ok, message = maa_action.dispatch(argv)
+            self.assertFalse(ok)
+            self.assertIn("不支持的动作", message)
 
     def test_copilot_prefix_survives_daily_maa_sweep(self) -> None:
         # DEV_GUIDE invariant #7: the daily card only removes hermes:btn:maa:
@@ -837,10 +847,10 @@ class ButtonRegistryTests(unittest.TestCase):
             token = "a" * 12
             path = searches / f"{token}.json"
             path.write_text(
-                json.dumps({"token": token, "status": "done", "message_id": "123"}),
+                json.dumps({"token": token, "status": "scheduled", "message_id": "123"}),
                 encoding="utf-8",
             )
-            owned = f"hermes:btn:maa-copilot:{token}:confirm"
+            owned = f"hermes:btn:maa-copilot:{token}:cancel"
             buttons.write_text(json.dumps({owned: {}}), encoding="utf-8")
             with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
                  patch.object(maa_copilot, "BUTTONS_PATH", buttons), \
@@ -979,15 +989,6 @@ class PickValidationTests(unittest.TestCase):
             else:
                 self.assertIsNotNone(reason, f"{at} 应拒绝")
 
-    def test_pick_rejects_bad_token_index_mode(self) -> None:
-        with patch.object(maa_action, "load_config", return_value=self.config):
-            ok, _message = maa_action.copilot_pick("nothex!", "1", "normal")
-            self.assertFalse(ok)
-            ok, _message = maa_action.copilot_pick("a" * 12, "1", "evil")
-            self.assertFalse(ok)
-            ok, _message = maa_action.copilot_pick("a" * 12, "0", "normal")
-            self.assertFalse(ok)
-
     def test_copilot_cancel_cleans_buttons_and_state(self) -> None:
         # NEW-1: copilot_cancel used BUTTONS_PATH without importing it
         # (NameError, ❌ button dead).  Full happy path: cancel a search,
@@ -999,8 +1000,8 @@ class PickValidationTests(unittest.TestCase):
             tok = "a" * 12
             (searches / f"{tok}.json").write_text(
                 json.dumps({
-                    "token": tok, "status": "done", "stage": "TO-9",
-                    "candidates": [],
+                    "token": tok, "status": "scheduled", "stage": "TO-9",
+                    "entries": [],
                 }),
                 encoding="utf-8",
             )
@@ -1024,873 +1025,6 @@ class PickValidationTests(unittest.TestCase):
             self.assertIn("hermes:btn:agent-book:x", registry)
             state = json.loads((searches / f"{tok}.json").read_text(encoding="utf-8"))
             self.assertEqual(state["status"], "canceled")
-
-    def test_pick_rejects_out_of_range_candidate(self) -> None:
-        state = {"token": "a" * 12, "status": "done", "candidates": [{"id": 1}]}
-        with patch.object(maa_action, "load_config", return_value=self.config), \
-             patch.object(maa_action, "_load_search", return_value=state):
-            ok, message = maa_action.copilot_pick("a" * 12, "2", "normal")
-            self.assertFalse(ok)
-            self.assertIn("超出范围", message)
-
-    def test_pick_rejects_superseded_or_already_executed_card(self) -> None:
-        for status in ("superseded", "canceled", "executing", "executed"):
-            state = {
-                "token": "a" * 12,
-                "status": status,
-                "candidates": [{"id": 1}],
-            }
-            with patch.object(maa_action, "load_config", return_value=self.config), \
-                 patch.object(maa_action, "_load_search", return_value=state):
-                ok, message = maa_action.copilot_pick("a" * 12, "1", "normal")
-            self.assertFalse(ok)
-            self.assertIn("不能重复启动", message)
-
-    def test_pick_rejects_candidate_id_out_of_bounds(self) -> None:
-        state = {"token": "a" * 12, "status": "done", "candidates": [{"id": 10 ** 12}]}
-        with patch.object(maa_action, "load_config", return_value=self.config), \
-             patch.object(maa_action, "_load_search", return_value=state):
-            ok, message = maa_action.copilot_pick("a" * 12, "1", "normal")
-            self.assertFalse(ok)
-            self.assertIn("超出安全范围", message)
-
-    def test_pick_dispatches_worker_with_exact_argv(self) -> None:
-        state = {
-            "token": "a" * 12, "status": "done", "stage": "TO-9",
-            "candidates": [{"id": 98774}],
-        }
-        # Pin the clock: pick goes through _copilot_blackout_reason, so without
-        # this the test only passes outside 07:35-08:00 and 21:35-22:00.
-        noon = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
-        with tempfile.TemporaryDirectory() as raw:
-            searches = Path(raw) / "searches"
-            searches.mkdir()
-            search_path = searches / f"{'a' * 12}.json"
-            search_path.write_text(json.dumps(state), encoding="utf-8")
-            with patch.object(maa_action, "load_config", return_value=self.config), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_action, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_action, "now_beijing", return_value=noon), \
-                 patch.object(maa_action, "is_run_locked", return_value=False), \
-                 patch.object(maa_action.subprocess, "Popen") as popen, \
-                 patch.object(maa_action.Path, "is_file", return_value=True):
-                ok, message = maa_action.copilot_pick("a" * 12, "1", "raid")
-                queued = json.loads(search_path.read_text(encoding="utf-8"))
-        self.assertTrue(ok)
-        self.assertEqual(queued["status"], "queued")
-        self.assertGreater(datetime.fromisoformat(queued["expires_at"]), noon)
-        args = popen.call_args.args[0]
-        self.assertEqual(args[-4:], ["run", "a" * 12, "1", "raid"])
-        self.assertIn("突袭", message)
-
-    def test_auto_pick_rejects_insufficient_cached_sanity(self) -> None:
-        noon = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
-        epoch = int(noon.timestamp())
-        state = {
-            "token": "a" * 12,
-            "status": "done",
-            "stage": "AT-8",
-            "auto_confirm": True,
-            "activity_key": "当前活动|AT",
-            "sanity_cost": 21,
-            "candidates": [{"id": 1}],
-        }
-        roster_data = {
-            "chars": {},
-            "sanity": {
-                "current": 10,
-                "max": 135,
-                "server_current_at": epoch,
-                "last_ap_add_at": epoch - 60,
-            },
-        }
-        with patch.object(maa_action, "load_config", return_value=self.config), \
-             patch.object(maa_action, "_load_search", return_value=state), \
-             patch.object(maa_action, "now_beijing", return_value=noon), \
-             patch.object(maa_copilot, "load_roster", return_value=roster_data), \
-             patch("maa_plan_card.query_activity_snapshot",
-                   return_value={"stages": ["AT-8"]}), \
-             patch.object(maa_action.subprocess, "Popen") as popen:
-            ok, message = maa_action.copilot_pick("a" * 12, "1", "normal")
-        self.assertFalse(ok)
-        self.assertIn("当前不足", message)
-        popen.assert_not_called()
-
-    def test_auto_pick_rejects_rotated_stage(self) -> None:
-        state = {
-            "token": "a" * 12,
-            "status": "done",
-            "stage": "AT-8",
-            "auto_confirm": True,
-            "activity_key": "当前活动|AT",
-            "sanity_cost": 21,
-            "candidates": [{"id": 1}],
-        }
-        with patch.object(maa_action, "load_config", return_value=self.config), \
-             patch.object(maa_action, "_load_search", return_value=state), \
-             patch("maa_plan_card.query_activity_snapshot",
-                   return_value={"stages": ["NEW-9"]}), \
-             patch.object(maa_action, "_invalidate_search_card",
-                          return_value="") as invalidate:
-            ok, message = maa_action.copilot_pick("a" * 12, "1", "normal")
-        self.assertFalse(ok)
-        self.assertIn("旧确认按钮已失效", message)
-        invalidate.assert_called_once_with("a" * 12, self.config)
-
-
-class ActivityAutomationTests(unittest.TestCase):
-    def test_watcher_adopts_orphaned_activity_search_after_crash(self) -> None:
-        import maa_activity_watch
-
-        token = "a" * 12
-        snapshot = {
-            "stages": ["AT-8"],
-            "events": [{"title": "SideStory「墟」复刻", "stages": ["AT-8"]}],
-            "all_supply_stages_open": False,
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            (searches / f"{token}.json").write_text(
-                json.dumps({
-                    "token": token,
-                    "status": "done",
-                    "stage": "AT-8",
-                    "source": "activity-watch",
-                    "activity_key": "SideStory「墟」复刻|AT",
-                    "created_at": datetime.now(BEIJING).isoformat(),
-                    "expires_at": (
-                        datetime.now(BEIJING) + timedelta(hours=1)
-                    ).isoformat(),
-                }),
-                encoding="utf-8",
-            )
-            watch = root / "activity_watch.json"
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_activity_watch, "load_config", return_value={}), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=snapshot), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot"), \
-                 patch.object(maa_activity_watch.maa_action,
-                              "start_copilot_search") as start:
-                adopted = maa_activity_watch.run_once()
-            self.assertEqual(adopted["search_token"], token)
-            self.assertEqual(adopted["status"], "ready")
-            start.assert_not_called()
-
-    def test_stale_prebattle_dispatch_can_be_retried_manually(self) -> None:
-        token = "a" * 12
-        now = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
-        state = {
-            "token": token,
-            "status": "queued",
-            "execution_requested_at": (now - timedelta(minutes=21)).isoformat(),
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [{"id": 1}],
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            searches = Path(raw) / "searches"
-            searches.mkdir()
-            path = searches / f"{token}.json"
-            path.write_text(json.dumps(state), encoding="utf-8")
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_copilot, "now_beijing", return_value=now), \
-                 patch.object(maa_copilot, "is_run_locked", return_value=False):
-                recovered = maa_copilot.recover_stale_prebattle_dispatch(
-                    token, state
-                )
-            self.assertEqual(recovered["status"], "done")
-            self.assertNotIn("requested_index", recovered)
-            self.assertIn("失联", recovered["last_prepare_error"])
-
-    def test_watcher_notifies_after_shared_prebattle_recovery(self) -> None:
-        import maa_activity_watch
-
-        token = "a" * 12
-        now = datetime(2026, 8, 2, 12, 0, tzinfo=BEIJING)
-        snapshot = {
-            "stages": ["AT-8"],
-            "events": [{"title": "SideStory「墟」复刻", "stages": ["AT-8"]}],
-            "all_supply_stages_open": False,
-        }
-        previous = {
-            "observation_key": "SideStory「墟」复刻|AT",
-            "activity_title": "SideStory「墟」复刻",
-            "target_stage": "AT-8",
-            "search_token": token,
-            "status": "preparing",
-        }
-        search = {
-            "token": token,
-            "status": "preparing",
-            "preparation_started_at": (now - timedelta(minutes=21)).isoformat(),
-            "requested_index": 1,
-            "requested_mode": "normal",
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            watch = root / "activity_watch.json"
-            watch.write_text(json.dumps(previous), encoding="utf-8")
-            search_path = searches / f"{token}.json"
-            search_path.write_text(json.dumps(search), encoding="utf-8")
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_copilot, "now_beijing", return_value=now), \
-                 patch.object(maa_copilot, "is_run_locked", return_value=False), \
-                 patch.object(maa_activity_watch, "now_beijing", return_value=now), \
-                 patch.object(maa_activity_watch, "load_config", return_value={}), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=snapshot), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot"), \
-                 patch.object(maa_activity_watch, "_notify") as notify:
-                recovered = maa_activity_watch.run_once()
-
-            self.assertEqual(recovered["status"], "ready")
-            self.assertEqual(
-                json.loads(search_path.read_text(encoding="utf-8"))["status"],
-                "done",
-            )
-            notify.assert_called_once_with(
-                {},
-                "⚠️ AT-8 自动作业未启动",
-                "执行进程在启动模拟器前失联；已恢复确认按钮，可再次执行。",
-                0xFEE75C,
-            )
-
-    def test_search_process_dispatch_failure_is_recorded(self) -> None:
-        token = "a" * 12
-        with tempfile.TemporaryDirectory() as raw:
-            searches = Path(raw) / "searches"
-            searches.mkdir()
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "ensure_private_dirs"), \
-                 patch.object(maa_action, "load_config", return_value={}), \
-                 patch.object(maa_action, "valid_copilot_stage",
-                              return_value=("act44side_08", "AT-8")), \
-                 patch.object(maa_action, "_new_search_token",
-                              return_value=token), \
-                 patch.object(maa_action.Path, "is_file", return_value=True), \
-                 patch.object(maa_action, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_action.subprocess, "Popen",
-                              side_effect=OSError("spawn failed")):
-                ok, message, returned_token = maa_action.start_copilot_search(
-                    "AT-8", auto_confirm=True
-                )
-            self.assertFalse(ok)
-            self.assertIsNone(returned_token)
-            self.assertIn("spawn failed", message)
-            state = json.loads(
-                (searches / f"{token}.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(state["status"], "failed")
-            self.assertIn("spawn failed", state["error"])
-
-    def test_automatic_search_fails_closed_when_fresh_roster_is_unavailable(self) -> None:
-        import maa_copilot_worker as worker
-        import maa_skland
-
-        stale = roster({"char_002_amiya": char()})
-        with patch.object(maa_skland, "refresh_roster",
-                          side_effect=RuntimeError(
-                              "cred 过期且重认证失败；请在本机终端运行 "
-                              "python3 ~/.hermes/scripts/maa_skland.py link"
-                          )), \
-             patch.object(maa_copilot, "load_roster", return_value=stale):
-            with self.assertRaisesRegex(RuntimeError, "maa_skland.py link"):
-                worker._roster_for_search({}, auto_confirm=True)
-
-    def test_watcher_notifies_skland_guidance_only_once(self) -> None:
-        import maa_activity_watch
-
-        token = "a" * 12
-        now = datetime(2026, 9, 1, 12, 0, tzinfo=BEIJING)
-        snapshot = {
-            "stages": ["AT-8"],
-            "events": [{"title": "SideStory「墟」复刻", "stages": ["AT-8"]}],
-            "all_supply_stages_open": False,
-        }
-        guidance = (
-            "RuntimeError: 森空岛练度与理智刷新失败：RuntimeError: "
-            "cred 过期且重认证失败；请在本机终端运行 "
-            "python3 ~/.hermes/scripts/maa_skland.py link"
-        )
-        previous = {
-            "observation_key": "SideStory「墟」复刻|AT",
-            "activity_title": "SideStory「墟」复刻",
-            "target_stage": "AT-8",
-            "search_token": token,
-            "status": "searching",
-            "attempted_at": now.isoformat(),
-            "last_notified_error": "",
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            (searches / f"{token}.json").write_text(
-                json.dumps({"status": "failed", "error": guidance}),
-                encoding="utf-8",
-            )
-            watch = root / "activity_watch.json"
-            watch.write_text(json.dumps(previous), encoding="utf-8")
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_activity_watch, "now_beijing", return_value=now), \
-                 patch.object(maa_activity_watch, "load_config", return_value={
-                     "activity_search_retry_minutes": 30,
-                 }), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=snapshot), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot"), \
-                 patch.object(maa_activity_watch, "_notify") as notify:
-                first = maa_activity_watch.run_once()
-                second = maa_activity_watch.run_once()
-
-            self.assertEqual(first["last_notified_error"], guidance)
-            self.assertEqual(second["last_notified_error"], guidance)
-            notify.assert_called_once()
-            self.assertIn(
-                "python3 ~/.hermes/scripts/maa_skland.py link",
-                notify.call_args.args[2],
-            )
-
-    def test_watcher_launches_once_and_new_rotation_launches_again(self) -> None:
-        import maa_activity_watch
-
-        first = {
-            "stages": ["AT-8", "AT-7"],
-            "events": [{"title": "SideStory「墟」复刻", "stages": ["AT-8", "AT-7"]}],
-            "all_supply_stages_open": False,
-        }
-        second = {
-            "stages": ["NEW-9"],
-            "events": [{"title": "SideStory「新活动」", "stages": ["NEW-9"]}],
-            "all_supply_stages_open": False,
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            watch = root / "activity_watch.json"
-            buttons = root / "buttons.json"
-            buttons.write_text("{}", encoding="utf-8")
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_activity_watch, "BUTTONS_PATH", buttons), \
-                 patch.object(maa_activity_watch, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "BUTTONS_PATH", buttons), \
-                 patch.object(maa_copilot, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_activity_watch, "load_config",
-                              return_value={"activity_search_retry_minutes": 30}), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot"), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=first) as query, \
-                 patch.object(maa_activity_watch.maa_action,
-                              "start_copilot_search",
-                              side_effect=[(True, "ok", "a" * 12),
-                                           (True, "ok", "b" * 12),
-                                           (True, "ok", "c" * 12)]) as start:
-                initial = maa_activity_watch.run_once()
-                self.assertEqual(initial["target_stage"], "AT-8")
-                self.assertEqual(start.call_count, 1)
-                (searches / f"{'a' * 12}.json").write_text(
-                    json.dumps({"status": "done"}), encoding="utf-8"
-                )
-                ready = maa_activity_watch.run_once()
-                self.assertEqual(ready["status"], "ready")
-                self.assertEqual(start.call_count, 1)
-                # Reordering recommendations inside the same rotation is not
-                # a new activity and must not create a duplicate card.
-                query.return_value = {
-                    **first,
-                    "stages": ["AT-7", "AT-8"],
-                    "events": [{"title": "SideStory「墟」复刻",
-                                "stages": ["AT-7", "AT-8"]}],
-                }
-                maa_activity_watch.run_once()
-                self.assertEqual(start.call_count, 1)
-                # Same activity identity, but AT-8 is no longer open: the old
-                # card must be replaced instead of remaining permanently dead.
-                query.return_value = {
-                    **first,
-                    "stages": ["AT-7"],
-                    "events": [{"title": "SideStory「墟」复刻",
-                                "stages": ["AT-7"]}],
-                }
-                changed_stage = maa_activity_watch.run_once()
-                self.assertEqual(changed_stage["target_stage"], "AT-7")
-                self.assertEqual(start.call_count, 2)
-                query.return_value = second
-                changed = maa_activity_watch.run_once()
-                self.assertEqual(changed["target_stage"], "NEW-9")
-                self.assertEqual(start.call_count, 3)
-
-    def test_watcher_enters_idle_on_recognized_empty_snapshot(self) -> None:
-        import maa_activity_watch
-
-        token = "a" * 12
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            watch = root / "activity_watch.json"
-            buttons = root / "buttons.json"
-            watch.write_text(
-                json.dumps({
-                    "observation_key": "SideStory「墟」复刻|AT",
-                    "activity_title": "SideStory「墟」复刻",
-                    "target_stage": "AT-8",
-                    "search_token": token,
-                    "status": "ready",
-                }),
-                encoding="utf-8",
-            )
-            search_path = searches / f"{token}.json"
-            search_path.write_text(
-                json.dumps({"token": token, "status": "done", "message_id": "123"}),
-                encoding="utf-8",
-            )
-            button_key = f"hermes:btn:maa-copilot:{token}:confirm"
-            buttons.write_text(json.dumps({button_key: {}}), encoding="utf-8")
-            empty_snapshot = {
-                "stages": [],
-                "events": [],
-                "all_supply_stages_open": False,
-            }
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_activity_watch, "BUTTONS_PATH", buttons), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "BUTTONS_PATH", buttons), \
-                 patch.object(maa_copilot, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_activity_watch, "load_config",
-                              return_value={"channel_id": "1"}), \
-                 patch.object(maa_activity_watch, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=empty_snapshot), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot") as persist, \
-                 patch.object(maa_activity_watch, "_notify") as notify, \
-                 patch.object(maa_activity_watch,
-                              "retire_discord_components") as retire:
-                debounced = maa_activity_watch.run_once()
-                idle = maa_activity_watch.run_once()
-
-            # Retiring a prepared card is one-way: the first empty read only
-            # arms the counter and must leave the card and the stage list alone.
-            self.assertEqual(debounced["status"], "ready")
-            self.assertEqual(debounced["empty_observations"], 1)
-
-            self.assertEqual(idle["status"], "idle")
-            self.assertEqual(idle["observation_key"], "")
-            self.assertEqual(
-                json.loads(search_path.read_text(encoding="utf-8"))["status"],
-                "superseded",
-            )
-            self.assertNotIn(
-                button_key,
-                json.loads(buttons.read_text(encoding="utf-8")),
-            )
-            persist.assert_called_once_with({"channel_id": "1"}, empty_snapshot)
-            retire.assert_called_once_with({"channel_id": "1"}, "123")
-            # Guardrail: retiring a live card is never silent.
-            self.assertEqual(notify.call_count, 1)
-            self.assertIn("SideStory「墟」复刻", notify.call_args.args[2])
-
-    def test_watcher_debounce_resets_when_the_activity_reappears(self) -> None:
-        """One flaky empty read must not linger and shorten the next gap."""
-        import maa_activity_watch
-
-        token = "b" * 12
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            watch = root / "activity_watch.json"
-            watch.write_text(
-                json.dumps({
-                    "observation_key": "SideStory「墟」复刻|AT",
-                    "activity_title": "SideStory「墟」复刻",
-                    "target_stage": "AT-8",
-                    "search_token": token,
-                    "status": "ready",
-                    "empty_observations": 1,
-                }),
-                encoding="utf-8",
-            )
-            searches.joinpath(f"{token}.json").write_text(
-                json.dumps({"token": token, "status": "done", "message_id": "9"}),
-                encoding="utf-8",
-            )
-            live_snapshot = {
-                "stages": ["AT-8"],
-                "events": [{
-                    "title": "SideStory「墟」复刻",
-                    "stages": ["AT-8"],
-                }],
-                "all_supply_stages_open": False,
-            }
-            with patch.object(maa_activity_watch, "WATCH_PATH", watch), \
-                 patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_activity_watch, "load_config",
-                              return_value={"channel_id": "1"}), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "query_activity_snapshot", return_value=live_snapshot), \
-                 patch.object(maa_activity_watch.maa_plan_card,
-                              "persist_activity_snapshot"), \
-                 patch.object(maa_activity_watch, "_notify") as notify:
-                record = maa_activity_watch.run_once()
-
-            self.assertEqual(record["status"], "ready")
-            self.assertNotIn("empty_observations", record)
-            self.assertNotIn(
-                "empty_observations",
-                json.loads(watch.read_text(encoding="utf-8")),
-            )
-            notify.assert_not_called()
-
-    def test_search_claim_does_not_revive_a_superseded_pending_state(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        with tempfile.TemporaryDirectory() as raw:
-            searches = Path(raw) / "searches"
-            searches.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(
-                json.dumps({"token": token, "status": "pending"}),
-                encoding="utf-8",
-            )
-            stale_pending = json.loads(search_path.read_text(encoding="utf-8"))
-            self.assertEqual(stale_pending["status"], "pending")
-            # The watcher wins the race after this worker observed pending but
-            # before its atomic claim.  The claim must re-read the live state.
-            search_path.write_text(
-                json.dumps({"token": token, "status": "superseded"}),
-                encoding="utf-8",
-            )
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()):
-                claimed = worker._claim_search(token)
-            self.assertIsNone(claimed)
-            self.assertEqual(
-                json.loads(search_path.read_text(encoding="utf-8"))["status"],
-                "superseded",
-            )
-
-    def test_begin_execution_does_not_revive_terminal_activity_states(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        candidate = {"id": 7}
-        stale_preparing = {
-            "token": token,
-            "status": "preparing",
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [candidate],
-        }
-        for terminal_status in ("superseded", "canceled"):
-            with self.subTest(status=terminal_status), tempfile.TemporaryDirectory() as raw:
-                searches = Path(raw) / "searches"
-                searches.mkdir()
-                search_path = searches / f"{token}.json"
-                search_path.write_text(
-                    json.dumps({**stale_preparing, "status": terminal_status}),
-                    encoding="utf-8",
-                )
-                with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                     patch.object(worker, "state_lock",
-                                  return_value=contextlib.nullcontext()):
-                    with self.assertRaisesRegex(RuntimeError, "已经失效"):
-                        worker._begin_execution(
-                            stale_preparing, candidate, 1, "normal"
-                        )
-                self.assertEqual(
-                    json.loads(search_path.read_text(encoding="utf-8"))["status"],
-                    terminal_status,
-                )
-
-    def test_pre_emulator_preparation_failure_restores_card_for_retry(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        candidate = {"id": 7, "title": "稳定作业", "ratio": 1.0}
-        queued = {
-            "token": token,
-            "status": "queued",
-            "stage": "AT-8",
-            "stage_id": "act44side_08",
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [candidate],
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            runs = root / "runs"
-            runs.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(json.dumps(queued), encoding="utf-8")
-            buttons = root / "buttons.json"
-            button_key = f"hermes:btn:maa-copilot:{token}:confirm"
-            buttons.write_text(json.dumps({button_key: {}}), encoding="utf-8")
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(worker, "RUNS_DIR", runs), \
-                 patch.object(worker, "BUTTONS_PATH", buttons), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(worker, "load_config",
-                              return_value={"channel_id": "1"}), \
-                 patch.object(worker, "discord_token", return_value="token"), \
-                 patch.object(worker, "discord_request"), \
-                 patch.object(worker, "merge_last_run"), \
-                 patch.object(worker, "_require_auto_run_preflight"), \
-                 patch.object(worker, "_prepare_op_file",
-                              side_effect=RuntimeError("作业下载失败")), \
-                 patch.object(worker, "emulator_is_online",
-                              return_value=(False, "离线")), \
-                 patch.object(worker, "open_emulator") as open_emulator:
-                rc = worker._run_locked(queued, candidate, 1, "normal")
-
-            self.assertEqual(rc, 1)
-            restored = json.loads(search_path.read_text(encoding="utf-8"))
-            self.assertEqual(restored["status"], "done")
-            self.assertIn("作业下载失败", restored["last_prepare_error"])
-            self.assertNotIn("requested_index", restored)
-            self.assertIn(
-                button_key,
-                json.loads(buttons.read_text(encoding="utf-8")),
-            )
-            open_emulator.assert_not_called()
-
-    def test_automatic_search_bypasses_cache_and_keeps_only_perfect_match(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        state = {
-            "token": token,
-            "status": "pending",
-            "stage": "AT-8",
-            "stage_id": "act44side_08",
-            "auto_confirm": True,
-            "activity_key": "SideStory「墟」复刻|AT",
-        }
-        perfect = {"id": 1, "ratio": 1.0, "gaps": [], "soft_gaps": []}
-        hard_gap = {"id": 2, "ratio": 0.5, "gaps": ["缺干员"], "soft_gaps": []}
-        soft_gap = {"id": 3, "ratio": 1.0, "gaps": [], "soft_gaps": ["模组未知"]}
-        roster_data = {"chars": {}, "sanity": {"current": 100}}
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(json.dumps(state), encoding="utf-8")
-            buttons = root / "buttons.json"
-            buttons.write_text("{}", encoding="utf-8")
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(maa_copilot, "SEARCH_LOCK_PATH", root / "search.lock"), \
-                 patch.object(maa_copilot, "ensure_private_dirs"), \
-                 patch.object(maa_copilot, "prune_expired_searches"), \
-                 patch.object(maa_copilot, "load_stage_index", return_value={
-                     "stages": {"act44side_08": "AT-8"},
-                 }), \
-                 patch.object(maa_copilot, "stage_sanity_cost", return_value=21), \
-                 patch.object(worker, "_roster_for_search",
-                              return_value=(roster_data, "")) as load_roster, \
-                 patch.object(maa_copilot, "search_copilots",
-                              return_value=[hard_gap, perfect, soft_gap]) as search, \
-                 patch.object(maa_copilot, "sanity_preflight",
-                              return_value={"known": True, "enough": True}), \
-                 patch.object(maa_copilot, "sanity_status_text",
-                              return_value="🧠 理智够用"), \
-                 patch.object(maa_copilot, "build_candidate_card",
-                              return_value=({"title": "x"}, [], {})) as build_card, \
-                 patch.object(worker, "BUTTONS_PATH", buttons), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(worker, "load_config",
-                              return_value={"channel_id": "1"}), \
-                 patch.object(worker, "discord_token", return_value="token"), \
-                 patch.object(worker, "discord_request", return_value={"id": "123"}):
-                rc = worker.cmd_search(token)
-
-            self.assertEqual(rc, 0)
-            load_roster.assert_called_once_with(
-                {"channel_id": "1"}, auto_confirm=True
-            )
-            self.assertFalse(search.call_args.kwargs["use_cache"])
-            self.assertEqual(search.call_args.kwargs["limit"], 1000)
-            self.assertEqual(build_card.call_args.args[1], [perfect])
-            finished = json.loads(search_path.read_text(encoding="utf-8"))
-            self.assertEqual(finished["status"], "done")
-            self.assertEqual(finished["candidates"], [perfect])
-
-    def test_execution_terminal_state_always_retires_buttons(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(
-                json.dumps({
-                    "token": token,
-                    "status": "executing",
-                    "message_id": "123",
-                }),
-                encoding="utf-8",
-            )
-            buttons = root / "buttons.json"
-            owned = f"hermes:btn:maa-copilot:{token}:confirm"
-            buttons.write_text(
-                json.dumps({owned: {}, "hermes:btn:agent-book:x": {}}),
-                encoding="utf-8",
-            )
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(worker, "BUTTONS_PATH", buttons), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(worker, "retire_discord_components") as retire:
-                finished = worker._finish_execution(
-                    token, {"channel_id": "1"}, ok=False
-                )
-            self.assertEqual(finished["status"], "execution_failed")
-            registry = json.loads(buttons.read_text(encoding="utf-8"))
-            self.assertNotIn(owned, registry)
-            self.assertIn("hermes:btn:agent-book:x", registry)
-            retire.assert_called_once_with({"channel_id": "1"}, "123")
-
-    def test_second_preflight_rotation_supersedes_before_battle(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        candidate = {"id": 7, "title": "稳定作业", "ratio": 1.0}
-        queued = {
-            "token": token,
-            "status": "queued",
-            "stage": "AT-8",
-            "stage_id": "act44side_08",
-            "auto_confirm": True,
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [candidate],
-            "message_id": "123",
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            searches = root / "searches"
-            searches.mkdir()
-            runs = root / "runs"
-            runs.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(json.dumps(queued), encoding="utf-8")
-            buttons = root / "buttons.json"
-            owned = f"hermes:btn:maa-copilot:{token}:confirm"
-            buttons.write_text(json.dumps({owned: {}}), encoding="utf-8")
-            rotated = maa_copilot.StaleActivityError("活动已切换")
-            patches = [
-                patch.object(maa_copilot, "SEARCHES_DIR", searches),
-                patch.object(worker, "RUNS_DIR", runs),
-                patch.object(worker, "BUTTONS_PATH", buttons),
-                patch.object(worker, "state_lock",
-                             return_value=contextlib.nullcontext()),
-                patch.object(worker, "load_config", return_value={
-                    "channel_id": "1", "maa_bin": "/maa", "adb_path": "/adb",
-                }),
-                patch.object(worker, "discord_token", return_value="token"),
-                patch.object(worker, "discord_request"),
-                patch.object(worker, "retire_discord_components"),
-                patch.object(worker, "merge_last_run"),
-                patch.object(worker, "_require_auto_run_preflight",
-                             side_effect=[None, rotated]),
-                patch.object(worker, "_prepare_op_file",
-                             return_value=("maa://7", False)),
-                patch.object(worker, "require_executable"),
-                patch.object(worker, "emulator_is_online",
-                             return_value=(False, "离线")),
-                patch.object(worker, "open_emulator"),
-                patch.object(worker, "wait_for_android"),
-                patch.object(worker, "verify_game_installed"),
-                patch.object(worker, "settle_android_runtime"),
-                patch.object(worker, "_navigate_to_stage", return_value=(True, "")),
-                patch.object(worker, "close_everything", return_value=[]),
-            ]
-            with contextlib.ExitStack() as stack:
-                for item in patches:
-                    stack.enter_context(item)
-                run_copilot = stack.enter_context(
-                    patch.object(worker, "_run_copilot_with_watchdog")
-                )
-                rc = worker._run_locked(queued, candidate, 1, "normal")
-            self.assertEqual(rc, 1)
-            self.assertEqual(
-                json.loads(search_path.read_text(encoding="utf-8"))["status"],
-                "superseded",
-            )
-            self.assertNotIn(
-                owned, json.loads(buttons.read_text(encoding="utf-8"))
-            )
-            run_copilot.assert_not_called()
-
-    def test_preflight_failure_never_opens_emulator(self) -> None:
-        import maa_copilot_worker as worker
-
-        token = "a" * 12
-        candidate = {"id": 1}
-        state = {
-            "token": token,
-            "status": "queued",
-            "stage": "AT-8",
-            "stage_id": "act44side_08",
-            "auto_confirm": True,
-            "requested_index": 1,
-            "requested_mode": "normal",
-            "candidates": [candidate],
-        }
-        with tempfile.TemporaryDirectory() as raw:
-            searches = Path(raw) / "searches"
-            searches.mkdir()
-            search_path = searches / f"{token}.json"
-            search_path.write_text(json.dumps(state), encoding="utf-8")
-            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()), \
-                 patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
-                 patch.object(worker, "discord_token", return_value="token"), \
-                 patch.object(worker, "_require_auto_run_preflight",
-                              side_effect=RuntimeError("理智不足")), \
-                 patch.object(worker, "discord_request"), \
-                 patch.object(worker, "merge_last_run"), \
-                 patch.object(worker, "emulator_is_online",
-                              return_value=(False, "离线")), \
-                 patch.object(worker, "open_emulator") as open_emulator:
-                rc = worker._run_locked(state, candidate, 1, "normal")
-        self.assertEqual(rc, 1)
-        open_emulator.assert_not_called()
-
 
 class SklandTests(unittest.TestCase):
     def test_signing_golden_vector(self) -> None:
@@ -2256,75 +1390,84 @@ class ReviewFixTests(unittest.TestCase):
                         {"id": 98660, "stage_name": "TO-9"}, "act53side_09", {}
                     )
 
-    def test_roster_refresh_failure_degrades_to_stale_roster(self) -> None:
-        # Every search refreshes; a throwing refresh must
-        # not abort the search — the stale roster still produces candidates.
+    def test_manual_search_hard_fails_when_skland_refresh_throws(self) -> None:
+        # D13：手动抄作业**不降级**——森空岛刷新失败直接报失败红卡，
+        # 绝不拿一份过期练度去挑作业（挑错了就是白打一场）。
         import maa_copilot_worker as worker
         import maa_skland
-        roster_data = roster({"char_479_surtr": char(elite=2, level=90)})
-        stale_state = {
-            "token": "a" * 12,
-            "status": "pending",
-            "stage": "TO-9",
-            "stage_id": "act53side_09",
-        }
+
         with tempfile.TemporaryDirectory() as raw:
             searches = Path(raw) / "searches"
             searches.mkdir(parents=True)
-            buttons = Path(raw) / "buttons.json"
             (searches / ("a" * 12 + ".json")).write_text(
-                json.dumps(stale_state), encoding="utf-8"
+                json.dumps({
+                    "token": "a" * 12, "status": "pending", "stage": "SR-8",
+                    "stage_id": "act54side_08", "modes": ["normal"],
+                }),
+                encoding="utf-8",
             )
+            notices: list[tuple[str, str]] = []
             with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
                  patch.object(maa_copilot, "SEARCH_LOCK_PATH", Path(raw) / "search.lock"), \
                  patch.object(maa_copilot, "prune_expired_searches", return_value=0), \
-                 patch.object(worker, "BUTTONS_PATH", buttons), \
-                 patch.object(worker, "load_config",
-                              return_value={"channel_id": "1"}), \
+                 patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
+                 patch.object(worker, "state_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(worker, "_notice",
+                              side_effect=lambda c, t_, b, col: notices.append((t_, b))), \
                  patch.object(maa_copilot, "load_stage_index",
-                              return_value={"stages": {"act53side_09": {}}}), \
-                 patch.object(maa_copilot, "load_roster", return_value=roster_data), \
-                 patch.object(maa_copilot, "search_copilots",
-                              return_value=[op_item(1, "act53side_09")]), \
-                 patch.object(maa_copilot, "build_candidate_card",
-                              return_value=({"title": "x"}, [], {})) as build_card, \
-                 patch.object(worker, "discord_request", return_value={"id": "111"}), \
-                 patch.object(worker, "discord_token", return_value="tok"), \
-                 patch.object(worker, "state_lock",
-                              return_value=contextlib.nullcontext()), \
+                              return_value={"stages": {"act54side_08": "SR-8"}}), \
+                 patch.object(maa_copilot, "stage_sanity_cost", return_value=21), \
+                 patch.object(maa_copilot, "pick_perfect_candidate") as pick, \
                  patch.object(maa_skland, "refresh_roster",
                               side_effect=RuntimeError("skland down")):
                 with contextlib.redirect_stdout(io.StringIO()):
                     rc = worker.cmd_search("a" * 12)
-            self.assertEqual(rc, 0)
-            self.assertIn("未取得最新进度", build_card.call_args.kwargs["roster_hint"])
-            self.assertIn("skland down", build_card.call_args.kwargs["roster_hint"])
             state = json.loads((searches / ("a" * 12 + ".json")).read_text(encoding="utf-8"))
-            self.assertEqual(state["status"], "done")
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("skland down", state["error"])
+        self.assertIn("不降级", state["error"])
+        pick.assert_not_called()
+        self.assertIn("未开始", notices[0][0])
 
-    def test_manual_search_refreshes_even_with_recent_cached_progress(self) -> None:
+    def test_manual_search_refuses_when_no_op_fully_matches(self) -> None:
+        # D12：练度不满足就直接红卡写清缺什么，绝不用助战 / 忽略练度要求。
         import maa_copilot_worker as worker
         import maa_skland
 
-        cached = roster({})
-        cached["fetched_at"] = datetime.now(BEIJING).isoformat()
-        cached["activity_progress"] = {"act54side": [
-            {"zoneId": "act54side_zone1", "clearedStage": 0, "totalStage": 11}
-        ]}
-        fresh = {**cached, "activity_progress": {"act54side": [
-            {"zoneId": "act54side_zone1", "clearedStage": 11, "totalStage": 11}
-        ]}}
-        with patch.object(maa_skland, "roster_needs_refresh", return_value=False), \
-             patch.object(maa_skland, "refresh_roster", return_value=fresh) as refresh, \
-             patch.object(maa_copilot, "load_roster",
-                          side_effect=lambda: fresh if refresh.called else cached):
-            actual, error = worker._roster_for_search(
-                {"skland_roster_refresh_days": 7}, auto_confirm=False
+        with tempfile.TemporaryDirectory() as raw:
+            searches = Path(raw) / "searches"
+            searches.mkdir(parents=True)
+            (searches / ("a" * 12 + ".json")).write_text(
+                json.dumps({
+                    "token": "a" * 12, "status": "pending", "stage": "SR-8",
+                    "stage_id": "act54side_08", "modes": ["normal", "raid"],
+                }),
+                encoding="utf-8",
             )
-        refresh.assert_called_once_with()
-        self.assertEqual(error, "")
-        self.assertIs(actual, fresh)
-        self.assertIsNone(maa_copilot.zone_progress_warning("SR-8", "act54side_08", actual))
+            notices: list[tuple[str, str]] = []
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "SEARCH_LOCK_PATH", Path(raw) / "search.lock"), \
+                 patch.object(maa_copilot, "prune_expired_searches", return_value=0), \
+                 patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
+                 patch.object(worker, "state_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(worker, "_notice",
+                              side_effect=lambda c, t_, b, col: notices.append((t_, b))), \
+                 patch.object(maa_copilot, "load_stage_index",
+                              return_value={"stages": {"act54side_08": "SR-8"}}), \
+                 patch.object(maa_copilot, "stage_sanity_cost", return_value=21), \
+                 patch.object(maa_copilot, "load_roster", return_value=roster({})), \
+                 patch.object(maa_copilot, "pick_perfect_candidate",
+                              return_value=(None, "SR-8 暂无完全满足当前干员练度的作业",
+                                            ["史尔特尔 专精3（你技能7）"])), \
+                 patch.object(maa_skland, "refresh_roster", return_value=roster({})):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = worker.cmd_search("a" * 12)
+            state = json.loads((searches / ("a" * 12 + ".json")).read_text(encoding="utf-8"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("史尔特尔", state["error"])
+        self.assertIn("练度", notices[0][1])
 
     def test_module_levels_keep_locked_slots_in_place(self) -> None:
         # P1-6: filtering locked equips collapsed the list and shifted
@@ -2553,21 +1696,15 @@ class ZoneProgressTests(unittest.TestCase):
             maa_copilot.zone_progress_warning("TO-9", "act53side_09", {"chars": {}})
         )
 
-    def test_candidate_card_includes_warning_line(self) -> None:
+    def test_zone_warning_is_available_for_the_copilot_card(self) -> None:
         r = self._roster_with_progress([
             {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
         ])
-        cand = maa_copilot.evaluate_candidate(
-            op_item(1, "act53side_09", opers=[{"name": "阿米娅", "skill": 1}]),
-            None,
-            {},
-        )
-        self.assertIsNotNone(cand)
-        embed, _components, _registry = maa_copilot.build_candidate_card(
-            "a" * 12, [cand], True, "TO-9", stage_id="act53side_09", roster=r
-        )
-        self.assertIn("1/13", embed["description"])
-        self.assertIn("大概率未解锁", embed["description"])
+        # 四期步骤 2：候选卡没了，这条单向启发改挂在抄作业卡的每关状态上。
+        warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        self.assertIsNotNone(warning)
+        self.assertIn("1/13", warning)
+        self.assertIn("大概率未解锁", warning)
 
     def test_warning_stamps_snapshot_age_without_nesting_parens(self) -> None:
         # NEW-28/NEW-29: roster_age_hint() already carries its own （） —

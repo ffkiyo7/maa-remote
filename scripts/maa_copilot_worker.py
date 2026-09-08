@@ -2,12 +2,13 @@
 """Background worker for the copilot (抄作业) flow.
 
 Subcommands:
-  search <token>   — prts search + match + candidate card (network, 5-20s)
-  run <token> <n> <mode> — real execution: emulator -> maa startup ->
-                     maa copilot -> screenshot -> cleanup -> report
+  search <token>     — prts search for one manually chosen stage (network, 5-20s);
+                       success dispatches `run-batch` straight away (四期 D6)
+  run-batch <token>  — 一条执行链：抢锁 → 开机 → 串行连抄 `entries` 里的每个
+                       `(关, 模式)` → 截图 → 清理 → 一条多关战报
 
-Deliberately NOT in the Hermes button whitelist; only maa_action.py may
-spawn this process.
+Deliberately NOT in the Hermes button whitelist; only maa_action.py and
+maa_activity_watch.py may spawn this process.
 """
 
 from __future__ import annotations
@@ -23,10 +24,12 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import maa_action
+import maa_clearing
 import maa_copilot
 from maa_daily import (
     capture_screenshot,
@@ -38,7 +41,6 @@ from maa_daily import (
 )
 from maa_common import (
     BUTTONS_PATH,
-    LAST_RUN_PATH,
     RUNS_DIR,
     SCRIPTS_DIR,
     atomic_write_json,
@@ -58,7 +60,7 @@ from maa_common import (
     state_lock,
 )
 
-# 探到模拟器在用时的统一说法（D18）。抄作业与队列都还没碰设备，说清楚「未执行」。
+# 探到模拟器在用时的统一说法（D18）。抄作业还没碰设备，说清楚「未执行」。
 EMULATOR_BUSY_NOTICE = (
     "检测到模拟器正在使用（多半是你在玩，或上一个任务没退干净），本次未执行，"
     "也没有碰设备。等你退出后再试一次即可。"
@@ -92,6 +94,21 @@ type = "Custom"
 task_names = ["CopilotNavigationReady"]
 """
 
+# ⚠️ **突袭切换这一段真机未验**（spike A 的 Q3 被塔罗牌弹窗卡死，没走到）。
+# Fight 导航停在的是**普通难度**详情页，要打突袭得先把难度切过去；MaaCore 自己
+# 在 `MultiCopilotTaskPlugin` 里用的就是 `RaidConfirm` / `ChangeToRaidDifficulty`
+# 这两个上游任务名，所以这里照抄后者。
+# **步骤 2 真机验收第一项就是它**：切换后截图能看到突袭标识且 `Copilot Completed`。
+# 验不过就把 `config.copilot_raid_switch_task` 设成空串——自动路径退回只打普通，
+# 突袭留人工，其余一行代码都不用改。
+RAID_SWITCH_TOML_TEMPLATE = """[[tasks]]
+name = "切换突袭难度"
+type = "Custom"
+[tasks.params]
+task_names = [{task}]
+"""
+DEFAULT_RAID_SWITCH_TASK = "ChangeToRaidDifficulty"
+
 # The takeover popup appears when the agent-command (代理指挥) switch is on:
 # "接管后，本次行动内将无法回到代理指挥模式 / 确认要接管作战吗？"
 # MaaCore's copilot chain does not handle it; tap the confirm button.
@@ -102,22 +119,53 @@ POPUP_MARK = "确认要接管作战"
 POPUP_CONFIRM_X_OFFSET = 130
 POPUP_CONFIRM_Y_OFFSET = 171
 
+def _search_path(token: str) -> Path:
+    return maa_copilot.SEARCHES_DIR / f"{token}.json"
+
+
+def _notice(config: dict[str, Any], title: str, body: str, color: int) -> None:
+    """任何一次「没干成」都必须可见（护栏 4：不许静默 return）。"""
+    try:
+        discord_request(
+            discord_token(),
+            "POST",
+            f"/channels/{config.get('channel_id', '')}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": title[:250],
+                        "description": body[:3500],
+                        "color": color,
+                        "timestamp": now_beijing().isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+    except Exception as exc:
+        print(f"copilot notice failed: {type(exc).__name__}: {exc}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# 手动搜索（`copilot find <关卡>` 的后台部分）
+# ---------------------------------------------------------------------------
 
 def _fail_search(token: str, message: str) -> None:
     with state_lock():
-        state = load_json(maa_copilot.SEARCHES_DIR / f"{token}.json", {})
+        state = load_json(_search_path(token), {})
         if not isinstance(state, dict):
             state = {"token": token}
         if state.get("status") not in {"pending", "running"}:
             return
         state["status"] = "failed"
         state["error"] = message[:400]
-        atomic_write_json(maa_copilot.SEARCHES_DIR / f"{token}.json", state)
+        state["finished_at"] = now_beijing().isoformat()
+        atomic_write_json(_search_path(token), state)
 
 
 def _claim_search(token: str) -> dict[str, Any] | None:
     """Atomically claim one still-pending search."""
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
+    path = _search_path(token)
     with state_lock():
         state = load_json(path, None)
         if not isinstance(state, dict) or state.get("status") != "pending":
@@ -128,30 +176,18 @@ def _claim_search(token: str) -> dict[str, Any] | None:
         return state
 
 
-def _roster_for_search(
-    config: dict[str, Any], *, auto_confirm: bool
-) -> tuple[dict[str, Any] | None, str]:
-    """Refresh every search; manual failures remain visible and may degrade."""
-    try:
-        import maa_skland
-
-        maa_skland.refresh_roster()
-    except Exception as exc:
-        if auto_confirm:
-            raise RuntimeError(
-                f"森空岛练度与理智刷新失败：{type(exc).__name__}: {exc}"
-            ) from exc
-        return maa_copilot.load_roster(), f"{type(exc).__name__}: {exc}"
-    return maa_copilot.load_roster(), ""
-
-
 def cmd_search(token: str) -> int:
+    """手动路径：搜一关的作业，搜到就直接排程 + 派发（D6 / D13）。
+
+    **不降级**：森空岛刷新失败直接报失败（不再「沿用缓存并提示」），
+    没有 `ratio == 1.0` 且无缺口的作业也直接报失败并写清缺什么。
+    """
     if not maa_copilot.SEARCH_TOKEN_RE.fullmatch(token or ""):
         print("invalid token", file=sys.stderr)
         return 2
     maa_copilot.ensure_private_dirs()
 
-    # Serialize searches: a concurrent search is marked failed so the watcher
+    # Serialize searches: a concurrent search is marked failed so the caller
     # can retry it instead of leaving a permanent pending state.
     with maa_copilot.SEARCH_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
         os.chmod(maa_copilot.SEARCH_LOCK_PATH, 0o600)
@@ -166,176 +202,113 @@ def cmd_search(token: str) -> int:
             return 0
 
         config: dict[str, Any] = {}
-        posted_message_id = ""
-        channel_id = ""
+        code = str(state.get("stage") or "")
         try:
             config = load_config()
-            # Expire old searches + their buttons under the shared lock.
             with state_lock():
                 maa_copilot.prune_expired_searches()
 
             index = maa_copilot.load_stage_index(config)
             stage_id = str(state.get("stage_id") or "")
-            code = str(state.get("stage") or "")
             if not stage_id or stage_id not in index.get("stages", {}):
                 raise RuntimeError(f"关卡 {code} 已不在本地索引中")
-            auto_confirm = bool(state.get("auto_confirm"))
             sanity_cost = maa_copilot.stage_sanity_cost(stage_id, code, config)
-            if auto_confirm and sanity_cost is None:
-                raise RuntimeError(f"{code} 的理智消耗尚未进入 MaaResource")
-            roster, roster_refresh_error = _roster_for_search(
-                config, auto_confirm=auto_confirm
-            )
-            if roster_refresh_error:
-                print(
-                    f"roster refresh skipped: {roster_refresh_error}",
-                    flush=True,
-                )
-            roster_ok = roster is not None
-            candidates = maa_copilot.search_copilots(
-                stage_id,
-                code,
-                config,
-                roster,
-                # fetch_stage_copilots is currently hard-capped below 1,000
-                # items.  Automatic mode must filter the complete evaluated
-                # set before choosing Top-1, otherwise an eligible item after
-                # an imperfect prefix would be missed.
-                limit=1000 if auto_confirm else 3,
-                use_cache=not auto_confirm,
-            )
-            if auto_confirm:
-                candidates = [
-                    candidate
-                    for candidate in candidates
-                    if candidate.get("ratio") == 1.0
-                    and not candidate.get("gaps")
-                    and not candidate.get("soft_gaps")
-                ][:1]
-            if not candidates:
-                detail = "完全满足当前干员练度的作业" if auto_confirm else "可执行的作业"
-                raise RuntimeError(f"{code} 暂时没有{detail}")
+            if sanity_cost is None:
+                raise RuntimeError(f"{code} 的理智消耗尚未进入 MaaResource，拒绝执行")
 
-            sanity = maa_copilot.sanity_preflight(roster, sanity_cost)
-            sanity_text = maa_copilot.sanity_status_text(sanity) if auto_confirm else ""
-            latest = load_json(maa_copilot.SEARCHES_DIR / f"{token}.json", None)
-            if (
-                not isinstance(latest, dict)
-                or latest.get("status") != "running"
-                or latest.get("activity_key") != state.get("activity_key")
-            ):
-                return 0
-            embed, components, entries = maa_copilot.build_candidate_card(
+            import maa_skland
+
+            try:
+                maa_skland.refresh_roster()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"森空岛练度与理智刷新失败，本次不降级执行：{type(exc).__name__}: {exc}"
+                ) from exc
+            roster = maa_copilot.load_roster()
+
+            candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
+                code, stage_id, config, roster
+            )
+            if candidate is None:
+                detail = reason
+                if gaps:
+                    detail += "\n缺：" + "；".join(gaps)
+                raise RuntimeError(detail)
+
+            modes = [
+                mode
+                for mode in (state.get("modes") or ["normal"])
+                if mode in ("normal", "raid")
+            ] or ["normal"]
+            entries = [
+                {
+                    "stage": code,
+                    "stage_id": stage_id,
+                    "mode": mode,
+                    "candidate": candidate,
+                    "sanity_cost": sanity_cost,
+                }
+                for mode in modes
+            ]
+            # 搜索本身要跑 5~20s，起点合规不代表现在还合规（07:50 点的关，搜完
+            # 已经 07:51 也可能刚好跨进 blackout）。派发前再过一次同一份闸门。
+            blocker = maa_action.dispatch_blocker(config, "", now_beijing())
+            note = (
+                "手动选关，选中即执行。"
+                if not blocker
+                else f"本轮未启动：{blocker}\n"
+                "手动轮不会自动重试，请日常结束后重新选关；"
+                "这一轮点「❌ 取消本轮」即可收起，过期也会自动清掉。"
+            )
+            message_id = maa_action.publish_round(
                 token,
-                candidates,
-                roster_ok,
-                code,
-                roster_hint="\n".join(filter(None, [
-                    maa_copilot.roster_age_hint(roster) if roster_ok else "",
-                    f"⚠️ 森空岛刷新失败，本次未取得最新进度：{roster_refresh_error}"
-                    if roster_refresh_error else "",
-                ])),
-                stage_id=stage_id,
-                roster=roster,
-                auto_confirm=auto_confirm,
-                activity_title=str(state.get("activity_title") or ""),
-                sanity_text=sanity_text,
+                entries,
+                config,
+                title=f"🤖 已排程：{code}",
+                note=note,
             )
-            channel_id = str(config.get("channel_id", ""))
-            message = discord_request(
-                discord_token(),
-                "POST",
-                f"/channels/{channel_id}/messages",
-                {"embeds": [embed], "components": components,
-                 "allowed_mentions": {"parse": []}},
-            )
-            message_id = str(message.get("id", "")) if isinstance(message, dict) else ""
-            if not message_id.isdigit():
-                raise RuntimeError("Discord 发卡响应缺少消息编号")
-            posted_message_id = message_id
-
             committed = False
             with state_lock():
-                latest = load_json(
-                    maa_copilot.SEARCHES_DIR / f"{token}.json", None
-                )
-                registry = load_json(BUTTONS_PATH, {})
-                if not isinstance(registry, dict):
-                    raise RuntimeError("共享按钮登记表格式错误")
-                if (
-                    isinstance(latest, dict)
-                    and latest.get("status") == "running"
-                    and latest.get("activity_key") == state.get("activity_key")
-                ):
-                    maa_copilot.prune_search_buttons(token, registry)
-                    registry.update(entries)
-                    atomic_write_json(BUTTONS_PATH, registry)
-                    latest["status"] = "done"
-                    latest["candidates"] = candidates
-                    latest["sanity_cost"] = sanity_cost
-                    latest["sanity_checked_at"] = now_beijing().isoformat()
+                latest = load_json(_search_path(token), None)
+                if isinstance(latest, dict) and latest.get("status") == "running":
+                    latest["status"] = "scheduled" if blocker else "queued"
+                    latest["entries"] = entries
                     latest["message_id"] = message_id
                     latest["finished_at"] = now_beijing().isoformat()
-                    atomic_write_json(
-                        maa_copilot.SEARCHES_DIR / f"{token}.json", latest
-                    )
+                    if blocker:
+                        latest["last_prepare_error"] = blocker
+                        latest["last_prepare_failed_at"] = now_beijing().isoformat()
+                    else:
+                        latest["execution_requested_at"] = now_beijing().isoformat()
+                    atomic_write_json(_search_path(token), latest)
                     committed = True
             if not committed:
-                try:
-                    discord_request(
-                        discord_token(),
-                        "PATCH",
-                        f"/channels/{channel_id}/messages/{message_id}",
-                        {"components": []},
-                    )
-                except Exception as retire_exc:
-                    print(
-                        "superseded candidate card could not be retired: "
-                        f"{type(retire_exc).__name__}: {retire_exc}",
-                        flush=True,
-                    )
+                retire_discord_components(config, message_id)
                 return 0
+            if blocker:
+                print(f"copilot search: 本轮未派发（{blocker}）", flush=True)
+                return 0
+            maa_action.dispatch_batch(token)
         except Exception as exc:
             _fail_search(token, f"{type(exc).__name__}: {exc}")
-            if posted_message_id:
-                try:
-                    retire_discord_components(config, posted_message_id)
-                except Exception as retire_exc:
-                    print(
-                        "failed candidate card could not be retired: "
-                        f"{type(retire_exc).__name__}: {retire_exc}",
-                        flush=True,
-                    )
-            try:
-                if state.get("auto_confirm"):
-                    return 1
-                discord_request(
-                    discord_token(),
-                    "POST",
-                    f"/channels/{config.get('channel_id', '')}/messages",
-                    {
-                        "embeds": [
-                            {
-                                "title": f"❌ {state.get('stage', '')} 作业匹配失败",
-                                "description": str(exc)[:1500],
-                                "color": 0xED4245,
-                                "timestamp": now_beijing().isoformat(),
-                            }
-                        ],
-                        "allowed_mentions": {"parse": []},
-                    },
-                )
-            except Exception:
-                pass
+            _notice(
+                config,
+                f"❌ {code} 抄作业未开始",
+                f"{exc}\n"
+                "不使用助战、不忽略练度要求，所以这一关只能等你练度够了或上游出新作业。",
+                0xED4245,
+            )
             return 1
     return 0
 
 
 # ---------------------------------------------------------------------------
-# Execution (C3)
+# 一条执行链（四期 2d）
 # ---------------------------------------------------------------------------
 
-def _prepare_op_file(candidate: dict[str, Any], stage_id: str, config: dict[str, Any]) -> tuple[str, bool]:
+def _prepare_op_file(
+    candidate: dict[str, Any], stage_id: str, config: dict[str, Any]
+) -> tuple[str, bool]:
     """Resolve the op URI; rewrite display-code ops into prepared/<id>.json."""
     uri, needs_rewrite = maa_copilot.execution_uri(candidate, stage_id)
     if not needs_rewrite:
@@ -360,8 +333,8 @@ def _prepare_op_file(candidate: dict[str, Any], stage_id: str, config: dict[str,
     return uri, True
 
 
-def _copilot_summary(lines: list[str], *, ok: bool, mode: str) -> str:
-    """Chinese summary of a maa copilot run (regexes tuned on real v6 logs)."""
+def _copilot_summary(lines: list[str], *, ok: bool) -> str:
+    """Chinese summary of one `maa copilot` run (regexes tuned on real v6 logs)."""
     parts: list[str] = []
     missions = 0
     deployments: list[str] = []
@@ -376,65 +349,17 @@ def _copilot_summary(lines: list[str], *, ok: bool, mode: str) -> str:
             name = deploy.group(1)
             if name not in deployments:
                 deployments.append(name)
-    if ok:
-        parts.append("🌟 总体：✅ 抄作业完成")
-    else:
-        parts.append("🌟 总体：❌ 抄作业失败（详见下方）")
     if missions:
-        parts.append(f"⚔️ 进入战斗 ×{missions}")
+        parts.append(f"进入战斗 ×{missions}")
     if deployments:
         parts.append("部署：" + "、".join(deployments[:6]))
     if not ok:
         for line in lines:
             text = str(line).strip()
             if re.search(r"(Copilot Error|Error: Some error)", text):
-                parts.append(f"❌ {text[:100]}")
+                parts.append(text[:100])
                 break
-    if len(parts) == 1:
-        parts.append("（未能从 CLI 输出解析出明细，日志已留存）")
-    mode_label = "突袭" if mode == "raid" else "普通"
-    parts.append(f"模式：{mode_label} · 碎石 0")
-    return "\n".join(parts[:12])
-
-
-def cmd_run(token: str, number: str, mode: str) -> int:
-    if not maa_copilot.SEARCH_TOKEN_RE.fullmatch(token or ""):
-        return 2
-    if mode not in {"normal", "raid"}:
-        return 2
-    try:
-        index = int(number)
-    except (TypeError, ValueError):
-        return 2
-    state = load_json(maa_copilot.SEARCHES_DIR / f"{token}.json", None)
-    if not isinstance(state, dict):
-        return 2
-    if state.get("status") != "queued":
-        return 2
-    if state.get("requested_index") != index or state.get("requested_mode") != mode:
-        return 2
-    candidates = state.get("candidates", []) or []
-    if not isinstance(candidates, list) or not 1 <= index <= len(candidates):
-        return 2
-    candidate = candidates[index - 1]
-    if not isinstance(candidate, dict):
-        return 2
-
-    with run_lock(blocking=False) as acquired:
-        if not acquired:
-            print("copilot run SKIPPED: run.lock 被占用（另一场 MAA 正在运行）")
-            message = "另一场 MAA 正在运行，本次未启动；原确认按钮仍可稍后重试。"
-            restored = _restore_ready(token, {"queued"}, message)
-            if restored:
-                try:
-                    _post_not_started(load_config(), state, message)
-                except Exception as exc:
-                    print(
-                        f"copilot busy notification failed: {type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-            return 1
-        return _run_locked(state, candidate, index, mode)
+    return " · ".join(parts[:4])
 
 
 def _run_copilot_with_watchdog(
@@ -455,6 +380,7 @@ def _run_copilot_with_watchdog(
     address = str(config.get("adb_address", "127.0.0.1:5555"))
     ocrbox = SCRIPTS_DIR / "ocrbox"
     watch_png = RUNS_DIR / ".watch.png"
+    # 单关级超时：整场的长度由 `min_lead_reason()` 的时间预算约束，不在这里叠加。
     timeout = int(config.get("maa_run_timeout", 3000))
     proc = subprocess.Popen(
         command,
@@ -531,654 +457,13 @@ def _run_copilot_with_watchdog(
     return proc.returncode or 0, taps
 
 
-def _require_auto_run_preflight(
-    state: dict[str, Any], candidate: dict[str, Any], config: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Recheck activity availability and live AP before touching the emulator."""
-    if not state.get("auto_confirm"):
-        return None
-    if (
-        candidate.get("ratio") != 1.0
-        or candidate.get("gaps")
-        or candidate.get("soft_gaps")
-    ):
-        raise RuntimeError("自动作业不再完全满足当前记录的干员要求，拒绝执行")
-    stage = str(state.get("stage") or "")
-    from maa_plan_card import activity_target_is_current, query_activity_snapshot
-
-    live = query_activity_snapshot(config)
-    if not activity_target_is_current(
-        live, stage, str(state.get("activity_key") or "")
-    ):
-        raise maa_copilot.StaleActivityError(
-            f"{stage} 已不属于当前自动活动目标，拒绝执行旧作业"
-        )
-    try:
-        cost = int(state.get("sanity_cost") or 0)
-    except (TypeError, ValueError):
-        cost = 0
-    if cost <= 0:
-        raise RuntimeError(f"无法确认 {stage} 的理智消耗，拒绝启动")
-    try:
-        import maa_skland
-
-        roster = maa_skland.refresh_roster()
-    except Exception as exc:
-        raise RuntimeError(
-            f"森空岛实时理智读取失败，未启动模拟器：{type(exc).__name__}: {exc}"
-        ) from exc
-    preflight = maa_copilot.sanity_preflight(roster, cost)
-    if not preflight.get("known"):
-        raise RuntimeError(
-            f"森空岛实时理智读取失败，未启动模拟器：{preflight.get('reason', '未知原因')}"
-        )
-    if not preflight.get("enough"):
-        raise RuntimeError(maa_copilot.sanity_status_text(preflight))
-    return preflight
-
-
-def _candidate_still_matches(
-    state: dict[str, Any], candidate: dict[str, Any], index: int, mode: str
-) -> bool:
-    candidates = state.get("candidates") or []
-    return bool(
-        state.get("requested_index") == index
-        and state.get("requested_mode") == mode
-        and isinstance(candidates, list)
-        and 1 <= index <= len(candidates)
-        and isinstance(candidates[index - 1], dict)
-        and candidates[index - 1].get("id") == candidate.get("id")
-    )
-
-
-def _begin_preparation(
-    state: dict[str, Any], candidate: dict[str, Any], index: int, mode: str
-) -> dict[str, Any]:
-    token = str(state.get("token") or "")
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if (
-            not isinstance(fresh, dict)
-            or fresh.get("status") != "queued"
-            or not _candidate_still_matches(fresh, candidate, index, mode)
-        ):
-            raise RuntimeError("作业确认已取消、失效或被另一进程接管")
-        fresh["status"] = "preparing"
-        fresh["preparation_started_at"] = now_beijing().isoformat()
-        fresh.pop("last_prepare_error", None)
-        atomic_write_json(path, fresh)
-        return fresh
-
-
-def _begin_execution(
-    state: dict[str, Any], candidate: dict[str, Any], index: int, mode: str
-) -> dict[str, Any]:
-    token = str(state.get("token") or "")
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if (
-            not isinstance(fresh, dict)
-            or fresh.get("status") != "preparing"
-            or not _candidate_still_matches(fresh, candidate, index, mode)
-        ):
-            raise RuntimeError("活动或作业确认在启动前已经失效")
-        fresh["status"] = "executing"
-        fresh["execution_started_at"] = now_beijing().isoformat()
-        atomic_write_json(path, fresh)
-        return fresh
-
-
-def _restore_ready(token: str, expected: set[str], message: str) -> bool:
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if not isinstance(fresh, dict) or fresh.get("status") not in expected:
-            return False
-        fresh["status"] = "done"
-        fresh["last_prepare_error"] = message[:500]
-        fresh["last_prepare_failed_at"] = now_beijing().isoformat()
-        for key in (
-            "requested_index",
-            "requested_mode",
-            "execution_requested_at",
-            "preparation_started_at",
-            "execution_started_at",
-        ):
-            fresh.pop(key, None)
-        atomic_write_json(path, fresh)
-        return True
-
-
-def _invalidate_prebattle_activity(
-    token: str, config: dict[str, Any]
-) -> bool:
-    """Invalidate a stale automatic run while battle consumption is impossible."""
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if not isinstance(fresh, dict) or fresh.get("status") not in {
-            "queued",
-            "preparing",
-            "executing",
-        }:
-            return False
-        registry = load_json(BUTTONS_PATH, {})
-        if not isinstance(registry, dict):
-            raise RuntimeError("共享按钮登记表格式错误")
-        maa_copilot.prune_search_buttons(token, registry)
-        atomic_write_json(BUTTONS_PATH, registry)
-        fresh["status"] = "superseded"
-        fresh["superseded_at"] = now_beijing().isoformat()
-        message_id = fresh.get("message_id")
-        atomic_write_json(path, fresh)
-    try:
-        retire_discord_components(config, message_id)
-    except Exception as exc:
-        print(
-            f"stale candidate card retire failed: {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-    return True
-
-
-def _retire_execution_controls(state: dict[str, Any], config: dict[str, Any]) -> None:
-    token = str(state.get("token") or "")
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if not isinstance(fresh, dict) or fresh.get("status") != "executing":
-            raise RuntimeError("执行状态已经失效，拒绝进入战斗")
-        registry = load_json(BUTTONS_PATH, {})
-        if not isinstance(registry, dict):
-            raise RuntimeError("共享按钮登记表格式错误")
-        maa_copilot.prune_search_buttons(token, registry)
-        atomic_write_json(BUTTONS_PATH, registry)
-        message_id = fresh.get("message_id")
-    try:
-        retire_discord_components(config, message_id)
-    except Exception as exc:
-        print(
-            f"candidate card retire failed: {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-
-def _finish_execution(
-    token: str, config: dict[str, Any], *, ok: bool
-) -> dict[str, Any]:
-    path = maa_copilot.SEARCHES_DIR / f"{token}.json"
-    with state_lock():
-        fresh = load_json(path, None)
-        if not isinstance(fresh, dict) or fresh.get("status") != "executing":
-            raise RuntimeError("执行终态写入时状态不一致")
-        registry = load_json(BUTTONS_PATH, {})
-        if not isinstance(registry, dict):
-            raise RuntimeError("共享按钮登记表格式错误")
-        maa_copilot.prune_search_buttons(token, registry)
-        atomic_write_json(BUTTONS_PATH, registry)
-        message_id = fresh.get("message_id")
-        fresh["status"] = "executed" if ok else "execution_failed"
-        timestamp_key = "executed_at" if ok else "execution_failed_at"
-        fresh[timestamp_key] = now_beijing().isoformat()
-        for key in ("requested_index", "requested_mode"):
-            fresh.pop(key, None)
-        atomic_write_json(path, fresh)
-    try:
-        retire_discord_components(config, message_id)
-    except Exception as exc:
-        print(
-            f"terminal candidate card retire failed: {type(exc).__name__}: {exc}",
-            flush=True,
-        )
-    return fresh
-
-
-def _post_not_started(
-    config: dict[str, Any], state: dict[str, Any], message: str
-) -> None:
-    stage = str(state.get("stage") or "")
-    discord_request(
-        discord_token(),
-        "POST",
-        f"/channels/{config.get('channel_id', '')}/messages",
-        {
-            "embeds": [
-                {
-                    "title": f"⛔ 未启动抄作业：{stage}",
-                    "description": message[:1500],
-                    "color": 0xED4245,
-                    "timestamp": now_beijing().isoformat(),
-                }
-            ],
-            "allowed_mentions": {"parse": []},
-        },
-    )
-
-
-def _run_locked(state: dict[str, Any], candidate: dict[str, Any], index: int, mode: str) -> int:
-    config = load_config()
-    token = str(state.get("token") or "")
-    stage_id = str(state.get("stage_id") or "")
-    stage_label = str(state.get("stage") or "")
-    cand_id = int(candidate.get("id") or 0)
-    ratio = candidate.get("ratio")
-    channel_id = str(config.get("channel_id", ""))
-    token_text = discord_token()
-    at = now_beijing()
-    stem = f"{at.date().isoformat()}-copilot-{token}"
-    log_path = RUNS_DIR / f"{stem}.log"
-    png_path = RUNS_DIR / f"{stem}.png"
-    started = time.monotonic()
-    emulator_touched = False
-    battle_touched = False
-
-    # D18：抢到锁之后、碰设备之前先探一次。在线就把卡恢复成可点，什么都不做——
-    # 任何失败路径都会 `close_everything()` 退掉 BlueStacks，等于把人踢出游戏。
-    online, probe_detail = emulator_is_online(config)
-    if online:
-        _restore_ready(token, {"queued", "preparing"}, EMULATOR_BUSY_NOTICE)
-        _post_not_started(config, state, f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}")
-        merge_last_run(
-            {
-                "status": "skipped",
-                "phase": f"copilot-{token}",
-                "skip_reason": "emulator_busy",
-                "summary": EMULATOR_BUSY_NOTICE,
-                "emulator_probe": probe_detail,
-                "finished_at": now_beijing().isoformat(),
-            }
-        )
-        return 0
-
-    try:
-        _require_auto_run_preflight(state, candidate, config)
-        state = _begin_preparation(state, candidate, index, mode)
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        if isinstance(exc, maa_copilot.StaleActivityError):
-            _invalidate_prebattle_activity(token, config)
-        else:
-            _restore_ready(token, {"queued", "preparing"}, message)
-        try:
-            _post_not_started(config, state, message)
-        except Exception as notify_exc:
-            print(
-                f"copilot preflight notification failed: "
-                f"{type(notify_exc).__name__}: {notify_exc}",
-                flush=True,
-            )
-        merge_last_run(
-            {
-                "status": "failed",
-                "finished_at": now_beijing().isoformat(),
-                "summary": f"❌ 抄作业未启动：{message}"[:500],
-                "ok": False,
-                "cleanup_errors": [],
-            }
-        )
-        return 1
-
-    try:
-        atomic_write_json(
-            RUNS_DIR / f"{stem}.json",
-            {
-                "date": at.date().isoformat(),
-                "phase": f"copilot-{token}",
-                "stage": stage_label,
-                "stage_id": stage_id,
-                "candidate_id": cand_id,
-                "candidate_title": str(candidate.get("title") or "")[:120],
-                "mode": mode,
-                "ratio": ratio,
-                "started_at": at.isoformat(),
-                "status": "running",
-            },
-        )
-        merge_last_run(
-            {
-                "status": "running",
-                "phase": f"copilot-{token}",
-                "stage": stage_label,
-                "started_at": at.isoformat(),
-                "log": str(log_path),
-                "plan": {"stage": stage_label, "skip": False},
-            }
-        )
-
-        # Resolve the op file before touching the emulator.
-        uri, rewritten = _prepare_op_file(candidate, stage_id, config)
-
-        try:
-            require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-            require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
-        except RuntimeError as exc:
-            raise RuntimeError(str(exc)) from exc
-
-        discord_request(
-            token_text,
-            "POST",
-            f"/channels/{channel_id}/messages",
-            {
-                "embeds": [
-                    {
-                        "title": f"▶️ 开始抄作业：{stage_label}"
-                        f"（{'突袭' if mode == 'raid' else '普通'}）",
-                        "description": (
-                            f"作业：{candidate.get('title', '')}\n"
-                            f"作者：{candidate.get('uploader', '')}\n"
-                            f"{'已忽略作业练度要求' if ratio is not None and ratio < 1.0 else ''}"
-                        )[:3500],
-                        "color": 0x5865F2,
-                        "timestamp": at.isoformat(),
-                    }
-                ],
-                "allowed_mentions": {"parse": []},
-            },
-        )
-
-        # Emulator -> game ready -> navigate to formation screen -> copilot
-        state = _begin_execution(state, candidate, index, mode)
-        emulator_touched = True
-        open_emulator(config)
-        wait_for_android(config)
-        verify_game_installed(config)
-        # 抄作业开的是同一台冷启模拟器，同样会撞上 MaaCore 那 3 秒的 MaaTouch 窗口
-        # （DEV_GUIDE §11.14）。这里没有日常那层重试兜底，闸门更不能省。
-        settle_android_runtime(config)
-
-        maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
-        env = maa_subprocess_env(config)
-        env["MAA_LOG_PREFIX"] = "Never"
-
-        navigated, detail = _navigate_to_stage(config, stage_label, env, log_path)
-        if not navigated:
-            raise RuntimeError(detail)
-
-        # The card can sit open while the emulator boots.  Recheck the live
-        # activity and AP once more at the last safe point before a battle can
-        # consume sanity.
-        _require_auto_run_preflight(state, candidate, config)
-        _retire_execution_controls(state, config)
-
-        copilot_command = [
-            maa_bin, "copilot", uri,
-            "--formation", "--batch", "-v",
-            "--raid", mode,
-        ]
-        if ratio is not None and ratio < 1.0:
-            copilot_command.append("--ignore-requirements")
-        battle_touched = True
-        with log_path.open("a", encoding="utf-8") as log_handle:
-            log_handle.write(
-                f"# {now_beijing().isoformat()} copilot {stage_label} id={cand_id} "
-                f"mode={mode} ignore={ratio is not None and ratio < 1.0}\n"
-            )
-            return_code, _taps = _run_copilot_with_watchdog(
-                config, copilot_command, log_handle, log_path, env
-            )
-
-        # Screenshot (best-effort, before cleanup)
-        screenshot_ok, screenshot_error = capture_screenshot(config, png_path)
-        cleanup_errors = close_everything(config)
-        duration = time.monotonic() - started
-
-        raw_lines: list[str] = []
-        try:
-            raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            pass
-        # Only the current run's section: everything after the last run marker.
-        marker_index = -1
-        for line_index in range(len(raw_lines) - 1, -1, -1):
-            if raw_lines[line_index].startswith("# ") and "copilot" in raw_lines[line_index]:
-                marker_index = line_index
-                break
-        if marker_index >= 0:
-            raw_lines = raw_lines[marker_index + 1:]
-        ok = return_code == 0 and not cleanup_errors
-        summary = _copilot_summary(raw_lines, ok=ok, mode=mode)
-        if ratio is not None and ratio < 1.0:
-            summary += "\n（已忽略作业练度要求）"
-
-        embed: dict[str, Any] = {
-            "title": f"{'✅' if ok else '❌'} 抄作业：{stage_label}",
-            "color": 0x57F287 if ok else 0xED4245,
-            "fields": [
-                {"name": "作业", "value": str(candidate.get("title") or "")[:100], "inline": True},
-                {"name": "模式", "value": "突袭" if mode == "raid" else "普通", "inline": True},
-                {"name": "总耗时", "value": f"{duration:.0f}s", "inline": True},
-                {"name": "📋 结果", "value": summary[:1024], "inline": False},
-            ],
-            "footer": {"text": "模拟器与 ADB 已执行清理"},
-            "timestamp": now_beijing().isoformat(),
-        }
-        if screenshot_ok:
-            embed["image"] = {"url": "attachment://shot.png"}
-        payload: dict[str, Any] = {
-            "embeds": [embed],
-            "allowed_mentions": {"parse": []},
-        }
-        if screenshot_ok:
-            payload["attachments"] = [{"id": 0, "filename": "shot.png"}]
-        if screenshot_ok:
-            from maa_common import discord_upload
-
-            try:
-                discord_upload(token_text, channel_id, payload, png_path)
-            except Exception as upload_exc:
-                embed.pop("image", None)
-                fields = list(embed.get("fields", []))
-                fields.append(
-                    {"name": "图片上传", "value": f"内嵌上传失败：{type(upload_exc).__name__}"}
-                )
-                embed["fields"] = fields
-                discord_request(
-                    token_text,
-                    "POST",
-                    f"/channels/{channel_id}/messages",
-                    {"embeds": [embed], "allowed_mentions": {"parse": []}},
-                )
-        else:
-            if screenshot_error:
-                embed["fields"].append({"name": "截图", "value": screenshot_error[:200]})
-            discord_request(
-                token_text,
-                "POST",
-                f"/channels/{channel_id}/messages",
-                payload,
-            )
-
-        merge_last_run(
-            {
-                "status": "success" if ok else "failed",
-                "finished_at": now_beijing().isoformat(),
-                "summary": summary,
-                "ok": ok,
-                "cleanup_errors": cleanup_errors,
-            }
-        )
-        cleanup_run_files(int(config.get("retention_days", 14)))
-        state = _finish_execution(token, config, ok=ok)
-        # Diagnostic for the one observed hang: a successful run whose
-        # interpreter lingered ~10 min holding run.lock.  Neither
-        # discord_request nor discord_upload can block (both have timeouts);
-        # if this ever re-appears the next run's output shows what was alive.
-        threads = [t.name for t in threading.enumerate()]
-        print(
-            f"copilot run ok={ok} return_code={return_code} "
-            f"cleanup_errors={cleanup_errors} threads={threads}",
-            flush=True,
-        )
-        sys.stdout.flush()
-        # Force-exit: a lingering interpreter (threads/fds) once held run.lock
-        # for 10 minutes after a successful run, silently blocking the next
-        # copilot.  flock dies with the process, so this is safe.
-        os._exit(0 if ok else 1)
-    except Exception as exc:
-        print(f"copilot run EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
-        cleanup_errors = []
-        if emulator_touched:
-            try:
-                cleanup_errors = close_everything(config)
-            except Exception as cleanup_exc:
-                cleanup_errors = [
-                    f"清理异常：{type(cleanup_exc).__name__}: {cleanup_exc}"
-                ]
-        message = f"{type(exc).__name__}: {exc}"
-        stale_activity = isinstance(exc, maa_copilot.StaleActivityError)
-        safe_before_battle = (
-            not stale_activity and not battle_touched and not cleanup_errors
-        )
-        retryable = False
-        if stale_activity:
-            _invalidate_prebattle_activity(token, config)
-        elif safe_before_battle:
-            retryable = _restore_ready(
-                token, {"preparing", "executing"}, message
-            )
-        if not stale_activity and not safe_before_battle:
-            try:
-                state = _finish_execution(token, config, ok=False)
-            except RuntimeError as finish_exc:
-                print(
-                    f"execution terminal state failed: {finish_exc}",
-                    flush=True,
-                )
-        try:
-            discord_request(
-                token_text,
-                "POST",
-                f"/channels/{channel_id}/messages",
-                {
-                    "embeds": [
-                        {
-                            "title": (
-                                f"⛔ 活动已切换，旧作业未执行：{stage_label}"
-                                if stale_activity
-                                else f"⛔ 抄作业未启动，可重试：{stage_label}"
-                                if retryable
-                                else f"⛔ 抄作业已取消或失效：{stage_label}"
-                                if safe_before_battle
-                                else f"❌ 抄作业失败：{stage_label}"
-                            ),
-                            "description": message[:1500],
-                            "color": 0xED4245,
-                            "timestamp": now_beijing().isoformat(),
-                        }
-                    ],
-                    "allowed_mentions": {"parse": []},
-                },
-            )
-        except Exception:
-            pass
-        merge_last_run(
-            {
-                "status": "failed",
-                "finished_at": now_beijing().isoformat(),
-                "summary": f"❌ 抄作业失败：{type(exc).__name__}: {exc}"[:500],
-                "ok": False,
-                "cleanup_errors": cleanup_errors,
-            }
-        )
-        sys.stdout.flush()
-        if battle_touched:
-            os._exit(1)
-        return 1
-
-
-# ---------------------------------------------------------------------------
-# 通关队列（PLAN_CLEARING 步骤 3）
-#
-# 执行接入点**复用本 worker**，不新建第二个（PLAN_CLEARING「不做的事」）。
-# 一次 `clearing` 调用 = 一轮：抢同一把 run.lock、开一次模拟器、按理智预算
-# 连打若干关，任何一关失败就停在那里并记账。
-# ---------------------------------------------------------------------------
-
-# Depot 的独立 cron 在北京时间 04:30 触发，到期时会持 run.lock 数分钟
-# （不变量 #23）。队列避开这个窗口，免得两边互相抢锁、谁也跑不成。
-DEPOT_WINDOW_START_MINUTES = 4 * 60 + 20
-DEPOT_WINDOW_END_MINUTES = 5 * 60
-
-
-def _depot_window_reason(at: datetime) -> str | None:
-    minutes = at.hour * 60 + at.minute
-    if DEPOT_WINDOW_START_MINUTES <= minutes < DEPOT_WINDOW_END_MINUTES:
-        return "处于 Depot 对表窗口（北京时间 04:20–05:00），队列不与它抢 run.lock。"
-    return None
-
-
-def _clearing_notice(config: dict[str, Any], title: str, body: str, color: int) -> None:
-    """队列的任何一次「没干成」都必须可见（护栏 4：不许静默 return）。"""
-    try:
-        discord_request(
-            discord_token(),
-            "POST",
-            f"/channels/{config.get('channel_id', '')}/messages",
-            {
-                "embeds": [
-                    {
-                        "title": title[:250],
-                        "description": body[:3500],
-                        "color": color,
-                        "timestamp": now_beijing().isoformat(),
-                    }
-                ],
-                "allowed_mentions": {"parse": []},
-            },
-        )
-    except Exception as exc:
-        print(f"clearing notice failed: {type(exc).__name__}: {exc}", flush=True)
-
-
-def _clearing_post_manual_card(
-    config: dict[str, Any], state: dict[str, Any], stage: str
-) -> None:
-    """发 needs_manual 卡片并登记按钮（独立前缀，不碰既有两条清扫边界）。"""
-    import maa_clearing
-
-    embed, components, entries = maa_clearing.build_manual_card(state, stage)
-    message = discord_request(
-        discord_token(),
-        "POST",
-        f"/channels/{config.get('channel_id', '')}/messages",
-        {"embeds": [embed], "components": components,
-         "allowed_mentions": {"parse": []}},
-    )
-    message_id = str(message.get("id", "")) if isinstance(message, dict) else ""
-    with state_lock():
-        registry = load_json(BUTTONS_PATH, {})
-        if not isinstance(registry, dict):
-            raise RuntimeError("共享按钮登记表格式错误")
-        registry.update(entries)
-        atomic_write_json(BUTTONS_PATH, registry)
-    manual = state.get("needs_manual")
-    if isinstance(manual, dict) and message_id.isdigit():
-        manual["message_id"] = message_id
-        maa_clearing.save_state(state)
-
-
-def _clearing_pick_op(
-    stage: str, stage_id: str, config: dict[str, Any], roster: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """队列自动选作业：只要完全满足练度、无软硬缺口的 Top-1（对齐不变量 #18）。"""
-    candidates = maa_copilot.search_copilots(
-        stage_id, stage, config, roster, limit=1000, use_cache=False
-    )
-    for candidate in candidates:
-        if (
-            candidate.get("ratio") == 1.0
-            and not candidate.get("gaps")
-            and not candidate.get("soft_gaps")
-        ):
-            return candidate
-    return None
-
-
 @contextmanager
-def _navigation_config(stage: str, env: dict[str, str]):
-    """Isolate the no-battle override from daily runs and subsequent Copilot."""
+def _isolated_config(env: dict[str, str], task_files: dict[str, str]):
+    """临时 `MAA_CONFIG_DIR`，把不进战斗的覆盖与任务文件隔离在本进程内。
+
+    只**读**上游 resource 目录、只**写**这个临时目录（不变量 #37）：日常与随后
+    真正的 `maa copilot` 仍然用原配置，`~/.config/maa-cli/` 一个字节都不动。
+    """
     source = Path(env["MAA_CONFIG_DIR"])
     with tempfile.TemporaryDirectory(prefix="maa-copilot-nav-") as raw:
         root = Path(raw)
@@ -1198,16 +483,24 @@ def _navigation_config(stage: str, env: dict[str, str]):
         overlay["FightBegin"] = dict(ready)
         overlay["CopilotNavigationReady"] = dict(ready)
         atomic_write_json(resource, overlay)
-        atomic_write_text(root / "tasks" / "copilot-nav.toml", NAV_TOML_TEMPLATE.format(stage=stage))
+        for name, body in task_files.items():
+            atomic_write_text(root / "tasks" / name, body)
         yield {**env, "MAA_CONFIG_DIR": str(root)}
+
+
+@contextmanager
+def _navigation_config(stage: str, env: dict[str, str]):
+    """Isolate the no-battle override from daily runs and subsequent Copilot."""
+    with _isolated_config(
+        env, {"copilot-nav.toml": NAV_TOML_TEMPLATE.format(stage=stage)}
+    ) as nav_env:
+        yield nav_env
 
 
 def _navigate_to_stage(
     config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
     """Run upstream navigation, then recognize the stage screen without clicking."""
-    import maa_clearing
-
     supported, detail = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))(stage)
     if not supported:
         return False, detail
@@ -1227,379 +520,290 @@ def _navigate_to_stage(
     return True, ""
 
 
-def _clearing_probe_sanity(
-    config: dict[str, Any],
-    stage: str,
-    env: dict[str, str],
-    log_path: Path,
-    png_path: Path,
-) -> tuple[int | None, str, str]:
-    """步骤 4：导航到编队界面，截图，OCR 读理智消耗。
+def switch_to_raid(
+    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+) -> tuple[bool, str]:
+    """把关卡详情页从普通难度切到突袭（⚠️ **真机未验**，见文件头的注释）。
 
-    返回 `(理智 | None, 失败种类, 明细)`，失败种类 ∈ {"", "nav", "ocr"}。
-    读不出一律 None——调用方按「今日堵住」记账，不许猜一个数。
+    `config.copilot_raid_switch_task` 是这一步的开关：默认
+    `"ChangeToRaidDifficulty"`（MaaCore 自己切突袭用的上游任务名），
+    **空串表示跳过切换直接打**——真机验不过时改这一个键就能退回只打普通。
     """
-    import maa_clearing
-
-    nav_ok, nav_detail = _navigate_to_stage(config, stage, env, log_path)
-    if not nav_ok:
-        return None, "nav", nav_detail
-    shot_ok, shot_detail = capture_screenshot(config, png_path)
-    if not shot_ok:
-        return None, "ocr", f"{stage} 编队界面截图失败：{shot_detail}"
-    cost, detail = maa_clearing.ocr_sanity_cost(png_path, config)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"# sanity-ocr {stage}: {cost} ({detail}) png={png_path}\n")
-    if cost is None:
-        return None, "ocr", f"{stage} 理智 OCR 读不出：{detail}"
-    return cost, "", detail
-
-
-def _clearing_fight_stage(
-    config: dict[str, Any],
-    stage: str,
-    stage_id: str,
-    roster: dict[str, Any] | None,
-    env: dict[str, str],
-    log_path: Path,
-    mode: str = "normal",
-) -> tuple[bool, str, str]:
-    """打一关。返回 `(是否成功, 失败种类, 明细)`；失败种类 ∈ {"", "nav", "op"}。
-
-    `stage` 已经是**去掉 `#raid` 后缀**的关卡名：理智查表、导航、作业匹配全都按
-    普通关名走，只有最后 `maa copilot --raid` 的取值受 `mode` 影响。
-    """
+    task = str(config.get("copilot_raid_switch_task", DEFAULT_RAID_SWITCH_TASK)).strip()
+    if not task:
+        return True, "已按配置跳过突袭切换"
     maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
-    candidate = _clearing_pick_op(stage, stage_id, config, roster)
-    if candidate is None:
-        return False, "op", f"{stage} 暂时没有完全满足当前干员练度的作业"
-    uri, _rewritten = _prepare_op_file(candidate, stage_id, config)
-
-    nav_ok, nav_detail = _navigate_to_stage(config, stage, env, log_path)
-    if not nav_ok:
-        return False, "nav", nav_detail
-
-    # `maa copilot --help`：normal / raid / both（另收 legacy 的 0/1/2）。
-    command = [maa_bin, "copilot", uri, "--formation", "--batch", "-v",
-               "--raid", mode]
-    marker = f"# {now_beijing().isoformat()} clearing {stage} mode={mode} "
+    body = RAID_SWITCH_TOML_TEMPLATE.format(task=json.dumps(task, ensure_ascii=False))
+    with _isolated_config(env, {"copilot-raid.toml": body}) as raid_env:
+        result = subprocess.run(
+            [maa_bin, "run", "copilot-raid", "--user-resource", "-v", "--batch"],
+            capture_output=True, text=True, check=False, timeout=300, env=raid_env,
+        )
+    output = f"{result.stdout}\n{result.stderr}"
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(f"{marker}id={candidate.get('id')}\n")
-        return_code, _taps = _run_copilot_with_watchdog(
-            config, command, handle, log_path, env
-        )
+        handle.write(f"# raid-switch {stage} task={task}\n{output}")
+    if result.returncode != 0 or "Custom Completed" not in output:
+        detail = " | ".join(output.strip().splitlines()[-3:])[-400:]
+        return False, f"{stage} 切换突袭难度失败：{detail}"
+    return True, ""
 
-    # 退出码 0 **不等于** 打过了：cursor 一前进就永久跳过这一关，所以要拿
-    # 本趟输出去判胜负（`maa_clearing.copilot_outcome()` 里写了判据与局限）。
-    import maa_clearing
+
+def _recheck_before_stage(
+    config: dict[str, Any], state: dict[str, Any], entry: dict[str, Any]
+) -> tuple[bool, str]:
+    """每关开打前的复核：活动还在不在、理智够不够。
+
+    活动只按 **key** 复核（不看具体关卡）：目标集合是整个活动的关，而
+    `maa activity` 只列上游推荐的那 4 关，按关卡复核会把 `SR-1` 判成过期。
+    非活动关（资源本 / 主线）没有 `activity_key`，整段跳过。
+    """
+    stage = str(entry.get("stage") or "")
+    activity_key = str(state.get("activity_key") or "")
+    if activity_key:
+        from maa_plan_card import activity_target, query_activity_snapshot
+
+        target = activity_target(query_activity_snapshot(config))
+        if target is None or target["key"] != activity_key:
+            raise maa_copilot.StaleActivityError(
+                f"活动已切换，{stage} 不再属于当前目标，本轮停止"
+            )
+    try:
+        cost = int(entry.get("sanity_cost") or 0)
+    except (TypeError, ValueError):
+        cost = 0
+    if cost <= 0:
+        return False, f"无法确认 {stage} 的理智消耗，拒绝开打"
+    import maa_skland
 
     try:
-        full = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        full = ""
-    this_run = full.rsplit(marker, 1)[-1] if marker in full else full
-    outcome, detail = maa_clearing.copilot_outcome(this_run, return_code)
-    if outcome == "won":
-        return True, "", str(candidate.get("title") or "")
-    return False, "op", f"{stage}（{mode}）作业未判定为通关：{detail}"
-
-
-def cmd_clearing() -> int:
-    """跑一轮通关队列。全程只用既有的 run.lock，不新增锁语义（不变量 #13）。"""
-    import maa_clearing
-
-    config = load_config()
-    if not bool(config.get("clearing_enabled", False)):
-        print("clearing disabled by config", flush=True)
-        return 0
-    at = now_beijing()
-
-    # 与抄作业同一条 blackout 闸门：08:00 / 22:00 前 copilot_blackout_minutes
-    # 分钟内不启动，避免与日常互斥抢占（不变量 #13）。
-    from maa_action import _copilot_blackout_reason
-
-    for reason in (_copilot_blackout_reason(config), _depot_window_reason(at)):
-        if reason:
-            _clearing_notice(config, "⏸️ 通关队列本轮未启动", reason, 0x99AAB5)
-            return 0
-
-    state = maa_clearing.load_state()
-    if state is None:
-        _clearing_notice(
-            config, "⏸️ 通关队列本轮未启动", "尚未建立队列（clearing.json 不存在）。", 0x99AAB5
-        )
-        return 0
-    if maa_clearing.is_finished(state):
-        _clearing_notice(config, "✅ 通关队列已到队尾", "全部关卡已推进完毕。", 0x57F287)
-        return 0
-    manual_stage = maa_clearing.awaiting_manual(state)
-    if manual_stage:
-        _clearing_notice(
-            config,
-            "⏸️ 通关队列本轮未启动",
-            f"仍在等你手动打完 {manual_stage} 并点卡片上的「已完成」。",
-            0x99AAB5,
-        )
-        return 0
-
-    # EX 闸门：森空岛不可用一律 fail-closed，且必须可见。
-    roster: dict[str, Any] | None = None
-    try:
-        import maa_skland
-
-        if maa_skland.roster_needs_refresh(config):
-            maa_skland.refresh_roster()
-        roster = maa_copilot.load_roster()
+        roster = maa_skland.refresh_roster()
     except Exception as exc:
-        print(f"clearing roster refresh failed: {type(exc).__name__}: {exc}", flush=True)
-        roster = maa_copilot.load_roster()
-    ex_count = int(config.get("clearing_ex_stage_count", 8))
-    state, notify_ex, ex_reason = maa_clearing.apply_ex_gate(
-        state, roster, ex_count, at=at
-    )
-    if notify_ex and maa_clearing.should_notify(state, "ex_gate", ex_reason):
-        _clearing_notice(
-            config,
-            maa_clearing.ex_gate_embed(ex_reason)["title"],
-            maa_clearing.ex_gate_embed(ex_reason)["description"],
-            0xED4245,
-        )
-    if not ex_reason:
-        maa_clearing.clear_notification(state, "ex_gate")
-    maa_clearing.save_state(state)
+        return False, f"森空岛实时理智读取失败：{type(exc).__name__}: {exc}"
+    preflight = maa_copilot.sanity_preflight(roster, cost)
+    if not preflight.get("known"):
+        return False, f"森空岛实时理智读取失败：{preflight.get('reason', '未知原因')}"
+    if not preflight.get("enough"):
+        return False, maa_copilot.sanity_status_text(preflight)
+    return True, ""
 
-    # 理智预算：**先扣剿灭那份**（地基事实 H），再排关。
-    last_run = load_json(LAST_RUN_PATH, {})
-    plan = maa_daily_attach_annihilation(at, last_run if isinstance(last_run, dict) else {})
-    sanity_snapshot = (roster or {}).get("sanity")
-    sanity = maa_copilot.estimated_sanity(
-        sanity_snapshot if isinstance(sanity_snapshot, dict) else {}, at
-    )
-    budget = maa_clearing.sanity_budget(sanity, plan, config)
-    index = maa_copilot.load_stage_index(config)
 
-    def lookup(stage: str) -> int | None:
-        resolved = maa_copilot.resolve_copilot_stage(stage, index)
-        if resolved is None:
+def _set_status(
+    token: str, expected: set[str], status: str, **extra: Any
+) -> dict[str, Any] | None:
+    """状态机的唯一改写口：只有当前状态在 `expected` 里才改，返回改后的状态。"""
+    path = _search_path(token)
+    with state_lock():
+        fresh = load_json(path, None)
+        if not isinstance(fresh, dict) or fresh.get("status") not in expected:
             return None
-        return maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+        fresh["status"] = status
+        fresh.update(extra)
+        atomic_write_json(path, fresh)
+        return fresh
 
-    def cost_of(entry: str) -> int | None:
-        # 突袭条目按**普通关名**查理智；`#raid` 只影响执行时的 --raid 取值。
-        # `stages.json` 有真值以它为准；没有（EX 关）才用步骤 4 的 OCR 缓存。
-        return maa_clearing.resolve_cost(entry, state, lookup)
 
-    # 上游导航键闸门（2026-09-05 范围变更）：队列只跑上游 `tasks/Stages/<前缀>.json`
-    # 已经写了导航键的关。`_resource_dirs()` 只读不改；本项目**不再**自写导航定义，
-    # 也不读 `~/.config/maa-cli/resource/tasks/Stages/`。每轮建一次，按前缀缓存。
-    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
+def _retire_round_controls(token: str, config: dict[str, Any], message_id: Any) -> None:
+    """收掉「取消本轮」按钮：开始碰设备之后取消已经没有意义。"""
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        maa_copilot.prune_search_buttons(token, registry)
+        atomic_write_json(BUTTONS_PATH, registry)
+    try:
+        retire_discord_components(config, message_id)
+    except Exception as exc:
+        print(f"round card retire failed: {type(exc).__name__}: {exc}", flush=True)
 
-    plan_result = maa_clearing.plan_round(state, budget, cost_of, at=at, nav_of=nav_of)
-    # 上游没导航定义的关：**立刻**走 needs_manual（同一个出口，`immediate=True`），
-    # 不等 `clearing_manual_after_days` 的 N 日规则——那条规则赌的是「明天也许就好了」，
-    # 而导航定义不会自己长出来。cursor 不前进，用户点「已完成」后照常前进。
-    # 只在它排在队首（本轮一关都排不出）时立刻转：它前面还有能打的关时先把那些打完，
-    # 下一轮它成为队首再转，同样一关都不会被跳过。
-    missing_nav = plan_result.get("missing_nav") or []
-    if missing_nav and not plan_result["stages"]:
-        blocked_entry = str(missing_nav[0])
-        nav_detail = str(plan_result.get("nav_detail") or "")
-        state, turned = maa_clearing.record_stage_failure(
-            state,
-            blocked_entry,
-            kind="nav_definition",
-            detail=nav_detail,
-            config=config,
-            at=at,
-            immediate=True,
-            reason_code=maa_clearing.NAV_MISSING_REASON,
-        )
-        maa_clearing.save_state(state)
-        # 同原因只发一次（复用 fail-closed 可见性的去重范式）；换了关或换了原因要重发。
-        if turned and maa_clearing.should_notify(
-            state, "nav_definition", f"{blocked_entry}|{nav_detail}"
-        ):
-            _clearing_post_manual_card(config, state, blocked_entry)
-        maa_clearing.save_state(state)
-        return 0
-    # 步骤 4：理智未知的关不再直接堵住——本轮去它的编队界面 OCR 一次，
-    # 读到就缓存（下一轮排得进），读不出才按「今日堵住」记账（在锁内做）。
-    # 当天已经因此堵过就不再开模拟器重试，与 nav 冻结同尺度。
-    probe = maa_clearing.probe_candidate(plan_result)
-    if probe and maa_clearing.blocked_today(state, at) == "unknown_cost":
-        probe = ""
-    if not plan_result["stages"] and not probe:
-        maa_clearing.save_state(state)
-        _clearing_notice(
-            config,
-            "⏸️ 通关队列本轮没有可打的关",
-            f"可用理智 {sanity if sanity is not None else '未知（森空岛不可用）'}（已扣剿灭预留 "
-            f"{maa_clearing.annihilation_reserve(plan, config)}），"
-            f"停在 `{plan_result['stop_reason']}`。"
-            + (
-                "\n今天已因理智读不出被堵住，日常照常刷理智；明天自动再试一次。"
-                if plan_result["stop_reason"] == "unknown_cost"
-                else ""
-            ),
-            0x99AAB5,
-        )
-        return 0
-    if plan_result["stages"]:
-        # 排得出关就说明堵塞已经解除（例如 OCR 读出理智之后）。
-        maa_clearing.clear_blocked(state)
-    maa_clearing.save_state(state)
+
+def cmd_run_batch(token: str) -> int:
+    if not maa_copilot.SEARCH_TOKEN_RE.fullmatch(token or ""):
+        return 2
+    state = load_json(_search_path(token), None)
+    if not isinstance(state, dict) or state.get("status") != "queued":
+        return 2
+    entries = state.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return 2
 
     with run_lock(blocking=False) as acquired:
         if not acquired:
-            _clearing_notice(
-                config,
-                "⏸️ 通关队列本轮未启动",
-                "另一场 MAA 正在运行（run.lock 被占），本轮跳过，下一轮再试。",
-                0xED4245,
-            )
+            message = "另一场 MAA 正在运行，本轮未启动；到点会自动重试。"
+            print("copilot run-batch SKIPPED: run.lock 被占用")
+            _set_status(token, {"queued"}, "scheduled", last_prepare_error=message)
+            _notice(load_config(), "⏸️ 自动作业本轮未启动", message, 0x99AAB5)
             return 1
-        return _clearing_run_locked(
-            config,
-            state,
-            plan_result["stages"],
-            roster,
-            at,
-            probe=probe,
-            remaining=max(0, int(budget) - int(plan_result["spent"])),
+        # 最后一道防线（不变量 #13）：派发与真正开跑之间可能隔了很久（worker 排队、
+        # 锁等待），这里再过一次三条**时间**闸门。run.lock 与模拟器不再查——锁刚
+        # 被自己拿在手上，再查只会自相矛盾；模拟器由 `_batch_run_locked()` 探。
+        config = load_config()
+        for reason in (
+            maa_action._copilot_blackout_reason(config),
+            maa_action.depot_window_reason(),
+            maa_action.min_lead_reason(config),
+        ):
+            if reason:
+                message = f"本轮未启动：{reason}"
+                print(f"copilot run-batch SKIPPED: {reason}")
+                _set_status(token, {"queued"}, "scheduled", last_prepare_error=message)
+                _notice(config, "⏸️ 自动作业本轮未启动", message, 0x99AAB5)
+                return 1
+        return _batch_run_locked(state)
+
+
+def _entry_result_lines(results: list[dict[str, Any]]) -> str:
+    icons = {"won": "✅", "failed": "❌", "unknown": "❓", "skipped": "⏭️"}
+    lines: list[str] = []
+    for result in results:
+        label = maa_clearing.entry_label(
+            maa_clearing.make_entry(result["stage"], result["mode"])
         )
+        icon = icons.get(str(result.get("outcome")), "❓")
+        detail = str(result.get("detail") or "")
+        lines.append(f"{icon} `{label}`" + (f" — {detail[:120]}" if detail else ""))
+    return "\n".join(lines) or "—"
 
 
-def maa_daily_attach_annihilation(
-    at: datetime, last_run: dict[str, Any]
-) -> dict[str, Any]:
-    """本轮的计划视图：只为了拿 `annihilation` 标志去算理智预留。"""
-    from maa_common import effective_plan
-    from maa_daily import attach_annihilation
+def _batch_run_locked(state: dict[str, Any]) -> int:
+    """锁内串行连抄：每关一次上游 Fight 导航 + 单作业 copilot（spike A 的 B 基线）。
 
-    return attach_annihilation(effective_plan(at), at, last_run)
-
-
-def _clearing_run_locked(
-    config: dict[str, Any],
-    state: dict[str, Any],
-    stages: list[str],
-    roster: dict[str, Any] | None,
-    at: datetime,
-    *,
-    probe: str = "",
-    remaining: int = 0,
-) -> int:
-    """锁内执行：先打排好的 `stages`，再（若有）对 `probe` 那关做步骤 4 的理智 OCR。
-
-    `probe` 是 `plan_round()` 撞上的第一个理智未知关（EX），`remaining` 是打完
-    `stages` 之后剩下的理智预算：OCR 读到的理智 ≤ remaining 就顺手把它打了，
-    否则只缓存、留给下一轮。读不出 → `mark_blocked()`，今日不再重试。
+    `copilot_list` 那条路挂起（spike A：stdout 分不出逐关成败，且它的导航链不处理
+    首通弹窗，实测死循环 9 分钟）。B 基线的每关成败能直接从 stdout 的
+    `Copilot Completed` 判，Fight 导航链又自带 `<前缀>-TarotClose` 这类弹窗处理。
     """
-    import maa_clearing
-
-    stem = f"{at.date().isoformat()}-clearing"
+    config = load_config()
+    token = str(state.get("token") or "")
+    entries = [entry for entry in state.get("entries") or [] if isinstance(entry, dict)]
+    at = now_beijing()
+    stem = f"{at.date().isoformat()}-copilot-{token}"
     log_path = RUNS_DIR / f"{stem}.log"
     png_path = RUNS_DIR / f"{stem}.png"
-    index = maa_copilot.load_stage_index(config)
-    done: list[str] = []
-    probed = ""
-    failure = ""
+    started = time.monotonic()
     emulator_touched = False
+    results: list[dict[str, Any]] = []
+    stop_reason = ""
     cleanup_errors: list[str] = []
 
-    # D18：与抄作业同一条闸门——锁到手了不代表设备是空的。
+    # D18：抢到锁之后、碰设备之前先探一次。在线就把这一轮放回排程，什么都不做——
+    # 任何失败路径都会 `close_everything()` 退掉 BlueStacks，等于把人踢出游戏。
     online, probe_detail = emulator_is_online(config)
     if online:
-        _clearing_notice(
+        _set_status(token, {"queued"}, "scheduled", last_prepare_error=EMULATOR_BUSY_NOTICE)
+        _notice(
             config,
-            "⏸️ 通关队列本轮未启动",
+            "⏸️ 自动作业本轮未启动",
             f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}",
             0x99AAB5,
         )
+        merge_last_run(
+            {
+                "status": "skipped",
+                "phase": f"copilot-{token}",
+                "skip_reason": "emulator_busy",
+                "summary": EMULATOR_BUSY_NOTICE,
+                "emulator_probe": probe_detail,
+                "finished_at": now_beijing().isoformat(),
+            }
+        )
         return 0
 
-    def attempt(entry: str) -> bool:
-        """打一关；成功前进 cursor 并返回 True，失败记账（可能转 needs_manual）返回 False。"""
-        nonlocal failure
-        stage, mode = maa_clearing.split_entry(entry)
-        resolved = maa_copilot.resolve_copilot_stage(stage, index)
-        if resolved is None:
-            kind, detail = "nav", f"{stage} 不在本地关卡索引里（多半是 MAA 没写导航定义）"
-            ok = False
-        else:
-            ok, kind, detail = _clearing_fight_stage(
-                config, stage, resolved[0], roster, env, log_path, mode
-            )
-        if ok:
-            maa_clearing.advance_cursor(state)
-            maa_clearing.save_state(state)
-            done.append(maa_clearing.entry_label(entry))
-            return True
-        _state, turned = maa_clearing.record_stage_failure(
-            state, entry, kind=kind, detail=detail, config=config, at=at
-        )
-        maa_clearing.save_state(state)
-        failure = detail
-        if turned:
-            _clearing_post_manual_card(config, state, entry)
-        return False
+    fresh = _set_status(
+        token, {"queued"}, "executing", execution_started_at=at.isoformat()
+    )
+    if fresh is None:
+        print("copilot run-batch: 状态已在启动前失效", flush=True)
+        return 1
+    _retire_round_controls(token, config, fresh.get("message_id"))
 
+    ledger, _note = maa_copilot.ensure_ledger(str(state.get("activity_key") or ""))
+    failed_stages: set[str] = set()
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
         require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+        atomic_write_json(
+            RUNS_DIR / f"{stem}.json",
+            {
+                "date": at.date().isoformat(),
+                "phase": f"copilot-{token}",
+                "entries": [
+                    {"stage": entry.get("stage"), "mode": entry.get("mode")}
+                    for entry in entries
+                ],
+                "started_at": at.isoformat(),
+                "status": "running",
+            },
+        )
         merge_last_run(
             {
                 "status": "running",
-                "phase": "clearing",
-                "stage": stages[0] if stages else probe,
+                "phase": f"copilot-{token}",
+                "stage": str(entries[0].get("stage") or ""),
                 "started_at": at.isoformat(),
                 "log": str(log_path),
             }
         )
+        _notice(
+            config,
+            f"▶️ 开始抄作业：共 {len(entries)} 项",
+            "\n".join(maa_copilot.entry_lines(entries))[:3500],
+            0x5865F2,
+        )
+
         open_emulator(config)
         emulator_touched = True
         wait_for_android(config)
         verify_game_installed(config)
+        # 抄作业开的是同一台冷启模拟器，同样会撞上 MaaCore 那 3 秒的 MaaTouch 窗口
+        # （DEV_GUIDE §11.14）。这里没有日常那层重试兜底，闸门更不能省。
         settle_android_runtime(config)
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
-        for entry in stages:
-            if not attempt(entry):
+        for entry in entries:
+            stage = str(entry.get("stage") or "")
+            mode = str(entry.get("mode") or "normal")
+            if stage in failed_stages:
+                # 普通没过就别去撞突袭：突袭是同一关再打一遍，普通没通它根本没解锁。
+                results.append(
+                    {"stage": stage, "mode": mode, "outcome": "skipped",
+                     "detail": "同一关的普通模式未通过"}
+                )
+                continue
+            lead = maa_action.min_lead_reason(config)
+            if lead:
+                stop_reason = lead
                 break
-
-        if probe and not failure:
-            stage, _mode = maa_clearing.split_entry(probe)
-            cost, kind, detail = _clearing_probe_sanity(
-                config, stage, env, log_path, RUNS_DIR / f"{stem}-sanity.png"
+            ok, detail = _recheck_before_stage(config, state, entry)
+            if not ok:
+                stop_reason = detail
+                break
+            outcome, detail = _fight_one(config, entry, env, log_path)
+            verdict = {"won": "won", "unknown": "unknown"}.get(outcome, "failed")
+            maa_copilot.record_copilot_attempt(
+                ledger,
+                stage,
+                mode,
+                outcome=verdict,
+                op=int((entry.get("candidate") or {}).get("id") or 0),
+                detail=detail,
             )
-            if kind == "nav":
-                _state, turned = maa_clearing.record_stage_failure(
-                    state, probe, kind="nav", detail=detail, config=config, at=at
-                )
-                maa_clearing.save_state(state)
-                failure = detail
-                if turned:
-                    _clearing_post_manual_card(config, state, probe)
-            elif cost is None:
-                # 读不出就按「今日堵住」记账：日常照常刷理智，明天再试一次。
-                # 不许猜一个数——理智算错会直接导致队列空跑。
-                maa_clearing.mark_blocked(
-                    state, "unknown_cost", [probe], at=at, detail=detail
-                )
-                maa_clearing.save_state(state)
-                failure = detail
-            else:
-                maa_clearing.remember_sanity_cost(state, stage, cost, at=at)
-                maa_clearing.clear_blocked(state)
-                maa_clearing.save_state(state)
-                probed = f"{stage} 理智 {cost}（编队界面 OCR）"
-                if cost <= remaining:
-                    attempt(probe)
-                else:
-                    probed += f"，本轮剩余预算 {remaining} 不够，留给下一轮"
+            maa_copilot.save_ledger(ledger)
+            results.append(
+                {"stage": stage, "mode": mode, "outcome": verdict, "detail": detail}
+            )
+            if verdict == "won":
+                continue
+            # 突袭没过 → 这一关不算通关（D7），下一轮只排它剩下的模式。
+            failed_stages.add(stage)
+            if outcome == "nav":
+                # 导航 / 切难度失败说明环境坏了，后面几关只会一路失败。
+                stop_reason = detail
+                break
+    except maa_copilot.StaleActivityError as exc:
+        stop_reason = str(exc)
     except Exception as exc:
-        failure = f"{type(exc).__name__}: {exc}"
+        stop_reason = f"{type(exc).__name__}: {exc}"
+        print(f"copilot run-batch EXCEPTION: {stop_reason}", flush=True)
     finally:
         if emulator_touched:
             try:
@@ -1611,116 +815,144 @@ def _clearing_run_locked(
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
-    ok = (bool(done) or bool(probed)) and not failure and not cleanup_errors
-    body = (
-        f"本轮推进：{('、'.join(done) or '无')}\n"
-        f"队列进度：{min(int(state.get('cursor', 0)), len(state.get('stages') or []))}"
-        f"/{len(state.get('stages') or [])}"
+    won = [r for r in results if r["outcome"] == "won"]
+    ok = bool(won) and not stop_reason and not cleanup_errors and all(
+        r["outcome"] in ("won", "skipped") for r in results
     )
-    if probed:
-        body += f"\n理智探测：{probed}"
-    if failure:
-        body += f"\n停在：{failure[:600]}"
+    duration = time.monotonic() - started
+    embed: dict[str, Any] = {
+        "title": f"{'✅' if ok else '⚠️'} 抄作业本轮结束：{len(won)}/{len(entries)} 通过",
+        "color": 0x57F287 if ok else 0xFEE75C,
+        "fields": [
+            {"name": "逐关结果", "value": _entry_result_lines(results)[:1024], "inline": False},
+            {"name": "总耗时", "value": f"{duration:.0f}s", "inline": True},
+        ],
+        "footer": {"text": "模拟器与 ADB 已执行清理 · 不吃药不碎石"},
+        "timestamp": now_beijing().isoformat(),
+    }
+    if stop_reason:
+        embed["fields"].append({"name": "停在", "value": stop_reason[:1024], "inline": False})
     if cleanup_errors:
-        body += f"\n清理异常：{'; '.join(cleanup_errors)[:400]}"
-    _clearing_notice(
-        config,
-        f"{'✅' if ok else '⚠️'} 通关队列本轮结束",
-        body,
-        0x57F287 if ok else 0xFEE75C,
-    )
+        embed["fields"].append(
+            {"name": "清理异常", "value": "; ".join(cleanup_errors)[:1024], "inline": False}
+        )
+    _post_report(config, embed, png_path if emulator_touched else None)
+
     merge_last_run(
         {
             "status": "success" if ok else "failed",
             "finished_at": now_beijing().isoformat(),
-            "summary": f"通关队列：{body}"[:500],
+            "summary": f"抄作业：{len(won)}/{len(entries)} 通过"
+            + (f"；停在 {stop_reason}" if stop_reason else ""),
             "ok": ok,
             "cleanup_errors": cleanup_errors,
         }
     )
+    cleanup_run_files(int(config.get("retention_days", 14)))
+    _set_status(
+        token,
+        {"executing"},
+        "executed" if ok else "execution_failed",
+        **{("executed_at" if ok else "execution_failed_at"): now_beijing().isoformat()},
+    )
+    print(
+        f"copilot batch ok={ok} results={results} "
+        f"threads={[t.name for t in threading.enumerate()]}",
+        flush=True,
+    )
     return 0 if ok else 1
 
 
-def cmd_sanity_probe(stage: str) -> int:
-    """步骤 4 的校准入口（本机终端用，不进 Discord 白名单）。
+def _fight_one(
+    config: dict[str, Any],
+    entry: dict[str, Any],
+    env: dict[str, str],
+    log_path: Path,
+) -> tuple[str, str]:
+    """打一关一种模式，返回 `(结论, 明细)`。
 
-    开模拟器 → 导航到 `stage` 的编队界面 → 截图 → OCR，把读到的理智与
-    `stages.json` 的真值并排打印成 JSON，然后关掉一切。对普通关先跑一遍、
-    `match` 为 true，才有资格拿它去读 EX（PLAN_CLEARING 步骤 4「先校准再用」）。
-    与队列同一条 blackout 闸门、同一把 run.lock。
+    结论 ∈ {`"won"`, `"nav"`, `"failed"`, `"unknown"`}：`nav` 是导航 / 切难度失败，
+    说明环境坏了，调用方停止整轮；其余两种只影响这一关，下一关照打。
     """
-    import maa_clearing
-    from maa_action import _copilot_blackout_reason
+    stage = str(entry.get("stage") or "")
+    stage_id = str(entry.get("stage_id") or "")
+    mode = str(entry.get("mode") or "normal")
+    candidate = entry.get("candidate") or {}
+    maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
 
-    config = load_config()
-    at = now_beijing()
-    stage = str(stage or "").strip()[:40]
-    for reason in (_copilot_blackout_reason(config), _depot_window_reason(at)):
-        if reason:
-            print(json.dumps({"ok": False, "error": reason}, ensure_ascii=False))
-            return 1
-    index = maa_copilot.load_stage_index(config)
-    resolved = maa_copilot.resolve_copilot_stage(stage, index)
-    if resolved is None:
-        print(json.dumps({"ok": False, "error": f"{stage} 不在本地关卡索引里"}, ensure_ascii=False))
-        return 1
-    truth = maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
-    stem = f"{at.date().isoformat()}-sanity-probe-{stage}"
-    log_path = RUNS_DIR / f"{stem}.log"
-    png_path = RUNS_DIR / f"{stem}.png"
-    result: dict[str, Any] = {
-        "ok": False,
-        "stage": stage,
-        "stage_id": resolved[0],
-        "stages_json": truth,
-        "ocr": None,
-        "detail": "",
-        "png": str(png_path),
-        "log": str(log_path),
-    }
-    with run_lock(blocking=False) as acquired:
-        if not acquired:
-            result["detail"] = "run.lock 被另一场 MAA 占用"
-            print(json.dumps(result, ensure_ascii=False))
-            return 1
-        cleanup_errors: list[str] = []
+    uri, _rewritten = _prepare_op_file(candidate, stage_id, config)
+    navigated, detail = _navigate_to_stage(config, stage, env, log_path)
+    if not navigated:
+        return "nav", detail
+    if mode == "raid":
+        switched, switch_detail = switch_to_raid(config, stage, env, log_path)
+        if not switched:
+            return "nav", switch_detail
+
+    # `maa copilot --help`：normal / raid / both。**三个降级开关（忽略练度要求 /
+    # 吃理智药 / 用助战）一个都不许出现在这条 argv 上**（D12 / D13，不变量 #15）。
+    # 它们连字面量都不许写进脚本，`CopilotDowngradeGuardTests` 全库 grep 守着。
+    command = [maa_bin, "copilot", uri, "--formation", "--batch", "-v", "--raid", mode]
+    marker = f"# {now_beijing().isoformat()} copilot {stage} mode={mode} "
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{marker}id={candidate.get('id')}\n")
+        return_code, _taps = _run_copilot_with_watchdog(
+            config, command, handle, log_path, env
+        )
+    try:
+        full = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        full = ""
+    this_run = full.rsplit(marker, 1)[-1] if marker in full else full
+    outcome, detail = maa_clearing.copilot_outcome(this_run, return_code)
+    if outcome == "won":
+        return "won", ""
+    summary = _copilot_summary(this_run.splitlines(), ok=False)
+    return outcome, f"{detail}{(' · ' + summary) if summary else ''}"[:400]
+
+
+def _post_report(
+    config: dict[str, Any], embed: dict[str, Any], png_path: Path | None
+) -> None:
+    """战报：有截图就内嵌上传，上传失败退回纯 embed（截图不该带走战报）。"""
+    token_text = discord_token()
+    channel_id = str(config.get("channel_id", ""))
+    has_shot = bool(png_path and png_path.is_file() and png_path.stat().st_size > 0)
+    payload: dict[str, Any] = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    if has_shot:
+        embed["image"] = {"url": "attachment://shot.png"}
+        payload["attachments"] = [{"id": 0, "filename": "shot.png"}]
+        from maa_common import discord_upload
+
         try:
-            require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-            require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
-            open_emulator(config)
-            wait_for_android(config)
-            verify_game_installed(config)
-            settle_android_runtime(config)
-            env = maa_subprocess_env(config)
-            env["MAA_LOG_PREFIX"] = "Never"
-            cost, kind, detail = _clearing_probe_sanity(config, stage, env, log_path, png_path)
-            result.update({"ocr": cost, "kind": kind, "detail": detail})
+            discord_upload(token_text, channel_id, payload, png_path)
+            return
         except Exception as exc:
-            result["detail"] = f"{type(exc).__name__}: {exc}"
-        finally:
-            try:
-                cleanup_errors = close_everything(config)
-            except Exception as exc:
-                cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
-    result["cleanup_errors"] = cleanup_errors
-    result["match"] = result["ocr"] is not None and result["ocr"] == truth
-    result["ok"] = result["ocr"] is not None and not cleanup_errors
-    print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["ok"] else 1
+            embed.pop("image", None)
+            payload.pop("attachments", None)
+            embed["fields"].append(
+                {"name": "图片上传", "value": f"内嵌上传失败：{type(exc).__name__}"}
+            )
+    try:
+        discord_request(
+            token_text, "POST", f"/channels/{channel_id}/messages", payload
+        )
+    except Exception as exc:
+        print(f"copilot report failed: {type(exc).__name__}: {exc}", flush=True)
 
 
 def main(argv: list[str]) -> int:
     if argv[:1] == ["search"] and len(argv) == 2:
         return cmd_search(argv[1])
-    if argv[:1] == ["run"] and len(argv) == 4:
-        return cmd_run(argv[1], argv[2], argv[3])
-    if argv == ["clearing"]:
-        return cmd_clearing()
-    if argv[:1] == ["sanity-probe"] and len(argv) == 2:
-        return cmd_sanity_probe(argv[1])
+    if argv[:1] == ["run-batch"] and len(argv) == 2:
+        code = cmd_run_batch(argv[1])
+        # Force-exit: a lingering interpreter (threads/fds) once held run.lock
+        # for 10 minutes after a successful run, silently blocking the next
+        # copilot.  flock dies with the process, so this is safe.
+        sys.stdout.flush()
+        os._exit(code)
     print(
-        "用法: maa_copilot_worker.py search <token> | run <token> <n> <mode> | "
-        "clearing | sanity-probe <关卡>",
+        "用法: maa_copilot_worker.py search <token> | run-batch <token>",
         file=sys.stderr,
     )
     return 2

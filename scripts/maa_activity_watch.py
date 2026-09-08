@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Detect activity rotations and prepare one Discord-confirmed copilot run."""
+"""活动上线后自动把「上游有导航定义的关」抄一遍（四期步骤 2b / 2c）。
+
+每 15 分钟一 tick，做四件事：
+
+1. 读 `maa activity Official`，判断活动是否轮换 / 结束（沿用三期的空窗闸门）；
+2. 排目标集合：当期前缀在本地关卡索引里的全部关 ∩ 上游导航键 − 已通关 − 退避中；
+3. 按理智预算排出这一轮的 `(关, 模式)` 条目，写 `searches/<token>.json` 并发一张
+   「已排程」卡（只有一个「取消本轮」按钮）；
+4. 到点、不在 blackout、`run.lock` 空闲、模拟器离线时派 `run-batch`。
+
+**静默执行、事后汇报**（D11）：不等用户确认，跑完发一条多关战报。
+"""
 
 from __future__ import annotations
 
@@ -11,38 +22,34 @@ from pathlib import Path
 from typing import Any
 
 import maa_action
+import maa_clearing
 import maa_copilot
 import maa_plan_card
 from maa_common import (
-    BUTTONS_PATH,
+    LAST_RUN_PATH,
     STATE_DIR,
     atomic_write_json,
     discord_request,
     discord_token,
-    is_run_locked,
     load_config,
     load_json,
     now_beijing,
     retire_discord_components,
     state_lock,
+    WATCH_PATH,
 )
 
 
-WATCH_PATH = STATE_DIR / "activity_watch.json"
 WATCH_LOCK_PATH = STATE_DIR / "activity_watch.lock"
-# Consecutive empty snapshots required before a prepared card is retired.
+# Consecutive empty snapshots required before a prepared round is retired.
 EMPTY_OBSERVATIONS_BEFORE_IDLE = 2
+# 一轮里最多现搜多少关：搜一关要 5~20s，无上限会让一次 cron 拖到十几分钟。
+# 排不下的关下一 tick 继续，不会丢。
+MAX_SEARCHES_PER_TICK = 6
 
 
 def _search_path(token: str) -> Path:
     return maa_copilot.SEARCHES_DIR / f"{token}.json"
-
-
-def _minutes_since(value: Any, at: datetime) -> float:
-    try:
-        return max(0.0, (at - datetime.fromisoformat(str(value))).total_seconds() / 60)
-    except (TypeError, ValueError):
-        return float("inf")
 
 
 def _notify(config: dict[str, Any], title: str, description: str, color: int) -> None:
@@ -67,7 +74,10 @@ def _notify(config: dict[str, Any], title: str, description: str, color: int) ->
     )
 
 
-def _supersede_search(token: str, config: dict[str, Any]) -> bool:
+def _supersede_round(token: str, config: dict[str, Any]) -> bool:
+    """作废一轮还没开打的条目并收掉它的按钮。"""
+    if not token:
+        return False
     changed, message_id = maa_copilot.supersede_search(token)
     if not changed:
         return False
@@ -81,326 +91,401 @@ def _supersede_search(token: str, config: dict[str, Any]) -> bool:
     return True
 
 
-def _start_search(
-    target: dict[str, str],
+def _save(state: dict[str, Any], at: datetime) -> dict[str, Any]:
+    state["updated_at"] = at.isoformat()
+    atomic_write_json(WATCH_PATH, state)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# 2b 目标集合
+# ---------------------------------------------------------------------------
+
+def collect_targets(
     config: dict[str, Any],
-    previous: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    # Crash recovery: start_copilot_search persists its token before spawning
-    # the child.  If this watcher died before writing WATCH_PATH, adopt that
-    # state on the next cron instead of creating a second executable card.
-    matching: list[dict[str, Any]] = []
-    for path in maa_copilot.SEARCHES_DIR.glob("*.json"):
-        state = load_json(path, None)
-        if not isinstance(state, dict):
-            raise RuntimeError(f"搜索状态格式错误：{path.name}")
-        if (
-            state.get("source") != "activity-watch"
-            or state.get("activity_key") != target["key"]
-            or state.get("stage") != target["stage"]
-            or state.get("status") == "superseded"
-        ):
-            continue
-        try:
-            expired = now_beijing() > datetime.fromisoformat(
-                str(state.get("expires_at") or "")
-            )
-        except ValueError:
-            expired = True
-        if expired:
-            _supersede_search(str(state.get("token") or ""), config)
-            continue
-        matching.append(state)
+    state: dict[str, Any],
+    prefix: str,
+    index: dict[str, Any],
+    ledger: dict[str, Any],
+    roster: dict[str, Any] | None,
+    at: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """`(要打的关, 排除掉的关及原因)`，顺序已按「数字 → EX → S」排好。
 
-    if matching:
-        priority = {
-            "canceled": 10,
-            "executed": 10,
-            "execution_failed": 10,
-            "executing": 9,
-            "queued": 8,
-            "preparing": 8,
-            "done": 7,
-            "running": 6,
-            "pending": 6,
-            "failed": 5,
-        }
-        matching.sort(
-            key=lambda state: (
-                priority.get(str(state.get("status") or ""), 0),
-                str(state.get("created_at") or ""),
-                str(state.get("token") or ""),
-            ),
-            reverse=True,
+    排除的四种理由各自的语义不同，卡片要分开显示：
+
+    - `no_nav`：上游没写导航定义（D8 / 不变量 #37）——**永远不会自动变好**；
+    - `not_indexed`：有导航键但本地 Tile-Pos 索引里没有，进去也会被拒；
+    - `zone_unopened`：森空岛该活动的 zone `totalStage == 0`（D9）——等热更新，不记失败；
+    - `cleared`：记账齐全或 zone 全清（D10）；
+    - `backoff`：本轮搜过、练度不满足 / 暂无作业，还没到重试点。
+    """
+    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
+    retry_minutes = max(5, int(config.get("activity_search_retry_minutes", 30)))
+    targets: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    for code in maa_copilot.activity_stage_codes(index, prefix):
+        supported, detail = nav_of(code)
+        if not supported:
+            excluded.append({"stage": code, "reason": "no_nav", "detail": detail})
+            continue
+        resolved = maa_copilot.resolve_copilot_stage(code, index)
+        if resolved is None:
+            excluded.append({"stage": code, "reason": "not_indexed", "detail": ""})
+            continue
+        stage_id = resolved[0]
+        if maa_copilot.zone_is_unopened(roster, stage_id):
+            excluded.append({"stage": code, "reason": "zone_unopened", "detail": ""})
+            continue
+        modes = maa_copilot.ledger_pending_modes(
+            ledger, roster, code, stage_id, maa_clearing.required_modes(code, prefix)
         )
-        adopted = matching[0]
-        for duplicate in matching[1:]:
-            _supersede_search(str(duplicate.get("token") or ""), config)
-        search_status = str(adopted.get("status") or "")
-        watch_status = {
-            "done": "ready",
-            "queued": "preparing",
-            "preparing": "preparing",
-            "executing": "executing",
-            "canceled": "dismissed",
-            "executed": "completed",
-            "execution_failed": "completed",
-            "failed": "waiting",
-        }.get(search_status, "searching")
-        record = {
-            "observation_key": target["key"],
-            "activity_title": target["title"],
-            "target_stage": target["stage"],
-            "search_token": str(adopted.get("token") or ""),
-            "status": watch_status,
-            "attempted_at": str(
-                adopted.get("created_at") or now_beijing().isoformat()
-            ),
-            "updated_at": now_beijing().isoformat(),
-            "last_notified_error": "",
-        }
-        if search_status == "execution_failed":
-            record["execution_result"] = "failed"
-        return record
+        if not modes:
+            excluded.append({"stage": code, "reason": "cleared", "detail": ""})
+            continue
+        if maa_clearing.minutes_since_failure(state, code, at) < retry_minutes:
+            entry = (state.get("stage_state") or {}).get(code) or {}
+            excluded.append(
+                {"stage": code, "reason": "backoff", "detail": str(entry.get("last_error") or "")}
+            )
+            continue
+        targets.append({"stage": code, "stage_id": stage_id, "modes": modes})
+    return targets, excluded
 
-    ok, message, token = maa_action.start_copilot_search(
-        target["stage"],
-        auto_confirm=True,
-        activity_title=target["title"],
-        activity_key=target["key"],
+
+# ---------------------------------------------------------------------------
+# 2c 理智预算与排轮
+# ---------------------------------------------------------------------------
+
+def round_budget(
+    config: dict[str, Any], roster: dict[str, Any] | None, at: datetime
+) -> tuple[int, int | None]:
+    """`(可花理智, 估算出的当前理智)`。理智未知一律 0（fail-closed）。"""
+    from maa_daily import attach_annihilation
+    from maa_common import effective_plan
+
+    last_run = load_json(LAST_RUN_PATH, {})
+    plan = attach_annihilation(
+        effective_plan(at), at, last_run if isinstance(last_run, dict) else {}
     )
-    if not ok or token is None:
-        raise RuntimeError(message)
-    record = {
-        "observation_key": target["key"],
-        "activity_title": target["title"],
-        "target_stage": target["stage"],
-        "search_token": token,
-        "status": "searching",
-        "attempted_at": now_beijing().isoformat(),
-        "updated_at": now_beijing().isoformat(),
-        "last_notified_error": "",
-    }
-    if isinstance(previous, dict):
-        record["last_notified_error"] = str(
-            previous.get("last_notified_error") or ""
-        )[:500]
-    return record
+    snapshot = (roster or {}).get("sanity")
+    sanity = maa_copilot.estimated_sanity(
+        snapshot if isinstance(snapshot, dict) else {}, at
+    )
+    return maa_clearing.sanity_budget(sanity, plan, config), sanity
 
+
+def cost_lookup(config: dict[str, Any], index: dict[str, Any]):
+    """条目 → 理智消耗。突袭条目按**普通关名**查（不变量 #34）。"""
+
+    def cost_of(entry: str) -> int | None:
+        stage, _mode = maa_clearing.split_entry(entry)
+        resolved = maa_copilot.resolve_copilot_stage(stage, index)
+        if resolved is None:
+            return None
+        return maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+
+    return cost_of
+
+
+def _entry_list(targets: list[dict[str, Any]]) -> list[str]:
+    """目标集合 → 有序条目表：每关先 `normal` 后 `raid`。"""
+    return [
+        maa_clearing.make_entry(target["stage"], mode)
+        for target in targets
+        for mode in target["modes"]
+    ]
+
+
+def build_round(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    targets: list[dict[str, Any]],
+    index: dict[str, Any],
+    roster: dict[str, Any] | None,
+    at: datetime,
+) -> tuple[list[dict[str, Any]], str, str]:
+    """排出这一轮：`(条目, 预计开始时刻, 说明)`。
+
+    排得满就现在打；排不满（理智不够）就只排**第一条**并算出它的 `ready_at`——
+    多排也没用，理智恢复到能打第二条时早就是下一 tick 了。
+    搜不到作业的关就地记账退避，并把它从这一轮剔掉后重排（D12：绝不降级）。
+    """
+    cost_of = cost_lookup(config, index)
+    budget, sanity = round_budget(config, roster, at)
+    remaining = list(targets)
+    searched = 0
+    while remaining and searched < MAX_SEARCHES_PER_TICK:
+        plan = maa_clearing.plan_round(_entry_list(remaining), budget, cost_of)
+        # 排不满时只排**第一个理智算得出来的**条目：理智算不出来的关（EX 还没进
+        # `stages.json`）排进去只会在 worker 里立刻被复核拒掉，每 tick 白发一张卡。
+        picked = plan["entries"] or [
+            entry for entry in _entry_list(remaining) if cost_of(entry) is not None
+        ][:1]
+        if not picked:
+            return [], "", ""
+        stages: list[str] = []
+        for entry in picked:
+            stage, _mode = maa_clearing.split_entry(entry)
+            if stage not in stages:
+                stages.append(stage)
+        entries: list[dict[str, Any]] = []
+        dropped = ""
+        for target in remaining:
+            if target["stage"] not in stages:
+                continue
+            candidate = target.get("candidate")
+            if candidate is None:
+                searched += 1
+                candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
+                    target["stage"], target["stage_id"], config, roster
+                )
+                if candidate is None:
+                    maa_clearing.record_stage_failure(
+                        state,
+                        target["stage"],
+                        kind="op",
+                        detail=reason,
+                        at=at,
+                        gaps=gaps,
+                    )
+                    dropped = target["stage"]
+                    break
+                target["candidate"] = candidate
+            for entry in picked:
+                stage, mode = maa_clearing.split_entry(entry)
+                if stage != target["stage"]:
+                    continue
+                entries.append(
+                    {
+                        "stage": stage,
+                        "stage_id": target["stage_id"],
+                        "mode": mode,
+                        "candidate": candidate,
+                        "sanity_cost": cost_of(entry),
+                    }
+                )
+        if dropped:
+            remaining = [t for t in remaining if t["stage"] != dropped]
+            continue
+        if not entries:
+            return [], "", ""
+        for target in remaining:
+            if target["stage"] in stages:
+                maa_clearing.clear_stage_failure(state, target["stage"])
+        if plan["entries"]:
+            return entries, at.isoformat(), ""
+        # 预算一条都排不满：把第一条排到理智够的时刻（D11）。
+        preflight = maa_copilot.sanity_preflight(
+            roster, entries[0].get("sanity_cost"), at
+        )
+        ready_at = str(preflight.get("ready_at") or "")
+        note = (
+            f"当前理智 {sanity if sanity is not None else '未知'}，"
+            f"不足以打 {entries[0]['stage']}，到点自动开跑。"
+            if ready_at
+            else "理智不足且算不出恢复时刻，下一 tick 再看。"
+        )
+        return entries[:1], ready_at, note
+    return [], "", ""
+
+
+# ---------------------------------------------------------------------------
+# 派发闸门
+# ---------------------------------------------------------------------------
+# 闸门本身住在 `maa_action.dispatch_blocker()`（不变量 #13 / #36：只有一份实现），
+# 自动与手动两条路共用。这里只负责「被挡了怎么记状态」。
+
+
+def _dispatch(state: dict[str, Any], token: str, config: dict[str, Any], at: datetime) -> str:
+    """派发一轮；返回状态说明。"""
+    blocker = maa_action.dispatch_blocker(config, str(state.get("scheduled_at") or ""), at)
+    if blocker:
+        if maa_clearing.should_notify(state, "dispatch_blocked", blocker):
+            print(f"activity watch: 本轮暂不派发（{blocker}）", flush=True)
+        return "scheduled"
+    maa_clearing.clear_notification(state, "dispatch_blocked")
+    with state_lock():
+        search = load_json(_search_path(token), None)
+        if not isinstance(search, dict) or search.get("status") != "scheduled":
+            return "scheduled"
+        search["status"] = "queued"
+        search["execution_requested_at"] = at.isoformat()
+        atomic_write_json(_search_path(token), search)
+    maa_action.dispatch_batch(token)
+    return "dispatched"
+
+
+# ---------------------------------------------------------------------------
+# 一 tick
+# ---------------------------------------------------------------------------
 
 def run_once() -> dict[str, Any]:
     config = load_config()
     snapshot = maa_plan_card.query_activity_snapshot(config)
     target = maa_plan_card.activity_target(snapshot)
-    previous = load_json(WATCH_PATH, {})
-    if not isinstance(previous, dict):
+    state = load_json(WATCH_PATH, {})
+    if not isinstance(state, dict):
         raise RuntimeError("activity_watch.json 格式错误")
-    previous.pop("probe_error", None)
+    state.pop("probe_error", None)
     now = now_beijing()
 
     if target is None:
-        retired_title = ""
-        if previous.get("observation_key"):
-            # Retiring a prepared card is one-way, so never do it on a single
-            # empty read: require the gap to hold across consecutive ticks and
-            # leave activity_stages untouched until then.
-            empty_observations = int(previous.get("empty_observations") or 0) + 1
-            if empty_observations < EMPTY_OBSERVATIONS_BEFORE_IDLE:
-                previous["empty_observations"] = empty_observations
-                previous["updated_at"] = now.isoformat()
-                atomic_write_json(WATCH_PATH, previous)
-                return previous
-            retired_title = str(previous.get("activity_title") or "当前活动")
-            token = str(previous.get("search_token") or "")
-            if token:
-                _supersede_search(token, config)
-        maa_plan_card.persist_activity_snapshot(config, snapshot)
-        idle = {
-            "observation_key": "",
-            "status": "idle",
-            "updated_at": now.isoformat(),
-        }
-        atomic_write_json(WATCH_PATH, idle)
-        # Settle the state first: a Discord failure here must not replay the
-        # supersede on the next tick.  Announce afterwards so retiring a live
-        # card is never silent.
-        if retired_title:
-            _notify(
-                config,
-                "🏁 活动已结束",
-                f"{retired_title} 已从 MAA 活动视图消失；作业卡已收起，活动关清单已清空。",
-                0x5865F2,
-            )
-        return idle
+        return _go_idle(config, state, snapshot, now)
 
     maa_plan_card.persist_activity_snapshot(config, snapshot)
-    previous.pop("empty_observations", None)
+    state.pop("empty_observations", None)
 
-    if previous.get("observation_key") != target["key"]:
-        token = str(previous.get("search_token") or "")
-        if token:
-            _supersede_search(token, config)
-        record = _start_search(target, config)
-        atomic_write_json(WATCH_PATH, record)
-        return record
-
-    previous_stage = str(previous.get("target_stage") or "")
-    if previous_stage and not maa_plan_card.activity_target_is_current(
-        snapshot, previous_stage, target["key"]
-    ):
-        token = str(previous.get("search_token") or "")
-        if token:
-            _supersede_search(token, config)
-        record = _start_search(target, config)
-        atomic_write_json(WATCH_PATH, record)
-        return record
-
-    status = str(previous.get("status") or "")
-    if status in {"dismissed", "completed"}:
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-
-    token = str(previous.get("search_token") or "")
-    search = load_json(_search_path(token), None) if token else None
-    search_status = str(search.get("status") or "") if isinstance(search, dict) else "missing"
-    if search_status == "done":
-        previous["status"] = "ready"
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-    if search_status == "executed":
-        previous["status"] = "completed"
-        previous["completed_at"] = str(search.get("executed_at") or now.isoformat())
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-    if search_status == "execution_failed":
-        previous["status"] = "completed"
-        previous["execution_result"] = "failed"
-        previous["completed_at"] = str(
-            search.get("execution_failed_at") or now.isoformat()
-        )
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-    if search_status in {"queued", "preparing"}:
-        restored = maa_copilot.recover_stale_prebattle_dispatch(
-            token, search if isinstance(search, dict) else {}
-        )
-        if restored is not None:
-            message = str(restored["last_prepare_error"])
-            _notify(
-                config,
-                f"⚠️ {target['stage']} 自动作业未启动",
-                message,
-                0xFEE75C,
-            )
-            previous["status"] = "ready"
-        else:
-            previous["status"] = "preparing"
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-    if search_status == "executing":
-        max_minutes = max(
-            90,
-            int(config.get("maa_run_timeout", 3000)) // 60 + 30,
-        )
-        if _minutes_since(search.get("execution_started_at"), now) > max_minutes and not is_run_locked():
-            message = "执行进程已失联；因无法确认是否已消耗理智，本次不会自动重跑。"
-            failed = False
-            failed_message_id: Any = None
-            with state_lock():
-                fresh = load_json(_search_path(token), None)
-                if isinstance(fresh, dict) and fresh.get("status") == "executing":
-                    registry = load_json(BUTTONS_PATH, {})
-                    if not isinstance(registry, dict):
-                        raise RuntimeError("共享按钮登记表格式错误")
-                    maa_copilot.prune_search_buttons(token, registry)
-                    atomic_write_json(BUTTONS_PATH, registry)
-                    fresh["status"] = "execution_failed"
-                    fresh["execution_failed_at"] = now.isoformat()
-                    fresh["error"] = message
-                    failed_message_id = fresh.get("message_id")
-                    atomic_write_json(_search_path(token), fresh)
-                    failed = True
-            if failed:
-                try:
-                    retire_discord_components(config, failed_message_id)
-                except Exception as exc:
-                    print(
-                        "失联作业卡按钮收起失败但已经失效："
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                _notify(
-                    config,
-                    f"❌ {target['stage']} 自动作业执行失联",
-                    message,
-                    0xED4245,
-                )
-                previous["status"] = "completed"
-                previous["execution_result"] = "failed"
-                previous["completed_at"] = now.isoformat()
-                previous["updated_at"] = now.isoformat()
-                atomic_write_json(WATCH_PATH, previous)
-                return previous
-        previous["status"] = "executing"
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-    if search_status == "canceled":
-        previous["status"] = "dismissed"
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-
-    retry_minutes = max(5, int(config.get("activity_search_retry_minutes", 30)))
-    attempted_at = previous.get("attempted_at")
-    if search_status in {"pending", "running"} and _minutes_since(
-        attempted_at, now
-    ) < retry_minutes:
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-
-    error = ""
-    if isinstance(search, dict) and search_status == "failed":
-        error = str(search.get("error") or "作业匹配失败")[:500]
-    elif search_status == "missing":
-        error = "搜索状态丢失或已过期"
-    elif search_status in {"pending", "running"}:
-        error = "作业匹配超时"
-    else:
-        error = f"作业匹配状态异常：{search_status or '空'}"
-
-    if error != str(previous.get("last_notified_error") or ""):
-        waiting = "暂时没有" in error and "作业" in error
+    if state.get("activity_key") != target["key"]:
+        _supersede_round(str(state.get("batch_token") or ""), config)
+        _ledger, note = maa_copilot.ensure_ledger(target["key"])
+        state = {
+            "activity_key": target["key"],
+            "activity_title": target["title"],
+            "prefix": maa_copilot._activity_prefix(target["key"]),
+            "status": "searching",
+            "stage_state": {},
+            "notified": {},
+        }
+        # 先落状态再发消息：Discord 挂了不能让下一 tick 把「换活动」重放一遍
+        # （归档已经做过了，重放只会多发一条通知）。
+        _save(state, now)
         _notify(
             config,
-            f"{'⏳' if waiting else '❌'} {target['title']}自动作业尚未就绪",
-            (
-                f"已检测到 {target['stage']}，prts.plus 暂无满足当前练度的作业；"
-                f"每 {retry_minutes} 分钟自动重试。"
-                if waiting
-                else f"{error}\n每 {retry_minutes} 分钟自动重试；不会自动执行。"
-            ),
-            0xFEE75C if waiting else 0xED4245,
+            f"🆕 {target['title']} 已上线",
+            "开始自动匹配上游写了导航定义的关（普通 + 突袭），"
+            "排到就静默执行、跑完发战报。" + (f"\n{note}。" if note else ""),
+            0x5865F2,
         )
-        previous["last_notified_error"] = error
 
-    if _minutes_since(attempted_at, now) < retry_minutes:
-        previous["status"] = "waiting"
-        previous["updated_at"] = now.isoformat()
-        atomic_write_json(WATCH_PATH, previous)
-        return previous
-
+    token = str(state.get("batch_token") or "")
     if token:
-        _supersede_search(token, config)
-    record = _start_search(target, config, previous)
-    atomic_write_json(WATCH_PATH, record)
-    return record
+        search = load_json(_search_path(token), None)
+        status = str(search.get("status") or "") if isinstance(search, dict) else "missing"
+        if status == "executing":
+            state["status"] = "running"
+            return _save(state, now)
+        if status == "queued":
+            restored = maa_copilot.recover_stale_dispatch(token, search)  # type: ignore[arg-type]
+            if restored is None:
+                state["status"] = "dispatched"
+                return _save(state, now)
+            _notify(
+                config,
+                "⚠️ 自动作业未启动，已放回排程",
+                str(restored.get("last_prepare_error") or ""),
+                0xFEE75C,
+            )
+            status = "scheduled"
+        if status == "scheduled":
+            state["status"] = _dispatch(state, token, config, now)
+            return _save(state, now)
+        # 终态（executed / execution_failed / canceled / superseded / failed / missing）：
+        # 这一轮结束了，下面按最新记账重新排。
+        state.pop("batch_token", None)
+        state.pop("scheduled_at", None)
+
+    index = maa_copilot.load_stage_index(config)
+    prefix = str(state.get("prefix") or maa_copilot._activity_prefix(target["key"]))
+    ledger, _note = maa_copilot.ensure_ledger(target["key"])
+    roster = maa_copilot.load_roster()
+    targets, excluded = collect_targets(
+        config, state, prefix, index, ledger, roster, now
+    )
+    if targets:
+        # 森空岛只在「有未执行的关」的 tick 刷新：练度与 zone 进度决定这一轮排什么，
+        # 拿一份 7 天前的快照排轮会漏关也会重抄。
+        try:
+            import maa_skland
+
+            maa_skland.refresh_roster()
+            roster = maa_copilot.load_roster()
+            targets, excluded = collect_targets(
+                config, state, prefix, index, ledger, roster, now
+            )
+        except Exception as exc:
+            print(
+                f"森空岛刷新失败，本轮沿用缓存：{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+
+    if not targets:
+        state["status"] = "done"
+        state["excluded"] = excluded[:40]
+        return _save(state, now)
+
+    entries, scheduled_at, note = build_round(
+        config, state, targets, index, roster, now
+    )
+    if not entries:
+        state["status"] = "waiting"
+        state["excluded"] = excluded[:40]
+        return _save(state, now)
+
+    token = maa_action.new_round_token()
+    maa_copilot.ensure_private_dirs()
+    atomic_write_json(
+        _search_path(token),
+        {
+            "token": token,
+            "status": "scheduled",
+            "source": "activity-watch",
+            "activity_key": target["key"],
+            "activity_title": target["title"],
+            "entries": entries,
+            "scheduled_at": scheduled_at,
+            "created_at": now.isoformat(),
+            "expires_at": (now + maa_copilot.SEARCH_TTL).isoformat(),
+            "message_id": None,
+        },
+    )
+    message_id = maa_action.publish_round(
+        token,
+        entries,
+        config,
+        title="🤖 自动作业已排程",
+        scheduled_at=scheduled_at,
+        note=note,
+    )
+    with state_lock():
+        search = load_json(_search_path(token), None)
+        if isinstance(search, dict):
+            search["message_id"] = message_id
+            atomic_write_json(_search_path(token), search)
+    state["batch_token"] = token
+    state["scheduled_at"] = scheduled_at
+    state["excluded"] = excluded[:40]
+    state["status"] = _dispatch(state, token, config, now)
+    return _save(state, now)
+
+
+def _go_idle(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    snapshot: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """活动结束：连续两次空快照才真的收摊（不变量 #20）。"""
+    retired_title = ""
+    if state.get("activity_key"):
+        empty_observations = int(state.get("empty_observations") or 0) + 1
+        if empty_observations < EMPTY_OBSERVATIONS_BEFORE_IDLE:
+            state["empty_observations"] = empty_observations
+            return _save(state, now)
+        retired_title = str(state.get("activity_title") or "当前活动")
+        _supersede_round(str(state.get("batch_token") or ""), config)
+    maa_plan_card.persist_activity_snapshot(config, snapshot)
+    idle = _save({"activity_key": "", "status": "idle"}, now)
+    # 先落状态：Discord 失败不能让下一 tick 重放一次作废。
+    if retired_title:
+        _notify(
+            config,
+            "🏁 活动已结束",
+            f"{retired_title} 已从 MAA 活动视图消失；未打完的一轮已收起，活动关清单已清空。"
+            "本地记账保留，下个活动上线时会归档。",
+            0x5865F2,
+        )
+    return idle
 
 
 def main() -> int:

@@ -34,6 +34,7 @@ from maa_common import (
     plan_stage_label,
     PLAN_PATH,
     state_lock,
+    WATCH_PATH,
 )
 
 
@@ -1156,56 +1157,114 @@ def build_embed(
 COPILOT_CARD_TITLE = "🤖 抄作业：现在能抄的关"
 
 
+def _scheduled_stages() -> dict[str, str]:
+    """当前这一轮已排程的 `关卡 → 预计开始时刻`（读不出来一律空表，绝不抛）。"""
+    watch = load_json(WATCH_PATH, {})
+    token = str(watch.get("batch_token") or "") if isinstance(watch, dict) else ""
+    if not token:
+        return {}
+    search = load_json(maa_copilot.SEARCHES_DIR / f"{token}.json", None)
+    if not isinstance(search, dict) or (
+        search.get("status") not in maa_copilot.LIVE_ROUND_STATUSES
+    ):
+        return {}
+    when = str(search.get("scheduled_at") or "")
+    try:
+        label = f"{datetime.fromisoformat(when):%H:%M}"
+    except (TypeError, ValueError):
+        label = "待发"
+    return {
+        str(entry.get("stage") or ""): label
+        for entry in (search.get("entries") or [])
+        if isinstance(entry, dict)
+    }
+
+
 def copilot_card_stages(
     config: dict[str, Any], at: datetime | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
-    """`([{stage, code, materials, nav, reason}], 是不是活动期)`。
+    """`([{stage, code, materials, nav, reason, status, status_text}], 是不是活动期)`。
 
-    **只读本地**：`config.activity_stages` 这份运行时缓存、上游 `stages.json`
-    的主掉落、本地关卡索引、上游 `tasks/Stages/*.json` 的导航键。零网络、零子进程，
-    整条按钮路径必须 < 20s（不变量 #6）。
+    候选集就是自动路径的目标集合（四期 2b）：**当期活动前缀在本地关卡索引里的
+    全部关**（不只是 `maa activity` 推荐的那 4 关），外加已通关的关——手动路径
+    允许重打（D14）。没有活动时退化成**当天开放的资源本 + `1-7`**。
 
-    活动期只列活动关（D5 的候选集）；没有活动就退化成**当天开放的资源本 + `1-7`**，
-    这些关的导航同样由上游提供（`Supplies.json` 键 / `EpisodeN`）。
+    **只读本地**：关卡索引、上游 `tasks/Stages/*.json` 的导航键、`stages.json`
+    的主掉落、`copilot/ledger.json`、`copilot/roster.json`、`activity_watch.json`。
+    零网络、零子进程，整条按钮路径必须 < 20s（不变量 #6）。
     """
     import maa_clearing
 
     index = maa_copilot.load_stage_index(config)
     nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
     drops = stage_drops(config)
-    activity = [
-        str(item).strip()
-        for item in (config.get("activity_stages") or [])
-        if str(item).strip()
-    ]
-    candidates = activity or (
-        [stage for _label, stage, _desc in current_supply_choices(config, at)] + ["1-7"]
-    )
+    watch = load_json(WATCH_PATH, {})
+    activity_key = str(watch.get("activity_key") or "") if isinstance(watch, dict) else ""
+    prefix = maa_copilot._activity_prefix(activity_key)
+    stage_state = watch.get("stage_state") if isinstance(watch, dict) else {}
+    if not isinstance(stage_state, dict):
+        stage_state = {}
+    ledger = maa_copilot.load_ledger() or {}
+    roster = maa_copilot.load_roster()
+    scheduled = _scheduled_stages()
+
+    candidates = maa_copilot.activity_stage_codes(index, prefix) if prefix else []
+    in_activity = bool(candidates)
+    if not candidates:
+        candidates = [
+            stage for _label, stage, _desc in current_supply_choices(config, at)
+        ] + ["1-7"]
+
     rows: list[dict[str, Any]] = []
     for stage in candidates:
-        if any(row["stage"] == stage for row in rows):
-            continue
         resolved = maa_copilot.resolve_copilot_stage(stage, index)
         supported, detail = nav_of(stage)
         if not supported:
             # 上游没写导航定义的关不自动进、也不给下拉（D8 / 不变量 #37）。
-            reason = detail or "上游无导航"
+            status, text = "no_nav", f"⛔ {detail or '上游无导航'}"
         elif resolved is None:
             # 有导航键但本地 Tile-Pos 索引里没有 → `copilot find` 那步会直接拒，
             # 与其发一个点了必失败的选项，不如在一览里说清楚。
-            reason = "不在本地关卡索引里"
+            status, text = "not_indexed", "⛔ 不在本地关卡索引里"
         else:
-            reason = ""
+            pending = maa_copilot.ledger_pending_modes(
+                ledger,
+                roster,
+                stage,
+                resolved[0],
+                maa_clearing.required_modes(stage, prefix),
+            )
+            failure = stage_state.get(stage) if isinstance(stage_state, dict) else None
+            gaps = list((failure or {}).get("gaps") or []) if isinstance(failure, dict) else []
+            if not pending:
+                status, text = "cleared", "✅ 已通"
+            elif stage in scheduled:
+                status, text = "scheduled", f"⏳ 排程 {scheduled[stage]}"
+            elif pending == ["raid"]:
+                status, text = "raid_pending", "🔁 普通已通、突袭待补"
+            elif gaps:
+                status, text = "gap", f"🚫 练度不满足（缺：{'；'.join(gaps[:2])}）"
+            elif isinstance(failure, dict) and failure.get("last_error"):
+                status, text = "gap", f"🚫 {str(failure['last_error'])[:60]}"
+            else:
+                # 单向启发：只在**能证明**这关锁着时开口，沉默不代表已解锁，
+                # 所以它只是显示，永远不当闸门用（不变量 #29 的精神）。
+                locked = maa_copilot.zone_progress_warning(stage, resolved[0], roster)
+                status, text = (
+                    ("locked", f"🔒 {locked[:80]}") if locked else ("todo", "🕐 待抄")
+                )
         rows.append(
             {
                 "stage": stage,
                 "code": resolved[1] if resolved else "",
                 "materials": (drops.get(stage) or {}).get("materials") or [],
-                "nav": not reason,
-                "reason": reason,
+                "nav": status not in {"no_nav", "not_indexed"},
+                "reason": text if status in {"no_nav", "not_indexed"} else "",
+                "status": status,
+                "status_text": text,
             }
         )
-    return rows, bool(activity)
+    return rows, in_activity
 
 
 def copilot_card_view(
@@ -1217,24 +1276,17 @@ def copilot_card_view(
     options: list[tuple[str, str, str]] = []
     for row in rows:
         materials = "、".join(row["materials"])
-        mark = "✅ 上游有导航" if row["nav"] else f"⛔ {row['reason']}"
         lines.append(
             f"`{row['stage']}`"
             + (f" · {materials}" if materials else "")
-            + f" · {mark}"
+            + f" · {row['status_text']}"
         )
         if row["nav"]:
             label = f"{row['stage']} · {materials}" if materials else row["stage"]
-            options.append(
-                (
-                    label,
-                    row["stage"],
-                    f"主掉落 {materials}" if materials else "去 prts.plus 搜这一关的作业",
-                )
-            )
+            options.append((label, row["stage"], row["status_text"]))
     fields: list[dict[str, Any]] = [
         {
-            "name": "当前开放活动关" if in_activity else "资源本 / 主线（当前无活动）",
+            "name": "当前活动关" if in_activity else "资源本 / 主线（当前无活动）",
             "value": ("\n".join(lines) or "没有可抄的关")[:1024],
             "inline": False,
         }
@@ -1242,18 +1294,12 @@ def copilot_card_view(
     deadline = activity_deadline_text(config, at)
     if deadline:
         fields.append({"name": "活动截止", "value": deadline, "inline": False})
-    fields.append(
-        {
-            "name": "已抄记录",
-            "value": "未记录（本地记账在后续步骤上线）",
-            "inline": False,
-        }
-    )
     embed = {
         "title": COPILOT_CARD_TITLE,
         "description": (
-            "从下拉里选一关，立刻去 prts.plus 匹配作业；"
-            "上游没写导航定义的关不在下拉里，MAA 进不去。"
+            "自动路径会把上游有导航定义的关按理智排队抄完（普通 + 突袭），这里是它的进度。\n"
+            "从下拉里选一关＝**立刻**去 prts.plus 搜作业，搜到就直接开跑；"
+            "已通的关也能选，那是重打。上游没写导航定义的关不在下拉里，MAA 进不去。"
         ),
         "color": 0x5865F2,
         "fields": fields,
