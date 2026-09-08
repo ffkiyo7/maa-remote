@@ -15,7 +15,7 @@
 - [x] ~~步骤 2 — 作业链统一：静默执行、普通+突袭、已通关跳过、理智调度、串行多关~~（09-09 验收通过并部署：357 项单测，净减约 2000 行；打回一次补手动路径 blackout 闸门；突袭切换 `ChangeToRaidDifficulty` 真机待验，不通就把 `copilot_raid_switch_task` 设空）
 - [x] ~~步骤 3 — 素材权重公式（一图流 / 企鹅物流）+ 活动期间 all-in + Fight drops 上限~~（09-09 验收通过并部署：新模块 `maa_farming.py`，397 项单测；EX 关理智一图流也不收录，仍是缺口）
 - [x] ~~步骤 4 — 肉鸽：手动触发、上游全托管、优雅停止~~（09-09 验收通过并部署：`maa_roguelike.py` + `maa_roguelike_worker.py`，456 项单测；打回一次修测试抢真锁 + 开机前先查闸门；真机首跑待验）
-- [ ] 步骤 5 — 上游增量（上报掉落、Award 开关、OperBox 后备）
+- [x] ~~步骤 5 — 上游增量（上报掉落、Award 开关、OperBox 后备）~~（09-09 验收通过并部署：掉落匿名上报、Award / Mall 开关、OperBox 练度后备（fail-closed）、非活动关独立账本；494 项单测）
 - [x] ~~spike A — `copilot_list` 真机验证~~（09-08 23:58 完成：Q1 ✓ / Q2 ✗ / Q3 未验 + 弹窗死循环；**`copilot_list` 挂起择日再验**，多关连抄走 B 基线，见「Spike 结论」与 `docs/spikes/copilot-list-2026-09-08.md`）
 - [x] ~~spike B — 一图流活动日历 / 物品价值接口~~（09-08 23:35 实测完成，见「Spike 结论」与 `docs/spikes/yituliu-2026-09-08.md`）
 - [x] ~~spike C — 肉鸽上游参数与优雅停止~~（09-08 只读调研完成，见「Spike 结论」与 `docs/spikes/roguelike-2026-09-08.md`）

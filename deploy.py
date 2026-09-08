@@ -104,6 +104,9 @@ MAA_CONFIG_RELATIVE_PATHS = (
     Path("profiles/default.toml"),
     Path("tasks/daily.toml"),
     Path("tasks/depot.toml"),
+    # 练度后备（四期步骤 5）：森空岛不可用时由 `maa_depot.run_depot()` 在同一次
+    # 会话里跑，`maa run operbox` 读的就是这个部署过去的任务文件。
+    Path("tasks/operbox.toml"),
     Path("tasks/infrast-smoke.toml"),
     Path("cli.toml"),
     Path("resource/tasks/tasks.json"),

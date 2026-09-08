@@ -48,6 +48,12 @@ from maa_common import (
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
+# 信用商店 `buy_first` / `blacklist` 的物品名白名单（四期步骤 5）。这两个列表来自
+# `config.json`，会**原样变成 TOML 字符串**交给 MaaCore 去 OCR 比对，所以渲染器
+# 只接受「中日文字 + 拉丁字母 + 数字 + 少数分隔符」，长度 ≤ 20。校验不过的项
+# **静默丢弃**：一个写歪的物品名不该让整场日常渲染不出来（D-2 的教训）。
+# 　-鿿 = CJK 标点 + 假名 + 汉字；· / ・ 是「技能概要·卷1」的中点。
+SAFE_MALL_ITEM_RE = re.compile(r"^[　-鿿·・A-Za-z0-9 \-_]{1,20}$")
 PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
 # Only the cron-driven phases defer to a running emulator. `now` is the user
 # saying "run it right now" and must never be probe-skipped (PLAN_NAV_GATE B-1).
@@ -232,6 +238,11 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _toml_bool(value: Any) -> str:
+    """配置里的布尔开关 → TOML 字面量。非布尔（写歪了）一律按 false。"""
+    return "true" if value is True else "false"
+
+
 def _drops_table(value: Any) -> str:
     """`{itemId: 数量}` → MaaCore Fight 的 `drops` 内联表；没上限就返回空串。
 
@@ -254,6 +265,40 @@ def _drops_table(value: Any) -> str:
     return "{ " + ", ".join(pairs) + " }" if pairs else ""
 
 
+def _mall_item_list(value: Any) -> str:
+    """`config` 里的物品名列表 → TOML 数组；**过不了白名单的项直接丢掉**。
+
+    这两个列表（`mall_buy_first` / `mall_blacklist`）会原样进任务文件交给 MaaCore
+    去 OCR 比对，所以渲染器不接受没校验过的字符串（DEV_GUIDE §8 不变量 #51）。
+    """
+    if not isinstance(value, list):
+        return "[]"
+    names = [
+        str(item)
+        for item in value
+        if isinstance(item, str) and SAFE_MALL_ITEM_RE.match(item)
+    ]
+    return "[" + ", ".join(_toml_string(name) for name in names) + "]"
+
+
+def _report_lines(config: dict[str, Any]) -> str:
+    """掉落匿名上报（一图流 / 企鹅物流）。总开关 `report_drops`，默认开。
+
+    ID 一律留空 = 匿名上报，不带任何账号标识；数据回馈的正是本项目自己
+    在用的那两个掉落源（四期步骤 3）。
+    """
+    if not bool(config.get("report_drops", True)):
+        return ""
+    return (
+        "report_to_penguin = true\n"
+        # 两个 ID 的协议默认就是空串（上游 `integration.md`）。这里**显式写出来**：
+        # 匿名是这条功能的前提，不能让它取决于「默认值将来会不会变」。
+        'penguin_id = ""\n'
+        "report_to_yituliu = true\n"
+        'yituliu_id = ""\n'
+    )
+
+
 def _fight_block(
     name: str,
     stage: str,
@@ -262,7 +307,7 @@ def _fight_block(
     *,
     drops: str,
 ) -> str:
-    """一个「刷理智」Fight 块。两个块**共用这一份**，硬编码字面量只写一次。"""
+    """一个 Fight 块。剿灭与两个刷理智块**共用这一份**，硬编码字面量只写一次。"""
     return (
         "[[tasks]]\n"
         f"name = {_toml_string(name)}\n"
@@ -280,6 +325,7 @@ def _fight_block(
         + (f"drops = {drops}\n" if drops else "")
         + 'server = "CN"\n'
         'client_type = "Official"\n'
+        + _report_lines(config)
     )
 
 
@@ -314,18 +360,9 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             # 代理指挥卡. MaaCore stops when the weekly 1800 orundum cap is
             # reached (todo gone / cards refused).
             blocks.append(
-                "[[tasks]]\n"
-                'name = "每日剿灭"\n'
-                'type = "Fight"\n'
-                "[tasks.params]\n"
-                'stage = "Annihilation"\n'
-                "medicine = 0\n"
-                f"medicine_expire_days = {max(0, medicine_days)}\n"
-                "stone = 0\n"
-                "series = 0\n"
-                f"times = {int(config.get('fight_times', 2147483647))}\n"
-                'server = "CN"\n'
-                'client_type = "Official"\n'
+                _fight_block(
+                    "每日剿灭", "Annihilation", config, medicine_days, drops=""
+                )
             )
         # Independent switch: 理智让路 removes ONLY this block.
         # Default True so the deploy seed and isolated renderer tests keep it.
@@ -389,6 +426,14 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             "shopping = true\n"
             "force_shopping_if_credit_full = false\n"
             "credit_fight = false\n"
+            # 四期步骤 5：优先买 / 黑名单 / 信用溢出与打折的开关都从配置读。
+            # 两个列表过 `SAFE_MALL_ITEM_RE` 白名单，默认空 = 完全沿用旧行为。
+            f"buy_first = {_mall_item_list(config.get('mall_buy_first'))}\n"
+            f"blacklist = {_mall_item_list(config.get('mall_blacklist'))}\n"
+            "reserve_max_credit = "
+            f"{_toml_bool(config.get('mall_reserve_max_credit', False))}\n"
+            "only_buy_discount = "
+            f"{_toml_bool(config.get('mall_only_buy_discount', False))}\n"
         )
     if tasks.get("award", True):
         blocks.append(
@@ -399,8 +444,11 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             "award = true\n"
             "mail = true\n"
             "recruit = false\n"
-            "orundum = false\n"
-            "mining = false\n"
+            # 四期步骤 5：三个「顺手领」开关从配置读，默认全 false（与改造前一致）。
+            f"orundum = {_toml_bool(config.get('award_orundum', False))}\n"
+            f"mining = {_toml_bool(config.get('award_mining', False))}\n"
+            "specialaccess = "
+            f"{_toml_bool(config.get('award_specialaccess', False))}\n"
         )
     blocks.append(
         "[[tasks]]\n"

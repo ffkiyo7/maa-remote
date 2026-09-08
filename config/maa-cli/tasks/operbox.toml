@@ -1,0 +1,18 @@
+[[tasks]]
+name = "启动国服"
+type = "StartUp"
+[tasks.params]
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+name = "干员识别"
+type = "OperBox"
+[tasks.params]
+enable = true
+
+# 森空岛不可用时的练度后备（四期步骤 5）。跟在同一次 Depot 会话之后跑，
+# 由 maa_depot.run_depot() 触发；StartUp 保留是因为它同时兼作「确认停在主页」，
+# 游戏已经开着时 MaaCore 直接认出主页返回。
+# CloseDown is deliberately kept out of the task chain. maa_depot.py always
+# closes the game and emulator in its cleanup path, including recognition errors.

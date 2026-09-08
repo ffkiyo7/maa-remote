@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -62,10 +63,14 @@ def _item_names(config: dict[str, Any]) -> dict[str, str]:
     raise RuntimeError("找不到 MaaCore item_index.json，无法给 Depot 物品 ID 对表")
 
 
-def _json_objects_after_depot(output: str) -> Iterable[dict[str, Any]]:
+def _json_objects_after(output: str, marker: str) -> Iterable[dict[str, Any]]:
+    """maa-cli 把回调整条打成 `<marker> <json>`；把每一条解出来。
+
+    `Depot:` 与 `OperBox:` 是同一形状（maa-cli `run/callback/`：两者都走
+    `info!("{}: {}", …, json_pretty(message))`），所以两个解析器共用这一份。
+    """
     decoder = json.JSONDecoder()
     cursor = 0
-    marker = "Depot:"
     while True:
         start = output.find(marker, cursor)
         if start < 0:
@@ -80,6 +85,10 @@ def _json_objects_after_depot(output: str) -> Iterable[dict[str, Any]]:
         cursor = start + len(output[start:]) - len(fragment) + consumed
         if isinstance(value, dict):
             yield value
+
+
+def _json_objects_after_depot(output: str) -> Iterable[dict[str, Any]]:
+    return _json_objects_after(output, "Depot:")
 
 
 def parse_depot_output(output: str, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -121,6 +130,139 @@ def parse_depot_output(output: str, config: dict[str, Any]) -> dict[str, dict[st
             raise RuntimeError(f"Depot 物品数量不能为负数：{item_id}={raw_quantity}")
         items[item_id] = {"name": names.get(item_id, item_id), "quantity": raw_quantity}
     return items
+
+
+# ---------------------------------------------------------------------------
+# 练度后备：森空岛不可用时顺手跑一趟 OperBox（四期步骤 5）
+# ---------------------------------------------------------------------------
+
+# maa-cli 0.7.5 把 `OperBox` 的 extra-info 回调整条打成 `OperBox: <json>`
+# （`crates/maa-cli/src/run/callback/`：`"OperBox" => info!("{}: {}", "OperBox",
+# json_pretty(message))`，与 `Depot:` 同一形状，二进制里两个字面量挨着），
+# 所以解析器与 Depot 那份共用 `_json_objects_after()`。
+# `details` 的字段来自 MaaCore `OperBoxRecognitionTask`：
+# `{done, all_opers[], own_opers[{id, name, own, elite, level, potential, rarity}]}`。
+OPERBOX_TASK = "operbox"
+OPERBOX_TIMEOUT_DEFAULT = 480
+
+
+def parse_operbox_output(output: str) -> dict[str, dict[str, Any]]:
+    """maa-cli 的 `OperBox:` 输出 → `roster.json` 兼容的 `chars`。
+
+    只认 `done=true` 的那一条完整回调（和 Depot 一样，过程回调会漏人）。
+    `own_opers` 里没有的字段（技能专精 / 模组）**留空**，`maa_copilot` 见到
+    `source == "operbox"` 时按「不满足」处理（fail-closed，D12）。
+    """
+    completed: dict[str, Any] | None = None
+    for message in _json_objects_after(output, "OperBox:"):
+        if message.get("taskchain") != "OperBox" or message.get("what") != "OperBoxInfo":
+            continue
+        details = message.get("details")
+        if not isinstance(details, dict) or details.get("done") is not True:
+            continue
+        completed = details
+    if completed is None:
+        raise RuntimeError("maa OperBox 输出中没有 done=true 的完整干员列表")
+    own = completed.get("own_opers")
+    if not isinstance(own, list) or not own:
+        raise RuntimeError("OperBox 完成事件没有 own_opers")
+
+    chars: dict[str, dict[str, Any]] = {}
+    for raw in own:
+        if not isinstance(raw, dict):
+            continue
+        char_id = str(raw.get("id") or "").strip()
+        # id 是 MaaCore BattleData 的 `char_xxx`，与森空岛 `charId` 同一套；
+        # 认不出 id 的干员**直接丢掉**——留一个假 key 会让作业匹配以为你有这人。
+        if not char_id.startswith("char_"):
+            continue
+        chars[char_id] = {
+            "name": str(raw.get("name") or char_id)[:40],
+            "level": _safe_int(raw.get("level")),
+            "elite": _safe_int(raw.get("elite")),
+            "potential": _safe_int(raw.get("potential")),
+            "rarity": _safe_int(raw.get("rarity")),
+            # 读不到的两项：留空 = 不满足（不是 0 级，也不是「没要求」）。
+            "main_skill_lvl": 0,
+            "skills": [],
+            "module_levels": [],
+        }
+    if not chars:
+        raise RuntimeError("OperBox 识别结果里没有一个可用的干员 id")
+    return chars
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def skland_unavailable(config: dict[str, Any], *, at: datetime | None = None) -> str:
+    """森空岛能不能用；不能用时返回原因（空串 = 能用）。
+
+    **只读本机状态、绝不发请求**：这条判断跑在 Depot 那趟的锁内，不能在这里等网络。
+    判据两条（四期步骤 5）：
+    ① `skland.json.last_error` 非空——上一次刷新已经明确失败（401 / 网络 / 限流）；
+    ② `roster.json` 缺失、坏掉，或已经超过 `skland_roster_refresh_days`——懒刷新挂在
+       抄作业与 watcher 的每条路径上，还这么旧就说明刷新一直没成功。
+    """
+    moment = at or now_beijing()
+    state = load_json(maa_copilot.SKLAND_PATH, None)
+    if isinstance(state, dict) and str(state.get("last_error") or "").strip():
+        return f"森空岛上次刷新失败：{str(state['last_error'])[:200]}"
+    roster = load_json(maa_copilot.ROSTER_PATH, None)
+    if not isinstance(roster, dict) or not isinstance(roster.get("chars"), dict):
+        return "本机还没有森空岛练度快照"
+    fetched = _parse_time(roster.get("fetched_at"))
+    if fetched is None:
+        return "森空岛练度快照没有可解析的时间戳"
+    limit = max(1, int(config.get("skland_roster_refresh_days", 7)))
+    age_days = (moment - fetched).days
+    if age_days >= limit:
+        return f"森空岛练度快照已 {age_days} 天未刷新（上限 {limit} 天）"
+    return ""
+
+
+def run_operbox(
+    config: dict[str, Any],
+    env: dict[str, str],
+    *,
+    at: datetime | None = None,
+) -> int:
+    """在 Depot 那趟已经开好的会话里跑一次 `OperBox`，写练度后备快照。
+
+    返回识别到的干员数。**只在 `skland_unavailable()` 有话说时才调**；失败由调用方
+    吞掉——练度后备坏掉不该把仓库对表这条主线也带红（不变量 #22 的精神）。
+    """
+    result = subprocess.run(
+        [str(config.get("maa_bin", "/opt/homebrew/bin/maa")), "run", OPERBOX_TASK, "-v", "--batch"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        timeout=max(60, int(config.get("operbox_timeout", OPERBOX_TIMEOUT_DEFAULT))),
+        env=env,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-1000:]
+        raise RuntimeError(f"maa OperBox 失败（退出码 {result.returncode}）：{detail}")
+    if "OperBox Completed" not in output:
+        raise RuntimeError("maa OperBox 未报告 Completed")
+    chars = parse_operbox_output(output)
+    roster = {
+        "fetched_at": (at or now_beijing()).isoformat(),
+        "uid": "",
+        "source": maa_copilot.OPERBOX_SOURCE,
+        "chars": chars,
+    }
+    maa_copilot.ensure_private_dirs()
+    atomic_write_json(maa_copilot.OPERBOX_ROSTER_PATH, roster)
+    os.chmod(maa_copilot.OPERBOX_ROSTER_PATH, 0o600)
+    return len(chars)
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -408,6 +550,7 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
         emulator_opened = False
         error: Exception | None = None
         items: dict[str, dict[str, Any]] | None = None
+        operbox_note = ""
         try:
             maa_daily.require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
             maa_daily.require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -435,6 +578,20 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
             if "Depot Completed" not in output:
                 raise RuntimeError("maa Depot 未报告 Completed")
             items = parse_depot_output(output, config)
+            # 练度后备（四期步骤 5）：森空岛不可用时，趁这台已经开好的模拟器顺手
+            # 跑一趟 OperBox。**放在 Depot 之后**——仓库对表是这趟的正事，
+            # 练度快照失败一个字都不许影响它（不变量 #22）。
+            operbox_reason = skland_unavailable(config, at=observed_at)
+            if operbox_reason:
+                try:
+                    count = run_operbox(config, env, at=observed_at)
+                    operbox_note = f"{operbox_reason}；OperBox 后备已记录 {count} 名干员"
+                except Exception as operbox_exc:
+                    operbox_note = (
+                        f"{operbox_reason}；OperBox 后备也失败："
+                        f"{type(operbox_exc).__name__}: {operbox_exc}"
+                    )
+                print(operbox_note, flush=True)
         except Exception as exc:
             error = exc
         cleanup_errors = maa_daily.close_everything(config) if emulator_opened else []
@@ -449,7 +606,9 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
         if error is not None:
             raise error
         assert items is not None
-        return reconcile(items, at=observed_at)
+        updated = reconcile(items, at=observed_at)
+        # 说明只跟着这一次的返回值走，不写进 `depot.json`（那是库存真值文件）。
+        return {**updated, "operbox_note": operbox_note} if operbox_note else updated
 
 
 def run_if_due(config: dict[str, Any], *, at: datetime | None = None) -> dict[str, Any]:
@@ -466,6 +625,7 @@ def run_if_due(config: dict[str, Any], *, at: datetime | None = None) -> dict[st
         "status": "updated",
         "snapshot_at": updated["snapshot_at"],
         "item_count": len(updated["snapshot_items"]),
+        "operbox_note": str(updated.get("operbox_note") or ""),
     }
 
 
@@ -523,6 +683,9 @@ def main() -> int:
     }
     if result.get("item_count") is not None:
         record["depot_item_count"] = result["item_count"]
+    if result.get("operbox_note"):
+        # 森空岛不可用时那趟顺手跑的练度后备，成败都留一行在 `last_run.json` 里。
+        record["depot_operbox_note"] = result["operbox_note"]
     merge_last_run(record)
     if result["status"] == "updated":
         print(

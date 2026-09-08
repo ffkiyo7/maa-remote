@@ -67,7 +67,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 |---|---|---|---|
 | `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry`、**场次级计划求值**（`plan_sessions` / `effective_plan`）、**模拟器占用探测**（`emulator_is_online` / `report_emulator_busy`） | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 早晚两张计划卡 + 抄作业卡的渲染层；早场卡还先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50（am）/ 21:50（pm）；抄作业卡由 `maa_action.py` 调 | 早场数秒～5 分钟（含 `maa update` / `brew`），晚场数秒 |
-| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率 | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
+| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率；**森空岛不可用时顺手跑一趟 `OperBox` 拿练度后备** | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；排目标集合、按理智排一轮 `(关, 模式)`、发「已排程」卡、到点派 `run-batch` | cron 每 15 分钟 | 通常 <1s；要现搜作业时每关 5~20s（每 tick ≤6 关） |
 | `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
@@ -395,6 +395,18 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    | 第一个 | `刷理智` | `plan["stage"]`（缺口第一名） | `plan["farming_drops"]` = `{itemId: 还差多少个}`，**刷够即停**（上游 `-D` 的协议字段） |
    | 第二个 | `刷理智·续` | `plan["farming_fallback_stage"]`（缺口第二名） | **没有**，打到理智不足为止 |
 
+   **三个 Fight 块（剿灭 + 两个刷理智）都走 `_fight_block()`**，所以掉落上报也只写一次：
+
+   ```toml
+   report_to_penguin = true    # 由 config.report_drops 总控，默认 true
+   penguin_id = ""             # 空 = 匿名，任何情况下不带账号标识
+   report_to_yituliu = true
+   yituliu_id = ""
+   ```
+
+   上报的对象正是材料推荐吃的那两份公开掉落数据（四期步骤 3）。`report_drops = false`
+   时这四行一行都不写——`DropReportTests` 里有一条「除了这四行两份渲染完全一致」的断言。
+
    第二个块**只在第一个块设了 `drops` 时才渲染**：没上限的话第一个块本来就会打到理智
    不足，第二块毫无意义。冷启动、缺口 ≤ 0、或用户手动选过关时 `farming_drops` 是空的，
    于是退回「一个块打到底」的老形态。两个块共用 `_fight_block()`，所以
@@ -414,7 +426,28 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    是 `1-7`，当天仍可通过计划卡临时覆盖。
 
    `Award` 固定启用 `award = true` 与 `mail = true`，每场都会尝试领取日常、周常和
-   邮箱内全部可领取附件；MAA 在没有可领取内容时正常结束。
+   邮箱内全部可领取附件；MAA 在没有可领取内容时正常结束。另外三项从配置读（四期步骤 5）：
+
+   | 参数 | 配置键 | 默认 | 含义 |
+   |---|---|---|---|
+   | `orundum` | `award_orundum` | `false` | 幸运墙每日合成玉 |
+   | `mining` | `award_mining` | `false` | 限时开采许可（采矿）合成玉 |
+   | `specialaccess` | `award_specialaccess` | `false` | 周年特权（月卡）奖励 |
+
+   `Mall` 的 `visit_friends` / `shopping` 固定开、`credit_fight` 固定关（信用作战要借助战，
+   不变量 #15 的精神），其余四项从配置读：
+
+   | 参数 | 配置键 | 默认 | 含义 |
+   |---|---|---|---|
+   | `buy_first` | `mall_buy_first` | `[]` | 优先购买的物品名 |
+   | `blacklist` | `mall_blacklist` | `[]` | 不买的物品名 |
+   | `reserve_max_credit` | `mall_reserve_max_credit` | `false` | 信用点低于 300 停止购买 |
+   | `only_buy_discount` | `mall_only_buy_discount` | `false` | 只买打折物品 |
+
+   两个列表要过 `_mall_item_list()` 的 `SAFE_MALL_ITEM_RE` 白名单（中日文 / 拉丁字母 /
+   数字 / `·`，≤20 字），**不合规的项静默丢弃、不抛异常**：它们会原样变成 TOML 字符串，
+   一个带引号或换行的物品名既能撬开任务文件也能让整场日常渲染不出来（不变量 #51）。
+   布尔键走 `_toml_bool()`，**只有真正的 `true` 才是 `true`**（写歪了一律按 false）。
 
    最后那个 `Custom` 的 `task_names` **每一项都必须带 `Home@` 前缀**（见
    `maa_daily.HOME_TASK_NAMES`）。MAA 的 `QuickSwitch` 是子程序，点完小房子里的首页图标
@@ -669,6 +702,13 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
   ②是 zone 粒度的妥协——代价是用户自己手打过的关可能被再抄一遍，用户已接受。
 - `activity_key` 变了（新活动 / 复刻）→ 旧账**归档**成 `ledger-<安全化的 key>.json` 再新开
   （`ensure_ledger()`）。归档而不是删：回头想知道上个活动抄到哪了只有这份说得清。
+- **非活动关（资源本 / 主线）另有一份 `ledger-standalone.json`**（四期步骤 5 修的线上隐患）：
+  手动抄 `CE-6` / `1-7` 时 `start_copilot_search()` 写的 `activity_key` 是**空串**，
+  worker 照样 `ensure_ledger("")`。原来这一步见 key 不同就把当期活动账本归档、新开一份
+  空的，下一 tick watcher 再归档回来——真实通关记录就这样散进归档文件。现在
+  `ledger_path(activity_key)` 决定落点：空 key → 独立账本，**永不归档、永不新开活动账本**；
+  worker 必须拿同一个 key 算出的路径去 `save_ledger()`，否则记完账会把独立账本写回活动账本。
+  独立账本不参与自动排轮（自动只跑活动关），种子也永远种不进去（前缀不是 `SR`）。
 - **种子**（`seed_ledger()`）：当期活动前缀是 `SR` 时，把 `SR-5 / SR-6 / SR-8`
   的**普通**模式写成 `2026-09-08T23:58:00+08:00`（来源：spike A 报告与用户自述——
   SR-5/SR-6 用户自己打过且 spike 又重打了一遍，SR-8 是 09-08 15:17 抄作业通关的），
@@ -708,6 +748,32 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
   永不经 argv/Discord/agent 上下文；`skland.json`/`roster.json` 0600。
 - cred 过期（10002/HTTP 401）→ 用存的 `hg_token` 重跑 grant，**只重试一次**，
   再失败记 `last_error` 提示重新 `link`，绝不循环。
+
+### 练度后备：OperBox（四期步骤 5）
+
+森空岛挂了不该让练度整条断掉。**Depot 那趟**（`maa_depot.run_depot()`，每周一次、
+04:30）在拿完库存之后、关模拟器之前，如果森空岛不可用就顺手跑一次
+`maa run operbox`（仓库里的 `config/maa-cli/tasks/operbox.toml`，`type = "OperBox"`）。
+
+- **判据 `skland_unavailable()` 只读本机状态、绝不发请求**（它跑在锁内，不能等网络）：
+  `skland.json.last_error` 非空，或 `roster.json` 缺失 / 坏掉 / 没有时间戳 /
+  已经超过 `skland_roster_refresh_days`（懒刷新挂在每条抄作业路径上，还这么旧就是一直没成功）。
+- 输出形状：maa-cli 把回调整条打成 `OperBox: <json>`（与 `Depot:` 同一形状，
+  `run/callback/` 里两者都走 `info!("{}: {}", …, json_pretty(message))`），
+  `details` 来自 MaaCore `OperBoxRecognitionTask`：
+  `{done, all_opers[], own_opers[{id, name, own, elite, level, potential, rarity}]}`。
+  解析器与 Depot 共用 `_json_objects_after()`，同样**只认 `done=true` 的那一条**。
+  `id` 是 `char_xxx`（BattleData 那套，与森空岛 `charId` 同源）；认不出 id 的条目直接丢，
+  一个都不剩就报错——绝不写一份假快照。
+- 快照落 `copilot/roster-operbox.json`（0600，`source = "operbox"`），**不覆盖
+  `roster.json`**：它只有 `{name, elite, level, potential}`，覆盖过去连能校验的信息也没了。
+  `load_roster()` 取两份里 `fetched_at` 更新的那一份，所以森空岛一恢复后备自动退场。
+- **fail-closed（D12）**：`check_op_requirements()` 见到 `source == "operbox"` 时，
+  技能与模组要求一律记**硬**缺口（森空岛那份里模组是软缺口）。
+  后备快照也没有 `sanity` / `activity_progress`，于是理智预算按未知处理（不变量 #28）、
+  zone 全清判据不成立——宁可多抄一遍，也不拿猜出来的练度去开代理。
+- OperBox 失败**不影响仓库对表**：异常被吞掉，成败各写一行到
+  `last_run.depot_operbox_note`（不变量 #22 的精神——练度只是搭车）。
 
 ---
 
@@ -850,6 +916,12 @@ maa-cli 0.7.5 的 `Theme` 枚举里**没有 `BlackFlow`**、`mode` 硬校验 `0.
                   会写**，`maa_activity_watch.cost_lookup()` 只读它（EX 关理智兜底）
   copilot/ledger.json      当期活动的作业记账：每关每模式的通关时间戳 + attempts（0600）
   copilot/ledger-<活动>.json 换活动时归档的旧账本（0600）
+  copilot/ledger-standalone.json 非活动关（资源本 / 主线）的记账（0600）。空
+                      `activity_key` 只写这一份，**永不归档、永不碰活动账本**（不变量 #52）
+  copilot/roster.json      森空岛练度 + 理智 + zone 进度快照（0600，`source = "skland"`）
+  copilot/roster-operbox.json 森空岛不可用时 Depot 那趟拿的练度后备（0600，
+                      `source = "operbox"`，只有精英化 / 等级 / 潜能）。`load_roster()`
+                      取两份里 `fetched_at` 更新的那一份（不变量 #53）
   copilot/searches/<token>.json 一轮的执行清单 `entries: [{stage, stage_id, mode,
                       candidate, sanity_cost}]` + scheduled_at + 状态机（25h TTL）
   copilot/card.json 上一张抄作业卡的 message_id（0600）。**不能放进 copilot/searches/**
@@ -917,7 +989,7 @@ result = normalize_plan(result)             ← 再规范化一次
 ```bash
 python3 -m unittest discover -s tests -v   # 必须在仓库根目录跑（测试要 import 根目录的 deploy.py）
 python3 deploy.py                          # 幂等；输出 {"ok":true,"changed":[…],"backup":"…"}
-python3 deploy.py --check                  # 检查脚本/ocrbox 与 6 个 maa-cli 配置是否存在，并逐字节核对其中 5 个
+python3 deploy.py --check                  # 检查脚本/ocrbox 与 7 个 maa-cli 配置是否存在，并逐字节核对其中 6 个
 ```
 
 做的事：
@@ -926,7 +998,7 @@ python3 deploy.py --check                  # 检查脚本/ocrbox 与 6 个 maa-c
    `~/.hermes/backups/maa-setup/<YYYYMMDDTHHMMSS>/`。
 2. **幂等写** — `write_bytes()` 内容一致就跳过（不写、不记 changed、不备份），
    否则 `mkstemp + fsync + os.replace` 原子替换，权限 0600/0700。
-   `--check` 对仓库管理的 6 个 `config/maa-cli/**` 文件查存在，并对其中 5 个逐字节比对
+   `--check` 对仓库管理的 7 个 `config/maa-cli/**` 文件查存在，并对其中 6 个逐字节比对
    仓库与运行时；文件存在但内容漂移会列入 `mismatched` 并返回失败，不再把“存在”误报成
    “部署干净”。
    - **`tasks/daily.toml` 是唯一的内容比对豁免项**（`deploy.RUNTIME_REWRITTEN_MAA_CONFIGS`）：
@@ -1075,6 +1147,9 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 48 | 肉鸽子进程**只许** `Popen` + `terminate()` + `wait(timeout)` + 万不得已 `kill()`，**不许 `subprocess.run(timeout=)`**：后者超时走 SIGKILL，MaaCore 来不及 destroy，模拟器会留在地图里。单局上限是 `roguelike_run_timeout`（默认 3600），整轮长度由 blackout / Depot 窗口约束 | `maa_roguelike_worker._run_one_exploration()` + `RoguelikeSubprocessTests`（AST 断言全模块没有 `subprocess.run`） |
 | 49 | **`dirty` 时不许换主题**：上游 `<Theme>@Roguelike@Begin` 的善后链只在同主题下成立，跨主题会死循环（issue #13245）。一局开跑**之前**就先落盘 `dirty = true` + `last_theme`（进程被杀也留得住），只有 **`Roguelike Completed` 且退出码 0** 才清掉——只看退出码会让被中断的一局被当成收过尾的 | `maa_roguelike.dirty_theme_conflict()` / `parse_run_output()` + `RoguelikeCardTests.test_a_dirty_run_refuses_to_switch_theme` / `RoguelikeOutputTests.test_only_completed_plus_exit_zero_counts_as_clean` |
 | 50 | 肉鸽卡用 `hermes:btn:maa-roguelike:` 前缀：它**不在** `hermes:btn:maa:` 之下（07:50 那趟整段清扫碰不到），也**不在** `hermes:btn:maa-copilot:` 之下（`prune_expired_searches()` 碰不到）。发新卡的顺序与 #14b 相同：「PATCH 旧卡组件 → 删旧登记 → merge 写新登记 → 发卡 → 记新 message_id」。**换主题必须重发卡**——模式 / 难度 / 分队的选项都随主题变，留着旧卡等于让人从上一个主题的分队里挑 | `maa_roguelike.BUTTON_PREFIX` / `maa_action._send_roguelike_card()` + `RoguelikeCardTests.test_the_roguelike_prefix_survives_both_sweeps` / `test_changing_the_theme_reposts_the_card_and_drops_the_old_registry` |
+| 51 | **配置里的字符串列表写进任务文件前必须过白名单**：`config.mall_buy_first` / `mall_blacklist` 由 `_mall_item_list()` 逐项过 `SAFE_MALL_ITEM_RE`（中日文 / 拉丁字母 / 数字 / `·`，≤20 字），不合规的项**静默丢弃**而不是抛异常（渲染器抛异常 = 整场日常没得跑）。同理布尔开关走 `_toml_bool()`，只有真正的 `true` 才写 `true`。渲染器不接受任何没校验过的外部字符串——`drops` 的表键早已这么办（`SAFE_ITEM_ID_RE`，不变量 #44） | `maa_daily._mall_item_list()` / `SAFE_MALL_ITEM_RE` / `_toml_bool()` + `AwardAndMallOptionTests` |
+| 52 | **空 `activity_key` 永远不动活动账本**：非活动关（资源本 / 主线）的记账落 `ledger-standalone.json`，`ensure_ledger("")` 既不归档也不新开活动账本，`ledger_path()` 与 `ensure_ledger()` 必须拿同一个 key 算落点。原来空 key 会把当期账本归档 + 新开空账本，下一 tick watcher 再归档回来，真实通关记录散进归档文件 | `maa_copilot.ledger_path()` / `ensure_ledger()` + `maa_copilot_worker._batch_run_locked()` + `LedgerTests.test_a_non_activity_stage_never_archives_the_running_ledger` / `CopilotBatchExecutionTests.test_a_non_activity_round_writes_only_the_standalone_ledger` |
+| 53 | **练度后备快照读不到的字段一律按「不满足」**（fail-closed，D12）：`roster.source == "operbox"` 时技能与模组要求记**硬**缺口。后备只在 `skland_unavailable()` 有话说时才写，落**单独的** `roster-operbox.json`（绝不覆盖森空岛那份），`load_roster()` 取 `fetched_at` 更新的一份，所以森空岛一恢复它就退场。OperBox 失败不得影响 Depot 的库存真值 | `maa_copilot.load_roster()` / `check_op_requirements()` / `maa_depot.skland_unavailable()` / `run_operbox()` + `OperBoxFallbackTests` / `OperBoxRosterTests` |
 
 ---
 
@@ -1181,6 +1256,10 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 肉鸽说「已经在跑了」但频道里什么都没发生 | worker 进程没了。`roguelike.json` 的 `status` 停在 `running` 而 `run.lock` 是空的、且 `updated_at` 超过 10 分钟时，再点一次「▶️ 开始」就会按新的一轮重开（`round_is_stale()`）。**不要手改状态文件**——等这 10 分钟或直接再点一次 |
 | 肉鸽一直点空 / 进错主题 | 手册要求把目标主题**置顶在终端**，自动导航「不保证长期可用」（社区 issue #13245 就是界园被认成萨卡兹）。先在游戏里置顶，再看 `runs/<date>-roguelike-<token>.log` |
 | 自动确认提示理智读取失败 | 森空岛凭据已过期或 API 变化；只在本机终端重新跑 `maa_skland.py link`，不要把 token 发到 Discord |
+| 森空岛挂了之后作业全被判「练度不满足」 | 这是设计（不变量 #53）：练度退到了 `copilot/roster-operbox.json`，它读不到技能专精与模组，凡是有这两项要求的作业一律算不满足。`maa_skland.py link` 修好森空岛，下一次刷新后备就自动退场 |
+| 森空岛挂着，`roster-operbox.json` 却一直不出现 | 后备只在 **Depot 那趟**（每周一次，京 04:30）顺手跑。看 `last_run.depot_operbox_note`：没有这行说明 `skland_unavailable()` 判定森空岛还能用（`roster.json` 还没到 `skland_roster_refresh_days`），有这行就写着失败原因 |
+| 手动抄了一次资源本，活动记账好像丢了 | 先看 `copilot/` 下是不是多了 `ledger-<key>.json` 归档。这是 2026-09-09 修掉的隐患（不变量 #52）：空 `activity_key` 会把当期账本归档。修完之后非活动关记在 `ledger-standalone.json`，活动账本不受影响 |
+| 信用商店没按 `mall_buy_first` 买 | 先看渲染出的 `~/.config/maa-cli/tasks/daily.toml` 里 `buy_first` 是不是空的：白名单（`SAFE_MALL_ITEM_RE`）会**静默丢弃**带引号、换行、超长（>20 字）的物品名。名字要和游戏里一模一样 |
 | 聊天改计划无效 | 看 agent 是否真的调了 `maa_action.py`；`plan.json` 的 `date` 是否是今天 |
 | 战报里步骤全是「未执行」 | maa-cli 输出格式变了 → 改 `_task_state()` / `TASK_STEPS` |
 | 截图失败 | ADB 断了或返回非 PNG；不阻断主流程，看 Embed 备注 |

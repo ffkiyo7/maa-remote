@@ -17,6 +17,10 @@ series = 0
 times = 2147483647
 server = "CN"
 client_type = "Official"
+report_to_penguin = true
+penguin_id = ""
+report_to_yituliu = true
+yituliu_id = ""
 
 [[tasks]]
 name = "刷理智"
@@ -30,6 +34,10 @@ series = 0
 times = 2147483647
 server = "CN"
 client_type = "Official"
+report_to_penguin = true
+penguin_id = ""
+report_to_yituliu = true
+yituliu_id = ""
 
 [[tasks]]
 name = "基建换班"
@@ -62,6 +70,10 @@ visit_friends = true
 shopping = true
 force_shopping_if_credit_full = false
 credit_fight = false
+buy_first = []
+blacklist = []
+reserve_max_credit = false
+only_buy_discount = false
 
 [[tasks]]
 name = "领取奖励"
@@ -72,6 +84,7 @@ mail = true
 recruit = false
 orundum = false
 mining = false
+specialaccess = false
 
 [[tasks]]
 name = "返回主界面"

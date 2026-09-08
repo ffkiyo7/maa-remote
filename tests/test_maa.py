@@ -1168,8 +1168,8 @@ Opening mini games:
                 checked = deploy.maa_config_content_checked_pairs()
                 self.assertEqual(deploy.content_mismatches(checked), [])
                 # Every config is still deployed and existence-checked.
-                self.assertEqual(len(deploy.maa_config_file_pairs()), 6)
-                self.assertEqual(len(checked), 5)
+                self.assertEqual(len(deploy.maa_config_file_pairs()), 7)
+                self.assertEqual(len(checked), 6)
 
                 daily = runtime / "tasks" / "daily.toml"
                 daily.write_bytes(b"rewritten by render_daily_toml\n")
@@ -4515,6 +4515,59 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(json.loads(archive.read_text("utf-8"))["activity_key"], SR_KEY)
         self.assertEqual(ledger["stages"], {})
 
+    def test_a_non_activity_stage_never_archives_the_running_ledger(self) -> None:
+        """手动抄资源本 / 主线时 `activity_key` 是空串（四期步骤 5 修的线上隐患）。
+
+        原来 `ensure_ledger("")` 见 key 不同就把当期账本归档、新开一份空的，
+        下一 tick watcher 再归档回来——真实通关记录散进归档文件。
+        """
+        activity, _note = self._ensure(SR_KEY)
+        maa_copilot.record_copilot_attempt(activity, "SR-7", "normal", outcome="won")
+        with patch.object(maa_copilot, "ensure_private_dirs"):
+            maa_copilot.save_ledger(activity, self.path)
+        before = self.path.read_bytes()
+
+        ledger, note = self._ensure("")
+        self.assertEqual(note, "")
+        # 当期账本一个字节都没动，也没有多出任何归档文件。
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(
+            sorted(p.name for p in self.path.parent.iterdir()),
+            ["ledger-standalone.json", "ledger.json"],
+        )
+        self.assertEqual(ledger["stages"], {})
+        # 返回的账本照样能记账，且落到独立文件里。
+        standalone = maa_copilot.ledger_path("", path=self.path)
+        maa_copilot.record_copilot_attempt(ledger, "CE-6", "normal", outcome="won")
+        with patch.object(maa_copilot, "ensure_private_dirs"):
+            maa_copilot.save_ledger(ledger, standalone)
+        saved = json.loads(standalone.read_text("utf-8"))
+        self.assertTrue(saved["stages"]["CE-6"]["normal"])
+        self.assertEqual(saved["activity_key"], "")
+        # 活动账本里既没有 CE-6，也没丢 SR-7。
+        kept = json.loads(self.path.read_text("utf-8"))
+        self.assertNotIn("CE-6", kept["stages"])
+        self.assertTrue(kept["stages"]["SR-7"]["normal"])
+
+    def test_the_standalone_ledger_is_reused_and_never_reseeded(self) -> None:
+        first, _note = self._ensure("")
+        maa_copilot.record_copilot_attempt(first, "1-7", "normal", outcome="won")
+        with patch.object(maa_copilot, "ensure_private_dirs"):
+            maa_copilot.save_ledger(first, maa_copilot.ledger_path("", path=self.path))
+        again, note = self._ensure("")
+        self.assertEqual(note, "")
+        self.assertTrue(again["stages"]["1-7"]["normal"])
+        # 空 key 的前缀不是 `SR`，种子绝不会写进这一份。
+        self.assertNotIn("SR-5", again["stages"])
+
+    def test_the_ledger_path_splits_activity_from_standalone(self) -> None:
+        self.assertEqual(maa_copilot.ledger_path(SR_KEY, path=self.path), self.path)
+        self.assertEqual(
+            maa_copilot.ledger_path("   ", path=self.path).name, "ledger-standalone.json"
+        )
+        self.assertEqual(maa_copilot.ledger_path(SR_KEY), maa_copilot.LEDGER_PATH)
+        self.assertEqual(maa_copilot.ledger_path(""), maa_copilot.LEDGER_STANDALONE_PATH)
+
     def test_a_broken_ledger_reads_as_absent_instead_of_raising(self) -> None:
         self.path.write_text("{not json", encoding="utf-8")
         self.assertIsNone(maa_copilot.load_ledger(self.path))
@@ -5043,12 +5096,30 @@ class CopilotBatchExecutionTests(unittest.TestCase):
             "sanity_cost": cost,
         }
 
-    def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None):
+    def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None, ledger_dir=None):
         import maa_copilot_worker as worker
 
         token = "a" * 12
         ledger = maa_copilot.new_ledger(activity_key)
         reports: list[dict] = []
+        # `ledger_dir` 打开的是**真的记账**（账本落在这个目录里），用来验证 worker
+        # 把哪一份账本写到了哪个文件；其余用例只关心内存里的账本。
+        ledger_patches = (
+            [
+                patch.object(maa_copilot, "LEDGER_PATH", ledger_dir / "ledger.json"),
+                patch.object(
+                    maa_copilot,
+                    "LEDGER_STANDALONE_PATH",
+                    ledger_dir / "ledger-standalone.json",
+                ),
+                patch.object(maa_copilot, "ensure_private_dirs"),
+            ]
+            if ledger_dir is not None
+            else [
+                patch.object(maa_copilot, "ensure_ledger", return_value=(ledger, "")),
+                patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l),
+            ]
+        )
         with tempfile.TemporaryDirectory() as raw:
             searches = Path(raw) / "searches"
             searches.mkdir()
@@ -5077,8 +5148,7 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 patch.object(worker, "cleanup_run_files"),
                 patch.object(maa_action, "min_lead_reason", return_value=lead),
                 patch.object(worker, "_recheck_before_stage", return_value=(True, "")),
-                patch.object(maa_copilot, "ensure_ledger", return_value=(ledger, "")),
-                patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l),
+                *ledger_patches,
                 patch.object(worker, "_fight_one", side_effect=fight),
                 patch.object(
                     worker, "_post_report",
@@ -5112,6 +5182,36 @@ class CopilotBatchExecutionTests(unittest.TestCase):
         for label in ("SR-5", "SR-5（突袭）", "SR-6"):
             self.assertIn(label, result.results)
         self.assertIn("3/3 通过", result.report["title"])
+
+    def test_a_non_activity_round_writes_only_the_standalone_ledger(self) -> None:
+        """手动抄资源本：`activity_key` 是空串，当期活动账本一个字节都不许动。"""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            activity = root / "ledger.json"
+            maa_common.atomic_write_json(
+                activity,
+                {
+                    "activity_key": SR_KEY,
+                    "seeded": "SR",
+                    "stages": {"SR-5": {"normal": "2026-09-09T02:00:00+08:00",
+                                        "raid": None, "attempts": []}},
+                },
+            )
+            before = activity.read_bytes()
+            entries = [self._entry("CE-6", stage_id="wk_melee_6", cost=30)]
+            result = self._run(
+                entries, lambda *a: ("won", ""), activity_key="", ledger_dir=root
+            )
+            self.assertEqual(result.code, 0)
+            self.assertEqual(activity.read_bytes(), before)
+            # 没有归档文件；记账落在独立账本里。
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()),
+                ["ledger-standalone.json", "ledger.json"],
+            )
+            standalone = json.loads((root / "ledger-standalone.json").read_text("utf-8"))
+        self.assertTrue(standalone["stages"]["CE-6"]["normal"])
+        self.assertEqual(standalone["activity_key"], "")
 
     def test_one_failed_stage_does_not_stop_the_next_one(self) -> None:
         entries = [self._entry("SR-5"), self._entry("SR-6"), self._entry("SR-8")]
@@ -7019,3 +7119,375 @@ class RoguelikeStaleRoundTests(unittest.TestCase):
         self.assertEqual(fresh["status"], "running")
         self.assertNotEqual(fresh["token"], "b" * 12)
         dispatch.assert_called_once()
+
+
+class DropReportTests(unittest.TestCase):
+    """步骤 5：日常掉落匿名上报一图流 / 企鹅物流（回馈步骤 3 的数据源）。"""
+
+    def setUp(self) -> None:
+        self.plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
+        self.plan["farming_drops"] = {"30013": 40}
+        self.plan["farming_fallback_stage"] = "CE-6"
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+
+    def _fight_blocks(self, rendered: str) -> list[str]:
+        return [block for block in rendered.split("[[tasks]]") if 'type = "Fight"' in block]
+
+    def test_every_fight_block_reports_anonymously_by_default(self) -> None:
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        blocks = self._fight_blocks(rendered)
+        # 每日剿灭 + 刷理智 + 刷理智·续。
+        self.assertEqual(len(blocks), 3)
+        for block in blocks:
+            self.assertIn("report_to_yituliu = true", block)
+            self.assertIn("report_to_penguin = true", block)
+            # ID 一律空串 = 匿名，任何情况下都不带账号标识。
+            self.assertIn('yituliu_id = ""', block)
+            self.assertIn('penguin_id = ""', block)
+
+    def test_the_switch_removes_every_report_line_and_nothing_else(self) -> None:
+        on = maa_daily.render_daily_toml(self.plan, self.config)
+        off = maa_daily.render_daily_toml(
+            self.plan, {**self.config, "report_drops": False}
+        )
+        for marker in ("report_to_yituliu", "report_to_penguin", "yituliu_id", "penguin_id"):
+            self.assertNotIn(marker, off)
+        # 差别**只有**上报那四行：把它们删掉两份必须一模一样。
+        stripped = "\n".join(
+            line
+            for line in on.splitlines()
+            if not line.startswith(("report_to_", "yituliu_id", "penguin_id"))
+        )
+        self.assertEqual(stripped, off.rstrip("\n") if off.endswith("\n") else off)
+
+    def test_the_safety_literals_are_untouched_by_reporting(self) -> None:
+        for report in (True, False):
+            rendered = maa_daily.render_daily_toml(
+                self.plan, {**self.config, "report_drops": report}
+            )
+            with self.subTest(report=report):
+                for block in self._fight_blocks(rendered):
+                    self.assertIn("medicine = 0", block)
+                    self.assertIn("stone = 0", block)
+                    self.assertIn("series = 0", block)
+                self.assertNotIn("stone = 1", rendered)
+
+
+class AwardAndMallOptionTests(unittest.TestCase):
+    """步骤 5：Award 三个开关 + Mall 细化，全部从 `config.json` 读。"""
+
+    def setUp(self) -> None:
+        self.plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+
+    def _award(self, config: dict) -> str:
+        rendered = maa_daily.render_daily_toml(self.plan, config)
+        return next(b for b in rendered.split("[[tasks]]") if 'type = "Award"' in b)
+
+    def _mall(self, config: dict) -> str:
+        rendered = maa_daily.render_daily_toml(self.plan, config)
+        return next(b for b in rendered.split("[[tasks]]") if 'type = "Mall"' in b)
+
+    def test_award_defaults_match_the_behaviour_before_the_switches(self) -> None:
+        block = self._award(self.config)
+        for line in ("orundum = false", "mining = false", "specialaccess = false"):
+            self.assertIn(line, block)
+        # 领日常 / 周常 / 邮件这三条不受开关影响。
+        self.assertIn("award = true", block)
+        self.assertIn("mail = true", block)
+
+    def test_award_switches_come_from_config(self) -> None:
+        block = self._award(
+            {
+                **self.config,
+                "award_orundum": True,
+                "award_mining": True,
+                "award_specialaccess": True,
+            }
+        )
+        for line in ("orundum = true", "mining = true", "specialaccess = true"):
+            self.assertIn(line, block)
+
+    def test_a_non_boolean_switch_is_read_as_off(self) -> None:
+        block = self._award({**self.config, "award_orundum": "yes"})
+        self.assertIn("orundum = false", block)
+
+    def test_mall_defaults_stay_empty_and_off(self) -> None:
+        block = self._mall(self.config)
+        self.assertIn("buy_first = []", block)
+        self.assertIn("blacklist = []", block)
+        self.assertIn("reserve_max_credit = false", block)
+        self.assertIn("only_buy_discount = false", block)
+        # 信用作战仍然固定关（借助战，不变量 #15 的精神）。
+        self.assertIn("credit_fight = false", block)
+
+    def test_mall_lists_come_from_config_and_go_through_the_whitelist(self) -> None:
+        block = self._mall(
+            {
+                **self.config,
+                "mall_buy_first": [
+                    "招聘许可",
+                    "技能概要·卷3",
+                    '坏"名字',          # 引号会撬开 TOML 字符串
+                    "x" * 40,           # 超长
+                    "赤金\n注入",        # 换行
+                    42,                  # 根本不是字符串
+                ],
+                "mall_blacklist": ["碳"],
+                "mall_reserve_max_credit": True,
+                "mall_only_buy_discount": True,
+            }
+        )
+        self.assertIn('buy_first = ["招聘许可", "技能概要·卷3"]', block)
+        self.assertIn('blacklist = ["碳"]', block)
+        self.assertIn("reserve_max_credit = true", block)
+        self.assertIn("only_buy_discount = true", block)
+        for rejected in ('坏"名字', "x" * 40, "注入"):
+            self.assertNotIn(rejected, block)
+
+    def test_a_broken_list_never_takes_the_whole_render_down(self) -> None:
+        block = self._mall({**self.config, "mall_buy_first": "招聘许可"})
+        self.assertIn("buy_first = []", block)
+
+
+class OperBoxFallbackTests(unittest.TestCase):
+    """步骤 5：森空岛不可用时，Depot 那趟顺手拿一份 OperBox 练度快照。"""
+
+    def _message(self, done: bool, own: list[dict]) -> str:
+        return "OperBox: " + json.dumps(
+            {
+                "taskchain": "OperBox",
+                "what": "OperBoxInfo",
+                "details": {"done": done, "all_opers": [], "own_opers": own},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _own(self, char_id: str = "char_350_surtr") -> dict:
+        return {
+            "id": char_id,
+            "name": "史尔特尔",
+            "own": True,
+            "elite": 2,
+            "level": 90,
+            "potential": 1,
+            "rarity": 6,
+        }
+
+    def test_parser_accepts_only_the_final_complete_callback(self) -> None:
+        output = "\n".join(
+            [
+                self._message(False, [self._own()]),
+                self._message(True, [self._own(), self._own("char_002_amiya")]),
+            ]
+        )
+        chars = maa_depot.parse_operbox_output(output)
+        self.assertEqual(sorted(chars), ["char_002_amiya", "char_350_surtr"])
+        entry = chars["char_350_surtr"]
+        self.assertEqual(entry["elite"], 2)
+        self.assertEqual(entry["level"], 90)
+        self.assertEqual(entry["potential"], 1)
+        # 读不到的两项留空 = 不满足，不是「0 级」也不是「没要求」。
+        self.assertEqual(entry["skills"], [])
+        self.assertEqual(entry["module_levels"], [])
+        self.assertEqual(entry["main_skill_lvl"], 0)
+
+    def test_a_partial_or_unusable_result_is_a_visible_error(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "done=true"):
+            maa_depot.parse_operbox_output(self._message(False, [self._own()]))
+        with self.assertRaisesRegex(RuntimeError, "own_opers"):
+            maa_depot.parse_operbox_output(self._message(True, []))
+        # 认不出 id 的干员全丢掉 → 一个都不剩时报错，绝不写一份假快照。
+        with self.assertRaisesRegex(RuntimeError, "干员 id"):
+            maa_depot.parse_operbox_output(
+                self._message(True, [{"id": "", "name": "认不出"}])
+            )
+
+    def test_skland_health_is_decided_from_local_state_only(self) -> None:
+        at = datetime(2026, 9, 9, 4, 30, tzinfo=BEIJING)
+        config = {"skland_roster_refresh_days": 7}
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            skland = root / "skland.json"
+            roster = root / "roster.json"
+            with patch.object(maa_copilot, "SKLAND_PATH", skland), patch.object(
+                maa_copilot, "ROSTER_PATH", roster
+            ):
+                # 还没有快照。
+                self.assertIn("还没有", maa_depot.skland_unavailable(config, at=at))
+                maa_common.atomic_write_json(skland, {"hg_token": "x"})
+                maa_common.atomic_write_json(
+                    roster,
+                    {
+                        "fetched_at": (at - timedelta(days=1)).isoformat(),
+                        "source": "skland",
+                        "chars": {"char_002_amiya": {"level": 90}},
+                    },
+                )
+                self.assertEqual(maa_depot.skland_unavailable(config, at=at), "")
+                # 快照太旧（懒刷新一直没成功）。
+                maa_common.atomic_write_json(
+                    roster,
+                    {
+                        "fetched_at": (at - timedelta(days=9)).isoformat(),
+                        "source": "skland",
+                        "chars": {"char_002_amiya": {"level": 90}},
+                    },
+                )
+                self.assertIn("9 天", maa_depot.skland_unavailable(config, at=at))
+                # 上一次刷新明确失败（401 / 网络）。
+                maa_common.atomic_write_json(
+                    skland, {"hg_token": "x", "last_error": "森空岛返回 401"}
+                )
+                self.assertIn("401", maa_depot.skland_unavailable(config, at=at))
+
+    def _run_depot(self, *, unavailable: str, operbox_output: str, returncode: int = 0):
+        depot_output = "Depot Completed\nDepot: " + json.dumps(
+            {
+                "taskchain": "Depot",
+                "what": "DepotInfo",
+                "details": {"done": True, "data": '{"30012": 40}'},
+            }
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+            if argv[2] == "depot":
+                return SimpleNamespace(returncode=0, stdout=depot_output, stderr="")
+            return SimpleNamespace(returncode=returncode, stdout=operbox_output, stderr="")
+
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = True
+        context.__exit__.return_value = False
+        at = datetime(2026, 9, 9, 4, 30, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            maa_common.atomic_write_json(
+                root / "item_index.json", {"30012": {"name": "固源岩组"}}
+            )
+            config = {"maa_bin": "/maa", "adb_path": "/adb", "maa_resource_dir": str(root)}
+            operbox_roster = root / "roster-operbox.json"
+            with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
+                maa_depot, "emulator_is_online", return_value=(False, "离线")
+            ), patch.object(maa_daily, "require_executable"), patch.object(
+                maa_daily, "open_emulator"
+            ), patch.object(maa_daily, "wait_for_android"), patch.object(
+                maa_daily, "verify_game_installed"
+            ), patch.object(maa_daily, "settle_android_runtime"), patch.object(
+                maa_daily, "close_everything", return_value=[]
+            ), patch.object(maa_depot, "maa_subprocess_env", return_value={}), patch.object(
+                maa_depot.subprocess, "run", side_effect=fake_run
+            ), patch.object(
+                maa_depot, "skland_unavailable", return_value=unavailable
+            ), patch.object(
+                maa_copilot, "OPERBOX_ROSTER_PATH", operbox_roster
+            ), patch.object(
+                maa_copilot, "ensure_private_dirs"
+            ), patch.object(
+                maa_depot, "reconcile", side_effect=lambda items, **kw: {
+                    "snapshot_at": kw["at"].isoformat(), "snapshot_items": items
+                }
+            ):
+                with contextlib.redirect_stdout(io.StringIO()) as printed:
+                    result = maa_depot.run_depot(config, at=at)
+            roster = (
+                json.loads(operbox_roster.read_text("utf-8"))
+                if operbox_roster.is_file()
+                else None
+            )
+        return SimpleNamespace(
+            result=result, calls=calls, roster=roster, printed=printed.getvalue()
+        )
+
+    def test_a_healthy_skland_never_runs_operbox(self) -> None:
+        run = self._run_depot(unavailable="", operbox_output="")
+        self.assertEqual([argv[2] for argv in run.calls], ["depot"])
+        self.assertIsNone(run.roster)
+        self.assertNotIn("operbox_note", run.result)
+
+    def test_a_broken_skland_gets_the_operbox_snapshot(self) -> None:
+        output = "OperBox Completed\n" + self._message(True, [self._own()])
+        run = self._run_depot(unavailable="森空岛返回 401", operbox_output=output)
+        self.assertEqual([argv[2] for argv in run.calls], ["depot", "operbox"])
+        self.assertEqual(run.roster["source"], "operbox")
+        self.assertEqual(run.roster["chars"]["char_350_surtr"]["elite"], 2)
+        self.assertIn("1 名干员", run.result["operbox_note"])
+        # 仓库真值仍然是这趟的正事，练度只是搭车。
+        self.assertEqual(run.result["snapshot_items"]["30012"]["quantity"], 40)
+
+    def test_a_failed_operbox_never_takes_the_depot_snapshot_down(self) -> None:
+        run = self._run_depot(
+            unavailable="森空岛返回 401", operbox_output="boom", returncode=1
+        )
+        self.assertEqual(run.result["snapshot_items"]["30012"]["quantity"], 40)
+        self.assertIsNone(run.roster)
+        self.assertIn("OperBox 后备也失败", run.result["operbox_note"])
+
+    def test_the_newest_snapshot_wins_between_skland_and_operbox(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            skland_roster = root / "roster.json"
+            operbox_roster = root / "roster-operbox.json"
+            with patch.object(maa_copilot, "ROSTER_PATH", skland_roster), patch.object(
+                maa_copilot, "OPERBOX_ROSTER_PATH", operbox_roster
+            ):
+                maa_common.atomic_write_json(
+                    operbox_roster,
+                    {
+                        "fetched_at": "2026-09-09T04:30:00+08:00",
+                        "source": "operbox",
+                        "chars": {"char_350_surtr": {"level": 90}},
+                    },
+                )
+                # 森空岛那份不在 → 用后备。
+                self.assertEqual(maa_copilot.load_roster()["source"], "operbox")
+                maa_common.atomic_write_json(
+                    skland_roster,
+                    {
+                        "fetched_at": "2026-09-08T15:30:00+08:00",
+                        "source": "skland",
+                        "chars": {"char_350_surtr": {"level": 90}},
+                    },
+                )
+                # 森空岛那份更旧 → 仍然用后备。
+                self.assertEqual(maa_copilot.load_roster()["source"], "operbox")
+                maa_common.atomic_write_json(
+                    skland_roster,
+                    {
+                        "fetched_at": "2026-09-10T07:50:00+08:00",
+                        "source": "skland",
+                        "chars": {"char_350_surtr": {"level": 90}},
+                    },
+                )
+                # 森空岛恢复 → 后备自动退场（它有技能与模组，能校验得更细）。
+                self.assertEqual(maa_copilot.load_roster()["source"], "skland")
+                # 两份都坏掉不许抛：练度读不到的后果是「一律判不满足」。
+                skland_roster.write_text("{not json", encoding="utf-8")
+                operbox_roster.write_text("{not json", encoding="utf-8")
+                self.assertIsNone(maa_copilot.load_roster())
+
+    def test_the_task_file_is_deployed_and_asks_for_operbox(self) -> None:
+        toml = (ROOT / "config" / "maa-cli" / "tasks" / "operbox.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('type = "OperBox"', toml)
+        # StartUp 保留（它兼作「确认停在主页」），CloseDown 仍然不进任务链。
+        self.assertIn('type = "StartUp"', toml)
+        self.assertNotIn("CloseDown\"", toml)
+        self.assertIn(
+            Path("tasks/operbox.toml"), list(deploy.MAA_CONFIG_RELATIVE_PATHS)
+        )
+        # 任务文件没有运行时重写，必须留在逐字节比对名单里。
+        self.assertNotIn(
+            Path("tasks/operbox.toml"), deploy.RUNTIME_REWRITTEN_MAA_CONFIGS
+        )

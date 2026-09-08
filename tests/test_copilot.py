@@ -1743,3 +1743,65 @@ class ZoneProgressTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OperBoxRosterTests(unittest.TestCase):
+    """步骤 5：OperBox 后备快照读不到的练度一律按「不满足」（fail-closed，D12）。"""
+
+    def _roster(self, source: str) -> dict:
+        return {
+            "fetched_at": "2026-09-09T04:30:00+08:00",
+            "source": source,
+            "chars": {
+                "char_350_surtr": {
+                    "name": "史尔特尔",
+                    "elite": 2,
+                    "level": 90,
+                    "potential": 1,
+                    # OperBox 认不出这两项，森空岛那份才有。
+                    "main_skill_lvl": 0,
+                    "skills": [],
+                    "module_levels": [],
+                }
+            },
+        }
+
+    def _check(self, requirements: dict, source: str):
+        with patch.object(
+            maa_copilot, "name_to_char_ids", return_value=["char_350_surtr"]
+        ):
+            return maa_copilot.check_op_requirements(
+                {"name": "史尔特尔", "skill": 1, "requirements": requirements},
+                self._roster(source),
+                CONFIG,
+            )
+
+    def test_elite_and_level_still_come_through(self) -> None:
+        ok, score, hard, soft = self._check({"elite": 2, "level": 90}, "operbox")
+        self.assertTrue(ok)
+        self.assertEqual((score, hard, soft), (1.0, [], []))
+        ok, _score, hard, _soft = self._check({"elite": 2, "level": 99}, "operbox")
+        self.assertFalse(ok)
+        self.assertIn("等级99", hard[0])
+
+    def test_a_skill_requirement_is_a_hard_gap_on_an_operbox_roster(self) -> None:
+        ok, score, hard, soft = self._check({"skill_level": 10}, "operbox")
+        self.assertFalse(ok)
+        self.assertEqual(score, 0.0)
+        self.assertEqual(soft, [])
+        self.assertIn("OperBox", hard[0])
+
+    def test_a_module_requirement_hardens_on_an_operbox_roster(self) -> None:
+        # 森空岛那份里模组是**软**缺口（游戏内序号对不上 equip id）；
+        # OperBox 那份连模组信息都没有，只能按不满足处理。
+        ok, _score, hard, soft = self._check({"module": 1}, "operbox")
+        self.assertFalse(ok)
+        self.assertEqual(soft, [])
+        self.assertIn("OperBox", hard[0])
+
+    def test_a_skland_roster_keeps_the_old_semantics(self) -> None:
+        ok, score, hard, soft = self._check({"module": 1}, "skland")
+        self.assertTrue(ok)
+        self.assertEqual(score, 0.5)
+        self.assertEqual(hard, [])
+        self.assertIn("模组1", soft[0])

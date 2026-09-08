@@ -715,7 +715,12 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         return 1
     _retire_round_controls(token, config, fresh.get("message_id"))
 
-    ledger, _note = maa_copilot.ensure_ledger(str(state.get("activity_key") or ""))
+    # 非活动关（资源本 / 主线）的 `activity_key` 是空串：账本另有一份
+    # `ledger-standalone.json`，`ledger_path()` 与 `ensure_ledger()` 必须用**同一个
+    # key** 算落点，否则记完账会把独立账本写回当期活动账本。
+    activity_key = str(state.get("activity_key") or "")
+    ledger, _note = maa_copilot.ensure_ledger(activity_key)
+    ledger_file = maa_copilot.ledger_path(activity_key)
     failed_stages: set[str] = set()
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
@@ -788,7 +793,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                 detail=detail,
                 log_name=log_path.name,
             )
-            maa_copilot.save_ledger(ledger)
+            maa_copilot.save_ledger(ledger, ledger_file)
             results.append(
                 {"stage": stage, "mode": mode, "outcome": verdict, "detail": detail}
             )

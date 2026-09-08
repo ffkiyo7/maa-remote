@@ -40,6 +40,11 @@ COPILOT_DIR = STATE_DIR / "copilot"
 STAGE_INDEX_PATH = COPILOT_DIR / "stage_index.json"
 SKLAND_PATH = COPILOT_DIR / "skland.json"
 ROSTER_PATH = COPILOT_DIR / "roster.json"
+# 森空岛不可用时由 Depot 那趟顺手跑的 `OperBox` 快照（四期步骤 5）。**单独一份文件**，
+# 不覆盖森空岛那份：它只有 `{name, elite, level, potential}`，技能专精 / 模组全缺，
+# 覆盖过去等于把能校验的信息也丢了。取哪一份看 `load_roster()`。
+OPERBOX_ROSTER_PATH = COPILOT_DIR / "roster-operbox.json"
+OPERBOX_SOURCE = "operbox"
 CACHE_DIR = COPILOT_DIR / "cache"
 SEARCHES_DIR = COPILOT_DIR / "searches"
 SEARCH_LOCK_PATH = COPILOT_DIR / "copilot_search.lock"
@@ -393,6 +398,13 @@ def check_op_requirements(
 
     hard: list[str] = []
     soft: list[str] = []
+    # OperBox 后备快照只认得出 `{name, elite, level, potential}`：技能专精与模组
+    # **一个字节都没有**。读不到就当**不满足**（fail-closed，D12）——三个降级开关
+    # 一个都不许用（不变量 #15），猜一个「大概够」的结论只会让这关在日常里执行不了。
+    # 森空岛恢复之后这些关自然重新进集合。
+    unverifiable = (
+        isinstance(roster, dict) and str(roster.get("source") or "") == OPERBOX_SOURCE
+    )
     req_elite = max(0, int(req.get("elite") or 0))
     char_elite = int(char.get("elite", 0) or 0)
     if req_elite and char_elite < req_elite:
@@ -403,18 +415,24 @@ def check_op_requirements(
         hard.append(f"{name} 等级{req_level}（你{char_level}级）")
     req_skill = max(0, int(req.get("skill_level") or 0))
     if req_skill:
-        effective = effective_skill_level(char, skill_index)
-        if effective is None:
-            hard.append(f"{name} 技能{skill_index}未解锁")
-        elif effective < req_skill:
-            hard.append(f"{name} {skill_label(req_skill)}（你{skill_label(effective)}）")
+        if unverifiable:
+            hard.append(f"{name} {skill_label(req_skill)}（森空岛不可用，OperBox 读不到技能）")
+        else:
+            effective = effective_skill_level(char, skill_index)
+            if effective is None:
+                hard.append(f"{name} 技能{skill_index}未解锁")
+            elif effective < req_skill:
+                hard.append(f"{name} {skill_label(req_skill)}（你{skill_label(effective)}）")
     req_module = max(0, int(req.get("module") or 0))
     if req_module:
-        module_levels = char.get("module_levels") or []
-        if not isinstance(module_levels, list):
-            module_levels = []
-        if len(module_levels) < req_module or int(module_levels[req_module - 1] or 0) < 1:
-            soft.append(f"{name} 模组{req_module}（未解锁，无法精确校验）")
+        if unverifiable:
+            hard.append(f"{name} 模组{req_module}（森空岛不可用，OperBox 读不到模组）")
+        else:
+            module_levels = char.get("module_levels") or []
+            if not isinstance(module_levels, list):
+                module_levels = []
+            if len(module_levels) < req_module or int(module_levels[req_module - 1] or 0) < 1:
+                soft.append(f"{name} 模组{req_module}（未解锁，无法精确校验）")
 
     if hard:
         return False, 0.0, hard, soft
@@ -761,6 +779,11 @@ def activity_stage_codes(index: dict[str, Any], prefix: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 LEDGER_PATH = COPILOT_DIR / "ledger.json"
+# 非活动关（资源本 / 主线）的记账落这里。它们**没有活动 key**，而
+# `ensure_ledger("")` 见 key 不同就会把当期活动账本归档、新开一份空的，
+# 下一 tick watcher 又原样归档回来——手动抄一次 CE-6 就能把真实通关记录
+# 打散进归档文件（2026-09-09 修）。分成两份账本之后空 key 连碰都碰不到活动账本。
+LEDGER_STANDALONE_PATH = COPILOT_DIR / "ledger-standalone.json"
 LEDGER_SCHEMA_VERSION = 1
 LEDGER_ATTEMPT_LIMIT = 40
 
@@ -837,6 +860,19 @@ def _activity_prefix(activity_key: str) -> str:
     return str(activity_key or "").rpartition("|")[2]
 
 
+def ledger_path(activity_key: str, *, path: Path | None = None) -> Path:
+    """这份记账该写到哪个文件。
+
+    活动关 → `ledger.json`（当期活动那本）；**空 key（资源本 / 主线）→
+    `ledger-standalone.json`**。调用方拿它去 `save_ledger()`，否则记完账会把
+    独立账本的内容写回活动账本。
+    """
+    target = path or LEDGER_PATH
+    if str(activity_key or "").strip():
+        return target
+    return target.parent / LEDGER_STANDALONE_PATH.name
+
+
 def ensure_ledger(
     activity_key: str, *, path: Path | None = None
 ) -> tuple[dict[str, Any], str]:
@@ -845,6 +881,12 @@ def ensure_ledger(
     活动 key 变了（新活动 / 复刻）→ 旧账归档到 `ledger-<key>.json` 再新开一份。
     归档而不是删：用户回头想知道上个活动抄到哪了，只有这份记录说得清。
 
+    **空 key 永远不归档、也永远碰不到活动账本**（2026-09-09 修）：手动抄资源本 /
+    主线时 `start_copilot_search()` 写的 `activity_key` 就是空串，worker 照样
+    `ensure_ledger("")`。原来这一步会把当期账本归档 + 新开一份空的，下一 tick
+    watcher 再归档回来，真实通关记录就散进了归档文件。现在空 key 走
+    `ledger-standalone.json`，记账照记。
+
     **种子按 `seeded` 标记补，不按「是不是首次建账」补**（2026-09-09 线上缺陷）：
     原来只在 `load_ledger()` 返回 `None` 时才种，而账本常常先被**别的活动**的
     tick 建出来——线上 02:23「墟」复刻（`|AT`）那一 tick 先建了账，03:00 SR 上线
@@ -852,9 +894,20 @@ def ensure_ledger(
     SR-5/6/8 的普通全是空的，第一轮就把它们重抄了一遍。
     `seed_ledger()` 只补空位、幂等，所以按标记补是安全的。
     """
-    target = path or LEDGER_PATH
+    target = ledger_path(activity_key, path=path)
     ledger = load_ledger(target)
     prefix = _activity_prefix(activity_key)
+    if not str(activity_key or "").strip():
+        # 非活动关：独立账本，不归档任何东西，也不新开活动账本。
+        if ledger is None:
+            ledger = new_ledger("")
+            save_ledger(ledger, target)
+        elif ledger.get("activity_key"):
+            # 只可能是有人手工塞进来的；改成空 key 而不是归档 / 清空——
+            # 这条路径的铁律是「绝不因为 key 对不上就丢记账」。
+            ledger["activity_key"] = ""
+            save_ledger(ledger, target)
+        return ledger, ""
     if ledger is not None and ledger.get("activity_key") == str(activity_key or ""):
         if ledger.get("seeded") != prefix:
             seed_ledger(ledger, activity_key)
@@ -1374,11 +1427,34 @@ def build_scheduled_card(
 # Roster helpers (shared with maa_skland.py productization, C4)
 # ---------------------------------------------------------------------------
 
+def _roster_fetched_at(roster: dict[str, Any]) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(roster.get("fetched_at") or ""))
+    except (TypeError, ValueError):
+        return None
+
+
 def load_roster() -> dict[str, Any] | None:
-    roster = load_json(ROSTER_PATH, None)
-    if isinstance(roster, dict) and isinstance(roster.get("chars"), dict):
-        return roster
-    return None
+    """练度快照：森空岛那份与 OperBox 后备里**更新的那一份**（四期步骤 5）。
+
+    OperBox 快照只在森空岛不可用时才写（`maa_depot.run_depot()`），所以森空岛
+    一恢复，它的 `fetched_at` 自然又是最新的、后备就退场了。时间戳读不出来算最旧；
+    文件坏掉当不存在——练度读不到的后果是「作业一律判不满足」（fail-closed，D12），
+    绝不能变成抛异常带走整轮。
+    """
+    best: dict[str, Any] | None = None
+    best_at: datetime | None = None
+    for path in (ROSTER_PATH, OPERBOX_ROSTER_PATH):
+        try:
+            roster = load_json(path, None)
+        except (ValueError, OSError):
+            continue
+        if not isinstance(roster, dict) or not isinstance(roster.get("chars"), dict):
+            continue
+        moment = _roster_fetched_at(roster)
+        if best is None or (moment is not None and (best_at is None or moment > best_at)):
+            best, best_at = roster, moment
+    return best
 
 
 def estimated_sanity(snapshot: dict[str, Any], at: datetime | None = None) -> int | None:
