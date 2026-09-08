@@ -22,12 +22,36 @@ import maa_clearing  # noqa: E402
 import maa_common  # noqa: E402
 import maa_copilot  # noqa: E402
 import maa_depot  # noqa: E402
+import maa_activity_watch  # noqa: E402
 import maa_daily  # noqa: E402
+import maa_farming  # noqa: E402
 import maa_plan_card  # noqa: E402
 import deploy  # noqa: E402
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+
+# 整套单测**一条都不许碰网**（DEV_GUIDE §9）。`maa_farming` 的抓取层默认把缓存写进
+# 线上 `~/.hermes/state/maa/farming/`，所以一条漏了打桩的用例既会打一图流，
+# 又会往运行时状态里塞一份带假时间戳的缓存。这里在模块级把网络出口整个封死，
+# 需要自己造响应的用例（`FarmingFetchTests`）再在 `with` 里覆盖它。
+_NO_NETWORK = None
+
+
+def setUpModule() -> None:
+    global _NO_NETWORK
+    _NO_NETWORK = patch.object(
+        maa_farming,
+        "_http_json",
+        side_effect=AssertionError("单测不许访问一图流 / 企鹅物流：传 data= 或自行打桩"),
+    )
+    _NO_NETWORK.start()
+
+
+def tearDownModule() -> None:
+    if _NO_NETWORK is not None:
+        _NO_NETWORK.stop()
+
 
 
 
@@ -2668,181 +2692,853 @@ class LogTailTests(unittest.TestCase):
         self.assertNotIn("raw cli line", message)
 
 
-class FarmingRecommendationTests(unittest.TestCase):
-    """PLAN_CLEARING 步骤 6：可用天数排序、冷启动降级、零消耗与短窗口。"""
+def _ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
+
+
+def _offline_market(**overrides) -> dict:
+    """一份「外部数据全都没有」的视图：单测**永远不许碰网**（DEV_GUIDE §9）。"""
+    data = {
+        "matrix": [],
+        "stages": [],
+        "item_values": {},
+        "store": None,
+        "degraded_reasons": [],
+    }
+    data.update(overrides)
+    return data
+
+
+# `stage/info` 的常驻哨兵值（2098-12-31 16:00 CST）。**`end` 永不为 null**，
+# 判常驻只能靠 `stageType` 或这个哨兵，不能判 null（spike B §1）。
+PERMANENT_SENTINEL = 4070880000000
+
+
+class FarmingFixture(unittest.TestCase):
+    """三项加权分的公共桩：上游资源 + 一图流三个接口的最小样本，全部离线。"""
+
+    at = datetime(2026, 9, 10, 8, 0, tzinfo=BEIJING)
 
     def setUp(self) -> None:
-        # 指向一个空的资源目录：这组用例测的是**手工表**那条路径，不能让本机
-        # 真实的 stages.json 派生表混进来（单测必须密闭，且不同机器结果要一致）。
         self._resources = tempfile.TemporaryDirectory()
         self.addCleanup(self._resources.cleanup)
+        self._cache = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache.cleanup)
+        self.cache_dir = Path(self._cache.name)
         maa_plan_card._STAGE_DROPS_CACHE.clear()
         self.addCleanup(maa_plan_card._STAGE_DROPS_CACHE.clear)
         self.config = {
             "maa_resource_dir": self._resources.name,
-            "farming_stage_table": {"固源岩组": "1-7", "碳素": "SK-5", "扭转醇": "9-9"},
-            "farming_manual_weights": {"固源岩组": 100, "碳素": 60, "扭转醇": 10},
+            # 指到一个不存在的路径：否则 `candidate_stages()` 会去读**本机真实**的
+            # `StageActivityV2.json`，结果随机器而变。单测必须密闭。
+            "maa_activity_cache": str(self.cache_dir / "no-such-activity.json"),
+            "activity_stages": ["SR-8"],
+            "farming_stage_table": {"固源岩组": "1-7"},
+            "farming_manual_weights": {"固源岩组": 100, "碳素": 40},
+            "farming_weights": {"scarcity": 0.5, "gap": 0.3, "efficiency": 0.2},
         }
-        self.available = {"1-7", "SK-5", "CE-6"}
-        self.at = datetime(2026, 10, 1, 8, 0, tzinfo=BEIJING)
+        self._seed_resources()
 
+    # --- 上游资源（stages.json / item_index.json / 导航键） -------------------
+    def _seed_resources(self) -> None:
+        root = Path(self._resources.name)
+        stages = [
+            {"stageId": "main_01-07", "code": "1-7", "apCost": 6,
+             "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30013"}]},
+            {"stageId": "main_14-11", "code": "14-12", "apCost": 21,
+             "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30043"}]},
+            {"stageId": "act54side_08", "code": "SR-8", "apCost": 21,
+             "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30043"}]},
+            {"stageId": "act54side_07", "code": "SR-7", "apCost": 18,
+             "dropInfos": [{"dropType": "NORMAL_DROP", "itemId": "30043"}]},
+            {"stageId": "wk_armor_3", "code": "SK-5", "apCost": 20, "dropInfos": []},
+        ]
+        (root / "stages.json").write_text(
+            json.dumps(stages, ensure_ascii=False), encoding="utf-8"
+        )
+        (root / "item_index.json").write_text(
+            json.dumps(
+                {
+                    "30013": {"name": "固源岩组"},
+                    "30043": {"name": "异铁组"},
+                    "act_token": {"name": "活动代币"},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        nav = root / "tasks" / "Stages"
+        nav.mkdir(parents=True, exist_ok=True)
+        (nav / "SR.json").write_text(
+            json.dumps({"SR-7": {}, "SR-8": {}}, ensure_ascii=False), encoding="utf-8"
+        )
+        maa_plan_card._STAGE_DROPS_CACHE.clear()
+
+    # --- 外部数据（一图流 stage/info + matrix + item/v7/value） ---------------
+    def _stage_info(self) -> list[dict]:
+        opened = self.at - timedelta(days=6)
+        closes = self.at + timedelta(days=8)
+        return [
+            {"stageId": "main_01-07", "stageCode": "1-7", "zoneId": "main_1",
+             "stageType": "MAIN", "start": _ms(datetime(2019, 5, 1, tzinfo=BEIJING)),
+             "end": PERMANENT_SENTINEL, "apCost": 6},
+            {"stageId": "main_14-11", "stageCode": "14-12", "zoneId": "main_14",
+             "stageType": "MAIN", "start": _ms(datetime(2023, 5, 1, tzinfo=BEIJING)),
+             "end": PERMANENT_SENTINEL, "apCost": 21},
+            {"stageId": "act54side_08", "stageCode": "SR-8", "zoneId": "act54side_zone1",
+             "stageType": "ACT", "start": _ms(opened), "end": _ms(closes), "apCost": 21},
+            {"stageId": "act54side_07", "stageCode": "SR-7", "zoneId": "act54side_zone1",
+             "stageType": "ACT", "start": _ms(opened), "end": _ms(closes), "apCost": 18},
+            {"stageId": "act50side_08", "stageCode": "OLD-8", "zoneId": "act50side_zone1",
+             "stageType": "ACT",
+             "start": _ms(self.at - timedelta(days=200)),
+             "end": _ms(self.at - timedelta(days=180)), "apCost": 21},
+        ]
+
+    def _matrix(self) -> list[dict]:
+        return [
+            # 异铁组：活动关 27.0 理智/件 vs 主线最优 40.4 —— 活动关便宜 1.49 倍
+            {"stageId": "act54side_08", "itemId": "30043",
+             "times": 1590021, "quantity": 1235993, "start": 1, "end": None},
+            {"stageId": "main_14-11", "itemId": "30043",
+             "times": 358998, "quantity": 186720, "start": 1, "end": None},
+            # 样本不足 300：一律不计
+            {"stageId": "act54side_07", "itemId": "30043",
+             "times": 100, "quantity": 90, "start": 1, "end": None},
+            # 已经关闭的往期活动关：`end` 早于 now，不计
+            {"stageId": "act50side_08", "itemId": "30043",
+             "times": 900000, "quantity": 900000, "start": 1,
+             "end": _ms(self.at - timedelta(days=180))},
+            # 固源岩组：1-7，10 理智/件
+            {"stageId": "main_01-07", "itemId": "30013",
+             "times": 100000, "quantity": 60000, "start": 1, "end": None},
+        ]
+
+    def market(self, **overrides) -> dict:
+        data = {
+            "matrix": self._matrix(),
+            "stages": self._stage_info(),
+            "item_values": {"30013": 17.21, "30043": 39.0, "act_token": None},
+            "store": None,
+            "degraded_reasons": [],
+        }
+        data.update(overrides)
+        return data
+
+    # --- Depot ------------------------------------------------------------
     @staticmethod
-    def _interval(to: datetime, days: float, items: dict) -> dict:
+    def depot(rates: dict[str, float], stock: dict[str, int], *, at: datetime) -> dict:
+        """一条 28 天的消耗区间 + 一份库存估算。`rates` 是「每天用几个」。"""
         return {
-            "from": (to - timedelta(days=days)).isoformat(),
-            "to": to.isoformat(),
-            "days": days,
-            "items": items,
-        }
-
-    def _depot(self, intervals, stock) -> dict:
-        return {
-            "consumption_history": list(intervals),
+            "consumption_history": [
+                {
+                    "from": (at - timedelta(days=30)).isoformat(),
+                    "to": (at - timedelta(days=2)).isoformat(),
+                    "days": 28.0,
+                    "items": {
+                        f"i{index}": {"name": name, "consumed": round(rate * 28)}
+                        for index, (name, rate) in enumerate(rates.items())
+                    },
+                }
+            ],
             "items": {
-                f"id{index}": {"name": name, "quantity": quantity}
+                f"s{index}": {"name": name, "quantity": quantity}
                 for index, (name, quantity) in enumerate(stock.items())
             },
         }
 
-    # --- 冷启动降级 ------------------------------------------------------
-    def test_cold_start_falls_back_to_manual_weights_and_says_so(self) -> None:
-        # 现在正是这个状态：depot.json 只有 1 份快照、consumption_history 为空。
-        result = maa_plan_card.farming_recommendations(
-            self.config, self._depot([], {"固源岩组": 5}), self.available, self.at
+    def result(self, *, depot=None, available=None, data=None, config=None) -> dict:
+        return maa_farming.farming_result(
+            config or self.config,
+            depot if depot is not None else {},
+            available_stages=available if available is not None else {"SR-8", "1-7"},
+            at=self.at,
+            data=data if data is not None else self.market(),
         )
+
+
+class FarmingScoreTests(FarmingFixture):
+    """四期步骤 3a：稀缺 / 缺口 / 效率 三项加权分。**全部离线**（`data=` 直接喂桩）。"""
+
+    # --- 掉率过滤 ---------------------------------------------------------
+    def test_a_low_sample_row_never_becomes_a_drop_rate(self) -> None:
+        rates = maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at)
+        self.assertNotIn("act54side_07", rates["30043"])
+        loose = maa_farming.drop_rates(self._matrix(), min_samples=50, at=self.at)
+        self.assertIn("act54side_07", loose["30043"])
+
+    def test_an_expired_activity_row_is_not_counted(self) -> None:
+        """活动关的统计只在开放期有效；往期那几行会让「历史最优」停在打不到的关上。"""
+        rates = maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at)
+        self.assertNotIn("act50side_08", rates["30043"])
+
+    # --- 常驻判定：哨兵值，不是 null --------------------------------------
+    def test_permanence_uses_the_sentinel_not_a_null_check(self) -> None:
+        windows = maa_farming.stage_windows(self._stage_info())
+        self.assertTrue(maa_farming.is_permanent(windows["main_01-07"], self.at))
+        self.assertFalse(maa_farming.is_permanent(windows["act54side_08"], self.at))
+        # 哨兵值 + 非常驻 stageType 也算常驻：判据是「10 年之后」而不是 null。
+        sentinel_act = {"type": "ACT", "start": self.at, "ap": 21,
+                        "end": maa_farming._moment(PERMANENT_SENTINEL)}
+        self.assertTrue(maa_farming.is_permanent(sentinel_act, self.at))
+        # `end` 是 None（企鹅那边的常驻写法）不当成「已关闭」，也不当成常驻。
+        self.assertTrue(maa_farming.is_open({"start": None, "end": None}, self.at))
+
+    # --- ① 稀缺 -----------------------------------------------------------
+    def test_a_first_run_counts_down_to_the_median_rerun_gap(self) -> None:
+        windows = maa_farming.stage_windows(self._stage_info())
+        per_item = maa_farming.ap_per_item(
+            maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at), windows
+        )
+        score, why = maa_farming.scarcity_score(
+            "30043", per_item=per_item, windows=windows, at=self.at,
+            activity_edge=1.3, rerun_days=378, horizon_days=400,
+        )
+        # 首发 start 是 6 天前 → 预计复刻 378-6=372 天后 → 372/400
+        self.assertAlmostEqual(score, 372 / 400, places=2)
+        self.assertIn("预计复刻", why)
+
+    def test_a_rerun_is_treated_as_never_coming_back(self) -> None:
+        stages = self._stage_info()
+        for entry in stages:
+            if entry["stageId"] == "act54side_08":
+                entry["stageType"] = "ACT_REP"
+        windows = maa_farming.stage_windows(stages)
+        per_item = maa_farming.ap_per_item(
+            maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at), windows
+        )
+        score, why = maa_farming.scarcity_score(
+            "30043", per_item=per_item, windows=windows, at=self.at,
+            activity_edge=1.3, rerun_days=378, horizon_days=400,
+        )
+        # end + 2 年 = 738 天后 > 400 天视野 → clamp 到 1
+        self.assertEqual(score, 1.0)
+        self.assertIn("不会再来", why)
+
+    def test_scarcity_is_zero_when_the_permanent_stage_is_nearly_as_cheap(self) -> None:
+        matrix = self._matrix()
+        for row in matrix:
+            if row["stageId"] == "main_14-11":
+                # 主线也 27.5 理智/件 → 活动关只便宜 1.02 倍，未达 1.3
+                row["quantity"] = int(row["times"] * 21 / 27.5)
+        windows = maa_farming.stage_windows(self._stage_info())
+        per_item = maa_farming.ap_per_item(
+            maa_farming.drop_rates(matrix, min_samples=300, at=self.at), windows
+        )
+        score, why = maa_farming.scarcity_score(
+            "30043", per_item=per_item, windows=windows, at=self.at,
+            activity_edge=1.3, rerun_days=378, horizon_days=400,
+        )
+        self.assertEqual(score, 0.0)
+        self.assertIn("未达", why)
+
+    def test_a_permanent_material_is_never_scarce(self) -> None:
+        windows = maa_farming.stage_windows(self._stage_info())
+        per_item = maa_farming.ap_per_item(
+            maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at), windows
+        )
+        score, _why = maa_farming.scarcity_score(
+            "30013", per_item=per_item, windows=windows, at=self.at,
+            activity_edge=1.3, rerun_days=378, horizon_days=400,
+        )
+        self.assertEqual(score, 0.0)
+
+    def test_without_the_calendar_scarcity_degrades_to_activity_only_drops(self) -> None:
+        """`stage/info` 不可用 → 退化成「当期活动关独有主掉落 = 1，其余 0」。"""
+        result = self.result(
+            depot=self.depot({"异铁组": 2.0}, {"异铁组": 5}, at=self.at),
+            data=self.market(stages=[]),
+        )
+        parts = {item["material"]: item["parts"] for item in result["items"]}
+        self.assertEqual(parts["异铁组"]["scarcity"], 1.0)
+        # 固源岩组在手工表里（1-7 也掉），不算活动关独有
+        self.assertEqual(parts["固源岩组"]["scarcity"], 0.0)
+
+    # --- ② 缺口 -----------------------------------------------------------
+    def test_the_gap_is_measured_in_sanity_not_in_pieces(self) -> None:
+        result = self.result(
+            depot=self.depot({"异铁组": 2.0}, {"异铁组": 5}, at=self.at)
+        )
+        head = next(item for item in result["items"] if item["material"] == "异铁组")
+        # 30 天用 60 个，库存 5 → 还缺 55 个
+        self.assertEqual(head["needed_qty"], 55)
+        self.assertGreater(head["parts"]["gap"], 0)
+
+    def test_a_null_item_value_never_reaches_the_gap_formula(self) -> None:
+        """129 条里 16 条 `itemValue == null`；`float * None` 会直接崩（spike B §2）。"""
+        config = dict(self.config)
+        config["farming_stage_table"] = {"活动代币": "SR-8"}
+        config["farming_manual_weights"] = {}
+        result = maa_farming.farming_result(
+            config,
+            self.depot({"活动代币": 3.0}, {"活动代币": 0}, at=self.at),
+            available_stages={"SR-8", "1-7"},
+            at=self.at,
+            data=self.market(),
+        )
+        token = next(item for item in result["items"] if item["material"] == "活动代币")
+        self.assertEqual(token["parts"]["gap"], 0.0)
+
+    def test_cold_start_uses_manual_weights_but_still_picks_a_stage(self) -> None:
+        """改写不变量 #31：候选集受活动限制 + 有掉率兜底，**降级期也写默认关**。"""
+        result = self.result(depot={})
         self.assertTrue(result["degraded"])
-        self.assertIn("consumption_history", result["reason"])
+        self.assertFalse(result["measured"])
+        stage, why = maa_farming.auto_stage(result)
+        self.assertTrue(stage)
+        self.assertIn("综合", why)
+        self.assertIn("降级", maa_farming.farming_note(result))
+        # 冷启动不设 drops 上限：缺口是猜的，拿它当「刷够就停」会提前收工。
+        self.assertEqual(maa_farming.drops_cap(result), {})
+
+    def test_zero_consumption_falls_back_to_the_manual_weight(self) -> None:
+        """4 周窗口里没消耗 = 可用量**未知**，不是 0 缺口，退回手工权重。"""
+        result = self.result(
+            depot=self.depot({"固源岩组": 0.0}, {"固源岩组": 300}, at=self.at)
+        )
+        item = next(one for one in result["items"] if one["material"] == "固源岩组")
+        self.assertEqual(item["basis"], "manual")
+        self.assertEqual(item["needed_qty"], 0)
+        self.assertGreater(item["parts"]["gap"], 0)
+
+    # --- ③ 效率 -----------------------------------------------------------
+    def test_efficiency_compares_the_candidate_best_with_the_all_time_best(self) -> None:
+        windows = maa_farming.stage_windows(self._stage_info())
+        per_item = maa_farming.ap_per_item(
+            maa_farming.drop_rates(self._matrix(), min_samples=300, at=self.at), windows
+        )
+        best = maa_farming.efficiency_score(
+            "30043", per_item=per_item, candidate_ids={"act54side_08", "main_14-11"}
+        )
+        worse = maa_farming.efficiency_score(
+            "30043", per_item=per_item, candidate_ids={"main_14-11"}
+        )
+        self.assertEqual(best, 1.0)
+        self.assertAlmostEqual(worse, 27.02 / 40.38, places=2)
         self.assertEqual(
-            [item["material"] for item in result["items"]], ["固源岩组", "碳素"]
-        )
-        self.assertTrue(all(item["basis"] == "manual" for item in result["items"]))
-        note = maa_plan_card.farming_note(result)
-        self.assertIn("降级模式", note)
-
-    def test_one_reconcile_is_still_cold_start(self) -> None:
-        # 「≥2 次成功对表」= consumption_history 里 ≥1 条区间；1 次对表只有
-        # 库存快照，算不出消耗。
-        self.assertFalse(maa_depot.has_measured_consumption({}))
-        self.assertFalse(maa_depot.has_measured_consumption({"consumption_history": []}))
-        self.assertTrue(
-            maa_depot.has_measured_consumption({"consumption_history": [{"days": 7}]})
+            maa_farming.efficiency_score("30043", per_item=per_item, candidate_ids=set()),
+            0.0,
         )
 
-    # --- 可用天数排序 ----------------------------------------------------
-    def test_ranking_is_days_left_ascending(self) -> None:
-        history = [
-            self._interval(
-                self.at - timedelta(days=3), 7.0,
-                {
-                    "a": {"name": "固源岩组", "consumed": 7},   # 1/day
-                    "b": {"name": "碳素", "consumed": 70},      # 10/day
-                },
-            )
-        ]
-        depot = self._depot(history, {"固源岩组": 100, "碳素": 20})
-        result = maa_plan_card.farming_recommendations(
-            self.config, depot, self.available, self.at
+    # --- 权重 -------------------------------------------------------------
+    def test_weights_normalize_whatever_they_sum_to(self) -> None:
+        parts = {"scarcity": 1.0, "gap": 0.0, "efficiency": 0.0}
+        self.assertAlmostEqual(
+            maa_farming._blend(parts, {"scarcity": 5, "gap": 3, "efficiency": 2}), 0.5
         )
-        self.assertFalse(result["degraded"])
-        # 碳素 20/10 = 2 天 < 固源岩组 100/1 = 100 天
+        self.assertAlmostEqual(
+            maa_farming._blend(parts, {"scarcity": 50, "gap": 30, "efficiency": 20}), 0.5
+        )
         self.assertEqual(
-            [item["material"] for item in result["items"]], ["碳素", "固源岩组"]
+            maa_farming._blend(parts, {"scarcity": 0, "gap": 0, "efficiency": 0}), 0.0
         )
-        self.assertEqual(result["items"][0]["days_left"], 2.0)
-        self.assertEqual(result["items"][1]["days_left"], 100.0)
-        self.assertIn("最缺：碳素", maa_plan_card.farming_note(result))
 
-    def test_low_stock_needs_no_extra_rule(self) -> None:
-        # 「库存特别少」天然就是「可用天数特别小」，不需要再叠一层例外规则。
-        history = [
-            self._interval(
-                self.at - timedelta(days=1), 7.0,
-                {"a": {"name": "固源岩组", "consumed": 7},
-                 "b": {"name": "碳素", "consumed": 7}},
-            )
-        ]
-        depot = self._depot(history, {"固源岩组": 1, "碳素": 500})
-        result = maa_plan_card.farming_recommendations(
-            self.config, depot, self.available, self.at
+    def test_changing_the_weights_changes_the_order(self) -> None:
+        """各给一个反例：稀缺当家时活动关材料在前，缺口当家时手工权重那个在前。"""
+        depot = self.depot(
+            {"异铁组": 1.0, "固源岩组": 40.0}, {"异铁组": 200, "固源岩组": 0}, at=self.at
         )
-        self.assertEqual(result["items"][0]["material"], "固源岩组")
-
-    # --- 零消耗与短窗口 --------------------------------------------------
-    def test_zero_consumption_is_never_first_and_never_raises(self) -> None:
-        # 养成消耗是突发的：一次精二吃 20 个，平时是 0。可用天数不是 ∞ 而是
-        # 「未知」——退回手工权重，排在有实测数据的材料之后。当成 0 天会把
-        # 没消耗的材料顶到第一位，正好反了。
-        history = [
-            self._interval(
-                self.at - timedelta(days=1), 7.0,
-                {"a": {"name": "固源岩组", "consumed": 0},   # 零消耗
-                 "b": {"name": "碳素", "consumed": 7}},      # 1/day
-            )
-        ]
-        depot = self._depot(history, {"固源岩组": 3, "碳素": 300})
-        result = maa_plan_card.farming_recommendations(
-            self.config, depot, self.available, self.at
+        config = dict(self.config)
+        config["farming_stage_table"] = {"固源岩组": "1-7", "异铁组": "SR-8"}
+        config["farming_weights"] = {"scarcity": 1, "gap": 0, "efficiency": 0}
+        scarce_first = maa_farming.farming_result(
+            config, depot, available_stages={"SR-8", "1-7"}, at=self.at,
+            data=self.market(),
         )
-        self.assertEqual(result["items"][0]["material"], "碳素")
-        self.assertEqual(result["items"][0]["basis"], "measured")
-        self.assertEqual(result["items"][1]["material"], "固源岩组")
-        self.assertEqual(result["items"][1]["basis"], "manual")
-        self.assertIsNone(result["items"][1]["days_left"])
-        self.assertIn("可用天数**未知**", maa_plan_card.farming_note(result))
+        config = dict(config)
+        config["farming_weights"] = {"scarcity": 0, "gap": 1, "efficiency": 0}
+        gap_first = maa_farming.farming_result(
+            config, depot, available_stages={"SR-8", "1-7"}, at=self.at,
+            data=self.market(),
+        )
+        self.assertEqual(scarce_first["items"][0]["material"], "异铁组")
+        self.assertEqual(gap_first["items"][0]["material"], "固源岩组")
 
-    def test_rate_window_sums_at_least_four_weeks_not_just_the_last_reconcile(self) -> None:
-        history = [
-            self._interval(self.at - timedelta(days=25), 7.0,
-                           {"a": {"name": "固源岩组", "consumed": 14}}),
-            self._interval(self.at - timedelta(days=4), 7.0,
-                           {"a": {"name": "固源岩组", "consumed": 0}}),
-        ]
-        rates = maa_depot.consumption_rates_window({"consumption_history": history}, at=self.at)
-        # 只看最近一次对表会得到 0；4 周窗口把 14 摊到 14 天 = 1/day。
-        self.assertEqual(rates["a"]["per_day"], 1.0)
-        self.assertEqual(rates["a"]["days"], 14.0)
-
-    def test_rate_window_drops_intervals_older_than_the_window(self) -> None:
-        history = [
-            self._interval(self.at - timedelta(days=200), 7.0,
-                           {"a": {"name": "固源岩组", "consumed": 700}}),
-            self._interval(self.at - timedelta(days=2), 7.0,
-                           {"a": {"name": "固源岩组", "consumed": 7}}),
-        ]
-        rates = maa_depot.consumption_rates_window({"consumption_history": history}, at=self.at)
-        self.assertEqual(rates["a"]["per_day"], 1.0)
-
-    def test_window_helpers_never_divide_by_zero(self) -> None:
-        for history in ([], [{"to": "bad", "days": 0, "items": {}}],
-                        [{"to": None}], [{"days": 0.0, "items": {"a": {}}}]):
-            with self.subTest(history=history):
-                self.assertEqual(
-                    maa_depot.consumption_rates_window(
-                        {"consumption_history": history}, at=self.at
-                    ),
-                    {},
-                )
-
-    # --- 查不到关卡 / 关卡未开放 ------------------------------------------
-    def test_material_without_a_stage_is_reported_not_guessed(self) -> None:
-        # 不许猜关——猜错就是每天几百理智刷错东西，而且用户看不出来。
-        history = [
-            self._interval(self.at - timedelta(days=1), 7.0,
-                           {"z": {"name": "聚合剂", "consumed": 7}})
-        ]
-        result = maa_plan_card.farming_recommendations(
-            self.config, self._depot(history, {"聚合剂": 2}), self.available, self.at
+    # --- 关卡查不到 / 今天没开 --------------------------------------------
+    def test_a_material_without_a_stage_is_reported_not_guessed(self) -> None:
+        config = dict(self.config)
+        config["farming_stage_table"] = {}
+        result = maa_farming.farming_result(
+            config,
+            self.depot({"聚合剂": 1.0}, {"聚合剂": 2}, at=self.at),
+            available_stages={"SR-8", "1-7"},
+            at=self.at,
+            data=self.market(),
         )
         self.assertNotIn("聚合剂", [item["material"] for item in result["items"]])
         self.assertIn("聚合剂", result["skipped_no_stage"])
-        self.assertIn("聚合剂", maa_plan_card.farming_note(result))
 
-    def test_a_stage_that_is_not_open_today_is_not_recommended(self) -> None:
-        result = maa_plan_card.farming_recommendations(
-            self.config, self._depot([], {}), self.available, self.at
+    def test_a_stage_that_is_not_open_today_is_reported_closed(self) -> None:
+        config = dict(self.config)
+        config["farming_stage_table"] = {"扭转醇": "9-9"}
+        result = maa_farming.farming_result(
+            config, {}, available_stages={"SR-8", "1-7"}, at=self.at, data=self.market()
         )
-        self.assertNotIn("扭转醇", [item["material"] for item in result["items"]])
         self.assertIn("扭转醇→9-9", result["skipped_closed"])
+
+    def test_losing_every_external_source_degrades_but_never_raises(self) -> None:
+        """抓取全失败 + 缓存也没有 → 不推荐外部数据那两项，沿用手工权重，不抛。"""
+        result = self.result(data=maa_farming.empty_market_data())
+        self.assertTrue(result["degraded"])
+        self.assertIn("外部掉率数据不可用", result["degraded_reasons"])
+        for item in result["items"]:
+            self.assertEqual(item["parts"]["efficiency"], 0.0)
+        self.assertIn("外部掉率数据不可用", maa_farming.farming_note(result))
+
+    def test_a_priced_material_picks_the_cheapest_open_stage(self) -> None:
+        config = dict(self.config)
+        config["farming_stage_table"] = {}
+        result = maa_farming.farming_result(
+            config,
+            self.depot({"异铁组": 2.0}, {"异铁组": 0}, at=self.at),
+            available_stages={"SR-8", "14-12", "1-7"},
+            at=self.at,
+            data=self.market(),
+        )
+        picked = {item["material"]: item["stage"] for item in result["items"]}
+        self.assertEqual(picked["异铁组"], "SR-8")
+
+
+class FarmingCandidateSetTests(FarmingFixture):
+    """D5：活动期间候选集只有活动关；活动一结束退回资源本 + 1-7。"""
+
+    def _activity_cache(self, expire: str) -> Path:
+        path = Path(self._cache.name) / "StageActivityV2.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "Official": {
+                        "sideStoryStage": {
+                            "SR": {
+                                "Activity": {
+                                    "Tip": "SideStory「月行水上」",
+                                    "UtcStartTime": "2026/09/04 12:00:00",
+                                    "UtcExpireTime": expire,
+                                    "TimeZone": 8,
+                                }
+                            }
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_the_candidate_set_is_activity_only_while_it_runs(self) -> None:
+        stages, in_activity, reason = maa_farming.candidate_stages(
+            self.config, self.at,
+            activity_cache=self._activity_cache("2026/09/18 03:59:59"),
+        )
+        self.assertTrue(in_activity)
+        self.assertEqual(stages, {"SR-8"})
+        self.assertIn("活动期", reason)
+        self.assertNotIn("1-7", stages)
+
+    def test_the_day_the_activity_ends_it_falls_back_to_supplies(self) -> None:
+        stages, in_activity, _reason = maa_farming.candidate_stages(
+            self.config, self.at,
+            activity_cache=self._activity_cache("2026/09/09 03:59:59"),
+        )
+        self.assertFalse(in_activity)
+        self.assertIn("1-7", stages)
+        self.assertNotIn("SR-8", stages)
+
+    def test_an_activity_stage_without_an_upstream_nav_key_is_dropped(self) -> None:
+        config = dict(self.config)
+        config["activity_stages"] = ["SR-8", "SR-9"]
+        stages, _in_activity, _reason = maa_farming.candidate_stages(
+            config, self.at,
+            activity_cache=self._activity_cache("2026/09/18 03:59:59"),
+        )
+        self.assertEqual(stages, {"SR-8"})
+
+
+class FarmingFetchTests(unittest.TestCase):
+    """抓取层：ETag 条件请求、缓存兜底、**失败一律不抛**（D-2 的教训）。"""
+
+    def setUp(self) -> None:
+        self._cache = tempfile.TemporaryDirectory()
+        self.addCleanup(self._cache.cleanup)
+        self.cache_dir = Path(self._cache.name)
+        self.at = datetime(2026, 9, 10, 8, 0, tzinfo=BEIJING)
+
+    def _seed(self, name: str, payload, *, etag: str = "", age_hours: float = 48) -> None:
+        maa_common.atomic_write_json(
+            self.cache_dir / f"{name}.json",
+            {
+                "fetched_at": (self.at - timedelta(hours=age_hours)).isoformat(),
+                "etag": etag,
+                "payload": payload,
+            },
+        )
+
+    def test_every_source_failing_falls_back_to_the_cache(self) -> None:
+        self._seed("matrix", {"matrix": [{"stageId": "s", "itemId": "i",
+                                          "times": 400, "quantity": 200}]})
+        with patch.object(maa_farming, "_http_json", side_effect=RuntimeError("网络错误")):
+            data = maa_farming.load_market_data({}, at=self.at, cache_dir=self.cache_dir)
+        self.assertEqual(len(data["matrix"]), 1)
+        self.assertTrue(any("缓存" in reason for reason in data["degraded_reasons"]))
+
+    def test_no_cache_and_no_network_degrades_instead_of_raising(self) -> None:
+        with patch.object(maa_farming, "_http_json", side_effect=RuntimeError("网络错误")):
+            data = maa_farming.load_market_data({}, at=self.at, cache_dir=self.cache_dir)
+        self.assertEqual(data["matrix"], [])
+        self.assertEqual(data["stages"], [])
+        self.assertEqual(data["item_values"], {})
+        self.assertTrue(data["degraded_reasons"])
+
+    def test_a_304_keeps_the_cached_matrix(self) -> None:
+        """`Cache-Control: max-age=7200` 不可信，用 `ETag`（spike B §5）。"""
+        self._seed(
+            "matrix",
+            {"matrix": [{"stageId": "s", "itemId": "i", "times": 400, "quantity": 200}]},
+            etag='"abc"',
+        )
+        seen: list[str] = []
+
+        def stub(url, *, method="GET", body=None, etag="", timeout=20):
+            seen.append(etag)
+            if "matrix.json" in url:
+                return 304, None, etag
+            raise RuntimeError("其它来源本例不关心")
+
+        with patch.object(maa_farming, "_http_json", side_effect=stub):
+            data = maa_farming.load_market_data({}, at=self.at, cache_dir=self.cache_dir)
+        self.assertIn('"abc"', seen)
+        self.assertEqual(len(data["matrix"]), 1)
+        # 304 不是失败，不该被写成降级原因。
+        self.assertFalse(any("matrix 抓取失败" in r for r in data["degraded_reasons"]))
+
+    def test_a_future_timestamp_is_never_treated_as_fresh(self) -> None:
+        """时钟跳变或写坏的时间戳会把缓存冻到那个未来时刻，宁可多抓一次。"""
+        self._seed("item_value", [{"itemId": "x", "itemValue": 1.0}], age_hours=-240)
+        calls: list[str] = []
+
+        def stub(url, *, method="GET", body=None, etag="", timeout=20):
+            calls.append(url)
+            return 200, [{"itemId": "30013", "itemValue": 17.2}], ""
+
+        with patch.object(maa_farming, "_http_json", side_effect=stub):
+            data = maa_farming.load_market_data({}, at=self.at, cache_dir=self.cache_dir)
+        self.assertTrue(any("item/v7/value" in url for url in calls))
+        self.assertEqual(data["item_values"], {"30013": 17.2})
+
+    def test_a_fresh_cache_is_not_requested_again(self) -> None:
+        self._seed("item_value", [{"itemId": "30013", "itemValue": 17.2}], age_hours=1)
+        with patch.object(maa_farming, "_http_json", side_effect=RuntimeError("不该被调用")):
+            data = maa_farming.load_market_data({}, at=self.at, cache_dir=self.cache_dir)
+        self.assertEqual(data["item_values"], {"30013": 17.2})
+
+    def test_penguin_zones_and_stages_become_the_yituliu_shape(self) -> None:
+        """企鹅 `closeTime: null` = 常驻，一图流用哨兵——统一成一套（spike B §6a）。"""
+        converted = maa_farming._penguin_stage_info(
+            [
+                {"zoneId": "main_1", "type": "MAINLINE",
+                 "existence": {"CN": {"openTime": 1, "closeTime": None}}},
+                {"zoneId": "act54side_zone1", "type": "ACTIVITY",
+                 "existence": {"CN": {"openTime": 100, "closeTime": 200}}},
+            ],
+            [
+                {"stageId": "main_01-07", "zoneId": "main_1", "code": "1-7", "apCost": 6},
+                {"stageId": "act54side_08", "zoneId": "act54side_zone1",
+                 "code": "SR-8", "apCost": 21},
+            ],
+        )
+        by_id = {entry["stageId"]: entry for entry in converted}
+        self.assertEqual(by_id["main_01-07"]["end"], PERMANENT_SENTINEL)
+        self.assertEqual(by_id["main_01-07"]["stageType"], "MAIN")
+        self.assertEqual(by_id["act54side_08"]["end"], 200)
+
+    def test_stage_ap_cost_only_reads_the_cache(self) -> None:
+        self._seed("stage_info", [{"stageId": "act54side_08", "stageCode": "SR-8",
+                                   "stageType": "ACT", "apCost": 21}])
+        with patch.object(maa_farming, "_http_json", side_effect=RuntimeError("不该联网")):
+            self.assertEqual(
+                maa_farming.stage_ap_cost("act54side_08", {}, cache_dir=self.cache_dir), 21
+            )
+            self.assertIsNone(
+                maa_farming.stage_ap_cost("act54side_EX-1", {}, cache_dir=self.cache_dir)
+            )
+
+
+class FarmingExCostFallbackTests(unittest.TestCase):
+    """步骤 2 留的坑：EX 关不在上游 `stages.json` 里，理智查表要有第二级。"""
+
+    def test_an_ex_stage_falls_back_to_the_stage_info_cache(self) -> None:
+        index = {"codes": {"SR-EX-1": "act54side_ex01"},
+                 "stages": {"act54side_ex01": "SR-EX-1"}}
+        with patch.object(maa_copilot, "stage_sanity_cost", return_value=None), \
+             patch.object(maa_farming, "stage_ap_cost", return_value=27) as fallback:
+            cost_of = maa_activity_watch.cost_lookup({}, index)
+            self.assertEqual(cost_of("SR-EX-1#raid"), 27)
+        # 突袭条目按**普通关名**查（不变量 #34）
+        fallback.assert_called_once_with("act54side_ex01", {})
+
+    def test_the_upstream_table_still_wins_when_it_knows_the_stage(self) -> None:
+        index = {"codes": {"SR-8": "act54side_08"}, "stages": {"act54side_08": "SR-8"}}
+        with patch.object(maa_copilot, "stage_sanity_cost", return_value=21), \
+             patch.object(maa_farming, "stage_ap_cost") as fallback:
+            self.assertEqual(maa_activity_watch.cost_lookup({}, index)("SR-8"), 21)
+        fallback.assert_not_called()
+
+    def test_neither_source_knowing_the_stage_still_fails_closed(self) -> None:
+        index = {"codes": {"SR-EX-1": "act54side_ex01"},
+                 "stages": {"act54side_ex01": "SR-EX-1"}}
+        with patch.object(maa_copilot, "stage_sanity_cost", return_value=None), \
+             patch.object(maa_farming, "stage_ap_cost", return_value=None):
+            self.assertIsNone(maa_activity_watch.cost_lookup({}, index)("SR-EX-1"))
+
+
+class FarmingDropsTests(unittest.TestCase):
+    """四期步骤 3b：Fight `drops` 上限 + 刷够之后的第二个 Fight 块。"""
+
+    def setUp(self) -> None:
+        self.config = {
+            "medicine_expire_days": 2,
+            "fight_times": 2147483647,
+            "recruit_times": 4,
+        }
+        self.plan = maa_common.normalize_plan(
+            {
+                "stage": "SR-8",
+                "tasks": {},
+                "farming_drops": {"30043": 55},
+                "farming_fallback_stage": "1-7",
+            }
+        )
+
+    def test_the_first_block_carries_the_drops_cap(self) -> None:
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        self.assertIn('drops = { "30043" = 55 }', rendered)
+        self.assertLess(
+            rendered.index('name = "刷理智"'), rendered.index('drops = { "30043" = 55 }')
+        )
+
+    def test_the_second_block_exists_has_no_drops_and_keeps_the_literals(self) -> None:
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        self.assertIn('name = "刷理智·续"', rendered)
+        self.assertEqual(rendered.count("drops = "), 1)
+        self.assertEqual(rendered.count("stone = 0"), 3)   # 剿灭 + 两个刷理智块
+        self.assertEqual(rendered.count("series = 0"), 3)
+        self.assertEqual(rendered.count("medicine = 0"), 3)
+        second = rendered[rendered.index('name = "刷理智·续"'):]
+        self.assertIn('stage = "1-7"', second)
+        self.assertNotIn("drops", second)
+
+    def test_the_two_blocks_sit_together_between_annihilation_and_infrast(self) -> None:
+        """任务链顺序不变（禁止触碰项）：两个 Fight 块紧挨着。"""
+        rendered = maa_daily.render_daily_toml(self.plan, self.config)
+        order = [
+            rendered.index(marker)
+            for marker in (
+                'name = "每日剿灭"',
+                'name = "刷理智"',
+                'name = "刷理智·续"',
+                'name = "基建换班"',
+            )
+        ]
+        self.assertEqual(order, sorted(order))
+
+    def test_no_gap_means_no_drops_and_no_second_block(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
+        rendered = maa_daily.render_daily_toml(plan, self.config)
+        self.assertNotIn("drops", rendered)
+        self.assertNotIn("刷理智·续", rendered)
+        self.assertEqual(rendered.count('type = "Fight"'), 2)  # 剿灭 + 刷理智
+
+    def test_a_fallback_stage_without_a_cap_renders_only_one_block(self) -> None:
+        """第一个块没上限时本来就打到理智不足，第二块没有意义。"""
+        plan = maa_common.normalize_plan(
+            {"stage": "1-7", "tasks": {}, "farming_fallback_stage": "CE-6"}
+        )
+        rendered = maa_daily.render_daily_toml(plan, self.config)
+        self.assertNotIn("刷理智·续", rendered)
+
+    def test_a_bad_item_id_never_reaches_the_toml(self) -> None:
+        """itemId 会原样变成 TOML 表键，只接受上游那套字符集。"""
+        plan = maa_common.normalize_plan(
+            {
+                "stage": "1-7",
+                "tasks": {},
+                "farming_drops": {'ev"il': 5, "30013": 0, "mod_unlock_token": 3},
+                "farming_fallback_stage": "CE-6",
+            }
+        )
+        self.assertEqual(plan["farming_drops"], {"mod_unlock_token": 3})
+        rendered = maa_daily.render_daily_toml(plan, self.config)
+        self.assertIn('drops = { "mod_unlock_token" = 3 }', rendered)
+        self.assertNotIn("ev", rendered.split("drops = ")[1].splitlines()[0])
+
+    def test_the_farming_block_switch_still_removes_both(self) -> None:
+        """理智让路只摘刷理智、保留剿灭（不变量 #26）——两个块一起摘。"""
+        rendered = maa_daily.render_daily_toml({**self.plan, "farming": False}, self.config)
+        self.assertNotIn('name = "刷理智"', rendered)
+        self.assertNotIn('name = "刷理智·续"', rendered)
+        self.assertIn('name = "每日剿灭"', rendered)
+
+    # --- 战报解析 ---------------------------------------------------------
+    LOG = [
+        "[刷理智] Fight SR-8 3 times",
+        "Drops: 异铁组 × 4",
+        "[刷理智] Fight Completed",
+        "[刷理智·续] Fight 1-7 5 times",
+        "Drops: 固源岩组 × 6",
+        "[刷理智·续] Fight Completed",
+        "[基建换班] Infrast Completed",
+    ]
+
+    def test_both_blocks_feed_one_drop_ledger(self) -> None:
+        merged = dict(maa_daily._drop_pairs(maa_daily.farming_sections(self.LOG)))
+        self.assertEqual(merged, {"异铁组": 4, "固源岩组": 6})
+
+    def test_the_report_lists_the_second_block_separately(self) -> None:
+        summary = maa_daily.extract_summary(self.LOG, [], plan=self.plan, ok=True)
+        self.assertIn("刷理智·续", summary)
+        self.assertIn("关卡 1-7", summary)
+        self.assertIn("关卡 SR-8", summary)
+        # 第一个块只统计自己那段，别把第二块的掉落算进来。
+        first = summary[summary.index("刷理智："): summary.index("刷理智·续")]
+        self.assertIn("异铁组 ×4", first)
+        self.assertNotIn("固源岩组", first)
+
+    def test_a_second_block_that_never_ran_is_not_reported_as_done(self) -> None:
+        """`_task_state()` 的通配退路是 `"<key> Completed"`——两个块共用 `Fight`
+        这个 key 会让根本没跑过的第二块被判成完成，所以它的 key 是 `Fight2`。"""
+        lines = ["[刷理智] Fight Completed"]
+        self.assertEqual(maa_daily._task_state(lines, "Fight", "刷理智"), "completed")
+        self.assertEqual(maa_daily._task_state(lines, "Fight2", "刷理智·续"), "pending")
+
+    def test_a_plan_without_a_second_block_does_not_show_the_step(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
+        summary = maa_daily.extract_summary(["[刷理智] Fight Completed"], [], plan=plan, ok=True)
+        self.assertNotIn("刷理智·续", summary)
+
+    # --- 计划字段 ---------------------------------------------------------
+    def test_effective_plan_carries_the_cap_and_now_gets_none(self) -> None:
+        at = datetime(2026, 9, 30, 8, 0, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            defaults = Path(tmp) / "defaults.json"
+            maa_common.atomic_write_json(defaults, {"stage": "1-7"})
+            maa_common.atomic_write_json(
+                plan_path,
+                {
+                    "date": at.date().isoformat(),
+                    "sessions": {
+                        "am": {
+                            "stage": "SR-8",
+                            "stage_source": "auto",
+                            "farming_drops": {"30043": 55},
+                            "farming_fallback_stage": "1-7",
+                        }
+                    },
+                },
+            )
+            with patch.object(maa_common, "PLAN_PATH", plan_path), patch.object(
+                maa_common, "DEFAULTS_PATH", defaults
+            ):
+                morning = maa_common.effective_plan(at, "am")
+                evening = maa_common.effective_plan(at, "pm")
+                manual = maa_common.effective_plan(at, "now")
+        self.assertEqual(morning["farming_drops"], {"30043": 55})
+        self.assertEqual(morning["farming_fallback_stage"], "1-7")
+        self.assertNotIn("farming_drops", evening)
+        self.assertNotIn("farming_drops", manual)
+        self.assertNotIn("farming_fallback_stage", manual)
+
+    def test_picking_a_stage_by_hand_clears_the_cap(self) -> None:
+        """手动选的关不带 drops 上限：那个上限是给缺口第一名算的。"""
+        at = maa_common.now_beijing()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            defaults = Path(tmp) / "defaults.json"
+            maa_common.atomic_write_json(defaults, {"stage": "1-7"})
+            maa_common.atomic_write_json(
+                plan_path,
+                {
+                    "date": at.date().isoformat(),
+                    "sessions": {
+                        "am": {
+                            "stage": "SR-8",
+                            "stage_source": "auto",
+                            "farming_drops": {"30043": 55},
+                            "farming_fallback_stage": "1-7",
+                        }
+                    },
+                },
+            )
+            with patch.object(maa_action, "PLAN_PATH", plan_path), patch.object(
+                maa_common, "PLAN_PATH", plan_path
+            ), patch.object(maa_common, "DEFAULTS_PATH", defaults), patch.object(
+                maa_action, "load_config", return_value={}
+            ), patch.object(
+                maa_action, "is_run_locked", return_value=False
+            ), patch.object(
+                maa_action, "state_lock", return_value=contextlib.nullcontext()
+            ):
+                ok, _message = maa_action.set_stage("CE-6", "am")
+                self.assertTrue(ok)
+                plan = maa_common.effective_plan(at, "am")
+        self.assertEqual(plan["stage"], "CE-6")
+        self.assertNotIn("farming_drops", plan)
+        self.assertNotIn("farming_fallback_stage", plan)
+
+    def test_the_auto_stage_writer_records_the_cap_and_the_spare_stage(self) -> None:
+        result = {
+            "degraded": False,
+            "measured": True,
+            "items": [
+                {"material": "异铁组", "item_id": "30043", "stage": "SR-8", "score": 0.9,
+                 "parts": {"scarcity": 1.0, "gap": 1.0, "efficiency": 1.0},
+                 "needed_qty": 55, "ap_per_item": 27.0, "stock": 5, "per_day": 2.0,
+                 "basis": "measured"},
+                {"material": "固源岩组", "item_id": "30013", "stage": "1-7", "score": 0.2,
+                 "parts": {"scarcity": 0.0, "gap": 0.4, "efficiency": 1.0},
+                 "needed_qty": 0, "ap_per_item": 10.0, "stock": 900, "per_day": 1.0,
+                 "basis": "measured"},
+            ],
+        }
+        at = datetime(2026, 9, 30, 7, 50, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "plan.json"
+            with patch.object(maa_plan_card, "PLAN_PATH", plan_path), patch.object(
+                maa_common, "PLAN_PATH", plan_path
+            ), patch.object(
+                maa_plan_card, "state_lock", return_value=contextlib.nullcontext()
+            ):
+                self.assertEqual(maa_plan_card.apply_auto_stage(result, "am", at), "SR-8")
+                written = json.loads(plan_path.read_text(encoding="utf-8"))
+        session = written["sessions"]["am"]
+        self.assertEqual(session["farming_drops"], {"30043": 55})
+        self.assertEqual(session["farming_fallback_stage"], "1-7")
+
+
+class FarmingConfigTests(unittest.TestCase):
+    def test_the_new_farming_keys_are_seeded_with_the_documented_defaults(self) -> None:
+        seed = deploy.load_json(deploy.ROOT / "state" / "config.json", {})
+        for key, default in maa_farming.FARMING_DEFAULTS.items():
+            self.assertIn(key, seed)
+            self.assertEqual(seed[key], default, key)
+
+    def test_the_new_farming_keys_are_repo_owned_not_runtime_caches(self) -> None:
+        # 混进 PRESERVED_RUNTIME_CACHE_KEYS 会让用户改了仓库种子却永远不生效
+        # （不变量 #25 的反面）。
+        for key in maa_farming.FARMING_DEFAULTS:
+            self.assertNotIn(key, deploy.PRESERVED_RUNTIME_CACHE_KEYS)
+
+    def test_bad_config_values_fall_back_to_the_defaults(self) -> None:
+        broken = {
+            "farming_weights": {"scarcity": "x", "gap": -1},
+            "farming_min_samples": "nope",
+            "farming_target_days": 0,
+        }
+        self.assertEqual(maa_farming.weights(broken)["scarcity"], 0.5)
+        self.assertEqual(maa_farming.weights(broken)["gap"], 0.0)
+        self.assertEqual(maa_farming.setting(broken, "farming_min_samples"), 300)
+        self.assertEqual(maa_farming.setting(broken, "farming_target_days"), 30)
 
 
 class FarmingAutoStageTests(unittest.TestCase):
@@ -3002,15 +3698,36 @@ class FarmingAutoStageTests(unittest.TestCase):
         )
 
     # --- 自动定关 --------------------------------------------------------
-    def test_degraded_never_changes_the_stage(self) -> None:
-        """降级期排序依据只是手工权重——拿猜的结果改每天刷什么，正是红线要防的。"""
-        result = maa_plan_card.farming_recommendations(self.config, {}, {"1-7"}, None)
+    def test_degraded_still_picks_a_stage_and_says_so(self) -> None:
+        """四期步骤 3 **改写了不变量 #31**：降级期照样自动定关。
+
+        三期不敢改是因为那时排序依据只有 `farming_manual_weights` 的手工权重。
+        现在候选集受活动 / 当日开放限制，而且外部掉率给了效率与稀缺两项兜底，
+        选出来的关是合理的；卡片标「降级」并列出原因即可。
+        """
+        result = maa_plan_card.farming_recommendations(
+            self.config, {}, {"1-7"}, None, data=_offline_market()
+        )
         self.assertTrue(result["degraded"])
+        stage, why = maa_plan_card.auto_stage(result)
+        self.assertEqual(stage, "1-7")
+        self.assertIn("综合", why)
+        self.assertIn("降级", maa_plan_card.farming_note(result))
+
+    def test_no_candidate_material_keeps_the_default_stage(self) -> None:
+        """一个材料都算不出来时才沿用默认关，而且说清楚。"""
+        config = dict(self.config)
+        config["farming_stage_table"] = {}
+        result = maa_plan_card.farming_recommendations(
+            config, {}, {"1-7"}, None, data=_offline_market()
+        )
         stage, why = maa_plan_card.auto_stage(result)
         self.assertEqual(stage, "")
         self.assertIn("沿用默认关", why)
 
-    def test_measured_data_picks_the_smallest_days_left(self) -> None:
+    def test_the_weighted_score_picks_the_stage(self) -> None:
+        """缺口大的材料（按理智当量算）应当赢过库存充裕的那个。"""
+        at = datetime(2026, 9, 30, 8, 0, tzinfo=BEIJING)
         depot = {
             "consumption_history": [
                 {
@@ -3018,29 +3735,34 @@ class FarmingAutoStageTests(unittest.TestCase):
                     "to": "2026-09-29T00:00:00+08:00",
                     "days": 28,
                     "items": {
-                        "a": {"name": "固源岩组", "consumed": 28, "per_day": 1.0},
-                        "b": {"name": "碳素", "consumed": 280, "per_day": 10.0},
+                        "a": {"name": "固源岩组", "consumed": 28},
+                        "b": {"name": "碳素", "consumed": 280},
                     },
                 }
             ],
             "items": {
-                "a": {"name": "固源岩组", "quantity": 100},   # 约 100 天
-                "b": {"name": "碳素", "quantity": 20},        # 约 2 天
+                "a": {"name": "固源岩组", "quantity": 1000},   # 30 天用 30，够
+                "b": {"name": "碳素", "quantity": 20},          # 30 天用 300，差 280
             },
         }
         self.config["farming_stage_table"] = {"固源岩组": "1-7", "碳素": "SK-5"}
+        self.config["farming_manual_weights"] = {"固源岩组": 100, "碳素": 10}
+        # 缺口要按**理智当量**算，所以材料名必须能对回 itemId（item_index.json）。
+        self._seed_resources([], {"30013": "固源岩组", "30017": "碳素"})
         result = maa_plan_card.farming_recommendations(
-            self.config, depot, {"1-7", "SK-5"},
-            datetime(2026, 9, 30, 8, 0, tzinfo=BEIJING),
+            self.config, depot, {"1-7", "SK-5"}, at,
+            data=_offline_market(item_values={"30013": 17.2, "30017": 3.0}),
         )
         stage, why = maa_plan_card.auto_stage(result)
         self.assertEqual(stage, "SK-5")
         self.assertIn("碳素", why)
 
     def test_auto_stage_writes_this_session_and_never_overwrites_a_manual_pick(self) -> None:
-        result = {"degraded": False, "items": [
-            {"material": "碳素", "stage": "SK-5", "stock": 20, "per_day": 10.0,
-             "days_left": 2.0, "weight": 0, "basis": "measured"},
+        result = {"degraded": False, "measured": True, "items": [
+            {"material": "碳素", "item_id": "30017", "stage": "SK-5", "score": 0.8,
+             "parts": {"scarcity": 0.0, "gap": 1.0, "efficiency": 1.0},
+             "needed_qty": 280, "ap_per_item": 4.0, "stock": 20, "per_day": 10.0,
+             "basis": "measured"},
         ]}
         at = datetime(2026, 9, 30, 7, 50, tzinfo=BEIJING)
         with tempfile.TemporaryDirectory() as tmp:
@@ -3097,9 +3819,11 @@ class FarmingAutoStageTests(unittest.TestCase):
         `apply_auto_stage()` 只认这个字段。少了这一笔，用户早上选完关，07:50 的
         自动定关会照样把它改掉——而卡片上还写着用户自己选的那个来源。
         """
-        result = {"degraded": False, "items": [
-            {"material": "碳素", "stage": "SK-5", "stock": 20, "per_day": 10.0,
-             "days_left": 2.0, "weight": 0, "basis": "measured"},
+        result = {"degraded": False, "measured": True, "items": [
+            {"material": "碳素", "item_id": "30017", "stage": "SK-5", "score": 0.8,
+             "parts": {"scarcity": 0.0, "gap": 1.0, "efficiency": 1.0},
+             "needed_qty": 280, "ap_per_item": 4.0, "stock": 20, "per_day": 10.0,
+             "basis": "measured"},
         ]}
         at = maa_common.now_beijing()
         with tempfile.TemporaryDirectory() as tmp:
@@ -3196,15 +3920,19 @@ class FarmingAutoStageTests(unittest.TestCase):
 
     def test_the_card_says_when_the_recommendation_is_a_guess(self) -> None:
         """不变量 #32：降级必须**可见**——而且降级期明说本场不自动改关。"""
-        result = maa_plan_card.farming_recommendations(self.config, {}, {"1-7"}, None)
+        result = maa_plan_card.farming_recommendations(
+            self.config, {}, {"1-7"}, None, data=_offline_market()
+        )
         embed = maa_plan_card.build_embed(self.plan, self.config, "am", None, result)
         names = [field["name"] for field in embed["fields"]]
         self.assertIn("为什么（降级）", names)
         value = next(
             field["value"] for field in embed["fields"] if field["name"].startswith("为什么")
         )
-        self.assertIn("降级模式", value)
-        self.assertIn("本场没有自动改关", value)
+        self.assertIn("降级", value)
+        # 降级期也会自动定关（改写后的不变量 #31），但原因必须写出来。
+        self.assertIn("本场自动定为", value)
+        self.assertIn("consumption_history", value)
 
     def test_the_seeded_table_only_names_stages_the_card_can_offer(self) -> None:
         # 种子里不许出现猜的关：每一个都必须是 1-7 或 SUPPLY_STAGES 里的资源本。
@@ -3321,6 +4049,9 @@ class PlanCardPhaseTests(unittest.TestCase):
             maa_plan_card, "refresh_activity_stages", return_value=(True, "")
         ), patch.object(
             maa_plan_card, "load_depot_state", return_value={}
+        ), patch.object(
+            # 单测一条都不许碰网（DEV_GUIDE §9）：计划卡这条链会去抓一图流。
+            maa_farming, "load_market_data", return_value=_offline_market()
         ), patch.object(
             maa_plan_card, "activity_deadline_text", return_value=""
         ), patch.object(

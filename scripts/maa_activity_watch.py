@@ -24,6 +24,7 @@ from typing import Any
 import maa_action
 import maa_clearing
 import maa_copilot
+import maa_farming
 import maa_plan_card
 from maa_common import (
     LAST_RUN_PATH,
@@ -176,14 +177,28 @@ def round_budget(
 
 
 def cost_lookup(config: dict[str, Any], index: dict[str, Any]):
-    """条目 → 理智消耗。突袭条目按**普通关名**查（不变量 #34）。"""
+    """条目 → 理智消耗。突袭条目按**普通关名**查（不变量 #34）。
+
+    两级查表，仍然 fail-closed：先问上游 `stages.json`
+    （`maa_copilot.stage_sanity_cost()`），它拿不到就问一图流 `stage/info`
+    的**本地缓存**（`maa_farming.stage_ap_cost()`）。第二级是为 **EX 关**加的：
+    上游 `stages.json` 里根本没有 `XX-EX-n` 的条目（步骤 2 留的坑），
+    以前这类条目一律算不出理智、直接被排轮丢掉（不变量 #28）。
+    两处都查不到就还是 `None`——**不猜**。
+    """
 
     def cost_of(entry: str) -> int | None:
         stage, _mode = maa_clearing.split_entry(entry)
         resolved = maa_copilot.resolve_copilot_stage(stage, index)
         if resolved is None:
             return None
-        return maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+        cost = maa_copilot.stage_sanity_cost(resolved[0], resolved[1], config)
+        if cost is not None:
+            return cost
+        try:
+            return maa_farming.stage_ap_cost(resolved[0], config)
+        except Exception:  # noqa: BLE001 - 兜底查表不该让整轮排程崩掉
+            return None
 
     return cost_of
 

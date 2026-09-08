@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import maa_copilot
+import maa_farming
 from maa_common import (
     BEIJING,
     BUTTONS_PATH,
@@ -692,7 +693,7 @@ _STAGE_DROPS_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def stage_drops(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """`{关卡代号: {"materials": [主掉落材料名], "ap": 理智}}`，从上游资源派生。
+    """`{关卡代号: {"materials": [主掉落材料名], "ap": 理智, "stage_id": 内部 id}}`。
 
     **这是「新活动自动跟随」的地基**：活动关的材料映射不再靠手工表——上游每次热更新
     带来新活动，`stages.json` 里就有它每一关的 `dropInfos`，下一张计划卡自动认识。
@@ -702,8 +703,12 @@ def stage_drops(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     `FURNITURE` / `SPECIAL_DROP` 同理排除。
 
     资源本（`CE-6` / `AP-5` 这些）在 `stages.json` 里**只有 `FURNITURE`**，龙门币和红票
-    不是以掉落建模的，所以这张表查不到它们——它们继续由 `farming_stage_table` 手工表覆盖，
-    两张表是**合并**关系，派生表不能替换手工表。
+    不是以掉落建模的，所以它们的 `materials` 是空表——它们继续由 `farming_stage_table`
+    手工表覆盖，两张表是**合并**关系，派生表不能替换手工表。
+
+    **没有主掉落的关也留在表里**（`materials: []`）：`maa_farming` 要靠这张表把
+    「关卡代号 → 内部 stageId / apCost」对上一图流与企鹅的掉落矩阵，
+    而资源本、EX 关这些恰恰是掉落表里查不到的那批。
 
     任何读取失败都返回空表，不抛异常：旁路数据不该带走整张计划卡（D-2 的教训）。
     """
@@ -743,12 +748,15 @@ def stage_drops(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 name = names.get(str(drop.get("itemId")))
                 if name and name not in materials:
                     materials.append(name)
-            if materials:
-                try:
-                    ap = int(entry.get("apCost") or 0)
-                except (TypeError, ValueError):
-                    ap = 0
-                table[code] = {"materials": materials, "ap": ap}
+            try:
+                ap = int(entry.get("apCost") or 0)
+            except (TypeError, ValueError):
+                ap = 0
+            table[code] = {
+                "materials": materials,
+                "ap": ap,
+                "stage_id": str(entry.get("stageId") or ""),
+            }
     except Exception:
         table = {}
     _STAGE_DROPS_CACHE[cache_key] = table
@@ -791,181 +799,37 @@ def material_stage_candidates(config: dict[str, Any]) -> dict[str, list[str]]:
     return candidates
 
 
-def _manual_weight(config: dict[str, Any], material: str) -> float:
-    weights = config.get("farming_manual_weights")
-    if not isinstance(weights, dict):
-        return 0.0
-    try:
-        return float(weights.get(material, 0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def farming_recommendations(
     config: dict[str, Any],
     depot_state: dict[str, Any],
-    available_stages: set[str],
+    available_stages: set[str] | None = None,
     at: datetime | None = None,
+    data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """按「可用天数 = 当前库存 / 该材料日均消耗」升序推荐关卡。
+    """三项加权分推荐表。**算法整个在 `maa_farming`**，这里只是渲染层的入口。
 
-    **排序指标只用这一个。**「库存特别少」天然就是「可用天数特别小」，会自动排到
-    最前，不需要额外的例外规则，也不许再叠一层「库存低于 N 就优先」。
-
-    三条降级路径，都不抛异常（异常会带走整张计划卡，D-2 的教训）：
-
-    1. **冷启动**：`consumption_history` 不足 2 次对表 → 全部按手工权重排，
-       卡片上明说是降级；
-    2. **零消耗**：≥4 周滚动窗口内该材料消耗为 0 → 它的可用天数不是 ∞ 而是
-       **未知**，退回该材料的手工权重排序，排在有实测数据的材料**之后**
-       （当成 0 天会把没消耗的材料顶到第一位，正好反了）；
-    3. **查不到关卡**：手工表与上游派生表都没有这个材料的关 → 不推荐、卡片明说。
-       **不许猜关**——猜错就是每天几百理智刷错东西，而且用户看不出来。
-       注意「查不到」和「今天没开」是两回事，分别记在 `skipped_no_stage` 和
-       `skipped_closed` 里：前者要补表，后者等它开就行。
-
-    关卡来源是 `material_stage_candidates()` 的**有序候选**，在 `available_stages`
-    里取第一个命中的。这样当期活动关（每期自动从 `stages.json` 认出来）能直接参与，
-    往期关闭的活动关不会把材料整条吃掉。
+    四期步骤 3 之前这里是「可用天数 = 库存 / 日均消耗」单指标排序；现在换成
+    稀缺（复刻窗口）/ 缺口（理智当量）/ 效率（件每理智）三项加权，数据来自
+    一图流与企鹅物流。`available_stages` 传 `None` 时由 `maa_farming` 自己按 D5
+    算候选集（活动期只有活动关）。
     """
-    import maa_depot
-
-    table = material_stage_candidates(config)
-    measured = maa_depot.has_measured_consumption(depot_state)
-    rates = (
-        maa_depot.consumption_rates_window(depot_state, at=at) if measured else {}
+    return maa_farming.farming_result(
+        config,
+        depot_state,
+        available_stages=available_stages,
+        at=at,
+        data=data,
     )
-    stock = maa_depot.stock_by_name(depot_state)
-    per_day = {
-        str(detail.get("name") or item_id): float(detail.get("per_day") or 0.0)
-        for item_id, detail in rates.items()
-        if isinstance(detail, dict)
-    }
-
-    manual = config.get("farming_stage_table")
-    manual = manual if isinstance(manual, dict) else {}
-
-    def worth_reporting(material: str) -> bool:
-        """值不值得在卡片上说「这个材料今天没关刷」。
-
-        派生表覆盖了全游戏几百种材料，其中绝大多数你既没在消耗、也没配过。
-        全报出来这行就是噪音，会把真正要看的信息淹掉。只报两种：
-        你**确实在消耗**的，和你**自己配进手工表**的（配了就说明你在意）。
-        """
-        return per_day.get(material, 0.0) > 0 or material in manual
-
-    universe = set(table) | {name for name, rate in per_day.items() if rate > 0}
-    ranked: list[dict[str, Any]] = []
-    no_stage: list[str] = []
-    closed: list[str] = []
-    for material in sorted(universe):
-        options = table.get(material) or []
-        if not options:
-            if worth_reporting(material):
-                no_stage.append(material)
-            continue
-        stage = next((code for code in options if code in available_stages), "")
-        if not stage:
-            if worth_reporting(material):
-                closed.append(f"{material}→{options[0]}")
-            continue
-        rate = per_day.get(material, 0.0)
-        days_left = (
-            round(stock.get(material, 0) / rate, 2) if measured and rate > 0 else None
-        )
-        ranked.append(
-            {
-                "material": material,
-                "stage": stage,
-                "stock": stock.get(material, 0),
-                "per_day": rate,
-                "days_left": days_left,
-                "weight": _manual_weight(config, material),
-                # measured = 实测推荐；manual = 猜的（冷启动或零消耗）
-                "basis": "measured" if days_left is not None else "manual",
-            }
-        )
-    # 有实测可用天数的排前面（升序）；其余按手工权重降序垫后。
-    ranked.sort(
-        key=lambda item: (
-            0 if item["days_left"] is not None else 1,
-            item["days_left"] if item["days_left"] is not None else 0.0,
-            -item["weight"],
-            item["material"],
-        )
-    )
-    return {
-        "degraded": not measured,
-        "reason": (
-            "尚无跨区间消耗数据（`depot.json` 的 `consumption_history` 不足 2 次对表），"
-            "当前按 `config.farming_manual_weights` 的手工权重推荐"
-            if not measured
-            else ""
-        ),
-        "items": ranked,
-        "skipped_no_stage": no_stage,
-        "skipped_closed": closed,
-    }
 
 
 def farming_note(result: dict[str, Any]) -> str:
-    """计划卡上的一句话说明：用户要能分辨「实测推荐」还是「这是猜的」。"""
-    lines: list[str] = []
-    if result.get("degraded"):
-        lines.append(f"⚠️ **降级模式**：{result['reason']}。")
-    items = result.get("items") or []
-    if not items:
-        lines.append("暂无可推荐的材料关卡。")
-    else:
-        measured = [item for item in items if item["basis"] == "measured"]
-        if measured:
-            head = measured[0]
-            lines.append(
-                f"最缺：{head['material']}（库存 {head['stock']}，"
-                f"日均 {head['per_day']:.2f}，约可用 {head['days_left']} 天）"
-            )
-        manual = [item for item in items if item["basis"] == "manual"]
-        if manual and not result.get("degraded"):
-            lines.append(
-                "（"
-                + "、".join(item["material"] for item in manual[:4])
-                + " 在近 4 周窗口里没有消耗，可用天数**未知**，按手工权重垫后）"
-            )
-    if result.get("skipped_no_stage"):
-        lines.append(
-            "未纳入推荐（上游掉落表和 `farming_stage_table` 里都查不到关卡）："
-            + "、".join(result["skipped_no_stage"][:6])
-        )
-    if result.get("skipped_closed"):
-        lines.append(
-            # 这一行同时收「你在消耗的」和「你配进手工表的」两类（见 worth_reporting），
-            # 所以措辞不能写成「在消耗但……」——手工表里那些多半并没有在消耗。
-            "今天没有开放的关可刷：" + "、".join(result["skipped_closed"][:6])
-        )
-    return "\n".join(lines)[:1024]
+    """计划卡上的一句话说明：前三名的三项分、降级原因、数据来源。"""
+    return maa_farming.farming_note(result)
 
 
 def auto_stage(result: dict[str, Any]) -> tuple[str, str]:
-    """今天自动定的关 + 一句为什么。定不下来就返回 `("", 原因)`，由调用方沿用默认。
-
-    取代原来那个「按材料缺口选关」的下拉（2026-09-08 用户拍板删掉）。删的理由是
-    那个下拉**没有存在意义**：缺口每天都在变，下拉却只能选关不能显示缺口，
-    和第一个下拉的语义完全重复。缺口应该是**后台固定计算**的结果，不是让用户去挑的选项。
-
-    **降级期不自动改关**：没有实测消耗数据时，排序依据只是 `farming_manual_weights`
-    的手工权重——那是猜的。拿猜的结果去改每天刷什么，用户还看不出是猜的，
-    正是「不许猜关」那条红线要防的事。此时沿用 `defaults.stage`，卡片写明在等数据。
-    """
-    if result.get("degraded"):
-        return "", "还没有实测消耗数据（Depot 需要满 2 次对表），今天沿用默认关"
-    for item in result.get("items") or []:
-        if item["basis"] != "measured":
-            continue
-        return item["stage"], (
-            f"{item['material']} 库存 {item['stock']}、日均 {item['per_day']:.2f}，"
-            f"约只够 {item['days_left']} 天"
-        )
-    return "", "所有材料在近 4 周窗口里都没有消耗，今天沿用默认关"
+    """今天自动定的关 + 一句为什么；定不下来返回 `("", 原因)`。"""
+    return maa_farming.auto_stage(result)
 
 
 def load_depot_state() -> dict[str, Any]:
@@ -982,12 +846,14 @@ def load_depot_state() -> dict[str, Any]:
 def current_farming_result(
     plan: dict[str, Any], config: dict[str, Any]
 ) -> dict[str, Any]:
-    """今天的材料推荐。只推**今天真的选得到**的关（与第一个下拉同一个可选集）。"""
-    return farming_recommendations(
-        config,
-        load_depot_state(),
-        {stage for _label, stage, _desc in _stage_choices(plan, config) if stage},
-    )
+    """今天的材料推荐。
+
+    候选集**不再**是下拉的可选集：D5 规定活动期间理智 all in 活动关，
+    所以由 `maa_farming.candidate_stages()` 说了算（活动期只有活动关，
+    否则 `1-7` + 当天开放资源本）。下拉仍然照旧全给——手动选资源本是允许的。
+    """
+    del plan
+    return farming_recommendations(config, load_depot_state())
 
 
 def build_components(
@@ -1037,10 +903,17 @@ def apply_auto_stage(
 
     每场卡各跑一次：卡片上写的关就是这一场真正会跑的关。
     次日 `plan.json` 按日期自然失效，重新自动算。
+
+    连带写下这一场的 **`farming_drops`**（第一名材料的 `{itemId: 还差多少个}`，
+    给 `daily.toml` 的 Fight `drops` 用）和 **`farming_fallback_stage`**（第二名的关，
+    刷够上限之后接着刷它，理智不浪费）。用户手动选关时 `maa_action.set_stage()`
+    会把这两个字段清掉——手动选的关不带 drops 上限。
     """
     stage, _why = auto_stage(result)
     if not stage:
         return ""
+    drops = maa_farming.drops_cap(result)
+    fallback = maa_farming.fallback_stage(result)
     moment = at or now_beijing()
     # 判据是 `stage_source` 而不是 `source`：`source` 记的是「最后一次写这份覆盖的是谁」，
     # 点一次「跳过」也会把它写成 discord，拿它当闸门等于点跳过就冻住当天的自动定关。
@@ -1059,6 +932,8 @@ def apply_auto_stage(
             return ""
         session["stage"] = stage
         session["stage_source"] = "auto"
+        session["farming_drops"] = drops
+        session["farming_fallback_stage"] = fallback
         session["updated_at"] = moment.isoformat()
         sessions[phase] = session
         current["updated_at"] = moment.isoformat()
@@ -1098,6 +973,14 @@ def build_embed(
     if farming is not None:
         auto, why = auto_stage(farming)
         lines = [f"{'✅ 本场自动定为 ' + auto if auto else '⏸️ 本场没有自动改关'}：{why}"]
+        cap = maa_farming.drops_cap(farming)
+        spare = maa_farming.fallback_stage(farming)
+        if cap and auto:
+            quantity = next(iter(cap.values()))
+            lines.append(
+                f"🎯 刷够 {quantity} 个就停"
+                + (f"，剩下的理智去 {spare}" if spare else "")
+            )
         note = farming_note(farming)
         if note:
             lines.append(note)

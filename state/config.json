@@ -37,6 +37,16 @@
   "auto_copilot_min_lead_minutes": 40,
   "copilot_raid_switch_task": "ChangeToRaidDifficulty",
   "annihilation_sanity": 25,
+  "farming_weights": {
+    "scarcity": 0.5,
+    "gap": 0.3,
+    "efficiency": 0.2
+  },
+  "farming_min_samples": 300,
+  "farming_target_days": 30,
+  "farming_activity_edge": 1.3,
+  "farming_rerun_days": 378,
+  "farming_scarcity_horizon_days": 400,
   "farming_stage_table": {
     "固源岩": "1-7",
     "固源岩组": "1-7",

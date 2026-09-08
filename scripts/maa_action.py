@@ -187,7 +187,16 @@ def set_stage(stage: str, phase: str) -> tuple[bool, str]:
         )
     was_running = is_run_locked()
     # 标成 discord：当天这一场的自动定关不再覆盖它（`maa_plan_card.apply_auto_stage()`）。
-    plan = _save_override(phase, "stage", stage, stage_source="discord")
+    # 同时**清掉 drops 上限和后备关**：那两个是给缺口第一名算的，换了关就不成立了；
+    # 手动选的关一律打到理智不足为止（四期步骤 3b）。
+    plan = _save_override(
+        phase,
+        "stage",
+        stage,
+        stage_source="discord",
+        farming_drops={},
+        farming_fallback_stage="",
+    )
     return True, _confirmation(plan, was_running, phase)
 
 

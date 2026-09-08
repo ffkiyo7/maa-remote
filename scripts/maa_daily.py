@@ -22,6 +22,7 @@ from maa_common import (
     MAA_CONFIG_DIR,
     RUNS_DIR,
     SAFE_APP_RE,
+    SAFE_ITEM_ID_RE,
     SCRIPTS_DIR,
     atomic_write_json,
     atomic_write_text,
@@ -55,6 +56,10 @@ TASK_STEPS = (
     ("StartUp", "🚀", "登录与首登领取", "正在登录并处理首登弹窗"),
     ("Annihilation", "☄️", "每日剿灭", "正在用代理卡全权委托清剿灭"),
     ("Fight", "⚔️", "刷理智", "正在刷理智"),
+    # 第二个刷理智块（四期步骤 3b）：第一个块刷够 `drops` 上限就停，剩下的理智
+    # 交给它。**key 故意不叫 `Fight`**——`_task_state()` 认不出命名段时会退回
+    # `"<key> Completed"` 这条通配，两个块共用 `Fight` 会让没跑过的第二块被判成完成。
+    ("Fight2", "⚔️", "刷理智·续", "正在刷第二个关"),
     ("Infrast", "🏭", "基建换班", "正在根据干员心情自动排班"),
     ("Recruit", "🎫", "公开招募", "正在处理公开招募"),
     ("Mall", "🛒", "信用商店", "正在领取信用并购买物资"),
@@ -112,6 +117,9 @@ CN_GAME_DAY_RESET = timedelta(hours=4)
 ANNIHILATION_WEEKLY_ORUNDUM = 1800
 # maa-cli 最终汇总用任务名；旧日志仍是「每周剿灭」。
 ANNIHILATION_TASK_NAMES = ("每日剿灭", "每周剿灭")
+# 两个刷理智块的任务名。渲染器、战报解析、掉落回写三处**共用这一份**，
+# 名字改了不会有哪一处偷偷对不上。
+FARMING_TASK_NAMES = ("刷理智", "刷理智·续")
 
 
 def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
@@ -224,6 +232,57 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _drops_table(value: Any) -> str:
+    """`{itemId: 数量}` → MaaCore Fight 的 `drops` 内联表；没上限就返回空串。
+
+    `drops` 是上游参数「刷到这么多个就停」。数量来自材料缺口（四期步骤 3a），
+    冷启动或缺口 ≤ 0 时 `farming_drops` 本来就是空的，这里也就不写这一行。
+    itemId 在 `maa_common.normalize_plan()` 里已经过 `SAFE_ITEM_ID_RE`，
+    这里再挡一次——渲染器不接受没校验过的表键。
+    """
+    if not isinstance(value, dict) or not value:
+        return ""
+    pairs: list[str] = []
+    for item_id, quantity in sorted(value.items()):
+        try:
+            count = int(quantity)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0 or not SAFE_ITEM_ID_RE.match(str(item_id)):
+            continue
+        pairs.append(f"{_toml_string(str(item_id))} = {count}")
+    return "{ " + ", ".join(pairs) + " }" if pairs else ""
+
+
+def _fight_block(
+    name: str,
+    stage: str,
+    config: dict[str, Any],
+    medicine_days: int,
+    *,
+    drops: str,
+) -> str:
+    """一个「刷理智」Fight 块。两个块**共用这一份**，硬编码字面量只写一次。"""
+    return (
+        "[[tasks]]\n"
+        f"name = {_toml_string(name)}\n"
+        'type = "Fight"\n'
+        "[tasks.params]\n"
+        f"stage = {_toml_string(stage)}\n"
+        "medicine = 0\n"
+        f"medicine_expire_days = {max(0, medicine_days)}\n"
+        # This literal is not derived from any state or user input.
+        "stone = 0\n"
+        # Let MaaCore select the largest series currently affordable in
+        # the connected client instead of forcing a fixed multiplier.
+        "series = 0\n"
+        f"times = {int(config.get('fight_times', 2147483647))}\n"
+        + (f"drops = {drops}\n" if drops else "")
+        + 'server = "CN"\n'
+        'client_type = "Official"\n'
+    )
+
+
 def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
     """Render the exact immutable plan used for this run; no CloseDown task.
 
@@ -271,23 +330,26 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
         # Independent switch: 理智让路 removes ONLY this block.
         # Default True so the deploy seed and isolated renderer tests keep it.
         if plan.get("farming", True):
+            drops = _drops_table(plan.get("farming_drops"))
             blocks.append(
-                "[[tasks]]\n"
-                'name = "刷理智"\n'
-                'type = "Fight"\n'
-                "[tasks.params]\n"
-                f"stage = {_toml_string(str(plan.get('stage', '')))}\n"
-                "medicine = 0\n"
-                f"medicine_expire_days = {max(0, medicine_days)}\n"
-                # This literal is not derived from any state or user input.
-                "stone = 0\n"
-                # Let MaaCore select the largest series currently affordable in
-                # the connected client instead of forcing a fixed multiplier.
-                "series = 0\n"
-                f"times = {int(config.get('fight_times', 2147483647))}\n"
-                'server = "CN"\n'
-                'client_type = "Official"\n'
+                _fight_block(
+                    FARMING_TASK_NAMES[0],
+                    str(plan.get("stage", "")),
+                    config,
+                    medicine_days,
+                    drops=drops,
+                )
             )
+            # 刷够 `drops` 上限之后 MaaCore 就停了，本场剩下的理智不能白扔：
+            # 再渲染一个 Fight 块打第二名的关，**不带 drops**，打到理智不足为止。
+            # 没有上限时第一个块本来就会打到理智不足，第二块也就没有意义。
+            spare = str(plan.get("farming_fallback_stage") or "")
+            if drops and spare:
+                blocks.append(
+                    _fight_block(
+                        FARMING_TASK_NAMES[1], spare, config, medicine_days, drops=""
+                    )
+                )
     if tasks.get("infrast", True):
         blocks.append(
             "[[tasks]]\n"
@@ -370,6 +432,14 @@ def _task_display_names(key: str, label: str) -> tuple[str, ...]:
     if key == "Annihilation":
         return ANNIHILATION_TASK_NAMES
     return (label,)
+
+
+def farming_sections(lines: list[str]) -> list[str]:
+    """两个刷理智块的 maa-cli 汇总段拼在一起（掉落要合并统计，四期步骤 3b）。"""
+    section: list[str] = []
+    for name in FARMING_TASK_NAMES:
+        section += _named_task_section(lines, name)
+    return section
 
 
 def _task_state(lines: list[str], key: str, label: str) -> str:
@@ -587,6 +657,9 @@ def progress_content(
             detail = running_text
             if key == "Fight" and plan is not None:
                 detail = f"正在刷 {plan_stage_label(plan)}，自动选择最大连战次数"
+            elif key == "Fight2" and plan is not None:
+                spare = str(plan.get("farming_fallback_stage") or "")
+                detail = f"正在刷 {spare or '第二个关'}，用掉刷够缺口后剩下的理智"
             status_lines.append(f"⏳ {emoji} {detail}")
 
     sanity = _last_match(clean, r"Current sanity:\s*(\d+)\s*/\s*(\d+)")
@@ -621,12 +694,22 @@ def extract_summary(
         f"[{name}]" in line for line in lines for name in ANNIHILATION_TASK_NAMES
     )
     annihilation_planned = (plan or {}).get("annihilation")
+    # 第二个刷理智块只有「第一块设了 drops 上限 + 有后备关」时才渲染出来，
+    # 战报也只在那时列它——否则每天都多一行「⏸️ 未执行」的噪音。
+    second_fight_planned = bool(
+        (plan or {}).get("farming_drops") and (plan or {}).get("farming_fallback_stage")
+    )
     enabled = {
         "StartUp": True,
         # Show the step when this run included it, or when older logs still
         # have the named summary.  A False flag means "already done today".
         "Annihilation": annihilation_in_logs or annihilation_planned is True,
         "Fight": bool(tasks.get("fight", True)),
+        "Fight2": bool(tasks.get("fight", True))
+        and (
+            second_fight_planned
+            or any(f"[{FARMING_TASK_NAMES[1]}]" in line for line in lines)
+        ),
         "Infrast": bool(tasks.get("infrast", True)),
         "Recruit": bool(tasks.get("recruit", True)),
         "Mall": bool(tasks.get("mall", True)),
@@ -663,9 +746,15 @@ def extract_summary(
                 if count
                 else f"代理卡全权委托；满 {ANNIHILATION_WEEKLY_ORUNDUM} 合成玉/周后停止"
             )
-        elif key == "Fight":
-            fight_lines = _named_task_section(lines, "刷理智") or lines
-            details.append(f"关卡 {plan_stage_label(plan or {})}")
+        elif key in ("Fight", "Fight2"):
+            if key == "Fight":
+                fight_lines = _named_task_section(lines, FARMING_TASK_NAMES[0]) or lines
+                stage_label = plan_stage_label(plan or {})
+            else:
+                # 第二块**不退回整份日志**：那会把第一块的掉落和次数重复算一遍。
+                fight_lines = _named_task_section(lines, FARMING_TASK_NAMES[1])
+                stage_label = str((plan or {}).get("farming_fallback_stage") or "第二个关")
+            details.append(f"关卡 {stage_label}")
             proxy_batches, refunded, _streak = proxy_failures(fight_lines)
             wiped_batches, _wiped_refund = fight_wiped_out(fight_lines)
             count = _fight_times(fight_lines)
@@ -1721,7 +1810,8 @@ def execute(phase: str) -> int:
                 except Exception as exc:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
-        fight_lines = _named_task_section(stdout_lines + stderr_lines, "刷理智")
+        # 两个刷理智块的掉落一起回写库存估算（四期步骤 3b）。
+        fight_lines = farming_sections(stdout_lines + stderr_lines)
         drops = _drop_pairs(fight_lines) if fight_lines else []
         if drops:
             try:

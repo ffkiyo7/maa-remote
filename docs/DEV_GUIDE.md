@@ -73,6 +73,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、目标集合、**本地作业记账**（`ledger.json`）、已排程卡 | 被 action/watch/worker/plan_card import | — |
 | `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 手动搜一关并直接排程；`run-batch <token>` **一条执行链**串行连抄一轮 | 仅由 `maa_action.py` / `maa_activity_watch.py` 派发 | 搜索 5~20s；一关 8~15 分钟 |
+| `scripts/maa_farming.py` | **素材权重领域层**：一图流 / 企鹅物流抓取层（缓存在 `state/maa/farming/`）+ 三项加权分纯函数（稀缺 / 缺口 / 效率）+ 候选关集合（D5）+ `stage_ap_cost()` 兜底 | 被 plan_card / activity_watch import | 有缓存 <0.5s；冷缓存 3~10s（下 1.4 MB matrix） |
 | `scripts/maa_clearing.py` | 作业链领域层（近纯函数）：条目形态（`#raid` 后缀）、上游导航键闸门、理智预算与排轮、搜索失败退避记账、通关判据 | 被 action/watch/worker/plan_card import | — |
 | `scripts/maa_skland.py` | 森空岛协议：stdlib HMAC 签名、grant→cred 链、练度与理智拉取、`link`（stdin 收 token） | 本机终端；手动搜索强制刷新（失败即失败）；watcher 在「有未执行的关」的 tick 刷新；每关开打前再刷一次 | 秒级 |
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
@@ -187,60 +188,83 @@ custom_id 里也带场次（`hermes:btn:maa:{phase}:stage-select` / `:skip` / `:
 万一 `retire_old_plan_cards()` 没收干净旧卡（它是尽力而为的），点旧卡只会得到
 「未登记」，而不会把早场的选择悄悄写进晚场。
 
-### 材料缺口 → 自动定关（三期步骤 6，2026-09-08 改版）
+### 材料缺口 → 自动定关（四期步骤 3，2026-09-09 改版）
 
 **这里曾经是第三个下拉（`hermes:btn:maa:farming-select`），已删除。** 删的理由：
-材料缺口天天变，而下拉只能选关、显示不了缺口，语义和第一个下拉完全重复——
-用户的原话是「光看下拉也不知道材料缺口，如果下拉只是用来选关，那存在的意义和
-第一个下拉直接重复」。缺口应该是**后台固定计算**的结果，不是让人去挑的选项。
+材料缺口天天变，而下拉只能选关、显示不了缺口，语义和第一个下拉完全重复。
+缺口应该是**后台固定计算**的结果，不是让人去挑的选项。
 
-现在的链路：
+算法整个在 **`scripts/maa_farming.py`**（纯函数 + 抓取层分开），`maa_plan_card`
+只剩三个薄封装（`farming_recommendations` / `auto_stage` / `farming_note`）负责渲染。
 
 ```
-stages.json + item_index.json ─┐
-                               ├─ material_stage_candidates() ── 材料 → [候选关]
-config.farming_stage_table ────┘                                      │
-                                                                      ▼
-depot.json ── consumption_rates_window(≥4 周) ── farming_recommendations()
-                                                                      │
-                                          auto_stage() ── 可用天数最小的那个
-                                                                      │
-                            apply_auto_stage() ── 写当天 plan.stage（source=auto）
+一图流 matrix.json（ETag）─┐
+一图流 stage/info（1h）   ─┼─ load_market_data() ── state/maa/farming/*.json 缓存
+一图流 item/v7/value（24h）┤     （企鹅 result/matrix / zones+stages 作后备）
+一图流 store/activity（可选）┘                     │
+                                                  ▼
+stages.json + item_index.json ── stage_drops() ── material_stage_candidates()
+                                                  │        （手工表在前，不变量 #38）
+depot.json ── consumption_rates_window(≥4 周) ────┤
+                                                  ▼
+StageActivityV2 + 导航键 ── candidate_stages() ── farming_result()
+                              （D5：活动期只有活动关）      │
+                                                  ┌───────┴────────┐
+                                          auto_stage()        drops_cap() / fallback_stage()
+                                                  │                │
+                                    apply_auto_stage() 写 sessions.<phase> 的
+                                    stage / stage_source=auto / farming_drops /
+                                    farming_fallback_stage
 ```
 
-- **映射以上游派生为主**（不变量 #38）：`stages.json` 每关都有 `dropInfos`，
-  只取 `NORMAL_DROP`。**新活动上线自动跟随**，这是这次改版的主要目的。
-  手工表只补上游没有的（资源本只有 `FURNITURE`）和你想钉死的。
-- **候选必须是有序列表、在当天可选集合里取第一个命中**。全局定死一个关会选中
-  早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。
-- **写的是同一个 `plan.stage` 字段**，不是新字段：`daily.toml` 只有一个「刷理智」
-  Fight 块，两个字段会立刻产生「谁赢」的歧义。
-- **`stage_source` 区分「自动定的」和「你选的」**，且必须留在
-  `maa_action._today_override()` 的字段白名单（`maa_common.PLAN_SESSION_FIELDS`）里——
-  掉了它，点一次「跳过」就会把那一场的自动定关当成手动选择冻住。写它的只有两处：
-  `apply_auto_stage()`（`auto`）与 `maa_action.set_stage()`（`discord`），
-  两处缺一，闸门就形同虚设。
-  `normalize_plan()` 现在**把 `stage_source` 带过去**（以前会连同其余字段一起丢掉），
-  所以 `effective_plan()` 返回的 plan 里查得到它；卡片上「这关是谁定的」那行仍走
-  `today_stage_source(phase)`，它按场次读 `plan.json`。
-- **每张卡各算一次，各写各的场次**：早场卡写 `sessions.am`，晚场卡写 `sessions.pm`。
-  用户在早场手动选过之后晚场照样自动算（D3）。
+**候选关集合（D5）**——`maa_farming.candidate_stages()`：
 
-排序指标只有一个：`可用天数 = 当前库存 / 该材料日均消耗`，升序。三条降级路径：
+| 情况 | 候选集 |
+|---|---|
+| 活动进行中（`StageActivityV2` 的截止时刻未过；读不到日历时退而看 `activity_stages` 非空） | **只有活动关**：`config.activity_stages ∩ 上游导航键`（`maa_clearing.nav_checker()`，与自动抄作业同一个闸门） |
+| 活动已结束 / 无活动 | `1-7` + 当天开放的资源本（`current_supply_choices()`） |
+| 活动期但一个带导航键的活动关都没有 | 退回上一行，并在卡片上写明——否则整张卡什么都推荐不了 |
+
+判「活动是否还在」**优先看日历而不是 `activity_stages`**：后者是运行时缓存，
+活动结束当天它可能还留着上一期的关。
+
+**三项加权分**（权重 `config.farming_weights`，默认 `0.5 / 0.3 / 0.2`，**和为任意值都归一**）：
+
+| 项 | 口径 | 数据 |
+|---|---|---|
+| ① 稀缺 | 「当前开放关最便宜 `best_now`」vs「常驻关最便宜 `best_perm`」，`best_perm / best_now ≥ farming_activity_edge`（1.3）才算活动关明显更优；下次可刷日 = `首发 start + farming_rerun_days`（378，42 组 `ACT→ACT_REP` 的中位数），已复刻（`ACT_REP`）视为不会再来按 `end + 2 年`；分值 = `clamp(剩余天数 / farming_scarcity_horizon_days, 0, 1)`。**只管「窗口要关了」这个时间维度**，平均用量归第 ② 项 | `stage/info` + `matrix.json` |
+| ② 缺口 | 缺口件数 = `farming_target_days`（30）天用量 − 库存估算；缺口价值 = 件数 × `itemValue`（把稀有度拉到同一理智量纲：1 个晶体电子单元 ≈ 302 理智 ≈ 17.6 个固源岩组）；分值 = 缺口价值 / 本场可用理智，clamp 到 1 | Depot + `item/v7/value` |
+| ③ 效率 | 候选集内该材料最优「件/理智」÷ 全游戏历史最优「件/理智」 | `matrix.json` + `apCost` |
+
+掉率两条过滤，抄一图流前端口径：`times < farming_min_samples`（300）不计；
+matrix 行 `end` 非空且早于 now 不计（**活动关统计只在开放期有效**）。
+`ap_per_item = apCost / (quantity / times)`。
+
+**几个只能踩一次的坑**（都写成了单测）：
+
+- `stage/info` 的 `end` **永不为 null**，常驻用哨兵 `4070880000000`。判常驻只能靠
+  `stageType ∈ {MAIN, ACT_PERM}` 或「end 在 10 年之后」，**不许判 null**。
+  企鹅 `/zones` 相反，`closeTime: null` 才是常驻——后备转换时统一成哨兵。
+- `item/v7/value` 129 条里 **16 条 `itemValue == null`**（活动代币、理智小样），
+  不判空会 `float * None` 直接崩；它们不参与缺口计价。
+- `matrix.json` 的 `Cache-Control: max-age=7200` 是骗人的（实测约 10 分钟刷一次），
+  要新数据必须用 **ETag 条件请求**；一图流两个后端接口干脆没有任何缓存头，TTL 自己定。
+
+**降级路径**（`degraded_reasons`，全部**不抛**、全部在卡片上可见）：
 
 | 情况 | 处理 |
 |---|---|
-| `consumption_history` 不足 2 次对表（冷启动） | 全部按 `farming_manual_weights` 排，**卡片上标「降级」**，且**不自动改关**（那时的排序是猜的） |
-| ≥4 周滚动窗口内消耗为 0 | 可用天数是**未知**不是 ∞ → 退回手工权重，排在实测材料**之后**（当成 0 天会把它顶到第一位，正好反了） |
-| 上游掉落表和 `farming_stage_table` 都没有这个材料 | 不推荐，卡片列出来。**不猜关** |
+| 抓取失败 | 用本地缓存；缓存也没有就当空数据（稀缺退化成「活动关独有主掉落 = 1」，效率全 0），卡片列出原因 |
+| 冷启动（`consumption_history` 不足 2 次对表） | 缺口项退 `farming_manual_weights` 手工权重，**仍然自动定关**（见改写后的不变量 #31），但**不写 drops 上限** |
+| ≥4 周窗口内零消耗 | 可用量是**未知**不是 0 缺口 → 同样退手工权重 |
+| 上游掉落表与手工表都查不到关卡 | 不推荐、卡片列出来。**永不猜关** |
 
-卡片上的「没关可刷」只报**你确实在消耗的**或**你自己配进手工表的**材料：
-派生表覆盖全游戏几百种材料，全报出来会把真正要看的信息淹掉。
+排序同分时先比「理智/件」再比材料名，保证**确定性**——活动首日几个材料三项常常同分。
 
-「≥2 次成功对表」在代码里就是 `len(consumption_history) >= 1`：每两次对表之间产生
-一条区间记录，1 次对表只有库存快照、算不出消耗（`maa_depot.has_measured_consumption()`）。
-取数口径在 `maa_depot.consumption_rates_window()`：取 `to` 落在窗口内的区间，
-`sum(consumed) / sum(days)`——不是只看最近一次对表，那正是把突发消耗看成 0 的原因。
+`stage_source` 仍然是「这关是谁定的」的唯一依据，必须留在
+`maa_common.PLAN_SESSION_FIELDS` 白名单里；写它的只有 `apply_auto_stage()`（`auto`）
+与 `maa_action.set_stage()`（`discord`）两处。`farming_drops` / `farming_fallback_stage`
+是同一批新字段，`maa_action.set_stage()` 手动选关时会把它们**清空**。
 
 现在所有登记项都是 `kind: "exec"`；`kind: "prompt"` 那条路径在 MAA 这边已经没有使用者。
 
@@ -355,7 +379,25 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
 7. **渲染 `daily.toml`** — `render_daily_toml(plan, config)` 把本场快照渲染成 TOML 并
    `atomic_write_text` 覆盖 `~/.config/maa-cli/tasks/daily.toml`。任务链固定：
 
-   `StartUp → [当日第一场 Annihilation] → Fight(1-7) → Infrast → Recruit → Mall → Award → Custom(Home)`
+   `StartUp → [当日第一场 Annihilation] → Fight(缺口第一名) → [Fight(第二名)] → Infrast → Recruit → Mall → Award → Custom(Home)`
+
+   **刷理智是两个 Fight 块**（四期步骤 3b），名字写死在 `maa_daily.FARMING_TASK_NAMES`：
+
+   | 块 | 名字 | 关 | `drops` |
+   |---|---|---|---|
+   | 第一个 | `刷理智` | `plan["stage"]`（缺口第一名） | `plan["farming_drops"]` = `{itemId: 还差多少个}`，**刷够即停**（上游 `-D` 的协议字段） |
+   | 第二个 | `刷理智·续` | `plan["farming_fallback_stage"]`（缺口第二名） | **没有**，打到理智不足为止 |
+
+   第二个块**只在第一个块设了 `drops` 时才渲染**：没上限的话第一个块本来就会打到理智
+   不足，第二块毫无意义。冷启动、缺口 ≤ 0、或用户手动选过关时 `farming_drops` 是空的，
+   于是退回「一个块打到底」的老形态。两个块共用 `_fight_block()`，所以
+   `medicine = 0 / stone = 0 / series = 0` 这三个字面量只写一次（不变量 #1~#3）。
+   理智让路（`plan["farming"] = False`）一次摘掉两个块。
+
+   战报里第二块的 `TASK_STEPS` key 是 **`Fight2` 而不是 `Fight`**：`_task_state()`
+   认不出命名段时会退回 `"<key> Completed"` 这条通配，两个块共用 `Fight`
+   会让根本没跑过的第二块被判成「完成」。掉落回写库存时用 `farming_sections()`
+   把两段合起来喂 `_drop_pairs()`。
 
    `StartUp` 本身已经复用 MaaCore 的首登处理链：登录后会处理签到/今日配给等弹窗，
    不是另起一条自定义点击任务。剿灭复用第二个 `Fight(stage = "Annihilation")`：
@@ -663,11 +705,18 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
   config.json     环境与阈值（路径、超时、channel_id、活动关缓存）    ← 计划卡会改写
   defaults.json   持久默认：stage="1-7" / medicine=expiring / tasks 全开
   plan.json       今日覆盖（**按场次**）：{date, sessions: {am: {stage, stage_source,
-                  skip, source, updated_at}, pm: {…}}, updated_at}
+                  skip, source, updated_at, farming_drops, farming_fallback_stage},
+                  pm: {…}}, updated_at}
   last_run.json   最近一次运行状态 + threads[] + 资源更新时间戳
   activity_watch.json 当前活动 + 本轮 token + 每关搜索失败退避（stage_state）+
                       idle/searching/waiting/done/scheduled/dispatched/running 状态
   depot.json      最近完整 Depot 真值 + 期间掉落增量 + 历次消耗与日均消耗率
+  farming/matrix.json        一图流掉落矩阵镜像（ETag 条件请求，1.4 MB，0600）
+  farming/stage_info.json    一图流关卡排期 / 复刻标记 / apCost（1h TTL）
+  farming/item_value.json    一图流物品价值表（24h TTL）
+  farming/store_activity.json 当期活动商店（可选，24h TTL）
+                  以上四份都是 `{fetched_at, etag, payload}`；**只有 `maa_plan_card`
+                  会写**，`maa_activity_watch.cost_lookup()` 只读它（EX 关理智兜底）
   copilot/ledger.json      当期活动的作业记账：每关每模式的通关时间戳 + attempts（0600）
   copilot/ledger-<活动>.json 换活动时归档的旧账本（0600）
   copilot/searches/<token>.json 一轮的执行清单 `entries: [{stage, stage_id, mode,
@@ -688,7 +737,8 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
 ```
 result = normalize_plan(defaults.json)
 if plan.json.date == 今天(Asia/Shanghai):
-    只叠加 sessions[phase] 里的 stage / stage_source / skip 三个键
+    只叠加 sessions[phase] 里的 stage / stage_source / skip /
+    farming_drops / farming_fallback_stage 五个键
 result = normalize_plan(result)             ← 再规范化一次
 ```
 
@@ -700,7 +750,10 @@ result = normalize_plan(result)             ← 再规范化一次
 - `normalize_plan()` 每次都**强制** `medicine="expiring"`、`stone=0`，
   即使磁盘上被人手工塞了别的值也没用（对应测试
   `test_persisted_medicine_choice_cannot_disable_fixed_expiry_policy`）；
-  但它**保留 `stage_source`**——那是卡片判断「这关是谁定的」的唯一依据。
+  但它**保留 `stage_source`**——那是卡片判断「这关是谁定的」的唯一依据；
+  `farming_drops` / `farming_fallback_stage` 同样穿过这层，其中 `farming_drops`
+  的 itemId 要过 `SAFE_ITEM_ID_RE`（它会原样变成 `daily.toml` 里 `drops` 表的键），
+  **空值等于没有**——手动选关就是靠写空把上限清掉的。
 
 **三把锁，别搞混**：
 
@@ -861,9 +914,9 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 28 | 排轮前**必须先扣掉剿灭那份理智**（地基事实 H）；理智未知一律 0（fail-closed）。理智成本为 `None` 的条目**不入当轮、不进预算**（那不是「打完了」，是「算不出来」） | `maa_clearing.sanity_budget()` / `plan_round()` + `CopilotRoundPlanningTests` |
 | 29 | 「已通关」有**两条独立判据**、是「或」的关系：本地记账所需模式齐全 **或** 森空岛该 zone 全清（D10）。`zone_fully_cleared()` 与 `zone_progress_warning()` **共用 `stage_zone()` 的定位、绝不合并结论**——后者是「只在能证明未解锁时才开口」的单向启发，沉默 ≠ 已解锁，永远不当闸门用 | `maa_copilot.stage_zone()` / `zone_fully_cleared()` / `ledger_pending_modes()` + `LedgerTests.test_zone_helpers_stay_two_separate_rules`（AST 结构断言） |
 | 30 | 记账**只有 `won` 才写模式时间戳**；活动关的所需模式是普通 + 突袭，**突袭失败 → 该关不算通关**，下一轮只排剩下的模式（D7）。`activity_key` 变了要**归档**旧账（`ledger-<key>.json`）而不是删。种子（`SR-5/6/8` 普通）**只在首次建账且前缀是 `SR` 时写，且只补空位** | `maa_copilot.record_copilot_attempt()` / `ensure_ledger()` / `seed_ledger()` + `LedgerTests` |
-| 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 改版：原第三个下拉已删除——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage(result, phase)` 写进当天**那一场**的 `sessions.<phase>.stage`（**同一个字段**：只有一个刷理智 Fight 块，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`。**用户在某一场手动选过（`stage_source="discord"`）当天那一场就不许再自动改**，另一场不受影响；`stage_source` 必须留在 `maa_common.PLAN_SESSION_FIELDS` 白名单里，否则点一次「跳过」就把那一场的自动定关冻住。排序指标**只有「可用天数」一个**，不许再叠「库存低于 N 就优先」的例外规则。**降级期（无实测消耗）一律不自动改关**——那时的排序只是手工权重，拿猜的结果改每天刷什么正是「不许猜关」要防的事 | `auto_stage()` / `apply_auto_stage()` + `FarmingAutoStageTests` |
-| 32 | 材料推荐的三条降级路径都**不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**：冷启动（`consumption_history` 不足 2 次对表）按手工权重且卡片标「降级」；≥4 周窗口内零消耗的材料可用天数是**未知**、退回手工权重排在实测材料之后（当成 0 天会把它顶到第一位）；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_plan_card.farming_recommendations()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingRecommendationTests` |
-| 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基，活动关的材料不靠手工维护。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在「今天真的选得到的关」里取第一个命中——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选排序：手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底（`stages.json` **没有掉率**，这是启发式；排序不确定会让同样的库存今天推 A 明天推 B）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` |
+| 31 | 材料缺口是**后台固定计算**，不是一个下拉（2026-09-08 删掉了原第三个下拉——缺口天天变，下拉只能选关、显示不了缺口，与第一个下拉语义重复）。计算结果由 `apply_auto_stage(result, phase)` 写进当天**那一场**的 `sessions.<phase>.stage`（**同一个字段**：`daily.toml` 只有一条刷理智链，两个字段必然产生「谁赢」的歧义），并打 `stage_source="auto"`，连带写下 `farming_drops` 与 `farming_fallback_stage`。**用户在某一场手动选过（`stage_source="discord"`）当天那一场就不许再自动改**，另一场不受影响；`stage_source` 必须留在 `maa_common.PLAN_SESSION_FIELDS` 白名单里，否则点一次「跳过」就把那一场的自动定关冻住。排序指标是**稀缺 / 缺口 / 效率三项加权分**（四期步骤 3，权重在 `config.farming_weights`，和为任意值都归一），不许再叠「库存低于 N 就优先」这类例外规则。**降级期照样自动定关**——2026-09-09 改写：三期不敢改是因为那时排序依据只有手工权重；现在候选集受活动 / 当日开放限制（D5），而且外部掉率数据给了效率与稀缺两项兜底，选出来的关是合理的。降级必须在卡片上标出来并列出原因，而且**降级期不写 `drops` 上限**（缺口是猜的，拿它当「刷够就停」会提前收工）| `maa_farming.farming_result()` / `auto_stage()` / `maa_plan_card.apply_auto_stage()` + `FarmingScoreTests.test_cold_start_uses_manual_weights_but_still_picks_a_stage` / `FarmingAutoStageTests.test_degraded_still_picks_a_stage_and_says_so`
+| 32 | 材料推荐的**每一条降级路径都不抛异常**（异常会带走整张计划卡，D-2 的教训）且**必须可见**（进 `degraded_reasons`，卡片上列出来）：外部抓取失败退本地缓存、缓存也没有就当空数据；冷启动（`consumption_history` 不足 2 次对表）缺口项退手工权重；≥4 周窗口内零消耗的材料可用量是**未知**、同样退手工权重；`itemValue == null` 的材料不参与缺口计价；上游掉落表与 `farming_stage_table` 都查不到关卡的材料不推荐且卡片说明原因——**永不猜关** | `maa_farming.load_market_data()` / `farming_result()` / `farming_note()` / `maa_depot.consumption_rates_window()` + `FarmingScoreTests` / `FarmingFetchTests`
+| 38 | 材料 → 关卡的映射**以上游 `stages.json` 的 `dropInfos` 为主**（`item_index.json` 翻中文名），`farming_stage_table` 只作补充：这是「新活动上线自动跟随」的地基。只认 `NORMAL_DROP`（按 `EXTRA_DROP` 定关，期望产出可能差一个数量级）。映射必须是**有序候选列表**、在候选关集合里取命中的——全局定死一个关会选中早已关闭的往期活动关（`异铁组 → DH-8`），然后被整条丢掉。候选里有掉率数据时按「理智/件」最便宜的挑，没有数据才退回启发式顺序（手工表指定的最优先 → 理智低的在前 → 关卡名字典序兜底）。资源本（`CE-6`/`AP-5`）在上游只有 `FURNITURE`，**只能**靠手工表，所以两张表是合并不是替换。**没有主掉落的关也留在表里**（`materials: []`）：`maa_farming` 要靠它把关卡代号对到内部 `stageId` 与 `apCost`。读取失败一律降级成空表，不抛异常（D-2） | `maa_plan_card.stage_drops()` / `material_stage_candidates()` + `FarmingAutoStageTests` / `FarmingScoreTests.test_a_priced_material_picks_the_cheapest_open_stage`
 | 33 | 记账**只在这一关被判定为通关时**才写：`copilot_outcome()` 要求退出码 0 **且**无失败标记 **且**有胜利标记 `Copilot Completed`，认不出胜利标记返回 `unknown` 并按失败处理。只看退出码会让撤退 / 三星未达 / 正常退出的 Fight Error 被当成通关而**永久跳关**。胜利标记字符串**已于 2026-09-08 用真实日志核对**（`runs/2026-09-08-copilot-9e14e500ac25.log` 第 47 行） | `maa_clearing.copilot_outcome()` + `CopilotVictoryJudgementTests` |
 | 34 | 一轮条目的突袭用 `#raid` 后缀表示，每关先普通后突袭；**除了 `maa copilot --raid` 的取值，理智查表 / 导航键闸门 / 作业匹配 / 状态展示一律用 `split_entry()` 去掉后缀的关卡名**。`--raid` 合法取值 `normal`/`raid`/`both`（`maa copilot --help` 核实） | `maa_clearing.split_entry()` / `make_entry()` / `required_modes()` + `CopilotModeTests` / `CopilotTargetSetTests.test_a_raid_entry_is_gated_under_its_plain_stage_name` |
 | 35 | 一轮里**一关失败继续下一关**，只有 `nav`（上游导航 / 切突袭难度）这类环境失败才停止整轮；两种情况战报都必须**逐关列出结果**。普通没过就跳过同一关的突袭（那关根本没解锁） | `maa_copilot_worker._batch_run_locked()` + `CopilotBatchExecutionTests` |
@@ -872,6 +925,10 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 40 | **晚场计划卡不跟随上游更新**（D1）：`brew` / `maa update` / `maa hot-update` 只在早场卡跑。晚场卡因此也没有「上游更新」字段，`main()` 末尾那个「更新失败就 raise」只在 `update is not None` 时判。计划卡**恰好两行控件**：一个 `stage-select` 下拉 + 一个「跳过本场 / 恢复本场」按钮；登记表里不许再出现 `explain` / `log` / `farming-select` / 抄作业下拉的键 | `maa_plan_card.main()` / `build_components()` + `PlanCardPhaseTests.test_the_evening_card_never_follows_upstream` / `DiscordCardTests.test_the_card_has_exactly_one_select_and_one_button` |
 | 37 | **只跑上游 `tasks/Stages/<前缀>.json` 里已有顶层键的关**（前缀 = 关卡名第一个 `-` 之前；突袭条目按去掉 `#raid` 的普通关名查）。本项目**不再自写导航定义**，也**不读、不建** `~/.config/maa-cli/resource/tasks/Stages/`；只读 `maa_copilot._resource_dirs()` 给的上游目录，文件缺失 / 读失败 / JSON 坏 / 顶层不是对象**一律视为无键**（fail-closed，异常摘要进原因）。无键的关**不进目标集合、不进抄作业卡的下拉**，只在一览里标「⛔ 上游无导航」——它**永远不会自动变好**，等下去毫无意义，所以既不重试也不记失败 | `maa_clearing.nav_checker()` / `read_nav_keys()` / `maa_activity_watch.collect_targets()` + `CopilotTargetSetTests.test_a_stage_without_an_upstream_nav_key_never_enters_the_set` |
 | 41 | 「已排程」卡**只有一个按钮**（❌ 取消本轮）。候选卡的 ▶️ / 🔥 / 🔄 与 `copilot pick` / `copilot again` 整套在四期步骤 2 删除：选关即执行，没有可挑的候选。登记表里不许再出现 `:raid-` / `:again` / `:confirm` 的键。一轮只在 `scheduled` / `queued` 可取消（`CANCELABLE_STATUSES`），`executing` 起理智可能已经花掉 | `maa_copilot.build_scheduled_card()` / `CANCELABLE_STATUSES` + `ButtonRegistryTests.test_the_scheduled_card_carries_exactly_one_cancel_button` / `test_no_module_still_builds_candidate_buttons` |
+| 42 | **候选关集合受活动限制**（D5）：`StageActivityV2` 说活动还没结束时，`maa_farming.candidate_stages()` 只返回 `config.activity_stages ∩ 上游导航键`——理智 all in 活动才换得完代币商店，不刷主线也不刷常驻资源本。活动结束（截止时刻已过）当天就退回 `1-7` + 当天开放资源本；判「还在不在」**优先看日历而不是 `activity_stages`**（后者是运行时缓存，结束当天可能还留着上一期的关）。用户从下拉手动选资源本仍然允许——这条只管**自动定关** | `maa_farming.candidate_stages()` + `FarmingCandidateSetTests` |
+| 43 | 外部数据（一图流 / 企鹅物流）的抓取层**任何失败都不抛**，只返回缓存或空并把原因写进 `degraded_reasons`，由计划卡显示；四份缓存落 `state/maa/farming/`（0600、`atomic_write_json`），`matrix.json` 走 **ETag 条件请求**（`max-age=7200` 不可信），`stage/info` 1h TTL、`item/v7/value` 24h TTL。统一 UA `maa-remote/4 (+仓库地址)`，卡片带一行「数据来源：明日方舟一图流 / 企鹅物流（CC BY-NC 4.0）」。**数据不 vendor 进仓库**（许可），**单测一条都不许碰网**——桩数据手写 | `maa_farming.load_market_data()` / `_fetch_cached()` / `SOURCE_LINE` + `FarmingFetchTests` |
+| 44 | Fight 的 `drops` 上限**只在有实测缺口时写**（`maa_farming.drops_cap()`：冷启动、缺口 ≤ 0、拿不到 itemId 一律空表），itemId 必须过 `maa_common.SAFE_ITEM_ID_RE`（它会原样变成 TOML 表键）。**第二个 Fight 块永远不带 `drops`**，而且只在第一块有上限时才渲染——没上限的话第一块本来就打到理智不足。两个块的 `medicine/stone/series` 由 `_fight_block()` 一处写死，任务链顺序不变（紧挨着，在剿灭之后、基建之前）。战报里第二块的 key 是 `Fight2` 而不是 `Fight`（共用 key 会让没跑过的第二块被 `"Fight Completed"` 这条通配判成完成），掉落用 `farming_sections()` 合并两段 | `maa_daily.render_daily_toml()` / `_drops_table()` / `_fight_block()` / `FARMING_TASK_NAMES` / `farming_sections()` + `FarmingDropsTests` |
+| 45 | 理智查表是**两级 fail-closed**：先上游 `stages.json`（`maa_copilot.stage_sanity_cost()`），拿不到再查一图流 `stage/info` 的**本地缓存**（`maa_farming.stage_ap_cost()`，**只读缓存、绝不发请求**——watcher 每 15 分钟一 tick，不能在这条路径上等网络）。两处都查不到仍然返回 `None`，条目不入轮（不变量 #28）。第二级是为 **EX 关**加的：上游 `stages.json` 里根本没有 `XX-EX-n` | `maa_activity_watch.cost_lookup()` + `FarmingExCostFallbackTests` |
 
 ---
 
@@ -897,6 +954,15 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、�
 在验缓存 TTL 时顺手调了真实的 prts.plus，结果整套测试既慢（15～59s）又会被对方
 一次 SSL EOF 判红——「全绿」这个验收标准就此不可信。现在网络层由
 `tests/test_copilot.py: prts_http_stub()` 桩掉，整套 2.4s。
+
+**一图流 / 企鹅物流那条出口在 `tests/test_maa.py` 的 `setUpModule()` 里被整个封死**
+（模块级 patch 掉 `maa_farming._http_json`）。这一层不是洁癖：抓取层默认把缓存写进
+**线上** `~/.hermes/state/maa/farming/`，一条漏了打桩的用例既会打对方接口，又会往运行时
+状态里塞一份带假时间戳（用例的 `at=`）的缓存，把线上数据冻到那个未来时刻。
+需要自己造响应的用例在 `with patch.object(maa_farming, "_http_json", …)` 里覆盖它；
+其余用例一律传 `data=`。**断网复核抓不到这一类**——抓取层吞掉所有异常只降级，
+不会让测试变红，所以这道模块级闸门是唯一的防线。
+（另：`_cache_age()` 把「未来的 `fetched_at`」一律当成不新鲜，写坏的缓存最多多抓一次。）
 
 改完测试用这条**断网复核**，必须仍然全绿：
 
@@ -950,6 +1016,11 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 卡片上没有「活动截止」这一行 | 是设计：`~/Library/Caches/com.loong.maa/StageActivityV2.json` 读不出来就整行不显示。跑一次 `maa activity Official` 让它刷出来，或用 `config.maa_activity_cache` 指到别处 |
 | 说「抄作业」发的卡下拉是空的 | 一览里每关都标了「⛔ 上游无导航」——下拉只放上游写了导航定义的关（不变量 #37）。等热更新带来导航定义，或改抄资源本 / 主线 |
 | 日常/抄作业/Depot 报「模拟器正在使用」 | 探测命中了（不变量 #24）。`pgrep -fi bluestacks` 看是不是真有残留进程；确实是残留就 `pkill` 掉再重试。日常想强行跑就说「现在跑」 |
+| 卡片「为什么」写着「⚠️ 降级：… 抓取失败」 | 一图流 / 企鹅都没连上。`ls -l ~/.hermes/state/maa/farming/` 看缓存的 `fetched_at` 有多旧；本机手验：`curl -sI https://cos.yituliu.cn/arknights/stage-drop/matrix.json` 与 `curl -sS -X POST https://backend.yituliu.cn/item/v7/value -H 'Content-Type: application/json' -d '{}' \| head -c 200`。**抓不到不会让卡片消失**，只会让稀缺 / 效率两项退化 |
+| 活动期间卡片说资源本「不在本场候选集里」 | 这是设计（D5 / 不变量 #42）：活动期理智 all in 活动关。想刷资源本就从下拉手动选，手动选的关不受这条限制、也不带 `drops` 上限 |
+| 一场日常里只看到一个 Fight 段 | `runs/<date>-<phase>.json` 里 `plan.farming_drops` 是不是空的。冷启动、缺口 ≤ 0、或者用户手动选过关时**本来就不写上限**，第二个块也就不渲染（不变量 #44） |
+| 战报里「刷理智·续」永远是「⏸️ 未执行」 | 第一个块没打到 `drops` 上限（理智先耗完了），MaaCore 直接把第二块跳过——正常。真要确认看 `runs/*.log` 里有没有 `[刷理智·续]` 段 |
+| EX 关排不进自动作业轮 | 理智算不出来（不变量 #28 fail-closed）。上游 `stages.json` 没有 EX 条目，兜底靠 `farming/stage_info.json` 缓存——但**一图流也不收 EX 关**（spike B §1），所以这条兜底现在只能捞到「一图流有、上游 `stages.json` 没有」的关，EX 仍是已知缺口 |
 | 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `activity_snapshot()` / `parse_activity_events()` 的分区解析与正则 |
 | 新活动上线后没有「已排程」卡 | `hermes cron list` 看“MAA 活动作业监控”；再看 `activity_watch.json`：`status=done` 说明目标集合是空的（看 `excluded` 里每关的理由），`waiting` 说明这一轮排不出条目，`scheduled` 说明排出来了但派发闸门没过 |
 | 「已排程」卡发了但一直不开跑 | `activity_watch.json` 的 `status` 停在 `scheduled`。原因按 `dispatch_blocker()` 的顺序看：还没到 `scheduled_at`（等理智）/ blackout / Depot 窗口 / `run.lock` 被占 / 模拟器在线 |

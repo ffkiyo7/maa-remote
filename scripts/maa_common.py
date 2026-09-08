@@ -76,9 +76,24 @@ PROXY_ENV_KEYS = (
 PLAN_PHASES = ("am", "pm")
 # 一个场次覆盖允许持久化的字段。`stage_source` 必须在里面：卡片靠它区分
 # 「这关是自动定的」和「你自己选的」，掉了它点一次「跳过」就会冻住当天的自动定关。
-PLAN_SESSION_FIELDS = ("stage", "stage_source", "skip", "source", "updated_at")
+# `farming_drops` / `farming_fallback_stage` 是四期步骤 3 加的：前者是
+# `{itemId: 还差多少个}`（渲染成 Fight 的 `drops`，刷够即停），后者是刷够之后
+# 接着刷的第二个关。两者由 `maa_plan_card.apply_auto_stage()` 写，
+# `maa_action.set_stage()` 在手动选关时清空——手动选的关不带上限。
+PLAN_SESSION_FIELDS = (
+    "stage",
+    "stage_source",
+    "skip",
+    "source",
+    "updated_at",
+    "farming_drops",
+    "farming_fallback_stage",
+)
 # 传给 `open -a` / `pgrep -f` 的模拟器名白名单：任何子进程都不接受未校验的名字。
 SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
+# 上游 itemId 的字符集（`30013` / `mod_unlock_token`）。它会原样变成 `daily.toml`
+# 里 `drops` 表的键，所以在写进计划之前就校验，不留「渲染时再说」的口子。
+SAFE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def now_beijing() -> datetime:
@@ -307,6 +322,24 @@ def normalize_plan(value: Any) -> dict[str, Any]:
     stage_source = str(raw.get("stage_source") or "")
     if stage_source:
         result["stage_source"] = stage_source
+    # Fight 的 `drops` 上限与「刷够之后接着刷哪关」，同样要穿过这层规范化
+    # （四期步骤 3）。**空值等于没有**：手动选关时写空就是「这关不带上限」。
+    drops = raw.get("farming_drops")
+    if isinstance(drops, dict) and drops:
+        capped: dict[str, int] = {}
+        for item_id, quantity in drops.items():
+            try:
+                count = int(quantity)
+            except (TypeError, ValueError):
+                continue
+            # itemId 会原样进 TOML 的表键，只接受上游那套 id 的字符集。
+            if count > 0 and SAFE_ITEM_ID_RE.match(str(item_id)):
+                capped[str(item_id)] = count
+        if capped:
+            result["farming_drops"] = capped
+    fallback = str(raw.get("farming_fallback_stage") or "")
+    if fallback:
+        result["farming_fallback_stage"] = fallback
     return result
 
 
@@ -346,7 +379,13 @@ def effective_plan(
     at = at or now_beijing()
     result = normalize_plan(load_json(DEFAULTS_PATH, DEFAULT_PLAN))
     override = session_override(phase, at)
-    for key in ("stage", "stage_source", "skip"):
+    for key in (
+        "stage",
+        "stage_source",
+        "skip",
+        "farming_drops",
+        "farming_fallback_stage",
+    ):
         if key in override:
             result[key] = override[key]
     result = normalize_plan(result)

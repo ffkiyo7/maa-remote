@@ -188,6 +188,7 @@ def deploy_scripts() -> None:
         "maa_action.py",
         "maa_clearing.py",
         "maa_copilot.py",
+        "maa_farming.py",
         "maa_copilot_worker.py",
         "maa_skland.py",
     ):
@@ -642,6 +643,7 @@ def main() -> int:
                 "maa_action.py",
                 "maa_clearing.py",
                 "maa_copilot.py",
+                "maa_farming.py",
                 "maa_copilot_worker.py",
                 "maa_skland.py",
                 "ocrbox",
