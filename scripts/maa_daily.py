@@ -20,6 +20,7 @@ from maa_common import (
     BEIJING,
     LAST_RUN_PATH,
     MAA_CONFIG_DIR,
+    MANUAL_RUN_PATH,
     RUNS_DIR,
     SAFE_APP_RE,
     SAFE_ITEM_ID_RE,
@@ -43,6 +44,7 @@ from maa_common import (
     report_emulator_busy as common_report_emulator_busy,
     require_executable,
     run_lock,
+    state_lock,
 )
 
 
@@ -128,11 +130,23 @@ ANNIHILATION_TASK_NAMES = ("每日剿灭", "每周剿灭")
 FARMING_TASK_NAMES = ("刷理智", "刷理智·续")
 
 
+MANUAL_TOKEN_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def manual_token_from_argv(argv: list[str]) -> str:
+    """`maa_daily.py now <token>` 的 token（`PLAN_MANUAL_RUN.md` M-e）；其余形式返回空串。"""
+    if len(argv) == 3 and argv[1] == "now" and MANUAL_TOKEN_RE.fullmatch(argv[2] or ""):
+        return argv[2]
+    return ""
+
+
 def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
     if len(argv) == 2 and argv[1] in PHASE_LABELS:
         return argv[1]
+    if manual_token_from_argv(argv):
+        return "now"
     if len(argv) > 1:
-        raise ValueError("场次只接受 am、pm 或 now")
+        raise ValueError("场次只接受 am、pm 或 now（now 后可跟一个选关请求 token）")
     marker = (cwd or Path.cwd()).name.lower()
     if marker in {"am", "pm"}:
         return marker
@@ -1738,7 +1752,50 @@ def report_lock_conflict(
         raise RuntimeError("；".join(errors))
 
 
-def execute(phase: str) -> int:
+def manual_run_stage(manual_token: str) -> str | None:
+    """`maa_daily.py now <token>` 要刷的关（`PLAN_MANUAL_RUN.md` M-e）。
+
+    请求必须是 `manual_run.json` 里**这个 token** 且已 `dispatched`；对不上返回 None，
+    调用方不跑。token 为空（终端直接 `maa_daily.py now`）不走这里（M6）。
+    """
+    with state_lock():
+        state = load_json(MANUAL_RUN_PATH, {})
+    if (
+        not isinstance(state, dict)
+        or state.get("token") != manual_token
+        or state.get("status") != "dispatched"
+        or "stage" not in state
+    ):
+        return None
+    return str(state.get("stage") or "")
+
+
+def report_manual_run_mismatch(
+    config: dict[str, Any], token: str, channel_id: str, manual_token: str
+) -> None:
+    discord_request(
+        token,
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {
+            "embeds": [
+                {
+                    "title": "❌ MAA 日常·手动未启动",
+                    "description": (
+                        f"选关请求 `{manual_token}` 与 manual_run.json 对不上"
+                        "（已过期、已作废或已被另一次派发消费），本场没有启动模拟器或执行任何任务。"
+                        "重新说「现在跑」再选一次。"
+                    ),
+                    "color": 0xED4245,
+                    "timestamp": now_beijing().isoformat(),
+                }
+            ],
+            "allowed_mentions": {"parse": []},
+        },
+    )
+
+
+def execute(phase: str, manual_token: str = "") -> int:
     started = now_beijing()
     config = load_config()
     channel_id = str(config.get("channel_id", "")).strip()
@@ -1748,10 +1805,21 @@ def execute(phase: str) -> int:
     last_run_state = load_json(LAST_RUN_PATH, {})
     if not isinstance(last_run_state, dict):
         last_run_state = {}
-    # 计划按场次求值（四期 D1~D3）：早场改的关不会带到晚场，
-    # 手动场 `now` 没有场次覆盖，永远走缺口默认关（D4）。
+    # 计划按场次求值（四期 D1~D3）：早场改的关不会带到晚场。
+    # 手动场 `now` 没有场次覆盖：带 token 时刷选关卡上选的关（PLAN_MANUAL_RUN M4，
+    # 不带 drops 上限和后备关）；不带 token 是终端排障入口，刷 defaults.json（M6）。
+    base_plan = effective_plan(started, phase)
+    if phase == "now" and manual_token:
+        manual_stage = manual_run_stage(manual_token)
+        if manual_stage is None:
+            report_manual_run_mismatch(config, token, channel_id, manual_token)
+            return 1
+        base_plan["stage"] = manual_stage
+        base_plan["stage_source"] = "discord"
+        base_plan["farming_drops"] = {}
+        base_plan["farming_fallback_stage"] = ""
     plan = attach_sanity_yield(
-        attach_annihilation(effective_plan(started, phase), started, last_run_state),
+        attach_annihilation(base_plan, started, last_run_state),
         config,
         started,
     )
@@ -2071,7 +2139,7 @@ def execute(phase: str) -> int:
 
 
 def main(argv: list[str]) -> int:
-    return execute(select_phase(argv))
+    return execute(select_phase(argv), manual_token_from_argv(argv))
 
 
 if __name__ == "__main__":

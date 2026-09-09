@@ -8,6 +8,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,11 @@ import maa_copilot
 import maa_roguelike
 from maa_common import (
     BUTTONS_PATH,
+    DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES,
     LAST_RUN_PATH,
+    MANUAL_RUN_BUTTON_PREFIX,
+    MANUAL_RUN_PATH,
+    MANUAL_RUN_TTL,
     PLAN_PATH,
     PLAN_PHASES,
     PLAN_SESSION_FIELDS,
@@ -42,7 +47,8 @@ from maa_common import (
 
 STAGE_PATTERN = re.compile(r"^[A-Za-z0-9]{1,8}-\d{1,2}$")
 ACTIVITY_STAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,30}-\d{1,2}$")
-# 场次的中文说法。只有这两个场次能被覆盖；`now` 是手动场，没有覆盖可写（D4）。
+# 场次的中文说法。只有这两个场次能被覆盖；`now` 是手动场，没有覆盖可写——
+# 它的关来自选关卡（`manual_run.json`，PLAN_MANUAL_RUN.md M4），不进 `plan.json`。
 PHASE_LABELS = {"am": "早场（08:00）", "pm": "晚场（22:00）"}
 
 
@@ -235,35 +241,405 @@ def show_plan() -> tuple[bool, str]:
     )
 
 
-def run_now() -> tuple[bool, str]:
-    if is_run_locked():
-        phase, stage = _running_context()
-        return False, f"{phase}已经在跑 {stage}，没有重复启动。"
-    script = SCRIPTS_DIR / "maa_daily.py"
-    if not script.is_file():
-        return False, "maa_daily.py 尚未部署。"
-    config = load_config()
+# ---------------------------------------------------------------------------
+# 手动场（「现在跑」）：先发选关卡，选了才派发，10 分钟不选作废（PLAN_MANUAL_RUN.md）
+# ---------------------------------------------------------------------------
+
+MANUAL_RUN_CARD_TITLE = "🎯 手动场选关"
+MANUAL_RUN_PENDING_TEXT = "计算中…"
+
+
+def manual_run_blackout_reason(
+    config: dict[str, Any], at: datetime | None = None
+) -> str | None:
+    """定时场优先（M10）：距 08:00 / 22:00 不足 N 分钟，手动场不发卡也不派发。
+
+    与 `_copilot_blackout_reason()` 同构但另开配置键：手动日常一场约 14 分钟，
+    加上卡片 10 分钟有效期，默认 30 比抄作业的 25 宽。0 = 关闭。
+    """
+    minutes = max(
+        0,
+        int(config.get("manual_run_blackout_minutes", DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES)),
+    )
+    if minutes == 0:
+        return None
+    now = at or now_beijing()
+    for hour in (8, 22):
+        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if now > target:
+            target = target + timedelta(days=1)
+        if (target - now).total_seconds() / 60 <= minutes:
+            return (
+                f"距 {hour:02d}:00 日常场次不足 {minutes} 分钟，定时场优先，"
+                "请在日常结束后再手动跑。"
+            )
+    return None
+
+
+def _load_manual_run() -> dict[str, Any]:
+    state = load_json(MANUAL_RUN_PATH, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _manual_run_custom_id(token: str) -> str:
+    return f"{MANUAL_RUN_BUTTON_PREFIX}{token}:stage-select"
+
+
+def _manual_run_components(
+    choices: list[list[str]] | list[tuple[str, str, str]],
+    token: str,
+    recommended: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """选关卡的一行下拉 + 它的登记项。
+
+    选项与早晚场卡同源（`maa_plan_card._stage_choices()`，M2），但**没有 `default`**：
+    这张卡的意义就是强制用户选（M1）。值仍是不透明 `choice:N`，argv 写死在登记表里
+    （不变量 #8）。`recommended` 只影响 emoji（🎯 标缺口推荐，M8），不预选。
+    """
+    select_args: dict[str, list[str]] = {}
+    options: list[dict[str, Any]] = []
+    for index, (label, stage, description) in enumerate(choices):
+        value = f"choice:{index}"
+        options.append(
+            {
+                "label": str(label)[:100],
+                "value": value,
+                "description": str(description)[:100],
+                "emoji": {"name": "🎯" if recommended is not None and stage == recommended else "▫️"},
+            }
+        )
+        select_args[value] = ["run", "start", str(stage), token]
+    custom_id = _manual_run_custom_id(token)
+    rows = [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 3,
+                    "custom_id": custom_id,
+                    "placeholder": "🎯 选这次手动场要刷的关（选中即开跑）",
+                    "min_values": 1,
+                    "max_values": 1,
+                    "options": options,
+                }
+            ],
+        }
+    ]
+    entries = {
+        custom_id: {
+            "kind": "exec",
+            "script": "maa_action.py",
+            "select_args": select_args,
+        }
+    }
+    return rows, entries
+
+
+def _manual_run_embed(
+    state: dict[str, Any], *, footer: str = "", color: int = 0x5865F2
+) -> dict[str, Any]:
     try:
-        require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
-    except RuntimeError as exc:
-        return False, f"暂时不能运行：{exc}"
+        deadline = f"{datetime.fromisoformat(str(state.get('expires_at'))):%H:%M}"
+    except (TypeError, ValueError):
+        deadline = "10 分钟"
+    recommendation = str(state.get("recommendation") or MANUAL_RUN_PENDING_TEXT)
+    return {
+        "title": MANUAL_RUN_CARD_TITLE,
+        "description": (
+            "从下拉选一关＝**立刻**开一场手动日常（基建 / 公招 / 商店 / 奖励照跑）。\n"
+            f"不选的话 **{deadline}** 后这张卡作废，要跑得重新说「现在跑」。\n"
+            "手动场不看早晚场卡上的选择；设了跳过也照跑；手动选的关不带掉落上限，打到理智不足为止。"
+        ),
+        "color": color,
+        "fields": [{"name": "缺口推荐", "value": recommendation[:1024], "inline": False}],
+        "footer": {"text": footer or f"{deadline} 前有效 · 定时场前 30 分钟内不接受"},
+        "timestamp": str(state.get("created_at") or now_beijing().isoformat()),
+    }
+
+
+def _manual_run_message_patch(
+    config: dict[str, Any], state: dict[str, Any], payload: dict[str, Any]
+) -> bool:
+    channel_id = str(config.get("channel_id") or "")
+    message_id = str(state.get("message_id") or "")
+    if not channel_id.isdigit() or not message_id.isdigit():
+        return False
+    discord_request(
+        discord_token(),
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message_id}",
+        payload,
+    )
+    return True
+
+
+def _retire_manual_run(
+    config: dict[str, Any], status: str, footer: str
+) -> dict[str, Any] | None:
+    """把当前 `pending` 请求收成 `status`：状态 → 删登记 → 收卡片组件。
+
+    返回收掉的请求（没有 pending 请求返回 None）。Discord PATCH 失败会抛，
+    调用方决定是进回执尾巴还是吞掉——本地登记在抛之前已经删干净。
+    """
+    with state_lock():
+        state = _load_manual_run()
+        if state.get("status") != "pending":
+            return None
+        state["status"] = status
+        state["updated_at"] = now_beijing().isoformat()
+        atomic_write_json(MANUAL_RUN_PATH, state)
+        registry = load_json(BUTTONS_PATH, {})
+        if isinstance(registry, dict):
+            for custom_id in [k for k in registry if k.startswith(MANUAL_RUN_BUTTON_PREFIX)]:
+                registry.pop(custom_id)
+            atomic_write_json(BUTTONS_PATH, registry)
+    _manual_run_message_patch(
+        config,
+        state,
+        {"embeds": [_manual_run_embed(state, footer=footer, color=0x99AAB5)], "components": []},
+    )
+    return state
+
+
+def _spawn_action(args: list[str]) -> None:
+    """派一个脱离会话的 `maa_action.py` 子进程（不受 Hermes exec 的 20s 限制）。"""
     subprocess.Popen(
-        [sys.executable, str(script), "now"],
+        [sys.executable, str(Path(__file__).resolve()), *args],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
     )
+
+
+def _skipped_sessions_note() -> str:
     # 跳过是按场次的（D2），所以这里要逐场看，不能再说「今天设了跳过」。
     skipped = [
         PHASE_LABELS[phase]
         for phase in PLAN_PHASES
         if effective_plan(phase=phase).get("skip")
     ]
-    note = f"（今天的{'、'.join(skipped)}设了跳过，手动场照跑）" if skipped else ""
-    return True, f"▶️ 已派发手动场{note}；后台会自行加锁，开跑消息稍后出现在频道。"
+    return f"（今天的{'、'.join(skipped)}设了跳过，手动场照跑）" if skipped else ""
+
+
+def run_now() -> tuple[bool, str]:
+    """「现在跑」→ 发一张选关卡（M-b）。不开跑；开跑在 `run_start()`。"""
+    from maa_plan_card import _stage_choices
+
+    if is_run_locked():
+        phase, stage = _running_context()
+        return False, f"{phase}已经在跑 {stage}，没有重复启动。"
+    config = load_config()
+    reason = manual_run_blackout_reason(config)
+    if reason:
+        return False, f"⛔ {reason}"
+    script = SCRIPTS_DIR / "maa_daily.py"
+    if not script.is_file():
+        return False, "maa_daily.py 尚未部署。"
+    try:
+        require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
+        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+    except RuntimeError as exc:
+        return False, f"暂时不能运行：{exc}"
+    channel_id = str(config.get("channel_id", "")).strip()
+    if not channel_id.isdigit():
+        return False, "config.json 中尚未配置 Discord channel_id。"
+
+    warning = ""
+    # 先收旧卡（状态 → 登记 → 组件），再写新登记、再发新卡（不变量 #14b）。
+    try:
+        _retire_manual_run(config, "superseded", "已被新的选关卡取代")
+    except Exception as exc:
+        warning = f"；上一张选关卡收起失败：{type(exc).__name__}: {exc}"
+
+    now = now_beijing()
+    token = _new_search_token()
+    choices = [list(choice) for choice in _stage_choices(effective_plan(phase="now"), config)]
+    rows, entries = _manual_run_components(choices, token)
+    state = {
+        "token": token,
+        "status": "pending",
+        "stage": "",
+        "choices": choices,
+        "recommendation": "",
+        "recommended_stage": "",
+        "message_id": "",
+        "created_at": now.isoformat(),
+        "expires_at": (now + MANUAL_RUN_TTL).isoformat(),
+        "updated_at": now.isoformat(),
+    }
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        for custom_id in [k for k in registry if k.startswith(MANUAL_RUN_BUTTON_PREFIX)]:
+            registry.pop(custom_id)
+        registry.update(entries)
+        atomic_write_json(BUTTONS_PATH, registry)
+    message = discord_request(
+        discord_token(),
+        "POST",
+        f"/channels/{channel_id}/messages",
+        {
+            "embeds": [_manual_run_embed(state)],
+            "components": rows,
+            "allowed_mentions": {"parse": []},
+        },
+    )
+    state["message_id"] = str(message.get("id", "")) if isinstance(message, dict) else ""
+    with state_lock():
+        atomic_write_json(MANUAL_RUN_PATH, state)
+    # 过期哨兵（M-d，尽力而为的 UI 清理）与缺口推荐补写（M-g，可能要查森空岛）
+    # 都是脱离会话的子进程，不占这个 20s 进程。
+    _spawn_action(["run", "expire", token, "--after", str(int(MANUAL_RUN_TTL.total_seconds()))])
+    _spawn_action(["run", "recommend", token])
+    deadline = f"{now + MANUAL_RUN_TTL:%H:%M}"
+    return (
+        True,
+        f"🎯 已发手动场选关卡{_skipped_sessions_note()}，从下拉选一关即开跑；"
+        f"{deadline} 前不选就作废{warning}。",
+    )
+
+
+def run_start(stage: str, token: str) -> tuple[bool, str]:
+    """卡上选了关 → 校验 → 派发 `maa_daily.py now <token>`（M-c）。只由登记表触发。"""
+    state = _load_manual_run()
+    if (
+        not maa_copilot.SEARCH_TOKEN_RE.fullmatch(token or "")
+        or state.get("token") != token
+        or state.get("status") != "pending"
+    ):
+        return False, "这张选关卡已失效，请再说一次「现在跑」。"
+    config = load_config()
+    now = now_beijing()
+    try:
+        expires_at = datetime.fromisoformat(str(state.get("expires_at")))
+    except (TypeError, ValueError):
+        expires_at = now - timedelta(seconds=1)
+    if now > expires_at:
+        # 硬闸门：哨兵晚到、adapter 重放、旧登记残留都拦在这里。
+        warning = ""
+        try:
+            _retire_manual_run(config, "expired", "⌛ 已过期，重新说「现在跑」")
+        except Exception as exc:
+            warning = f"（卡片收起失败：{type(exc).__name__}: {exc}）"
+        return False, f"⌛ 这张选关卡已过期（{expires_at:%H:%M}），请再说一次「现在跑」。{warning}"
+    if not valid_stage(stage, config):
+        return False, "关卡不在白名单：只接受常规关卡格式（如 CE-6、1-7）、空串（上次的本）或当前活动关。"
+    if is_run_locked():
+        phase, running = _running_context()
+        return False, f"{phase}已经在跑 {running}，等它结束后再选（这张卡 {expires_at:%H:%M} 前有效）。"
+    reason = manual_run_blackout_reason(config, now)
+    if reason:
+        return False, f"⛔ {reason}"
+    script = SCRIPTS_DIR / "maa_daily.py"
+    if not script.is_file():
+        return False, "maa_daily.py 尚未部署。"
+    try:
+        require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
+        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+    except RuntimeError as exc:
+        return False, f"暂时不能运行：{exc}"
+
+    with state_lock():
+        state = _load_manual_run()
+        if state.get("token") != token or state.get("status") != "pending":
+            return False, "这张选关卡已失效，请再说一次「现在跑」。"
+        state["status"] = "dispatched"
+        state["stage"] = stage
+        state["dispatched_at"] = now.isoformat()
+        state["updated_at"] = now.isoformat()
+        atomic_write_json(MANUAL_RUN_PATH, state)
+        registry = load_json(BUTTONS_PATH, {})
+        if isinstance(registry, dict):
+            for custom_id in [k for k in registry if k.startswith(MANUAL_RUN_BUTTON_PREFIX)]:
+                registry.pop(custom_id)
+            atomic_write_json(BUTTONS_PATH, registry)
+    warning = ""
+    try:
+        _manual_run_message_patch(
+            config,
+            state,
+            {
+                "embeds": [
+                    _manual_run_embed(
+                        state, footer=f"▶️ 已选 {plan_stage_label(state)}，手动场已派发", color=0x57F287
+                    )
+                ],
+                "components": [],
+            },
+        )
+    except Exception as exc:
+        warning = f"；卡片收起失败：{type(exc).__name__}: {exc}"
+    subprocess.Popen(
+        [sys.executable, str(script), "now", token],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return (
+        True,
+        f"▶️ 已派发手动场，刷 {plan_stage_label(state)}（不带掉落上限，打到理智不足为止）"
+        f"{_skipped_sessions_note()}；开跑消息稍后出现在频道{warning}。",
+    )
+
+
+def run_expire(token: str, after: int = 0) -> tuple[bool, str]:
+    """到期收卡（M-d）。幂等：不是这个 token 的 pending 请求、或还没到期，就什么都不做。"""
+    if after > 0:
+        time.sleep(after)
+    state = _load_manual_run()
+    if state.get("token") != token or state.get("status") != "pending":
+        return True, "没有待过期的选关卡。"
+    try:
+        expires_at = datetime.fromisoformat(str(state.get("expires_at")))
+    except (TypeError, ValueError):
+        expires_at = now_beijing()
+    if now_beijing() < expires_at:
+        return True, f"选关卡 {expires_at:%H:%M} 才到期。"
+    config = load_config()
+    retired = _retire_manual_run(config, "expired", "⌛ 已过期，重新说「现在跑」")
+    return True, "⌛ 选关卡已过期并收起。" if retired else "没有待过期的选关卡。"
+
+
+def run_recommend(token: str) -> tuple[bool, str]:
+    """缺口推荐补写（M-g）：算完 PATCH 卡片，只在请求仍 pending 时写回。
+
+    只由 `run_now()` 派发的脱离会话子进程调用；计算链与 07:50 建卡相同（D5 口径）。
+    """
+    from maa_plan_card import auto_stage, current_farming_result, farming_note
+
+    config = load_config()
+    recommended = ""
+    try:
+        result = current_farming_result(effective_plan(phase="now"), config)
+        recommended, why = auto_stage(result)
+        note = farming_note(result)
+        if recommended:
+            text = f"**{recommended}**" + (f" · {why}" if why else "")
+        else:
+            text = f"推荐暂不可用（{why or '缺口算不出来'}）"
+        if note:
+            text = f"{text}\n{note}"
+    except Exception as exc:
+        text = f"推荐暂不可用（{type(exc).__name__}: {exc}）"
+    with state_lock():
+        state = _load_manual_run()
+        if state.get("token") != token or state.get("status") != "pending":
+            return True, "选关卡已不在等待中，推荐不再写回。"
+        state["recommendation"] = text[:1000]
+        state["recommended_stage"] = recommended
+        state["updated_at"] = now_beijing().isoformat()
+        atomic_write_json(MANUAL_RUN_PATH, state)
+    choices = state.get("choices") if isinstance(state.get("choices"), list) else []
+    rows, _entries = _manual_run_components(choices, token, recommended or None)
+    _manual_run_message_patch(
+        config, state, {"embeds": [_manual_run_embed(state)], "components": rows}
+    )
+    return True, f"缺口推荐已写回：{recommended or '暂不可用'}。"
 
 
 def log_tail() -> tuple[bool, str]:
@@ -1029,6 +1405,19 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return show_plan()
     if argv == ["run", "now"]:
         return run_now()
+    if argv[:2] == ["run", "start"] and len(argv) == 4:
+        return run_start(argv[2], argv[3])
+    if argv[:2] == ["run", "expire"] and len(argv) == 3:
+        return run_expire(argv[2])
+    if (
+        argv[:2] == ["run", "expire"]
+        and len(argv) == 5
+        and argv[3] == "--after"
+        and argv[4].isdigit()
+    ):
+        return run_expire(argv[2], int(argv[4]))
+    if argv[:2] == ["run", "recommend"] and len(argv) == 3:
+        return run_recommend(argv[2])
     if argv == ["log", "tail"]:
         return log_tail()
     if argv == ["copilot", "card"]:
@@ -1057,7 +1446,8 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return roguelike_status()
     return False, (
         "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
-        "plan skip-today <on|off> <am|pm>、plan show、run now、log tail、"
+        "plan skip-today <on|off> <am|pm>、plan show、run now、run start <关卡> <token>、"
+        "run expire <token> [--after 秒]、run recommend <token>、log tail、"
         "copilot card/find/cancel/status/mark-cleared/unmark、"
         "roguelike card/set/start/stop/abort/status。"
     )

@@ -1,6 +1,6 @@
 # 开发指南（基于当前代码实现）
 
-面向要改这套东西的人。[PLAN_PHASE4.md](./PLAN_PHASE4.md) 是最近一期（四期，2026-09-09 结项）的设计意图与决策（更早的在 [archive/](./archive/)），[README.md](../README.md) 是功能与落地状态，
+面向要改这套东西的人。[PLAN_MANUAL_RUN.md](./PLAN_MANUAL_RUN.md) 是最近一次改动（手动场选关卡，2026-09-09）的方案；四期及更早的设计意图与决策在 [archive/](./archive/)（[archive/PLAN_PHASE4.md](./archive/PLAN_PHASE4.md) 为四期），[README.md](../README.md) 是功能与落地状态，
 本文只讲**现状的自动化链路是怎么串起来的、改哪里会影响什么**。
 
 ---
@@ -69,7 +69,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/maa_plan_card.py` | 早晚两张计划卡 + 抄作业卡的渲染层；早场卡还先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50（am）/ 21:50（pm）；抄作业卡由 `maa_action.py` 调 | 早场数秒～5 分钟（含 `maa update` / `brew`），晚场数秒 |
 | `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率；**森空岛不可用时顺手跑一趟 `OperBox` 拿练度后备** | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；排目标集合、按理智排一轮 `(关, 模式)`、发「已排程」卡、到点派 `run-batch` | cron 每 15 分钟 | 通常 <1s；要现搜作业时每关 5~20s（每 tick ≤6 关） |
-| `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；`run now` 派发 | 10～50 分钟 |
+| `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；选关卡 `run start` 派发 `now <token>` | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、目标集合、**本地作业记账**（`ledger.json`）、已排程卡 | 被 action/watch/worker/plan_card import | — |
 | `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 手动搜一关并直接排程；`run-batch <token>` **一条执行链**串行连抄一轮 | 仅由 `maa_action.py` / `maa_activity_watch.py` 派发 | 搜索 5~20s；一关 8~15 分钟 |
@@ -538,7 +538,10 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
 | `plan set-stage <关卡> <am\|pm>` | 白名单校验（关卡 + 场次）后写**那一场**的今日覆盖 |
 | `plan skip-today on\|off <am\|pm>` | 写**那一场**的今日覆盖 |
 | `plan show` | 只读，一次念完两场（关、来源、跳不跳） |
-| `run now` | 抢锁探测 → 预检 → `Popen` 派发 `maa_daily.py now` 后立即返回 |
+| `run now` | **不开跑**。抢锁探测 → 拒绝窗（`manual_run_blackout_minutes`，默认 30）→ 预检 → 作废上一张 pending 选关卡 → 发「🎯 手动场选关」卡（选项 = `maa_plan_card._stage_choices()`，无 default）→ 写 `manual_run.json`（`pending`，10 分钟 TTL）→ `Popen` 过期哨兵 + 推荐补写后返回（`PLAN_MANUAL_RUN.md`） |
+| `run start <关卡> <token>` | **只由选关卡登记表触发**。token 匹配且 `pending` 且未过期 → 关卡白名单 → 锁 → 拒绝窗 → 预检 → 状态改 `dispatched` → 删登记 → 收卡 → `Popen maa_daily.py now <token>`。过期就地收卡（硬闸门） |
+| `run expire <token> [--after 秒]` | 过期哨兵（`run now` 派的脱离会话子进程）：睡够后若仍 `pending` 且到期 → `expired` + 删登记 + PATCH 收卡；幂等 |
+| `run recommend <token>` | 推荐补写（同上，脱离会话）：`current_farming_result` → `auto_stage`，仍 `pending` 才 PATCH 卡片写「缺口推荐」并给该选项打 🎯；算不出写「推荐暂不可用」 |
 | `log tail` | 读 `last_run.summary`；若是旧版格式则回读 log 用 `extract_summary` 重建 |
 | `copilot card` | 发抄作业一览卡（§3）。只读本地 + 一次 Discord POST，同步做完 |
 | `copilot find <关卡>` | 写一份 `pending` 搜索并 `Popen` 派 `search` worker（§5.5） |
@@ -649,7 +652,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    直到 900s 超时。Fight 导航链自带 `<前缀>-TarotClose` 这类处理，B 基线因此更稳。
    详见 `docs/spikes/copilot-list-2026-09-08.md`。
 3. **突袭切换 ❌ 2026-09-09 真机验证失败，功能默认关闭**（现场与下次验证清单见
-   `docs/PLAN_PHASE4.md` 的「突袭切换真机验证（2026-09-09）」）。
+   `docs/archive/PLAN_PHASE4.md` 的「突袭切换真机验证（2026-09-09）」）。
    Fight 导航停在的是普通难度详情页，要打突袭得先切过去；MaaCore 自己在
    `MultiCopilotTaskPlugin` 里用 `RaidConfirm` / `ChangeToRaidDifficulty`，这里照抄后者，
    跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。实测：SR-5 导航两段都 Completed，
@@ -944,6 +947,10 @@ maa-cli 0.7.5 的 `Theme` 枚举里**没有 `BlackFlow`**、`mode` 硬校验 `0.
   plan.json       今日覆盖（**按场次**）：{date, sessions: {am: {stage, stage_source,
                   skip, source, updated_at, farming_drops, farming_fallback_stage},
                   pm: {…}}, updated_at}
+  manual_run.json 手动场选关请求（单文件、同一时刻只有一个）：{token, status ∈ pending/
+                  dispatched/expired/superseded, stage, choices, recommendation,
+                  recommended_stage, message_id, created_at, expires_at(+10min), …}
+                  手动关**只经它**传给 `maa_daily.py now <token>`，不进 plan.json
   last_run.json   最近一次运行状态 + threads[] + 资源更新时间戳
   activity_watch.json 当前活动 + 本轮 token + 每关搜索失败退避（stage_state）+
                       idle/searching/waiting/done/scheduled/dispatched/running 状态
@@ -1190,6 +1197,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 51 | **配置里的字符串列表写进任务文件前必须过白名单**：`config.mall_buy_first` / `mall_blacklist` 由 `_mall_item_list()` 逐项过 `SAFE_MALL_ITEM_RE`（中日文 / 拉丁字母 / 数字 / `·`，≤20 字），不合规的项**静默丢弃**而不是抛异常（渲染器抛异常 = 整场日常没得跑）。同理布尔开关走 `_toml_bool()`，只有真正的 `true` 才写 `true`。渲染器不接受任何没校验过的外部字符串——`drops` 的表键早已这么办（`SAFE_ITEM_ID_RE`，不变量 #44） | `maa_daily._mall_item_list()` / `SAFE_MALL_ITEM_RE` / `_toml_bool()` + `AwardAndMallOptionTests` |
 | 52 | **空 `activity_key` 永远不动活动账本**：非活动关（资源本 / 主线）的记账落 `ledger-standalone.json`，`ensure_ledger("")` 既不归档也不新开活动账本，`ledger_path()` 与 `ensure_ledger()` 必须拿同一个 key 算落点。原来空 key 会把当期账本归档 + 新开空账本，下一 tick watcher 再归档回来，真实通关记录散进归档文件 | `maa_copilot.ledger_path()` / `ensure_ledger()` + `maa_copilot_worker._batch_run_locked()` + `LedgerTests.test_a_non_activity_stage_never_archives_the_running_ledger` / `CopilotBatchExecutionTests.test_a_non_activity_round_writes_only_the_standalone_ledger` |
 | 53 | **练度后备快照读不到的字段一律按「不满足」**（fail-closed，D12）：`roster.source == "operbox"` 时技能与模组要求记**硬**缺口。后备只在 `skland_unavailable()` 有话说时才写，落**单独的** `roster-operbox.json`（绝不覆盖森空岛那份），`load_roster()` 取 `fetched_at` 更新的一份，所以森空岛一恢复它就退场。OperBox 失败不得影响 Depot 的库存真值 | `maa_copilot.load_roster()` / `check_op_requirements()` / `maa_depot.skland_unavailable()` / `run_operbox()` + `OperBoxFallbackTests` / `OperBoxRosterTests` |
+| 54 | **手动场只由选关卡派发**（`PLAN_MANUAL_RUN.md`）：「现在跑」只发卡不开跑；`run start <关卡> <token>` 只由登记表触发，token 必须与 `manual_run.json` 匹配、`pending` 且未过期（过期就地收卡，这是硬闸门，过期哨兵只是 UI 清理）；`maa_daily.py now <token>` 再核对一次 `dispatched` + 同 token，对不上不跑、发红色告警。手动关**不进 `plan.json`**（`_today_override()` 只认 am/pm）、不带 drops 上限和后备关。选关卡用 `hermes:btn:maa-now:` 前缀，不在 `hermes:btn:maa:` / `hermes:btn:maa-copilot:` 之下，两趟清扫都碰不到；发新卡顺序同 #14b。定时场优先：距 08:00/22:00 不足 `manual_run_blackout_minutes`（默认 30）既不发卡也不派发。缺口推荐（森空岛查询）只在 `run recommend` 的脱离会话子进程里算，绝不进 20s 的 `run now` / `run start` | `maa_action.run_now()` / `run_start()` / `run_expire()` / `run_recommend()` / `manual_run_blackout_reason()` + `maa_daily.manual_run_stage()` + `ManualRunCardTests` |
 
 ---
 

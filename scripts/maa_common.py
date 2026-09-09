@@ -39,6 +39,17 @@ LAST_RUN_PATH = STATE_DIR / "last_run.json"
 WATCH_PATH = STATE_DIR / "activity_watch.json"
 RUN_LOCK_PATH = STATE_DIR / "run.lock"
 LAST_RUN_LOCK_PATH = STATE_DIR / "last_run.lock"
+# 手动场选关请求（`PLAN_MANUAL_RUN.md` M-a）：单文件、同一时刻只有一个请求。
+# 「现在跑」发一张选关卡并写 `pending`，从卡上选了关才派发 `maa_daily.py now <token>`；
+# 10 分钟不选作废。手动关**不写 `plan.json`**（M4），只经这份文件传给手动场。
+MANUAL_RUN_PATH = STATE_DIR / "manual_run.json"
+MANUAL_RUN_TTL = timedelta(minutes=10)
+# 选关卡自己的登记前缀：不在 `hermes:btn:maa:` 下（07:50 / 21:50 建卡整前缀清扫碰不到），
+# 也不在 `hermes:btn:maa-copilot:` 下（`prune_expired_searches()` 碰不到）。
+MANUAL_RUN_BUTTON_PREFIX = "hermes:btn:maa-now:"
+# 定时场优先（M10）：距 08:00 / 22:00 不足这么多分钟，手动场既不发卡也不派发。
+# 实测一场手动日常约 14 分钟 + 卡片 10 分钟有效期。
+DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES = 30
 
 # Hermes' persistent-button patch intentionally has one global registry. MAA
 # must merge its keys under the same lock used by agent-book.

@@ -88,7 +88,7 @@
 | 08:00 | 按**早场**的计划跑一遍完整日常。频道发「🟡 开跑」，其下开一个子区滚动中文步骤；跑完发战报卡片 + 主界面截图 |
 | 21:50 | 刷新当期活动关 → 发**晚场计划卡**（同样两行控件）。**不跟随上游更新**，早上跟过了 |
 | 22:00 | 按**晚场**的计划跑，任务链完全一致 |
-| 任意时刻 | 点计划卡改**那一场**的关卡／跳过，或说「现在跑」立刻开一场手动日常；说「抄作业」拿一览卡（每关标已通 / 排程 / 练度不满足），从下拉选一关＝**立刻开跑** |
+| 任意时刻 | 点计划卡改**那一场**的关卡／跳过，或说「现在跑」拿一张选关卡、选了关就开一场手动日常（10 分钟不选作废）；说「抄作业」拿一览卡（每关标已通 / 排程 / 练度不满足），从下拉选一关＝**立刻开跑** |
 | 日常开跑前 | 估算理智；不够刷默认关就**跳过刷理智**，剿灭 / 基建 / 公招 / 商店 / 领奖照常（估不出来一律照常刷） |
 
 ## 仓库 ≠ 运行时
@@ -112,7 +112,9 @@
 ### 计划卡（每天两张：07:50 早场 / 21:50 晚场）
 
 **计划是按场次的**：早场卡管 08:00 那场，晚场卡管 22:00 那场。改一场**不影响另一场**，
-说「现在跑」的手动场两场覆盖都不吃，永远走缺口默认关。
+说「现在跑」的手动场两场覆盖都不吃：它先发一张「🎯 手动场选关」卡（选项与早晚场卡同源，
+另附「缺口推荐」），你在卡上选了关才开跑，10 分钟不选作废；距 08:00 / 22:00 不足 30 分钟拒绝（定时场优先）。
+详见 `docs/DISCORD_GUIDE.md`「手动场怎么跑」与 `docs/PLAN_MANUAL_RUN.md`。
 
 每张卡**恰好两行控件**：一个关卡下拉 + 一个「⏭️ 跳过本场 / ▶️ 恢复本场」按钮。
 
@@ -403,7 +405,8 @@ maa_action.py plan set-stage <关卡> <am|pm>     # 「早上刷 CE-6」「晚�
 maa_action.py plan set-stage "" <am|pm>         # 「这场刷上次的本」
 maa_action.py plan skip-today on|off <am|pm>    # 「早场别跑」/「晚上还是跑吧」
 maa_action.py plan show                         # 「今天怎么跑」（一次念完两场）
-maa_action.py run now                           # 「现在跑」（豁免 skip、不吃场次覆盖）
+maa_action.py run now                           # 「现在跑」：只发选关卡（豁免 skip、不吃场次覆盖）
+maa_action.py run start <关卡> <token>           # 选关卡登记表专用：选中即派发 maa_daily.py now <token>
 maa_action.py log tail                          # 「最近怎么了」「看日志」
 maa_action.py copilot card                      # 「抄作业」「有什么关能抄」「打到第几关了」
 maa_action.py copilot find <关卡>               # 「抄 SR-8」——搜到就直接开跑
@@ -481,7 +484,7 @@ maa_action.py roguelike status                  # 「肉鸽到哪了」
 task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]
 ```
 
-**启用前必须真机验一关**（命令级清单在 `docs/PLAN_PHASE4.md` 的
+**启用前必须真机验一关**（命令级清单在 `docs/archive/PLAN_PHASE4.md` 的
 「突袭切换真机验证（2026-09-09）」）：日志里 `[切换突袭难度] … Completed`、
 收尾截图确实停在突袭详情页、那一趟有 `Copilot Completed`、账本 `stages.<关>.raid`
 出现时间戳——四条缺一条就把开关改回 `""`。另外注意：**突袭只在复刻活动里存在**，
@@ -531,8 +534,9 @@ python3 -m unittest discover -s tests -v
 |---|---|
 | [docs/DISCORD_GUIDE.md](./docs/DISCORD_GUIDE.md) | **面向使用者**：频道里会自动发生什么、能点什么、能说什么 |
 | [docs/DEV_GUIDE.md](./docs/DEV_GUIDE.md) | **现状的链路怎么串起来、改哪里影响什么**。§8 是不可破坏的不变量，§10 是「症状 → 看哪里」，§11 是 18 条踩坑记录 |
-| [docs/PLAN_PHASE4.md](./docs/PLAN_PHASE4.md) | **四期（2026-09-09 结项）**：22 条决策、地基事实、步骤 0~5 交付记录、spike 与真机验证结论、遗留缺口清单 |
+| [docs/PLAN_MANUAL_RUN.md](./docs/PLAN_MANUAL_RUN.md) | **手动场选关卡（2026-09-09）**：「现在跑」先发选关卡、选了才跑、10 分钟作废、定时场优先；决策 M1~M10 与验收清单 |
 | [docs/spikes/](./docs/spikes) | 三份实测报告：`copilot_list` 真机、一图流 / 企鹅物流数据源、肉鸽上游参数 |
+| [docs/archive/PLAN_PHASE4.md](./docs/archive/PLAN_PHASE4.md) | （归档）**四期（2026-09-09 结项）**：22 条决策、地基事实、步骤 0~5 交付记录、spike 与真机验证结论、遗留缺口清单；D4 已被手动场选关卡改写 |
 | [docs/archive/PLAN.md](./docs/archive/PLAN.md) | （归档）一期的设计意图与决策表 |
 | [docs/archive/PLAN_PHASE2.md](./docs/archive/PLAN_PHASE2.md) | （归档）二期（prts.plus 抄作业）方案 |
 | [docs/archive/PLAN_NAV_GATE.md](./docs/archive/PLAN_NAV_GATE.md) | （归档）导航闸门 + 自动任务模拟器探测的实测记录 |
