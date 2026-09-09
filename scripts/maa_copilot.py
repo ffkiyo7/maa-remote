@@ -977,6 +977,60 @@ def record_copilot_attempt(
     return ledger
 
 
+MANUAL_MARK_DETAIL = "手动标记：用户自己打过"
+
+
+def mark_stage_cleared(
+    ledger: dict[str, Any],
+    stage: str,
+    modes: Iterable[str],
+    *,
+    at: datetime | None = None,
+) -> list[str]:
+    """用户自己打过的关，手动写进账本；返回**这次真正补上的模式**。
+
+    2026-09-09 的教训：SR-5/6/7/8 用户手打通了，但「已通关」只认本地记账与森空岛
+    zone 全清（D10），手动通关没有任何渠道进账本，`act54side_zone1` 又是 10/11
+    没全清，于是第一轮把四关原样重抄了一遍。硬编码的 `SEED_CLEARED_NORMAL` 只救
+    得了 SR 这一期，下个活动还会重演——这就是那条缺掉的写路径。
+
+    只补空位：已有时间戳的模式原样保留（与 `seed_ledger()` 同一条铁律），
+    所以重复标记是幂等的。`attempts` 追加一条 `won`——**必须是 `won`**，
+    `attempts_today()` 把所有非 `won` 都算成当天失败次数，写成别的 outcome
+    会让这一关平白吃掉当日上限。
+    """
+    entry = ledger_stage(ledger, stage)
+    moment = (at or now_beijing()).isoformat()
+    marked: list[str] = []
+    for mode in modes:
+        if mode not in ("normal", "raid") or entry.get(mode):
+            continue
+        entry[mode] = moment
+        entry["attempts"].append(
+            {"at": moment, "mode": mode, "op": 0, "outcome": "won", "detail": MANUAL_MARK_DETAIL}
+        )
+        marked.append(mode)
+    del entry["attempts"][:-LEDGER_ATTEMPT_LIMIT]
+    return marked
+
+
+def unmark_stage_cleared(ledger: dict[str, Any], stage: str) -> list[str]:
+    """撤销一关的通关时间戳（普通 + 突袭都清），返回被清掉的模式。
+
+    标错了要能改回来：账本一旦写成「通关」这一关就永远不再排（`maa_clearing` 里
+    反复强调的那条），没有撤销入口等于逼人手改 JSON。`attempts` 历史原样保留——
+    它是记录，不是判据。
+    """
+    stages = ledger.get("stages")
+    entry = stages.get(stage) if isinstance(stages, dict) else None
+    if not isinstance(entry, dict):
+        return []
+    cleared = [mode for mode in ("normal", "raid") if entry.get(mode)]
+    for mode in cleared:
+        entry[mode] = None
+    return cleared
+
+
 DEFAULT_DAILY_ATTEMPT_CAP = 2
 
 

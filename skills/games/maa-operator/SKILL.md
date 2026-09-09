@@ -71,6 +71,8 @@ python3 ~/.hermes/scripts/maa_action.py copilot card
 python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
 python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
+python3 ~/.hermes/scripts/maa_action.py copilot mark-cleared <关卡> [normal|raid|all]
+python3 ~/.hermes/scripts/maa_action.py copilot unmark <关卡>
 python3 ~/.hermes/scripts/maa_action.py roguelike card
 python3 ~/.hermes/scripts/maa_action.py roguelike stop
 python3 ~/.hermes/scripts/maa_action.py roguelike abort
@@ -104,6 +106,10 @@ token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑�
 - “这一轮到哪了” → `copilot status <token>`（token 来自「已排程」卡）
 - “不抄了 / 取消这轮” → 「已排程」卡上的 ❌ 按钮（`copilot cancel`）
 - “再打一遍 SR-6” → `copilot find SR-6`，已通的关也允许重打
+- “SR-7 我自己打过了 / 别再抄 SR-7 / 这关我手动通了” → `copilot mark-cleared SR-7`
+  （写进账本，自动排轮从此跳过；不传模式就按当前规则取要打的模式，用户明说
+  「突袭也打过了」才加 `all`）。**用户没说打过的关不要替他标**——标错等于永远漏抄。
+- “标错了 / SR-7 其实没打过” → `copilot unmark SR-7`（撤销记账，下一轮重新考虑）
 - 「🤖 自动作业已排程」卡 → 不需要用户确认，到点自己跑；不能把“已排程”说成“已完成”，
   最终状态只认随后那条战报。
 - 战报里某关 ❌ → 不要建议立刻重试；下一轮 watcher 会按退避自己再试，

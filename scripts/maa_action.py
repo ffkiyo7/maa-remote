@@ -569,6 +569,76 @@ def copilot_find(stage: str) -> tuple[bool, str]:
     return ok, message
 
 
+MARK_MODE_ARGS = {"normal": ("normal",), "raid": ("raid",), "all": ("normal", "raid")}
+
+
+def _ledger_target(stage: str) -> tuple[str, str, str, dict[str, Any]] | str:
+    """`(关卡代号, 活动 key, 活动前缀, config)`，或一句拒绝理由。
+
+    活动 key 的取法与 `start_copilot_search()` 完全一致：当期活动关落活动账本，
+    非活动关（主线 / 资源本）落 `ledger-standalone.json`。取错文件就等于写进
+    一本没人读的账。
+    """
+    config = load_config()
+    resolved = valid_copilot_stage(stage, config)
+    if resolved is None:
+        return f"关卡 {stage[:40]} 不在本地关卡索引里；只接受当期活动关、主线或资源关。"
+    _stage_id, code = resolved
+    activity_key = str(load_json(WATCH_PATH, {}).get("activity_key") or "")
+    prefix = maa_copilot._activity_prefix(activity_key)
+    if not (prefix and code.startswith(f"{prefix}-")):
+        activity_key = ""
+    return code, activity_key, prefix, config
+
+
+def copilot_mark_cleared(stage: str, mode_arg: str = "") -> tuple[bool, str]:
+    """「SR-7 我自己打过了」→ 写进账本，自动排轮从此跳过这一关。
+
+    不传模式时按 D7 取这一关**要打的模式**（突袭功能关着就只有普通）；
+    `normal` / `raid` / `all` 可以指定。只补空位，重复标记幂等。
+    """
+    target = _ledger_target(stage)
+    if isinstance(target, str):
+        return False, target
+    code, activity_key, prefix, config = target
+    import maa_clearing
+
+    mode_key = str(mode_arg or "").strip().lower()
+    if mode_key and mode_key not in MARK_MODE_ARGS:
+        return False, "模式只接受 normal / raid / all，不传则按当前规则取这一关要打的模式。"
+    modes = MARK_MODE_ARGS.get(mode_key) or maa_clearing.required_modes(code, prefix, config)
+    with state_lock():
+        ledger, _note = maa_copilot.ensure_ledger(activity_key)
+        marked = maa_copilot.mark_stage_cleared(ledger, code, modes)
+        if marked:
+            maa_copilot.save_ledger(ledger, maa_copilot.ledger_path(activity_key))
+    labels = "、".join(
+        maa_clearing.entry_label(maa_clearing.make_entry(code, mode)) for mode in marked
+    )
+    if not marked:
+        return True, f"ℹ️ {code} 账本里已经记着通关了，没有改动。"
+    return True, (
+        f"✅ 已把 {labels} 记为手动通关；自动抄作业不再排这一关，"
+        f"抄作业卡上会显示 ✅ 已通。标错了可用 `copilot unmark {code}` 撤销。"
+    )
+
+
+def copilot_unmark(stage: str) -> tuple[bool, str]:
+    """撤销某关的通关记账（普通 + 突袭），下一轮自动排轮会重新考虑它。"""
+    target = _ledger_target(stage)
+    if isinstance(target, str):
+        return False, target
+    code, activity_key, _prefix, _config = target
+    with state_lock():
+        ledger = maa_copilot.load_ledger(maa_copilot.ledger_path(activity_key))
+        cleared = maa_copilot.unmark_stage_cleared(ledger, code) if ledger else []
+        if cleared:
+            maa_copilot.save_ledger(ledger, maa_copilot.ledger_path(activity_key))
+    if not cleared:
+        return True, f"ℹ️ {code} 账本里本来就没有通关记录，没有改动。"
+    return True, f"↩️ 已撤销 {code} 的通关记账（{'、'.join(cleared)}）；下一轮自动排轮会重新考虑它。"
+
+
 def _copilot_card_components(
     options: list[tuple[str, str, str]],
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -969,6 +1039,10 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return copilot_cancel(argv[2])
     if argv[:2] == ["copilot", "status"] and len(argv) == 3:
         return copilot_status(argv[2])
+    if argv[:2] == ["copilot", "mark-cleared"] and len(argv) in (3, 4):
+        return copilot_mark_cleared(argv[2], argv[3] if len(argv) == 4 else "")
+    if argv[:2] == ["copilot", "unmark"] and len(argv) == 3:
+        return copilot_unmark(argv[2])
     if argv == ["roguelike", "card"]:
         return roguelike_card()
     if argv[:2] == ["roguelike", "set"] and len(argv) == 4:
@@ -984,7 +1058,7 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
     return False, (
         "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
         "plan skip-today <on|off> <am|pm>、plan show、run now、log tail、"
-        "copilot card/find/cancel/status、"
+        "copilot card/find/cancel/status/mark-cleared/unmark、"
         "roguelike card/set/start/stop/abort/status。"
     )
 

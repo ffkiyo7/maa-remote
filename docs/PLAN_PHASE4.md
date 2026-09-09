@@ -8,7 +8,7 @@
 > **本文的线上快照会过期。** 每步开工第一件事是按 `archive/PLAN_CLEARING.md` 全局护栏 9 对一遍现场；
 > 对不上就以现场为准并回报。本文写于 2026-09-08 深夜。
 
-> **状态（2026-09-09 05:30）**：步骤 0~5 已全部交付并部署（commit `560da38`…`6df489a`）。真机待验项见「Spike 结论」下的真机验证小节；已知缺口：突袭功能默认关闭、`copilot_list` 挂起、EX 关理智无数据源、肉鸽未真机跑过。
+> **状态（2026-09-09 结项）**：步骤 0~5 已全部交付并部署（commit `560da38`…`6df489a`），当日两个线上缺陷（手动通关重抄、抄完杀游戏导致代理指挥未解锁）已修并真机验证。四期到此结项；遗留缺口不再在本文推进，列在这里备查：突袭功能默认关闭（首次开放的 SideStory 可能本来就没有突袭）、`copilot_list` 挂起、EX 关理智无数据源、肉鸽未真机跑过、抄作业收尾停在结算页不回主界面（已验证无害）。
 
 ## 进度
 
@@ -48,7 +48,7 @@
 | D7 | **活动数字关一律 `--raid both`**（先普通后突袭），作业匹配也按「同一份作业普通 + 突袭都打」考虑；资源本 / 主线只普通（它们没有突袭）。**突袭失败则该关不记为通关** |
 | D8 | 自动匹配只针对**上游写了导航定义**的活动关（`Stages/<前缀>.json` 顶层键），常驻关不自动匹配；上游没导航的关不自动抄、不自动进（`PLAN_CLEARING` 步骤 2 的决策不变） |
 | D9 | EX / S 关**不因为「还没开放」就不去匹配**：上游没有单关开放时间（见地基事实 E），按「活动进行中 + 该关已出现在本地索引与导航键 + 森空岛 zone `totalStage > 0`」判定，每轮重试 |
-| D10 | 已通关判定 = **森空岛 zone 全清 + 本地记账**（森空岛只有 zone 粒度，这是妥协；代价是用户手打过的关可能被再抄一遍，用户接受） |
+| D10 | 已通关判定 = **森空岛 zone 全清 + 本地记账**（森空岛只有 zone 粒度，这是妥协；代价是用户手打过的关可能被再抄一遍，用户接受）。**09-09 修正**：这个代价真的付了一次（SR-5/6/7/8 重抄，见「手动通关重抄」小节），补了 `copilot mark-cleared <关卡>` / `copilot unmark <关卡>` 让用户把手打过的关写进账本 |
 | D11 | 自动匹配**静默执行 + 事后汇报**，不等确认；理智不够就排到理智够的时刻执行；执行后若理智不够跑默认关，日常跳过刷理智、其余环节照常 |
 | D12 | **练度不满足的关自动跳过**，绝不用助战、绝不 `--ignore-requirements`（借了助战之后这关不能开代理，以后日常刷到它会执行不了） |
 | D13 | 手动抄作业**不降级**：森空岛刷新失败直接报失败；同样不允许助战 / `--ignore-requirements` |
@@ -206,7 +206,7 @@
 
 ### 允许改动的文件
 
-已在工作区的那几个；`docs/DEV_GUIDE.md`；`docs/PLAN_CLEARING.md`（只改批注）。
+已在工作区的那几个；`docs/DEV_GUIDE.md`；`docs/archive/PLAN_CLEARING.md`（当时还在 `docs/` 下；只改批注）。
 
 ### 禁止触碰
 
@@ -363,6 +363,10 @@ D6（执行部分）、D7 ~ D16、D20。做完之后：活动上线 → watcher 
 - `activity_key` 变化（新活动 / 复刻）→ 归档到 `ledger-<key>.json`，新开一份。
 - 「已通关」判定（D10）= 本地记账所需模式齐全 **或** 森空岛该关所属 zone `clearedStage == totalStage`（zone 全清）。
   `zone_progress_warning()` 那条单向启发**不参与**，也不合并（`PLAN_CLEARING` 不变量 #29 的精神）。
+- （09-09 补）**用户手打过的关**：`maa_action.py copilot mark-cleared <关卡> [normal|raid|all]` 写入
+  `maa_copilot.mark_stage_cleared()`——只补空位、`attempts` 追加一条 `won`（非 `won` 会被 `attempts_today()`
+  算成当天失败），活动关落 `ledger.json`、非活动关落 `ledger-standalone.json`；`copilot unmark <关卡>` 清掉
+  `normal` / `raid` 时间戳但保留 `attempts`。硬编码种子 `SEED_CLEARED_NORMAL` 只救 SR 这一期，以后靠这条入口。
 
 **2b. 目标集合与顺序（`maa_activity_watch.py`）**
 
@@ -747,6 +751,52 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/maa/copilot/le
 `copilot_list` 的条目有意义），跳过切换打完会把**普通难度**记成一次突袭通关。
 现在：`required_modes()` 不再产生 `raid` 条目 → worker `_batch_run_locked()` 再兜一道判 `skipped` →
 `switch_to_raid()` 直接拒绝。仓库种子已改成 `""`（D22：验不过就退回只打普通）。
+
+### 手动通关重抄（2026-09-09 03:00–05:02）—— D10 的代价兑现了一次，已补写路径
+
+用户手打通了 SR-5/6/7/8，SR 上线后第一轮照样全抄。账本 `copilot/ledger.json` 现场：
+
+| 关 | 自动抄的时间 | 各自的原因 |
+|---|---|---|
+| SR-5 | 03:06、03:35、04:06 普通；05:02 突袭 `failed` | 种子没种上 + 30 分钟退避重排 + 突袭当时还开着 |
+| SR-6 | 03:09、03:39、04:09 | 同上 |
+| SR-7 | 03:42 | 不在 `SEED_CLEARED_NORMAL` 里，账本无记录 |
+| SR-8 | 03:47 | 种子没种上 |
+
+三个叠加的原因，前两个当天已修：
+
+1. **手动通关没有渠道进账本**（结构性）。「已通关」只认本地记账与 zone 全清，森空岛 `act54side_zone1` 是 10/11 没全清，
+   整个活动这条判据都不会生效。→ 补 `copilot mark-cleared` / `copilot unmark`（见 2a），SKILL.md 与 DISCORD_GUIDE 同步。
+2. **种子没种上**：02:23「墟」复刻（`|AT`）先建了账，03:00 走「归档 + 新开」时 `ledger is not None`，种子一次没跑。→ `2434d42` 改按 `seeded` 标记补。
+3. **30 分钟退避重排**：`unknown` 退避一到就重排。→ 同一 commit 加 `auto_copilot_max_attempts_per_day = 2`。
+4. **突袭**：05:26 `6df489a` 把 `copilot_raid_switch_task` 默认清空。
+
+### SR-8 三星但代理指挥未解锁（2026-09-09 08:02 早场）—— 抄完直接杀游戏，结算流程被掐断
+
+**现场**：早场日常刷 SR-8，导航成功（08:02:39 OCR 认到 SR-8），`UsePrts.png` 点了 10 次
+`UsePrtsSuccessCheck` 都没亮，08:03:03 `Fight Error`，一颗理智没花；MaaCore 接着把基建 / 公招 /
+商店 / 奖励跑完。游戏里 SR-8 显示三星、「代理指挥」带锁。
+
+**排除「借了助战」**（asst.log 两场 SR-8 抄作业，09-08 15:18 与 09-09 03:43）：`append_task Copilot`
+参数 `formation: true`，无 `support_unit_usage`（maa-cli 默认 0 = 不用助战）；`BattleFormationSelected`
+8 个位置全是自己的干员（黍填「奶盾」组）；日志里的 `BattleQuickFormationRole-Support` 是快速编队的
+职业筛选「辅助」页签，真借助战走的是 `BattleSupportUnitFormation`，两场都没出现。
+
+**根因（推断，待真机验）**：两场都是 `Copilot Completed` 后 **5 秒** `CloseDown/StopGameTask`，
+收尾截图（`runs/2026-09-08-copilot-9e14e500ac25.png`、`2026-09-09-copilot-fda56c1811ba.png`）
+都停在战后剧情页（右上「自动 OFF / 跳过 ▶」）。三星在战斗结束时就记上了，代理记录要等结算流程走完。
+
+**修法**（同日）：① worker 每关打完先 `settle_after_battle()`（跳过剧情 + 返回主界面）再退游戏，
+见 DEV_GUIDE §5.5 关键事实 11；② 日常 runner 主关 Fight 空跑失败时改刷 `farming_fallback_stage`
+（`fight_failed_dry()` / `_fallback_fight_run()`），见 DEV_GUIDE §11.13。
+
+**真机验证 ✅（09-09 08:59，手动 `copilot find SR-8`，`runs/2026-09-09-copilot-71bfa8404dbe.log`）**：
+剧情又放了一遍（昨天没看完，游戏没记成已看）→ 「跳过」与确认框都点到 → 进结算页 → **代理指挥解锁**。
+两段收尾任务都报 Error：第一段等上游 `EndOfPlot` 白等 20 轮（跳过后直接进结算页，没有剧情结束画面），
+第二段主界面任务不认结算页。推断坐实：**代理记录在结算页落库，昨天两次都没到结算页**。
+收口（同日）：跳过链派生一份、确认后 `next` 清空，两段任一 Completed 即算收尾成功，措辞改中性；
+结算页本身不处理（多关连抄由下一关 `StartUp` 处理，最后一关停在结算页被关掉已验证无害）。
+「跳过剧情后先处理结算页再回主界面」的完整版**不做**，触发条件与坑见 DEV_GUIDE 关键事实 11。
 
 ### spike B — 一图流活动日历 / 物品价值接口 ✅（2026-09-08 23:35 实测，报告全文在当晚 scratchpad `research_yituliu.md`，要点如下）
 

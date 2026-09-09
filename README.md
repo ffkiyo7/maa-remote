@@ -531,7 +531,7 @@ python3 -m unittest discover -s tests -v
 |---|---|
 | [docs/DISCORD_GUIDE.md](./docs/DISCORD_GUIDE.md) | **面向使用者**：频道里会自动发生什么、能点什么、能说什么 |
 | [docs/DEV_GUIDE.md](./docs/DEV_GUIDE.md) | **现状的链路怎么串起来、改哪里影响什么**。§8 是不可破坏的不变量，§10 是「症状 → 看哪里」，§11 是 18 条踩坑记录 |
-| [docs/PLAN_PHASE4.md](./docs/PLAN_PHASE4.md) | **四期（当前）**：22 条决策、地基事实、步骤 0~5 交付记录、spike 与真机验证结论 |
+| [docs/PLAN_PHASE4.md](./docs/PLAN_PHASE4.md) | **四期（2026-09-09 结项）**：22 条决策、地基事实、步骤 0~5 交付记录、spike 与真机验证结论、遗留缺口清单 |
 | [docs/spikes/](./docs/spikes) | 三份实测报告：`copilot_list` 真机、一图流 / 企鹅物流数据源、肉鸽上游参数 |
 | [docs/archive/PLAN.md](./docs/archive/PLAN.md) | （归档）一期的设计意图与决策表 |
 | [docs/archive/PLAN_PHASE2.md](./docs/archive/PLAN_PHASE2.md) | （归档）二期（prts.plus 抄作业）方案 |

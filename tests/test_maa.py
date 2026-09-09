@@ -2040,6 +2040,153 @@ class SalvageTests(unittest.TestCase):
         self.assertIn("🏠 返回主界面：✅ 完成", summary)
 
 
+# 2026-09-09 08:02 早场的真实汇总段：SR-8 代理指挥未解锁，Fight 一颗理智没花就 Error，
+# MaaCore 接着把其余链条跑完了。`farming_fallback_stage = SR-7` 躺在计划里没人用。
+DRY_FIGHT_ERROR_LOG = [
+    "StartUp Completed",
+    "Fight Start",
+    "Current sanity: 116/207",
+    "Mission started (1 times, use 25 sanity)",
+    "Drops: 初级作战记录 × 9, 合成玉 × 320, 声望 × 240, 理智 × 1, 龙门币 × 240",
+    "Fight Completed",
+    "Fight Start",
+    "Fight Error",
+    "Infrast Completed",
+    "Recruit Completed",
+    "Mall Completed",
+    "Award Completed",
+    "Custom Completed",
+    "[启动国服] 08:01:08 - 08:01:39 (30s) Completed",
+    "[每日剿灭] 08:01:39 - 08:02:06 (26s) Completed",
+    "Fight 拉特兰 1 times, drops:",
+    "1. 初级作战记录 × 9, 合成玉 × 320, 声望 × 240, 理智 × 1, 龙门币 × 240",
+    "[刷理智] 08:02:07 - 08:03:03 (56s) Error",
+    "[基建换班] 08:03:04 - 08:11:05 (8m 1s) Completed",
+    "[公开招募] 08:11:06 - 08:12:01 (55s) Completed",
+    "[信用商店] 08:12:02 - 08:13:53 (1m 51s) Completed",
+    "[领取奖励] 08:13:54 - 08:14:28 (34s) Completed",
+    "[返回主界面] 08:14:29 - 08:14:29 (0s) Completed",
+    "Error: Some error occurred during running task!",
+]
+
+
+class FightFallbackTests(unittest.TestCase):
+    """主关空跑失败 → 改刷后备关（2026-09-09 早场 SR-8 的教训）。"""
+
+    def _plan(self, **extra):
+        return maa_common.normalize_plan({
+            "stage": "SR-8", "farming_fallback_stage": "SR-7", "stage_source": "auto", **extra,
+        })
+
+    def test_the_real_morning_log_reads_as_a_dry_failure(self) -> None:
+        self.assertTrue(maa_daily.fight_failed_dry(DRY_FIGHT_ERROR_LOG))
+
+    def test_a_failure_after_real_battles_is_not_dry(self) -> None:
+        lines = list(DRY_FIGHT_ERROR_LOG)
+        idx = lines.index("[刷理智] 08:02:07 - 08:03:03 (56s) Error")
+        lines[idx + 1:idx + 1] = ["Fight SR-8 2 times, drops:", "1. 龙门币 × 400"]
+        self.assertFalse(maa_daily.fight_failed_dry(lines))
+
+    def test_a_completed_fight_or_a_second_block_is_not_dry(self) -> None:
+        completed = [l.replace("(56s) Error", "(5m) Completed") for l in DRY_FIGHT_ERROR_LOG]
+        self.assertFalse(maa_daily.fight_failed_dry(completed))
+        with_second = DRY_FIGHT_ERROR_LOG + ["[刷理智·续] 08:20 - 08:30 Completed"]
+        self.assertFalse(maa_daily.fight_failed_dry(with_second))
+        self.assertFalse(maa_daily.fight_failed_dry(["StartUp Completed"]))
+
+    def test_the_fallback_plan_keeps_only_the_fight_on_the_spare_stage(self) -> None:
+        plan = self._plan()
+        retry = maa_daily.fallback_fight_plan(plan)
+        assert retry is not None
+        self.assertEqual(retry["stage"], "SR-7")
+        self.assertTrue(retry["tasks"]["fight"])
+        for key in ("infrast", "recruit", "mall", "award"):
+            self.assertFalse(retry["tasks"][key])
+        self.assertFalse(retry["annihilation"])
+        toml = maa_daily.render_daily_toml(retry, {})
+        self.assertIn('name = "刷理智·续"', toml)
+        self.assertIn('stage = "SR-7"', toml)
+        self.assertNotIn('name = "刷理智"\n', toml)
+        self.assertNotIn("每日剿灭", toml)
+        self.assertNotIn("drops", toml)
+        self.assertNotIn("基建换班", toml)
+        # 原计划原封不动：它还要进快照和战报。
+        self.assertEqual(plan["stage"], "SR-8")
+        self.assertTrue(plan["tasks"]["infrast"])
+
+    def test_no_fallback_without_a_distinct_spare_stage(self) -> None:
+        self.assertIsNone(maa_daily.fallback_fight_plan(self._plan(farming_fallback_stage="")))
+        self.assertIsNone(maa_daily.fallback_fight_plan(self._plan(farming_fallback_stage="SR-8")))
+        let_way = self._plan()
+        let_way["farming"] = False  # 理智让路那一场本来就没有刷理智
+        self.assertIsNone(maa_daily.fallback_fight_plan(let_way))
+        off = self._plan()
+        off["tasks"]["fight"] = False
+        self.assertIsNone(maa_daily.fallback_fight_plan(off))
+
+    def test_the_fallback_run_respects_the_switch_and_the_budget(self) -> None:
+        for config, elapsed, note in (
+            ({"fight_fallback_on_error": False}, 0, ""),
+            ({"maa_run_timeout": 3000}, 2900, "跳过后备关补跑"),
+        ):
+            with self.subTest(config=config), patch.object(maa_daily, "run_maa") as runner:
+                code, _out, err = maa_daily._fallback_fight_run(
+                    config=config, plan=self._plan(), task_path=Path("/nonexistent/daily.toml"),
+                    log_path=Path("/nonexistent/fallback.log"), token="t", thread_id="1",
+                    progress_message_id="2", carry_lines=[], elapsed=elapsed,
+                )
+            runner.assert_not_called()
+            self.assertIsNone(code)
+            if note:
+                self.assertIn(note, err[0])
+            else:
+                self.assertEqual(err, [])
+
+    def test_the_fallback_run_writes_the_toml_and_reuses_the_leftover_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            task_path = Path(raw) / "daily.toml"
+            with patch.object(
+                maa_daily, "run_maa",
+                return_value=(0, ["[刷理智·续] 08:20 - 08:30 Completed", "Fight SR-7 3 times, drops:"], []),
+            ) as runner:
+                code, out, err = maa_daily._fallback_fight_run(
+                    config={"maa_run_timeout": 3000}, plan=self._plan(), task_path=task_path,
+                    log_path=Path(raw) / "fallback.log", token="t", thread_id="1",
+                    progress_message_id="2", carry_lines=["Fight Error"], elapsed=900,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(len(out), 2)
+            self.assertIn("已改刷后备关 SR-7", err[0])
+            self.assertEqual(runner.call_args.kwargs["timeout"], 2100)
+            self.assertEqual(runner.call_args.kwargs["carry_lines"], ["Fight Error"])
+            self.assertTrue(runner.call_args.args[5]["fallback_run"])
+            written = task_path.read_text(encoding="utf-8")
+            self.assertIn('stage = "SR-7"', written)
+            self.assertNotIn("基建换班", written)
+
+    def test_the_summary_shows_the_dry_failure_and_the_spare_stage_result(self) -> None:
+        merged = DRY_FIGHT_ERROR_LOG + [
+            "Fight Start",
+            "Mission started (3 times, use 63 sanity)",
+            "Drops: 龙门币 × 900",
+            "Fight Completed",
+            "[刷理智·续] 08:20:00 - 08:30:00 (10m) Completed",
+            "Fight SR-7 3 times, drops:",
+            "1. 龙门币 × 900",
+        ]
+        summary = maa_daily.extract_summary(
+            merged, [], plan=self._plan(), ok=True, home_verified=True,
+        )
+        self.assertIn("⚔️ 刷理智：❌ 未完成（关卡 SR-8；未消耗理智，已改刷后备关 SR-7", summary)
+        self.assertIn("⚔️ 刷理智·续：✅ 完成（关卡 SR-7；3 次", summary)
+        # 没补跑时只说「未消耗理智」，不许假装刷了后备关。
+        alone = maa_daily.extract_summary(
+            DRY_FIGHT_ERROR_LOG, [], plan=self._plan(), ok=False, home_verified=True,
+        )
+        self.assertIn("关卡 SR-8；未消耗理智；", alone)
+        self.assertNotIn("已改刷后备关", alone)
+
+
 class RetentionTests(unittest.TestCase):
     def test_cleanup_only_removes_old_regular_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -5153,12 +5300,17 @@ class CopilotBatchExecutionTests(unittest.TestCase):
         }
 
     def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None, ledger_dir=None,
-             config=None):
+             config=None, settle=None):
         import maa_copilot_worker as worker
 
         token = "a" * 12
         ledger = maa_copilot.new_ledger(activity_key)
         reports: list[dict] = []
+        settled: list[str] = []
+
+        def default_settle(_config, stage, _env, _log):
+            settled.append(stage)
+            return True, ""
         # `ledger_dir` 打开的是**真的记账**（账本落在这个目录里），用来验证 worker
         # 把哪一份账本写到了哪个文件；其余用例只关心内存里的账本。
         ledger_patches = (
@@ -5210,6 +5362,7 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 patch.object(worker, "_recheck_before_stage", return_value=(True, "")),
                 *ledger_patches,
                 patch.object(worker, "_fight_one", side_effect=fight),
+                patch.object(worker, "settle_after_battle", side_effect=settle or default_settle),
                 patch.object(
                     worker, "_post_report",
                     side_effect=lambda config, embed, png: reports.append(embed),
@@ -5225,8 +5378,31 @@ class CopilotBatchExecutionTests(unittest.TestCase):
             final = json.loads((searches / f"{token}.json").read_text("utf-8"))
         return SimpleNamespace(
             code=code, ledger=ledger, report=reports[0], state=final,
-            results=reports[0]["fields"][0]["value"],
+            results=reports[0]["fields"][0]["value"], settled=settled,
         )
+
+    def test_every_fought_stage_is_settled_before_moving_on(self) -> None:
+        """打过就要收尾（跳剧情 + 回主界面），导航失败的不收尾——它没进过战斗。
+
+        2026-09-09：SR-8 两次 `Copilot Completed` 之后 5 秒就 closedown，截图停在
+        战后剧情页，三星记上了、代理指挥没解锁，早场日常因此空跑一场。
+        """
+        entries = [self._entry("SR-5"), self._entry("SR-6"), self._entry("SR-8")]
+        outcomes = iter([("won", ""), ("failed", "撤退"), ("nav", "SR-8 导航失败")])
+        result = self._run(entries, lambda *a: next(outcomes))
+        self.assertEqual(result.settled, ["SR-5", "SR-6"])
+
+    def test_a_failed_settle_is_reported_but_does_not_change_the_verdict(self) -> None:
+        entries = [self._entry("SR-8")]
+        result = self._run(
+            entries, lambda *a: ("won", ""),
+            settle=lambda *a: (False, "SR-8 战后未回到主界面：x"),
+        )
+        self.assertEqual(result.code, 0)
+        self.assertIn("✅ `SR-8` — SR-8 战后未回到主界面", result.results)
+        # 记账照记通关：收尾失败是收尾的事，不是这一关没打赢。
+        self.assertTrue(result.ledger["stages"]["SR-8"]["normal"])
+        self.assertIn("战后未回到主界面", result.ledger["stages"]["SR-8"]["attempts"][-1]["detail"])
 
     def test_a_clean_round_records_every_mode_and_reports_each_stage(self) -> None:
         entries = [self._entry("SR-5"), self._entry("SR-5", "raid"), self._entry("SR-6")]
@@ -5546,6 +5722,87 @@ class CopilotRaidSwitchTests(unittest.TestCase):
         watchdog.assert_not_called()
 
 
+class CopilotSettleTests(unittest.TestCase):
+    """战后收尾：跳过首通剧情 → 返回主界面，跑在隔离的临时 MAA_CONFIG_DIR 里。"""
+
+    def _settle(self, stdout, returncode=0, raise_exc=None):
+        import maa_copilot_worker as worker
+
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "config"
+            (source / "resource" / "tasks").mkdir(parents=True)
+            (source / "resource" / "tasks" / "tasks.json").write_text("{}", encoding="utf-8")
+            log_path = Path(raw) / "copilot.log"
+            log_path.write_text("", encoding="utf-8")
+            written: dict[str, str] = {}
+            overlays: dict[str, dict] = {}
+            run_kwargs = (
+                {"side_effect": raise_exc} if raise_exc
+                else {"return_value": SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")}
+            )
+            with patch.object(worker.subprocess, "run", **run_kwargs) as run, patch.object(
+                worker, "atomic_write_text",
+                side_effect=lambda path, body: written.__setitem__(Path(path).name, body),
+            ), patch.object(
+                worker, "atomic_write_json",
+                side_effect=lambda path, body: overlays.__setitem__(Path(path).name, body),
+            ):
+                ok, detail = worker.settle_after_battle(
+                    {"maa_bin": "/bin/maa"}, "SR-8", {"MAA_CONFIG_DIR": str(source)}, log_path
+                )
+            log = log_path.read_text("utf-8")
+        return SimpleNamespace(
+            ok=ok, detail=detail, written=written, overlays=overlays, run=run, log=log,
+        )
+
+    def test_the_settle_run_skips_the_plot_then_returns_home(self) -> None:
+        import maa_copilot_worker as worker
+
+        result = self._settle("[跳过剧情] 03:47:20 Completed\n[返回主界面] 03:47:30 Completed\n")
+        self.assertTrue(result.ok, result.detail)
+        toml = result.written["copilot-settle.toml"]
+        self.assertIn('name = "跳过剧情"', toml)
+        self.assertIn('"CopilotSettleSkip"', toml)
+        self.assertIn('name = "返回主界面"', toml)
+        for name in worker.HOME_TASK_NAMES:
+            self.assertIn(f'"{name}"', toml)
+        self.assertEqual(result.run.call_args.args[0][:3], ["/bin/maa", "run", "copilot-settle"])
+        self.assertIn("--user-resource", result.run.call_args.args[0])
+        self.assertNotIn("config", result.run.call_args.kwargs["env"]["MAA_CONFIG_DIR"].split("/")[-1])
+        self.assertIn("# settle SR-8", result.log)
+
+    def test_the_skip_chain_is_derived_from_upstream_and_stops_after_the_confirm(self) -> None:
+        """09-09 真机：上游 `SkipBattlePlotConfirm.next = [EndOfPlot]`，跳过后直接进结算页，
+        `EndOfPlot` 永远等不到，白等 20 轮才 Error。派生一份把 `next` 清空，只写临时目录。"""
+        result = self._settle("[跳过剧情] Completed\n")
+        tasks = result.overlays["tasks.json"]
+        self.assertEqual(tasks["CopilotSettleSkip"]["baseTask"], "SkipBattlePlot")
+        self.assertEqual(tasks["CopilotSettleSkip"]["next"], ["CopilotSettleSkipConfirm"])
+        self.assertEqual(tasks["CopilotSettleSkipConfirm"]["baseTask"], "SkipBattlePlotConfirm")
+        self.assertEqual(tasks["CopilotSettleSkipConfirm"]["next"], [])
+        # 原有的两条导航覆盖仍在同一份 tasks.json 里。
+        self.assertIn("CopilotNavigationReady", tasks)
+
+    def test_either_segment_completing_counts_as_settled(self) -> None:
+        # 剧情跳过了、没回到主界面：游戏已到结算页，代理记录已落库（09-09 真机），算成功。
+        skipped = self._settle("[跳过剧情] 09:04 Completed\n[返回主界面] 09:04 Error\n", returncode=1)
+        self.assertTrue(skipped.ok, skipped.detail)
+        # 没有剧情、直接回家：第一段 Error（找不到跳过键）、第二段 Completed，也算成功。
+        home = self._settle("[跳过剧情] 09:04 Error\n[返回主界面] 09:04 Completed\n", returncode=1)
+        self.assertTrue(home.ok, home.detail)
+        # 两段都 Error（09-09 08:59 的真机现场）：措辞中性，不提代理指挥。
+        neither = self._settle("[跳过剧情] 09:04:05 Error\n[返回主界面] 09:04:20 Error\n", returncode=1)
+        self.assertFalse(neither.ok)
+        self.assertIn("SR-8 战后未回到主界面", neither.detail)
+        self.assertNotIn("代理指挥", neither.detail)
+
+    def test_a_settle_exception_is_reported_instead_of_raised(self) -> None:
+        result = self._settle("", raise_exc=subprocess.TimeoutExpired("maa", 240))
+        self.assertFalse(result.ok)
+        self.assertIn("战后收尾异常", result.detail)
+        self.assertIn("TimeoutExpired", result.log)
+
+
 class CopilotVictoryJudgementTests(unittest.TestCase):
     """记账只在这一关被判定为通关时才写：退出码 0 不够（不变量 #33）。"""
 
@@ -5654,6 +5911,125 @@ class SanityYieldTests(unittest.TestCase):
         self.assertFalse(hasattr(maa_daily, "dispatch_clearing_round"))
         self.assertFalse(hasattr(maa_daily, "report_clearing_dispatch_failure"))
         self.assertFalse(hasattr(maa_daily, "attach_clearing_yield"))
+
+
+class ManualClearMarkTests(unittest.TestCase):
+    """手动通关的写路径：`copilot mark-cleared` / `copilot unmark`。
+
+    2026-09-09 线上：SR-5/6/7/8 用户手打通了，账本与森空岛 zone（10/11）都不知道，
+    第一轮原样重抄。硬编码种子只救 SR 这一期，所以补一条用户能说话的入口。
+    """
+
+    def _run(self, argv, *, watch_state=None, config=None, ledger=None):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            watch = root / "activity_watch.json"
+            maa_common.atomic_write_json(watch, watch_state or {"activity_key": SR_KEY})
+            ledger_file = root / "ledger.json"
+            if ledger is not None:
+                maa_common.atomic_write_json(ledger_file, ledger)
+            with patch.object(maa_action, "WATCH_PATH", watch), \
+                 patch.object(maa_action, "load_config", return_value=config or {}), \
+                 patch.object(maa_action, "state_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(maa_copilot, "LEDGER_PATH", ledger_file), \
+                 patch.object(maa_copilot, "ensure_private_dirs"), \
+                 patch.object(maa_copilot, "load_stage_index", return_value=SR_INDEX):
+                ok, message = maa_action.dispatch(argv)
+            files = {
+                path.name: json.loads(path.read_text("utf-8"))
+                for path in root.glob("ledger*.json")
+            }
+        return SimpleNamespace(ok=ok, message=message, files=files)
+
+    def test_marking_writes_the_required_modes_into_the_activity_ledger(self) -> None:
+        result = self._run(["copilot", "mark-cleared", "SR-1"], config=dict(RAID_OFF))
+        self.assertTrue(result.ok, result.message)
+        entry = result.files["ledger.json"]["stages"]["SR-1"]
+        self.assertTrue(entry["normal"])
+        # 突袭功能关着 → 只标普通，不替用户把没打过的突袭也记上。
+        self.assertIsNone(entry["raid"])
+        self.assertEqual(entry["attempts"][-1]["outcome"], "won")
+        self.assertEqual(entry["attempts"][-1]["detail"], maa_copilot.MANUAL_MARK_DETAIL)
+        self.assertIn("SR-1", result.message)
+        self.assertIn("copilot unmark SR-1", result.message)
+        # 顺手把账建好、种子也种上（`ensure_ledger` 那条路），不另开一套。
+        self.assertEqual(result.files["ledger.json"]["seeded"], "SR")
+
+    def test_marking_with_raid_on_covers_both_modes_and_all_is_explicit(self) -> None:
+        both = self._run(["copilot", "mark-cleared", "SR-1"])
+        entry = both.files["ledger.json"]["stages"]["SR-1"]
+        self.assertTrue(entry["normal"] and entry["raid"])
+        self.assertIn("SR-1（突袭）", both.message)
+        only_raid = self._run(["copilot", "mark-cleared", "SR-1", "raid"], config=dict(RAID_OFF))
+        entry = only_raid.files["ledger.json"]["stages"]["SR-1"]
+        self.assertIsNone(entry["normal"])
+        self.assertTrue(entry["raid"])
+        bad = self._run(["copilot", "mark-cleared", "SR-1", "hard"])
+        self.assertFalse(bad.ok)
+        self.assertIn("normal / raid / all", bad.message)
+
+    def test_marking_is_idempotent_and_never_overwrites_an_existing_timestamp(self) -> None:
+        seeded = {
+            "activity_key": SR_KEY, "seeded": "SR",
+            "stages": {"SR-5": {"normal": "2026-09-09T03:35:38+08:00", "raid": None,
+                                "attempts": []}},
+        }
+        result = self._run(["copilot", "mark-cleared", "SR-5"], config=dict(RAID_OFF),
+                           ledger=seeded)
+        self.assertTrue(result.ok)
+        self.assertIn("已经记着通关了", result.message)
+        entry = result.files["ledger.json"]["stages"]["SR-5"]
+        self.assertEqual(entry["normal"], "2026-09-09T03:35:38+08:00")
+        self.assertEqual(entry["attempts"], [])
+
+    def test_the_manual_mark_does_not_count_against_the_daily_cap(self) -> None:
+        """写成 `won` 是刻意的：`attempts_today()` 把非 `won` 全算成当天失败。"""
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        maa_copilot.mark_stage_cleared(ledger, "SR-7", ("normal",))
+        self.assertEqual(maa_copilot.attempts_today(ledger, "SR-7", "normal"), 0)
+        self.assertEqual(
+            maa_copilot.ledger_pending_modes(ledger, None, "SR-7", "act54side_07", ("normal",)),
+            [],
+        )
+
+    def test_a_non_activity_stage_lands_in_the_standalone_ledger(self) -> None:
+        result = self._run(["copilot", "mark-cleared", "CE-6"])
+        self.assertTrue(result.ok, result.message)
+        self.assertNotIn("ledger.json", result.files)
+        entry = result.files["ledger-standalone.json"]["stages"]["CE-6"]
+        self.assertTrue(entry["normal"])
+        self.assertIsNone(entry["raid"])
+
+    def test_an_unknown_stage_is_refused_without_touching_the_ledger(self) -> None:
+        result = self._run(["copilot", "mark-cleared", "SR-99"])
+        self.assertFalse(result.ok)
+        self.assertIn("不在本地关卡索引里", result.message)
+        self.assertEqual(result.files, {})
+
+    def test_unmark_clears_both_timestamps_but_keeps_the_history(self) -> None:
+        marked = {
+            "activity_key": SR_KEY, "seeded": "SR",
+            "stages": {"SR-8": {"normal": "2026-09-08T15:22:14+08:00",
+                                "raid": "2026-09-09T05:00:00+08:00",
+                                "attempts": [{"at": "2026-09-08T15:22:14+08:00",
+                                              "mode": "normal", "outcome": "won"}]}},
+        }
+        result = self._run(["copilot", "unmark", "SR-8"], ledger=marked)
+        self.assertTrue(result.ok, result.message)
+        self.assertIn("normal、raid", result.message)
+        entry = result.files["ledger.json"]["stages"]["SR-8"]
+        self.assertIsNone(entry["normal"])
+        self.assertIsNone(entry["raid"])
+        self.assertEqual(len(entry["attempts"]), 1)
+        again = self._run(["copilot", "unmark", "SR-8"], ledger=result.files["ledger.json"])
+        self.assertTrue(again.ok)
+        self.assertIn("本来就没有通关记录", again.message)
+
+    def test_unmark_without_a_ledger_changes_nothing(self) -> None:
+        result = self._run(["copilot", "unmark", "SR-8"])
+        self.assertTrue(result.ok)
+        self.assertIn("本来就没有通关记录", result.message)
+        self.assertEqual(result.files, {})
 
 
 class ManualCopilotPathTests(unittest.TestCase):

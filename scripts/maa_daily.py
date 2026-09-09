@@ -366,7 +366,16 @@ def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
             )
         # Independent switch: 理智让路 removes ONLY this block.
         # Default True so the deploy seed and isolated renderer tests keep it.
-        if plan.get("farming", True):
+        if plan.get("farming", True) and plan.get("fallback_run"):
+            # 后备补跑（`fallback_fight_plan()`）：主关的 Fight 一颗理智没花就 Error 了，
+            # 这一趟只打后备关。块名用第二块的名字，战报里自然落在「刷理智·续」那一行，
+            # 不带 drops——它本来就是拿来把剩余理智花完的。
+            blocks.append(
+                _fight_block(
+                    FARMING_TASK_NAMES[1], str(plan.get("stage", "")), config, medicine_days, drops=""
+                )
+            )
+        elif plan.get("farming", True):
             drops = _drops_table(plan.get("farming_drops"))
             blocks.append(
                 _fight_block(
@@ -813,6 +822,14 @@ def extract_summary(
                 details.append("实际完成 0 次")
             elif count:
                 details.append(f"{count} 次")
+            elif key == "Fight" and state == "failed" and _main_fight_was_dry(lines):
+                spare = str((plan or {}).get("farming_fallback_stage") or "")
+                second = _task_state(lines, "Fight2", FARMING_TASK_NAMES[1])
+                details.append(
+                    f"未消耗理智，已改刷后备关 {spare}"
+                    if spare and second != "pending"
+                    else "未消耗理智"
+                )
             if proxy_batches:
                 details.append(f"代理指挥失误 {proxy_batches} 批，理智已返还 ×{refunded}")
             medicine = _expiring_medicine_used(fight_lines)
@@ -1414,6 +1431,89 @@ def salvage_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
     return {**plan, "tasks": tasks}
 
 
+def fallback_fight_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
+    """主关 Fight 空跑失败后，只刷后备关的补跑计划；没有可用后备关时返回 None。
+
+    2026-09-09 早场：SR-8 的代理指挥没解锁，`Fight Error` 一颗理智没花，MaaCore 接着把
+    基建 / 公招 / 商店 / 奖励都跑完了，唯独 `farming_fallback_stage = SR-7` 躺在计划里
+    没人用——那一场 94 理智白挂到晚上。补跑只带 Fight：其余链条已经跑过，重跑是重复劳动；
+    剿灭按游戏日记账，也不重进。
+    """
+    if not bool((plan.get("tasks") or {}).get("fight", True)) or not plan.get("farming", True):
+        return None
+    spare = str(plan.get("farming_fallback_stage") or "").strip()
+    if not spare or spare == str(plan.get("stage") or ""):
+        return None
+    tasks = {key: False for key in ("infrast", "recruit", "mall", "award")}
+    tasks["fight"] = True
+    return {
+        **plan,
+        "stage": spare,
+        "tasks": tasks,
+        "annihilation": False,
+        "farming": True,
+        "fallback_run": True,
+    }
+
+
+def fight_failed_dry(lines: list[str]) -> bool:
+    """主关的 Fight 段以 Error 收尾、且一次作战都没发起（一颗理智没花）。
+
+    只认 maa-cli 汇总里 `[刷理智]` 那一段：段里没有 `Fight <关> n times`、没有掉落，
+    才算「空跑」。打了几批之后才报错的不算——那是别的问题，补跑后备关只会把
+    理智花在没人核对过的地方。第二块已经跑过（drops 上限那条路）也不补。
+    """
+    return _main_fight_was_dry(lines) and not _named_task_section(lines, FARMING_TASK_NAMES[1])
+
+
+def _main_fight_was_dry(lines: list[str]) -> bool:
+    """`[刷理智]` 段以 Error 收尾且没打过一批（战报文案与补跑判定共用）。"""
+    section = _named_task_section(lines, FARMING_TASK_NAMES[0])
+    if not section or _task_state(section, "Fight", FARMING_TASK_NAMES[0]) != "failed":
+        return False
+    return not (_fight_times(section) or _drop_pairs(section))
+
+
+def _fallback_fight_run(
+    *,
+    config: dict[str, Any],
+    plan: dict[str, Any],
+    task_path: Path,
+    log_path: Path,
+    token: str,
+    thread_id: str,
+    progress_message_id: str,
+    carry_lines: list[str],
+    elapsed: float,
+) -> tuple[int | None, list[str], list[str]]:
+    """主关空跑失败后改刷后备关。返回码为 None 表示没跑（无后备关 / 关闭 / 时间不够）。"""
+    if not bool(config.get("fight_fallback_on_error", True)):
+        return None, [], []
+    retry_plan = fallback_fight_plan(plan)
+    if retry_plan is None:
+        return None, [], []
+    remaining = int(config.get("maa_run_timeout", 3000)) - int(elapsed)
+    floor = max(60, int(config.get("fight_fallback_min_seconds", 300)))
+    if remaining < floor:
+        return None, [], [f"剩余预算 {max(0, remaining)}s 不足 {floor}s，跳过后备关补跑。"]
+    atomic_write_text(task_path, render_daily_toml(retry_plan, config))
+    code, out, err = run_maa(
+        config,
+        log_path,
+        token,
+        thread_id,
+        progress_message_id,
+        retry_plan,
+        timeout=remaining,
+        carry_lines=carry_lines,
+    )
+    note = (
+        f"刷理智 {plan_stage_label(plan)} 失败且未消耗理智，"
+        f"已改刷后备关 {retry_plan['stage']}（其余任务链不重跑）。"
+    )
+    return code, out, [note, *err]
+
+
 def _salvage_run(
     *,
     config: dict[str, Any],
@@ -1832,6 +1932,26 @@ def execute(phase: str) -> int:
                     salvage_log_path = salvage_log
                 stdout_lines += salvage_out
                 stderr_lines += salvage_err
+            elif return_code != 0 and fight_failed_dry(stdout_lines + stderr_lines):
+                # 主关一颗理智没花就 Error（2026-09-09 早场 SR-8 代理指挥未解锁），其余
+                # 链条 MaaCore 已经跑完。只补一趟 Fight 打后备关，预算同样从总超时里扣。
+                fallback_log = RUNS_DIR / f"{run_stem}-fallback.log"
+                fallback_code, fallback_out, fallback_err = _fallback_fight_run(
+                    config=config,
+                    plan=plan,
+                    task_path=task_path,
+                    log_path=fallback_log,
+                    token=token,
+                    thread_id=thread_id,
+                    progress_message_id=progress_message_id,
+                    carry_lines=stdout_lines + stderr_lines,
+                    elapsed=(now_beijing() - started).total_seconds(),
+                )
+                if fallback_code is not None:
+                    return_code = fallback_code
+                    salvage_log_path = fallback_log
+                stdout_lines += fallback_out
+                stderr_lines += fallback_err
             # The final Custom task has returned to Home. Let the last UI
             # animation settle, then capture before the separate CloseDown and
             # confirm by OCR that the frame we ship really is the home page.

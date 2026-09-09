@@ -1,6 +1,6 @@
 # 开发指南（基于当前代码实现）
 
-面向要改这套东西的人。[PLAN_PHASE4.md](./PLAN_PHASE4.md) 是当前一期的设计意图与决策（更早的在 [archive/](./archive/)），[README.md](../README.md) 是功能与落地状态，
+面向要改这套东西的人。[PLAN_PHASE4.md](./PLAN_PHASE4.md) 是最近一期（四期，2026-09-09 结项）的设计意图与决策（更早的在 [archive/](./archive/)），[README.md](../README.md) 是功能与落地状态，
 本文只讲**现状的自动化链路是怎么串起来的、改哪里会影响什么**。
 
 ---
@@ -624,7 +624,8 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    │    _navigate_to_stage()     临时 MAA_CONFIG_DIR 里 Fight(times=1) + Custom 界面检查
    │    switch_to_raid()         仅 raid：Custom(ChangeToRaidDifficulty)（❌ 真机验失败，默认关闭）
    │    maa copilot <uri> --formation --batch -v --raid <mode>   （watchdog 处理接管弹窗）
-   │    copilot_outcome() → record_copilot_attempt() → save_ledger()
+   │    copilot_outcome() → settle_after_battle()（跳过首通剧情 + 返回主界面，非 nav 都跑）
+   │    → record_copilot_attempt() → save_ledger()
    │    一关失败 **继续下一关**；`nav`（导航/切难度）失败 **停止整轮**
    └─ 截图 → close_everything() → 一条多关战报 → status=executed/execution_failed
 ```
@@ -695,6 +696,30 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    绝不能在别处把「没警告」当成「已解锁」的依据。它现在只用于**抄作业卡上的一行显示**
    （`🔒 …大概率未解锁`），永远不当闸门。
    序号超出第一个 zone（act17side 型多 zone 活动）一律静默；警告带森空岛快照时效标注。
+11. **打完不能直接杀游戏——先跳剧情、回主界面**（2026-09-09）。SR-8 两次抄作业
+   （`runs/2026-09-08-copilot-9e14e500ac25`、`2026-09-09-copilot-fda56c1811ba`）
+   `Copilot Completed` 之后 5 秒 `close_everything()` 就 `maa closedown`，两张收尾截图
+   都停在**战后剧情页**（右上「自动 OFF / 跳过 ▶」）。结果：游戏里 SR-8 三星，
+   **代理指挥却锁着**，早场日常点了 10 次 `UsePrts` 点不亮、`Fight Error` 空跑。
+   asst.log 复核过两场都没借助战（Copilot 参数无 `support_unit_usage`，8 个位置全是
+   自己的干员；`BattleQuickFormationRole-Support` 是职业筛选「辅助」页签）。
+   **09-09 08:59 真机验证**（`runs/2026-09-09-copilot-71bfa8404dbe.log`）：顺序是
+   战斗结束 → 剧情 → 结算页；剧情跳过成功、游戏进到结算页、代理指挥解锁，虽然最终
+   没回到主界面。**界线是结算页，不是主界面**——昨天被杀在剧情里，结算页从没出现过，
+   所以今天剧情还重放了一遍（游戏没记成已看）。
+   现在 `_batch_run_locked()` 对每个进过战斗的条目（`outcome != "nav"`）调
+   `settle_after_battle()`：隔离 `MAA_CONFIG_DIR` 里跑 `copilot-settle.toml` 两段 Custom
+   ——`["CopilotSettleSkip", *HOME_TASK_NAMES]`（在剧情页走跳过链，在详情页直接回家）
+   + `HOME_TASK_NAMES`。`CopilotSettleSkip` / `CopilotSettleSkipConfirm` 派生自上游
+   `SkipBattlePlot` / `SkipBattlePlotConfirm`（`SETTLE_OVERLAY_TASKS`，经 `_isolated_config()`
+   的 `overlay_tasks` 只写临时 tasks.json），差别只有确认后的 `next` 清空：上游接的
+   `EndOfPlot` 在跳过后直接进结算页时永远等不到，真机白等了 20 轮才 Error。
+   **两段任一 `Completed` 即算成功**；两段都 Error 才在战报和账本 `detail` 带一句中性的
+   「战后未回到主界面」，**不改胜负**。`copilot_settle_timeout` 默认 240s。
+   结算页本身**不处理**：多关连抄时下一关的 `StartUp` 自带 `EndOfAction → ClickCorner`
+   （03:06 SR-5 → SR-6 的日志），最后一关停在结算页被关掉已验证无害。若哪一关结算页
+   之后还有第二个弹窗 / 剧情才需要派生 `EndOfAction`——注意上游 `ClickCorner.next` 里
+   有 `StartButton2`，照搬会再开一局。
 
 ### 本地作业记账（`copilot/ledger.json`，四期 2a）
 
@@ -1381,6 +1406,17 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       `CircuitBreakerTests`、`SalvageTests`，并用 2026-08-07/08-06 两份真实日志回放
       过解析），但「StartUp 能否从结算页把游戏带回主界面」只在真机上才算数，
       下次遇到代理失误时要盯一眼补跑那趟的日志。
+    - **主关空跑失败 → 改刷后备关**（2026-09-09 早场加）：SR-8 的代理指挥没解锁，
+      `[刷理智]` 段 `Error` 收尾、一颗理智没花，MaaCore 接着把基建 / 公招 / 商店 / 奖励
+      跑完了，`farming_fallback_stage = SR-7` 却没人用，94 理智白挂到晚上。现在
+      `execute()` 在 `return_code != 0` 且 `fight_failed_dry()`（段里没有
+      `Fight <关> n times`、没有掉落、`[刷理智·续]` 没跑过）时调 `_fallback_fight_run()`：
+      `fallback_fight_plan()` 只保留 Fight、`annihilation = False`、块名用
+      `FARMING_TASK_NAMES[1]`（战报自然落在「刷理智·续」那一行，不带 drops）。预算同样
+      从 `maa_run_timeout` 里扣，剩余不足 `fight_fallback_min_seconds`（默认 300s）就跳过，
+      `fight_fallback_on_error: false` 整体关掉；日志落在 `runs/<date>-<phase>-fallback.log`
+      （`last_run.salvage_log` 复用同一个字段）。打了几批之后才 Error 的**不补**——
+      那是别的问题。测试：`FightFallbackTests`（含 09-09 早场真实汇总段回放）。
 14. **MaaTouch 握手超 3 秒 → MaaCore SIGSEGV，整场 35 秒暴毙**——这一条和代理失误
     （§11.13）毫无关系，是连模拟器都没连上，游戏里一个键都没点过。
 

@@ -32,6 +32,7 @@ import maa_action
 import maa_clearing
 import maa_copilot
 from maa_daily import (
+    HOME_TASK_NAMES,
     capture_screenshot,
     close_everything,
     open_emulator,
@@ -109,6 +110,40 @@ type = "Custom"
 task_names = [{task}]
 """
 DEFAULT_RAID_SWITCH_TASK = maa_clearing.DEFAULT_RAID_SWITCH_TASK
+
+# 战后收尾（2026-09-09 加）：**先跳掉首通剧情，再回主界面，然后才许退游戏**。
+# 现场：SR-8 两次抄作业（09-08 15:22、09-09 03:47）`Copilot Completed` 之后 5 秒
+# `close_everything()` 就 `maa closedown` 把游戏杀了，两张收尾截图都停在战后剧情页
+# （右上「自动 OFF / 跳过 ▶」）。结果是三星记上了、**代理指挥没解锁**——早场日常
+# 点 SR-8 的代理指挥 10 次点不亮，`Fight Error` 空跑一场。
+# 09-09 08:59 真机验证（`runs/2026-09-09-copilot-71bfa8404dbe.log`）：剧情跳过成功，
+# 游戏进到**结算页**，代理指挥就解锁了——**界线是结算页，不是主界面**。顺序是
+# 战斗结束 → 剧情 → 结算页，昨天被杀在剧情里所以结算页从没出现过。
+# 第一段 `CopilotSettleSkip` 与主界面任务并列：在剧情页就走跳过链，在详情页就直接回家；
+# 第二段再兜一道回主界面。跳过链派生自上游 `SkipBattlePlot`（`SETTLE_OVERLAY_TASKS`），
+# 只把确认之后的 `next` 清空：上游接的 `EndOfPlot` 在跳过后直接进结算页时永远等不到，
+# 真机上白等了 20 轮才报 Error。派生任务只写临时目录（不变量 #37）。
+# 结算页本身**不处理**：多关连抄时下一关的 `StartUp` 自带 `EndOfAction → ClickCorner`
+# （03:06 SR-5 → SR-6 的日志），最后一关停在结算页被关掉已验证无害。若哪一关结算页
+# 之后还有第二个弹窗 / 剧情，再回来派生 `EndOfAction`（注意上游 `ClickCorner.next` 里
+# 有 `StartButton2`，照搬会再开一局）。
+SETTLE_SKIP_TASK = "CopilotSettleSkip"
+SETTLE_OVERLAY_TASKS = {
+    SETTLE_SKIP_TASK: {"baseTask": "SkipBattlePlot", "next": ["CopilotSettleSkipConfirm"]},
+    "CopilotSettleSkipConfirm": {"baseTask": "SkipBattlePlotConfirm", "next": []},
+}
+SETTLE_TOML_TEMPLATE = """[[tasks]]
+name = "跳过剧情"
+type = "Custom"
+[tasks.params]
+task_names = {skip_names}
+
+[[tasks]]
+name = "返回主界面"
+type = "Custom"
+[tasks.params]
+task_names = {home_names}
+"""
 RAID_DISABLED_NOTICE = (
     "突袭切换未启用（config.copilot_raid_switch_task 为空）；"
     "单文件 maa copilot --raid raid 不会切难度，跑下去等于拿普通难度冒充突袭"
@@ -463,11 +498,17 @@ def _run_copilot_with_watchdog(
 
 
 @contextmanager
-def _isolated_config(env: dict[str, str], task_files: dict[str, str]):
+def _isolated_config(
+    env: dict[str, str],
+    task_files: dict[str, str],
+    overlay_tasks: dict[str, dict[str, Any]] | None = None,
+):
     """临时 `MAA_CONFIG_DIR`，把不进战斗的覆盖与任务文件隔离在本进程内。
 
     只**读**上游 resource 目录、只**写**这个临时目录（不变量 #37）：日常与随后
     真正的 `maa copilot` 仍然用原配置，`~/.config/maa-cli/` 一个字节都不动。
+    `overlay_tasks` 是调用方额外派生的任务（`baseTask` 继承上游、只改 `next`），
+    与这里固定的 `FightBegin` / `CopilotNavigationReady` 覆盖写进同一份 tasks.json。
     """
     source = Path(env["MAA_CONFIG_DIR"])
     with tempfile.TemporaryDirectory(prefix="maa-copilot-nav-") as raw:
@@ -487,6 +528,8 @@ def _isolated_config(env: dict[str, str], task_files: dict[str, str]):
         overlay = load_json(resource, {})
         overlay["FightBegin"] = dict(ready)
         overlay["CopilotNavigationReady"] = dict(ready)
+        for name, task in (overlay_tasks or {}).items():
+            overlay[name] = dict(task)
         atomic_write_json(resource, overlay)
         for name, body in task_files.items():
             atomic_write_text(root / "tasks" / name, body)
@@ -552,6 +595,46 @@ def switch_to_raid(
     if result.returncode != 0 or "Custom Completed" not in output:
         detail = " | ".join(output.strip().splitlines()[-3:])[-400:]
         return False, f"{stage} 切换突袭难度失败：{detail}"
+    return True, ""
+
+
+def settle_after_battle(
+    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+) -> tuple[bool, str]:
+    """一关打完后收尾：跳过战后剧情 → 返回主界面（见 `SETTLE_TOML_TEMPLATE`）。
+
+    **两段任一 `Completed` 即算成功**：第一段完成 = 剧情已跳过（或本来就在能回家的
+    页面），此时游戏至少到了结算页，代理指挥的记录已经落库（09-09 真机）；第二段完成
+    = 真的回到了主界面。只影响收尾质量，不改这一关的胜负判定：失败只把一句中性说明
+    带回战报。跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。
+    """
+    maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    body = SETTLE_TOML_TEMPLATE.format(
+        skip_names=json.dumps([SETTLE_SKIP_TASK, *HOME_TASK_NAMES], ensure_ascii=False),
+        home_names=json.dumps(HOME_TASK_NAMES, ensure_ascii=False),
+    )
+    timeout = max(60, int(config.get("copilot_settle_timeout", 240)))
+    try:
+        with _isolated_config(
+            env, {"copilot-settle.toml": body}, overlay_tasks=SETTLE_OVERLAY_TASKS
+        ) as settle_env:
+            result = subprocess.run(
+                [maa_bin, "run", "copilot-settle", "--user-resource", "-v", "--batch"],
+                capture_output=True, text=True, check=False, timeout=timeout, env=settle_env,
+            )
+    except Exception as exc:
+        note = f"{stage} 战后收尾异常：{type(exc).__name__}: {exc}"
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"# settle {stage}\n{note}\n")
+        return False, note[:300]
+    output = f"{result.stdout}\n{result.stderr}"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"# settle {stage}\n{output}")
+    skipped = re.search(r"\[跳过剧情\][^\n]*Completed", output) is not None
+    home_done = re.search(r"\[返回主界面\][^\n]*Completed", output) is not None
+    if not (skipped or home_done):
+        detail = " | ".join(output.strip().splitlines()[-3:])[-300:]
+        return False, f"{stage} 战后未回到主界面：{detail}"
     return True, ""
 
 
@@ -799,6 +882,12 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                 stop_reason = detail
                 break
             outcome, detail = _fight_one(config, entry, env, log_path)
+            if outcome != "nav":
+                # 进过战斗就要正常收尾：跳过首通剧情、回主界面，再往下走（或退游戏）。
+                # 直接 closedown 会把结算流程掐断——SR-8 三星却没解锁代理指挥（2026-09-09）。
+                settled, settle_note = settle_after_battle(config, stage, env, log_path)
+                if not settled:
+                    detail = " · ".join(part for part in (detail, settle_note) if part)[:400]
             verdict = {"won": "won", "unknown": "unknown"}.get(outcome, "failed")
             maa_copilot.record_copilot_attempt(
                 ledger,
