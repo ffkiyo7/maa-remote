@@ -221,6 +221,9 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
         )
         return 0
 
+    # 任务文件以 `StartUp` 开头（`maa_roguelike.STARTUP_TOML`）：下面的开机链只拉
+    # **模拟器**，拉起**游戏**的是 MaaCore 的 `StartUp`。2026-09-11 那次事故就是任务文件
+    # 里少了它，模拟器停在 Android 桌面、`Roguelike` 直接 Error。
     # 任务文件整轮只渲染一次：参数在 `roguelike start` 那一刻就冻结了，
     # 中途改卡改不动这一轮（`roguelike set` 在 running 时直接拒绝）。
     # 卡片**不收**：开跑之后「⏹️ / ⏏️」两个按钮正是要一直可点的。
@@ -331,7 +334,10 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
             if parsed["invest_full"]:
                 stop_reason = "源石锭储备已达上限（999），上游自己收手了。"
                 break
-            error_streak = error_streak + 1 if parsed["error"] else 0
+            # 按 `outcome` 而不是 `parsed["error"]` 数：游戏没起来时输出里只有
+            # `StartUp Error`，`parse_run_output()` 会把它收敛成 `outcome == "error"`，
+            # 这道闸门必须一样认（2026-09-11 事故：空转两局才靠 `Roguelike Error` 收尾）。
+            error_streak = error_streak + 1 if parsed["outcome"] == "error" else 0
             if error_streak >= ERROR_STREAK_LIMIT:
                 stop_reason = f"上游连续 {ERROR_STREAK_LIMIT} 局报错，本轮收尾。"
                 break

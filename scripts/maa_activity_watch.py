@@ -354,6 +354,56 @@ def _dispatch(state: dict[str, Any], token: str, config: dict[str, Any], at: dat
 
 
 # ---------------------------------------------------------------------------
+# 开打前环境故障的当日上限
+# ---------------------------------------------------------------------------
+# `daily_cap` 按「(关, 模式) 的记账」数，而开打前就失败的轮一关都没进、不记账，
+# 永远数不到上限。这里另记一本按天的流水账，到上限当天不再排。
+
+DEFAULT_PREFIGHT_FAILURE_CAP = 2
+
+
+def _prefight_cap(config: dict[str, Any]) -> int:
+    try:
+        return max(1, int(config.get(
+            "auto_copilot_max_prefight_failures_per_day", DEFAULT_PREFIGHT_FAILURE_CAP
+        )))
+    except (TypeError, ValueError):
+        return DEFAULT_PREFIGHT_FAILURE_CAP
+
+
+def _count_prefight_failure(
+    config: dict[str, Any], state: dict[str, Any], detail: str, at: datetime
+) -> None:
+    today = at.date().isoformat()
+    record = state.get("prefight_failures")
+    if not isinstance(record, dict) or record.get("date") != today:
+        record = {"date": today, "count": 0}
+    record["count"] = int(record.get("count") or 0) + 1
+    record["last_error"] = detail[:400]
+    state["prefight_failures"] = record
+    cap = _prefight_cap(config)
+    if record["count"] == cap:
+        # 先落状态再发：Discord 挂了不能让下一 tick 重复计数。
+        _save(state, at)
+        _notify(
+            config,
+            "⛔ 自动作业今天不再排轮",
+            f"开打前连续失败 {record['count']} 次（还没进关、没花理智）。"
+            f"明天自动恢复；修好后想立刻恢复，说「恢复自动作业」。\n最近一次：{detail[:600]}",
+            0xED4245,
+        )
+
+
+def _prefight_blocked(config: dict[str, Any], state: dict[str, Any], at: datetime) -> str:
+    record = state.get("prefight_failures")
+    if not isinstance(record, dict) or record.get("date") != at.date().isoformat():
+        return ""
+    if int(record.get("count") or 0) < _prefight_cap(config):
+        return ""
+    return f"今天开打前已失败 {record['count']} 次：{record.get('last_error', '')}"[:400]
+
+
+# ---------------------------------------------------------------------------
 # 一 tick
 # ---------------------------------------------------------------------------
 
@@ -415,12 +465,30 @@ def run_once() -> dict[str, Any]:
             )
             status = "scheduled"
         if status == "scheduled":
+            if maa_copilot.auto_pause_state():
+                _supersede_round(token, config)
+                state.pop("batch_token", None)
+                state.pop("scheduled_at", None)
+                state["status"] = "paused"
+                return _save(state, now)
             state["status"] = _dispatch(state, token, config, now)
             return _save(state, now)
         # 终态（executed / execution_failed / canceled / superseded / failed / missing）：
         # 这一轮结束了，下面按最新记账重新排。
+        if isinstance(search, dict) and search.get("prefight_error"):
+            _count_prefight_failure(config, state, str(search["prefight_error"]), now)
         state.pop("batch_token", None)
         state.pop("scheduled_at", None)
+
+    if maa_copilot.auto_pause_state():
+        state["status"] = "paused"
+        return _save(state, now)
+    blocked = _prefight_blocked(config, state, now)
+    if blocked:
+        state["status"] = "blocked"
+        state["blocked_reason"] = blocked
+        return _save(state, now)
+    state.pop("blocked_reason", None)
 
     index = maa_copilot.load_stage_index(config)
     prefix = str(state.get("prefix") or maa_copilot._activity_prefix(target["key"]))
@@ -436,15 +504,29 @@ def run_once() -> dict[str, Any]:
             import maa_skland
 
             maa_skland.refresh_roster()
-            roster = maa_copilot.load_roster()
-            targets, excluded = collect_targets(
-                config, state, prefix, index, ledger, roster, now
-            )
         except Exception as exc:
-            print(
-                f"森空岛刷新失败，本轮沿用缓存：{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+            # **读不到就不排**（fail-closed）。以前是「沿用缓存照排」：2026-10-11
+            # 森空岛过期一个月，缓存里根本没有当期活动的 zone 进度，YW-4 没解锁也
+            # 被排上，每 15 分钟开一次模拟器。登录过期由计划卡每天提醒一次
+            # （`maa_skland.daily_health_check()`），这里只在原因变化时发一条。
+            detail = f"{type(exc).__name__}: {exc}"
+            print(f"森空岛刷新失败，本轮不排：{detail}", file=sys.stderr)
+            if maa_clearing.should_notify(state, "skland", detail):
+                _notify(
+                    config,
+                    "⛔ 自动作业暂停排轮：森空岛读取失败",
+                    f"读不到练度与活动进度，不知道哪些关已解锁，先不排。\n{detail}",
+                    0xED4245,
+                )
+            state["status"] = "blocked"
+            state["blocked_reason"] = "森空岛读取失败"
+            state["excluded"] = excluded[:40]
+            return _save(state, now)
+        maa_clearing.clear_notification(state, "skland")
+        roster = maa_copilot.load_roster()
+        targets, excluded = collect_targets(
+            config, state, prefix, index, ledger, roster, now
+        )
 
     if not targets:
         state["status"] = "done"
@@ -483,6 +565,7 @@ def run_once() -> dict[str, Any]:
         title="🤖 自动作业已排程",
         scheduled_at=scheduled_at,
         note=note,
+        pause_button=True,
     )
     with state_lock():
         search = load_json(_search_path(token), None)

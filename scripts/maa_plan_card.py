@@ -1324,9 +1324,43 @@ def main(argv: list[str] | None = None) -> int:
             "allowed_mentions": {"parse": []},
         },
     )
+    _skland_health_notice(token, channel_id)
     if update is not None and not update.get("ok"):
         raise RuntimeError("maa 上游更新失败；已发送红色告警")
     return 0
+
+
+def _skland_health_notice(token: str, channel_id: str) -> None:
+    """森空岛每日体检：过期 / 读不到就发一条，一天一条（`daily_health_check()`）。
+
+    挂在计划卡后面而不是活动监控里：监控可能被暂停，计划卡每天必跑。
+    体检本身的失败不能拖垮计划卡。
+    """
+
+    def notify(title: str, body: str) -> None:
+        discord_request(
+            token,
+            "POST",
+            f"/channels/{channel_id}/messages",
+            {
+                "embeds": [
+                    {
+                        "title": title[:256],
+                        "description": body[:1500],
+                        "color": 0xED4245,
+                        "timestamp": now_beijing().isoformat(),
+                    }
+                ],
+                "allowed_mentions": {"parse": []},
+            },
+        )
+
+    try:
+        import maa_skland
+
+        maa_skland.daily_health_check(notify)
+    except Exception as exc:  # noqa: BLE001
+        print(f"森空岛体检失败：{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

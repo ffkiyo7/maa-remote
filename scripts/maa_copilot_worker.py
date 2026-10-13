@@ -163,24 +163,33 @@ def _search_path(token: str) -> Path:
     return maa_copilot.SEARCHES_DIR / f"{token}.json"
 
 
-def _notice(config: dict[str, Any], title: str, body: str, color: int) -> None:
+def _notice(
+    config: dict[str, Any],
+    title: str,
+    body: str,
+    color: int,
+    components: list[dict[str, Any]] | None = None,
+) -> None:
     """任何一次「没干成」都必须可见（护栏 4：不许静默 return）。"""
+    payload: dict[str, Any] = {
+        "embeds": [
+            {
+                "title": title[:250],
+                "description": body[:3500],
+                "color": color,
+                "timestamp": now_beijing().isoformat(),
+            }
+        ],
+        "allowed_mentions": {"parse": []},
+    }
+    if components:
+        payload["components"] = components
     try:
         discord_request(
             discord_token(),
             "POST",
             f"/channels/{config.get('channel_id', '')}/messages",
-            {
-                "embeds": [
-                    {
-                        "title": title[:250],
-                        "description": body[:3500],
-                        "color": color,
-                        "timestamp": now_beijing().isoformat(),
-                    }
-                ],
-                "allowed_mentions": {"parse": []},
-            },
+            payload,
         )
     except Exception as exc:
         print(f"copilot notice failed: {type(exc).__name__}: {exc}", flush=True)
@@ -638,10 +647,21 @@ def settle_after_battle(
     return True, ""
 
 
+class PrefightError(RuntimeError):
+    """开打前的**环境**故障（森空岛读不到、理智消耗查不到）。
+
+    和「理智不够」分开：后者等一会儿自己会好，前者不修就每 15 分钟开一次
+    模拟器白跑一趟（2026-10-11 森空岛过期，YW-4 空转 17 轮）。worker 把它记进
+    这一轮的 `prefight_error`，watcher 按天计数、到上限当天停排。
+    """
+
+
 def _recheck_before_stage(
     config: dict[str, Any], state: dict[str, Any], entry: dict[str, Any]
 ) -> tuple[bool, str]:
     """每关开打前的复核：活动还在不在、理智够不够。
+
+    理智不够 → `(False, 说明)`；环境故障 → 抛 `PrefightError`。
 
     活动只按 **key** 复核（不看具体关卡）：目标集合是整个活动的关，而
     `maa activity` 只列上游推荐的那 4 关，按关卡复核会把 `SR-1` 判成过期。
@@ -662,16 +682,20 @@ def _recheck_before_stage(
     except (TypeError, ValueError):
         cost = 0
     if cost <= 0:
-        return False, f"无法确认 {stage} 的理智消耗，拒绝开打"
+        raise PrefightError(f"无法确认 {stage} 的理智消耗，拒绝开打")
     import maa_skland
 
     try:
         roster = maa_skland.refresh_roster()
     except Exception as exc:
-        return False, f"森空岛实时理智读取失败：{type(exc).__name__}: {exc}"
+        raise PrefightError(
+            f"森空岛实时理智读取失败：{type(exc).__name__}: {exc}"
+        ) from exc
     preflight = maa_copilot.sanity_preflight(roster, cost)
     if not preflight.get("known"):
-        return False, f"森空岛实时理智读取失败：{preflight.get('reason', '未知原因')}"
+        raise PrefightError(
+            f"森空岛实时理智读取失败：{preflight.get('reason', '未知原因')}"
+        )
     if not preflight.get("enough"):
         return False, maa_copilot.sanity_status_text(preflight)
     return True, ""
@@ -727,6 +751,11 @@ def cmd_run_batch(token: str) -> int:
         # 锁等待），这里再过一次三条**时间**闸门。run.lock 与模拟器不再查——锁刚
         # 被自己拿在手上，再查只会自相矛盾；模拟器由 `_batch_run_locked()` 探。
         config = load_config()
+        if state.get("source") == "activity-watch" and maa_copilot.auto_pause_state():
+            # 派发之后才按的暂停：还没碰设备，直接作废，不开模拟器。
+            print("copilot run-batch SKIPPED: 自动作业已暂停")
+            _set_status(token, {"queued"}, "superseded", superseded_at=now_beijing().isoformat())
+            return 1
         for reason in (
             maa_action._copilot_blackout_reason(config),
             maa_action.depot_window_reason(),
@@ -812,6 +841,16 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
     ledger, _note = maa_copilot.ensure_ledger(activity_key)
     ledger_file = maa_copilot.ledger_path(activity_key)
     failed_stages: set[str] = set()
+    # 只有 watcher 自动排的轮受「暂停自动作业」开关管；手动 `copilot find` 照打。
+    auto_round = str(state.get("source") or "") == "activity-watch"
+    prefight_error = ""
+    start_components: list[dict[str, Any]] | None = None
+    if auto_round:
+        try:
+            maa_copilot.register_auto_buttons()
+            start_components = [maa_copilot.pause_button_row()]
+        except Exception as exc:
+            print(f"pause button register failed: {type(exc).__name__}: {exc}", flush=True)
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
         require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
@@ -842,6 +881,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             f"▶️ 开始抄作业：共 {len(entries)} 项",
             "\n".join(maa_copilot.entry_lines(entries))[:3500],
             0x5865F2,
+            start_components,
         )
 
         open_emulator(config)
@@ -873,6 +913,9 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                      "detail": "同一关的普通模式未通过"}
                 )
                 continue
+            if auto_round and maa_copilot.auto_pause_state():
+                stop_reason = "自动作业已暂停"
+                break
             lead = maa_action.min_lead_reason(config)
             if lead:
                 stop_reason = lead
@@ -912,9 +955,16 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                 break
     except maa_copilot.StaleActivityError as exc:
         stop_reason = str(exc)
+    except PrefightError as exc:
+        stop_reason = str(exc)
+        prefight_error = stop_reason
     except Exception as exc:
         stop_reason = f"{type(exc).__name__}: {exc}"
         print(f"copilot run-batch EXCEPTION: {stop_reason}", flush=True)
+        if not any(r["outcome"] in ("won", "failed", "unknown") for r in results):
+            # 一关都没进就炸（开机、ADB、游戏没装）：同样是环境故障，
+            # 不记账就永远到不了 daily_cap，watcher 会每 tick 重派。
+            prefight_error = stop_reason
     finally:
         if emulator_touched:
             try:
@@ -959,12 +1009,30 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             "cleanup_errors": cleanup_errors,
         }
     )
+    # 运行快照收到终态：以前一直停在 `running`，排查时分不清是还在跑还是早挂了。
+    snapshot_path = RUNS_DIR / f"{stem}.json"
+    snapshot = load_json(snapshot_path, None)
+    if isinstance(snapshot, dict):
+        snapshot.update(
+            {
+                "status": "success" if ok else "failed",
+                "finished_at": now_beijing().isoformat(),
+                "results": results,
+                "stop_reason": stop_reason,
+            }
+        )
+        atomic_write_json(snapshot_path, snapshot)
     cleanup_run_files(int(config.get("retention_days", 14)))
+    extra: dict[str, Any] = {
+        ("executed_at" if ok else "execution_failed_at"): now_beijing().isoformat()
+    }
+    if prefight_error:
+        extra["prefight_error"] = prefight_error[:400]
     _set_status(
         token,
         {"executing"},
         "executed" if ok else "execution_failed",
-        **{("executed_at" if ok else "execution_failed_at"): now_beijing().isoformat()},
+        **extra,
     )
     print(
         f"copilot batch ok={ok} results={results} "

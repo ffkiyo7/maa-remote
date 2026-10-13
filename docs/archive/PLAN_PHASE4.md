@@ -848,6 +848,8 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/maa/copilot/le
   储备满 `TraderInvestSystemFull`；结尾 summary 段 `Explorations: … Summary: Passed x, Failed y, …` 可整块转 embed。
   `RoguelikeInvestmentReachLimit / ReachFull` 回调 maa-cli 不打印（要 `-vvv`）。
 - **不耗理智**（PRTS wiki）；`maa roguelike` / 任务文件都**不含 StartUp**，模拟器与游戏由项目自己起（同 `_clearing_run_locked` 的开机链）；`--batch` 非必需但无害；
+  > **订正（2026-09-11 真机事故）**：后半句错了——项目的开机链只拉**模拟器**，从来没有一步启动游戏；`_clearing_run_locked` 能跑起来是因为它的 `NAV_TOML_TEMPLATE` 以 `StartUp` 开头。肉鸽任务文件缺这一段，真机上 `Roguelike Start → Roguelike Error` 37 秒退 1。现已在 `maa_roguelike.render_task_toml()` 里补上 `StartUp`（见 DEV_GUIDE §5.7）。
+
   环境用 `maa_subprocess_env(config)`（不留代理）+ `MAA_LOG_PREFIX=Never`。
 - **难度上限**（GUI 字典）：Phantom 15 / Mizuki 18 / Sami 15 / Sarkaz 18 / JieGarden 18 / BlackFlow 15。
   **分队 / 职业组**是 OCR 字符串，白名单在 MAA GUI 的 `_squadDictionary`（各主题专属 + 通用 6 个 + 高规格；`roles` = 先手必胜 / 稳扎稳打 / 取长补短，

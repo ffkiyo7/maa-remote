@@ -351,9 +351,46 @@ def _toml_value(value: Any) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+# **每局的任务链必须以 `StartUp` 开头**（2026-09-11 线上事故）：`maa roguelike`
+# 预设和我们这份任务文件都**不会自己启动游戏**（spike C 第 6.1 节），而项目的开机链
+#（`open_emulator / wait_for_android / verify_game_installed / settle_android_runtime`）
+# 只负责把**模拟器**拉起来，从来没有一步去起明日方舟。首轮真机现象：模拟器停在
+# Android 桌面，MaaCore 直接 `Roguelike Start → Roguelike Error`，37 秒退出码 1，
+# 两局连挂后 worker 判失败。日常 `config/maa-cli/tasks/daily.toml` 与抄作业的
+# `maa_copilot_worker.NAV_TOML_TEMPLATE` 都是靠这一段把游戏拉起来并登录到主界面的。
+#
+# **放在 `render_task_toml()` 里**（而不是 worker 只在首局单跑一次 `maa startup`）：
+# ① 和抄作业完全一致，任务链只有一处定义、一处单测；② 每局一个子进程，子进程之间
+# MaaCore 全部销毁重连，没有「上一局已经登录过」这种跨进程状态可依赖；
+# ③ 少一次子进程与一条错误处理分支。
+#
+# **第 2 局及之后是幂等的**：上游 `StartUp` 在游戏已经在前台时不重复启动，
+# 走的是「确认停在主界面」那条链（`config/maa-cli/tasks/operbox.toml` 的注释、
+# DEV_GUIDE §11.13 补跑那条「StartUp 顺手把卡在结算页的游戏带回主界面」）；
+# 抄作业连抄多关就是靠下一关的 `StartUp` 从上一关的结算页回主界面的
+#（2026-09-09 03:06 SR-5 → SR-6 的真机日志）。上一局用尽 `starts_count` 时
+# MaaCore 停在**主题入口页**，`EndOfAction → ClickCorner` 那条返回链同样适用。
+# 万一它在某个肉鸽内部界面认不出来：`StartUp Error` 之后 MaaCore 仍会继续跑
+# `Roguelike`，而 `<Theme>@Roguelike@Begin` 自带 `Continue → ExitThenAbandon`
+# 善后链，所以最坏情况是白花几十秒，不会把这一轮带死（`parse_run_output()` 的
+# `startup_failed` 会把它记进战报）。**这一条尚未真机验收。**
+STARTUP_TOML = (
+    "[[tasks]]\n"
+    'name = "启动国服"\n'
+    'type = "StartUp"\n'
+    "[tasks.params]\n"
+    'client_type = "Official"\n'
+    "start_game_enabled = true\n"
+)
+
+
 def render_task_toml(params: dict[str, Any]) -> str:
-    """maa-cli 任务文件。`[tasks.params]` 原样透传给 MaaCore。"""
+    """maa-cli 任务文件：`StartUp`（拉起游戏）→ `Roguelike`。
+
+    `[tasks.params]` 原样透传给 MaaCore。`StartUp` 的理由见上面的注释。
+    """
     lines = [
+        STARTUP_TOML,
         "[[tasks]]",
         'name = "肉鸽"',
         'type = "Roguelike"',
@@ -392,6 +429,11 @@ INVEST_FULL_MARK = "TraderInvestSystemFull"
 CLEAN_MARK = "Roguelike Completed"
 STOPPED_MARK = "Roguelike Stopped"
 ERROR_MARK = "Roguelike Error"
+# 任务链现在以 `StartUp` 开头，所以输出里多了 `StartUp Start/Completed`。它们和上面
+# 这些 `Roguelike *` 标记不重名，其余判据一个都不用动；只有「游戏根本没起来」这种
+# 情况要认出来——否则它会落进 `unknown`，`ERROR_STREAK_LIMIT` 那道收尾闸门就不生效，
+# worker 会一局接一局地空转下去（正是 2026-09-11 那次事故的放大器）。
+STARTUP_ERROR_MARK = "StartUp Error"
 
 OUTCOME_LABELS = {
     "settled": "已结算",
@@ -425,6 +467,7 @@ def parse_run_output(output: str, return_code: int) -> dict[str, Any]:
         "clean": CLEAN_MARK in text and return_code == 0,
         "interrupted": STOPPED_MARK in text,
         "error": ERROR_MARK in text,
+        "startup_failed": STARTUP_ERROR_MARK in text,
         "return_code": return_code,
     }
     if result["error"]:
@@ -437,8 +480,14 @@ def parse_run_output(output: str, return_code: int) -> dict[str, Any]:
         outcome = "abandoned"
     else:
         outcome = "unknown"
+    # 只在「什么都没发生」时才让 StartUp 的失败决定结论：结算 / 放弃 / 被中断都是
+    # 更具体的事实，不该被开头那一段盖掉。
+    if outcome == "unknown" and result["startup_failed"]:
+        outcome = "error"
     result["outcome"] = outcome
     detail = [OUTCOME_LABELS[outcome]]
+    if result["startup_failed"]:
+        detail.append("游戏没起来（StartUp 失败）")
     if result["exp"] is not None:
         detail.append(f"经验 {result['exp']}")
     if invest:

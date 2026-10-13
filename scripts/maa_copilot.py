@@ -1147,6 +1147,74 @@ CARD_BUTTON_PREFIX = f"{BUTTON_PREFIX}card:"
 # 刻意**不放在 `SEARCHES_DIR`** 下——那个目录里的每个 `*.json` 都会被
 # `prune_expired_searches()` 当成一次搜索删掉。
 CARD_PATH = COPILOT_DIR / "card.json"
+# 「暂停自动作业」开关：只管 watcher 自动排的轮，手动 `copilot find` 不受影响。
+# 同样不放在 `SEARCHES_DIR` 下（理由同 `CARD_PATH`）。
+AUTO_PAUSE_PATH = COPILOT_DIR / "auto_pause.json"
+# 暂停 / 恢复按钮的 custom_id 是**固定**的：`auto` 不是 12 位 hex，
+# `prune_expired_searches()` 永远轮不到它；登记一次，任何卡片都能复用。
+AUTO_PAUSE_BUTTON_ID = f"{BUTTON_PREFIX}auto:off"
+AUTO_RESUME_BUTTON_ID = f"{BUTTON_PREFIX}auto:on"
+AUTO_BUTTON_REGISTRY = {
+    AUTO_PAUSE_BUTTON_ID: {
+        "kind": "exec",
+        "script": "maa_action.py",
+        "args": ["copilot", "auto", "off"],
+    },
+    AUTO_RESUME_BUTTON_ID: {
+        "kind": "exec",
+        "script": "maa_action.py",
+        "args": ["copilot", "auto", "on"],
+    },
+}
+
+
+def auto_pause_state() -> dict[str, Any] | None:
+    """暂停中返回 `{"paused_at": ..., "by": ...}`，否则 `None`。"""
+    state = load_json(AUTO_PAUSE_PATH, None)
+    if isinstance(state, dict) and state.get("paused"):
+        return state
+    return None
+
+
+def set_auto_paused(paused: bool, by: str = "discord") -> None:
+    ensure_private_dirs()
+    if paused:
+        atomic_write_json(
+            AUTO_PAUSE_PATH,
+            {"paused": True, "paused_at": now_beijing().isoformat(), "by": by},
+        )
+    else:
+        atomic_write_json(
+            AUTO_PAUSE_PATH,
+            {"paused": False, "resumed_at": now_beijing().isoformat(), "by": by},
+        )
+
+
+def register_auto_buttons() -> None:
+    """把暂停 / 恢复按钮 merge 进共享登记表（幂等）。"""
+    with state_lock():
+        registry = load_json(BUTTONS_PATH, {})
+        if not isinstance(registry, dict):
+            raise RuntimeError("共享按钮登记表格式错误")
+        if all(registry.get(key) == value for key, value in AUTO_BUTTON_REGISTRY.items()):
+            return
+        registry.update(AUTO_BUTTON_REGISTRY)
+        atomic_write_json(BUTTONS_PATH, registry)
+
+
+def pause_button_row() -> dict[str, Any]:
+    """一行只含「⏸️ 暂停自动作业」的组件。调用方负责 `AUTO_BUTTON_REGISTRY` 已登记。"""
+    return {
+        "type": 1,
+        "components": [
+            {
+                "type": 2,
+                "style": 4,
+                "label": "⏸️ 暂停自动作业",
+                "custom_id": AUTO_PAUSE_BUTTON_ID,
+            }
+        ],
+    }
 
 # 还能取消的状态：`scheduled`（排好没派）与 `queued`（派了没抢到锁）。
 # `executing` 起就可能已经消耗理智，取消没有意义也不安全。
@@ -1325,8 +1393,8 @@ def zone_is_unopened(roster: dict[str, Any] | None, stage_id: str) -> bool:
     """该关所属活动的 zone 是否**全部** `totalStage == 0`（D9：活动尚未全开）。
 
     真为真时该关先不排，下一轮再看；**不记失败**（等下去会自己变好）。
-    森空岛不可用、活动不在进度里一律返回 False——多排一关的代价远小于
-    「森空岛一坏就整个活动不抄」。
+    活动不在进度里返回 False。森空岛整个读不到的情况不归这里管：watcher 那一 tick
+    刷新失败就直接不排（不变量 #55），根本走不到这一步。
     """
     if not isinstance(roster, dict):
         return False
@@ -1419,8 +1487,11 @@ def build_scheduled_card(
     title: str,
     scheduled_at: str = "",
     note: str = "",
+    pause_button: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """「已排程」卡：一轮要打的 `(关, 模式)` 清单 + **唯一**一个「取消本轮」按钮。
+    """「已排程」卡：一轮要打的 `(关, 模式)` 清单 + 「取消本轮」按钮。
+
+    `pause_button`：自动轮再加一个「⏸️ 暂停自动作业」（固定 custom_id，登记表一并返回）。
 
     候选卡的 ▶️ / 🔥 / 🔄 三种按钮在四期步骤 2 全部删除（D6）：选关即执行，
     执行方式由记账与理智预算决定，没有可供用户挑选的候选。
@@ -1474,6 +1545,9 @@ def build_scheduled_card(
             "args": ["copilot", "cancel", token],
         }
     }
+    if pause_button:
+        components[0]["components"].append(pause_button_row()["components"][0])
+        registry.update(AUTO_BUTTON_REGISTRY)
     return embed, components, registry
 
 

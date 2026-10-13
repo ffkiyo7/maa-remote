@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from maa_common import atomic_write_json, atomic_write_text, load_json, now_beijing
 import maa_copilot
@@ -357,7 +357,57 @@ def refresh_roster() -> dict[str, Any]:
     if isinstance(data.get("sanity"), dict):
         roster["sanity"] = data["sanity"]
     atomic_write_json(ROSTER_PATH, roster)
+    # 成功一次就把旧错误清掉：`_ensure_cred()` 只在重新换 cred 时清，
+    # cred 本身没过期的成功路径会让过期告警一直挂在 skland.json 里。
+    fresh = load_json(SKLAND_PATH, None)
+    if isinstance(fresh, dict) and fresh.pop("last_error", None) is not None:
+        atomic_write_json(SKLAND_PATH, fresh)
     return roster
+
+
+LINK_COMMAND = "python3 ~/.hermes/scripts/maa_skland.py link"
+
+
+def daily_health_check(
+    notify: Callable[[str, str], None], at: datetime | None = None
+) -> str:
+    """每个北京日探一次森空岛；失败就在频道里发一条，**一天最多一条**。
+
+    由计划卡（早 07:50 / 晚 21:50）调用：早场探过且成功或已通知，晚场直接跳过；
+    早场 Discord 发送失败则不记「今天已查」，晚场再试。返回 `checked` / `ok` / `notified`。
+    """
+    today = (at or now_beijing()).date().isoformat()
+    state = load_json(SKLAND_PATH, None)
+    if isinstance(state, dict) and state.get("health_checked_on") == today:
+        return "checked"
+    try:
+        refresh_roster()
+        error = ""
+    except Exception as exc:  # noqa: BLE001 - 任何失败都要让用户看见
+        error = f"{type(exc).__name__}: {exc}"
+    if error:
+        expired = "过期" in error or "link" in error or "未配置" in error
+        title = "🔑 森空岛登录已过期" if expired else "⚠️ 森空岛读取失败"
+        notify(
+            title,
+            "影响：自动抄作业停止排轮（读不到活动进度和实时理智），练度快照不再更新。\n"
+            + (
+                f"修复：在本机终端运行 `{LINK_COMMAND}`，粘贴鹰角 token 后回车。\n"
+                if expired
+                else "多半是网络或森空岛接口临时故障，明天会再探一次。\n"
+            )
+            + "恢复之前每天提醒一次。\n"
+            + f"原始错误：{error[:600]}",
+        )
+    # 重读：`refresh_roster()` 可能刚改写过它。没配过森空岛时也落一份只含日期的
+    # 文件——`load_skland_state()` 只认带 `hg_token` 的，不会被它误导。
+    state = load_json(SKLAND_PATH, None)
+    if not isinstance(state, dict):
+        state = {}
+    state["health_checked_on"] = today
+    maa_copilot.ensure_private_dirs()
+    atomic_write_json(SKLAND_PATH, state)
+    return "notified" if error else "ok"
 
 
 def roster_needs_refresh(config: dict[str, Any]) -> bool:

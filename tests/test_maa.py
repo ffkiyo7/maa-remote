@@ -5361,7 +5361,7 @@ class CopilotBatchExecutionTests(unittest.TestCase):
         }
 
     def _run(self, entries, fight, *, activity_key=SR_KEY, lead=None, ledger_dir=None,
-             config=None, settle=None):
+             config=None, settle=None, recheck=None, source=None, paused=False):
         import maa_copilot_worker as worker
 
         token = "a" * 12
@@ -5397,9 +5397,16 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 "token": token, "status": "queued", "activity_key": activity_key,
                 "entries": entries, "message_id": "999",
             }
+            if source:
+                state["source"] = source
             (searches / f"{token}.json").write_text(json.dumps(state), encoding="utf-8")
+            pause_path = Path(raw) / "auto_pause.json"
+            if paused:
+                pause_path.write_text(json.dumps({"paused": True}), encoding="utf-8")
             patches = [
                 patch.object(maa_copilot, "SEARCHES_DIR", searches),
+                patch.object(maa_copilot, "AUTO_PAUSE_PATH", pause_path),
+                patch.object(maa_copilot, "register_auto_buttons"),
                 patch.object(worker, "RUNS_DIR", Path(raw)),
                 patch.object(worker, "state_lock", return_value=contextlib.nullcontext()),
                 patch.object(
@@ -5420,7 +5427,8 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 patch.object(worker, "merge_last_run"),
                 patch.object(worker, "cleanup_run_files"),
                 patch.object(maa_action, "min_lead_reason", return_value=lead),
-                patch.object(worker, "_recheck_before_stage", return_value=(True, "")),
+                patch.object(worker, "_recheck_before_stage", return_value=(True, ""),
+                             side_effect=recheck),
                 *ledger_patches,
                 patch.object(worker, "_fight_one", side_effect=fight),
                 patch.object(worker, "settle_after_battle", side_effect=settle or default_settle),
@@ -5437,10 +5445,61 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                         (searches / f"{token}.json").read_text("utf-8")
                     ))
             final = json.loads((searches / f"{token}.json").read_text("utf-8"))
+            snapshots = [
+                json.loads(path.read_text("utf-8"))
+                for path in Path(raw).glob("*-copilot-*.json")
+            ]
         return SimpleNamespace(
             code=code, ledger=ledger, report=reports[0], state=final,
             results=reports[0]["fields"][0]["value"], settled=settled,
+            snapshot=snapshots[0] if snapshots else None,
         )
+
+    def test_a_prefight_environment_failure_is_marked_on_the_round(self) -> None:
+        """2026-10-11：森空岛过期，每轮都在复核时退出、不记账，watcher 每 15 分钟重派。"""
+        import maa_copilot_worker as worker
+
+        def boom(*_a):
+            raise worker.PrefightError("森空岛实时理智读取失败：HTTP 401")
+
+        fought: list[str] = []
+        result = self._run(
+            [self._entry("SR-5")], lambda *a: fought.append("x") or ("won", ""),
+            recheck=boom, source="activity-watch",
+        )
+        self.assertEqual(fought, [])
+        self.assertEqual(result.state["status"], "execution_failed")
+        self.assertIn("森空岛", result.state["prefight_error"])
+        self.assertEqual(result.snapshot["status"], "failed")
+        self.assertIn("森空岛", result.snapshot["stop_reason"])
+
+    def test_sanity_shortage_is_not_a_prefight_environment_failure(self) -> None:
+        result = self._run(
+            [self._entry("SR-5")], lambda *a: ("won", ""),
+            recheck=lambda *a: (False, "理智不足"),
+        )
+        self.assertNotIn("prefight_error", result.state)
+
+    def test_a_finished_round_closes_its_run_snapshot(self) -> None:
+        result = self._run([self._entry("SR-5")], lambda *a: ("won", ""))
+        self.assertEqual(result.snapshot["status"], "success")
+        self.assertIn("finished_at", result.snapshot)
+
+    def test_a_paused_auto_round_stops_before_the_next_stage(self) -> None:
+        fought: list[str] = []
+        result = self._run(
+            [self._entry("SR-5")], lambda *a: fought.append("x") or ("won", ""),
+            source="activity-watch", paused=True,
+        )
+        self.assertEqual(fought, [])
+        self.assertIn("暂停", result.snapshot["stop_reason"])
+        self.assertNotIn("prefight_error", result.state)
+
+    def test_pausing_never_stops_a_manual_round(self) -> None:
+        result = self._run(
+            [self._entry("SR-5")], lambda *a: ("won", ""), source="discord", paused=True,
+        )
+        self.assertEqual(result.code, 0)
 
     def test_every_fought_stage_is_settled_before_moving_on(self) -> None:
         """打过就要收尾（跳剧情 + 回主界面），导航失败的不收尾——它没进过战斗。
@@ -6677,7 +6736,8 @@ class ActivityWatchTickTests(unittest.TestCase):
     }
 
     def _tick(self, state, *, snapshot=None, entries=None, targets=None,
-              blocker="", notify=None, seed_rounds=None):
+              blocker="", notify=None, seed_rounds=None, skland_error=None,
+              paused=False, config=None):
         import maa_activity_watch as watch
 
         dispatch = unittest.mock.MagicMock()
@@ -6686,6 +6746,9 @@ class ActivityWatchTickTests(unittest.TestCase):
             watch_path = root / "activity_watch.json"
             searches = root / "searches"
             searches.mkdir()
+            pause_path = root / "auto_pause.json"
+            if paused:
+                maa_common.atomic_write_json(pause_path, {"paused": True})
             for token, round_state in (seed_rounds or {}).items():
                 maa_common.atomic_write_json(searches / f"{token}.json", round_state)
             maa_common.atomic_write_json(watch_path, state)
@@ -6693,7 +6756,14 @@ class ActivityWatchTickTests(unittest.TestCase):
             patches = [
                 patch.object(watch, "WATCH_PATH", watch_path),
                 patch.object(maa_copilot, "SEARCHES_DIR", searches),
-                patch.object(watch, "load_config", return_value={"channel_id": "1"}),
+                patch.object(maa_copilot, "AUTO_PAUSE_PATH", pause_path),
+                patch.object(watch, "_supersede_round",
+                             side_effect=lambda token, cfg: maa_copilot.supersede_search(token)),
+                patch.object(maa_copilot, "state_lock",
+                             return_value=contextlib.nullcontext()),
+                patch.object(maa_copilot, "BUTTONS_PATH", root / "buttons.json"),
+                patch.object(watch, "load_config",
+                             return_value={"channel_id": "1", **(config or {})}),
                 patch.object(watch, "state_lock", return_value=contextlib.nullcontext()),
                 patch.object(maa_plan_card, "query_activity_snapshot",
                              return_value=snapshot if snapshot is not None else self.SNAPSHOT),
@@ -6722,7 +6792,8 @@ class ActivityWatchTickTests(unittest.TestCase):
                 import maa_skland
 
                 stack.enter_context(
-                    patch.object(maa_skland, "refresh_roster", return_value={})
+                    patch.object(maa_skland, "refresh_roster", return_value={},
+                                 side_effect=skland_error)
                 )
                 result = watch.run_once()
                 rounds = [
@@ -6730,6 +6801,86 @@ class ActivityWatchTickTests(unittest.TestCase):
                     for path in sorted(searches.glob("*.json"))
                 ]
         return SimpleNamespace(state=result, rounds=rounds, dispatch=dispatch)
+
+    TARGETS = [{"stage": "YW-4", "stage_id": "act52side_04", "modes": ["normal"]}]
+    ENTRIES = [{"stage": "YW-4", "stage_id": "act52side_04", "mode": "normal",
+                "candidate": {"id": 1}, "sanity_cost": 12}]
+
+    def test_a_skland_failure_blocks_scheduling_instead_of_using_the_cache(self) -> None:
+        """2026-10-11：森空岛过期一个月，缓存里没有当期 zone 进度，YW-4 没解锁也被排。"""
+        notices: list[str] = []
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR"},
+            targets=self.TARGETS, entries=self.ENTRIES,
+            skland_error=RuntimeError("cred 过期且重认证失败"),
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(result.state["status"], "blocked")
+        self.assertEqual(result.rounds, [])
+        result.dispatch.assert_not_called()
+        self.assertEqual(len(notices), 1)
+        # 同一原因下一 tick 不再刷屏。
+        again = self._tick(
+            result.state, targets=self.TARGETS, entries=self.ENTRIES,
+            skland_error=RuntimeError("cred 过期且重认证失败"),
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(again.state["status"], "blocked")
+        self.assertEqual(len(notices), 1)
+
+    def test_prefight_failures_stop_scheduling_for_the_day_at_the_cap(self) -> None:
+        """开打前就挂的轮不记账、到不了 daily_cap：另记一本按天的账。"""
+        notices: list[str] = []
+        token = "b" * 12
+        failed_round = {
+            "token": token, "status": "execution_failed", "source": "activity-watch",
+            "entries": self.ENTRIES, "prefight_error": "森空岛实时理智读取失败：x",
+        }
+        first = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR", "batch_token": token},
+            targets=self.TARGETS, entries=self.ENTRIES, blocker="run.lock 被占",
+            seed_rounds={token: failed_round},
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(first.state["prefight_failures"]["count"], 1)
+        self.assertEqual(first.state["status"], "scheduled")  # 一次还没到上限，照排
+        second = self._tick(
+            {**first.state, "batch_token": token},
+            targets=self.TARGETS, entries=self.ENTRIES,
+            seed_rounds={token: failed_round},
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(second.state["prefight_failures"]["count"], 2)
+        self.assertEqual(second.state["status"], "blocked")
+        second.dispatch.assert_not_called()
+        self.assertEqual(sum("不再排轮" in title for title in notices), 1)
+        third = self._tick(
+            second.state, targets=self.TARGETS, entries=self.ENTRIES,
+            notify=lambda config, title, body, color: notices.append(title),
+        )
+        self.assertEqual(third.state["status"], "blocked")
+        self.assertEqual(sum("不再排轮" in title for title in notices), 1)
+
+    def test_prefight_failures_from_yesterday_do_not_block_today(self) -> None:
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR",
+             "prefight_failures": {"date": "2000-01-01", "count": 9}},
+            targets=self.TARGETS, entries=self.ENTRIES,
+        )
+        self.assertEqual(result.state["status"], "dispatched")
+
+    def test_pausing_supersedes_the_scheduled_round_and_schedules_nothing(self) -> None:
+        token = "c" * 12
+        result = self._tick(
+            {"activity_key": SR_KEY, "prefix": "SR", "batch_token": token},
+            targets=self.TARGETS, entries=self.ENTRIES, paused=True,
+            seed_rounds={token: {"token": token, "status": "scheduled",
+                                 "source": "activity-watch", "entries": self.ENTRIES}},
+        )
+        self.assertEqual(result.state["status"], "paused")
+        self.assertNotIn("batch_token", result.state)
+        self.assertEqual([r["status"] for r in result.rounds], ["superseded"])
+        result.dispatch.assert_not_called()
 
     def test_a_new_activity_resets_the_watch_state_and_announces_itself(self) -> None:
         notices: list[str] = []
@@ -6818,6 +6969,188 @@ class ActivityWatchTickTests(unittest.TestCase):
         self.assertTrue(any("活动已结束" in title for title in notices))
 
 
+class SklandDailyHealthTests(unittest.TestCase):
+    """森空岛过期：每个北京日在频道里提醒一次，直到恢复。"""
+
+    def _check(self, *, skland, error=None, at=None):
+        import maa_skland
+
+        notices: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "skland.json"
+            if skland is not None:
+                maa_common.atomic_write_json(path, skland)
+            with patch.object(maa_skland, "SKLAND_PATH", path), \
+                 patch.object(maa_copilot, "ensure_private_dirs"), \
+                 patch.object(maa_skland, "refresh_roster", side_effect=error,
+                              return_value={}):
+                status = maa_skland.daily_health_check(
+                    lambda title, body: notices.append((title, body)), at
+                )
+            stored = json.loads(path.read_text("utf-8"))
+        return status, notices, stored
+
+    AT = datetime(2026, 10, 12, 7, 50, tzinfo=maa_common.BEIJING)
+
+    def test_an_expired_login_is_announced_with_the_fix(self) -> None:
+        status, notices, stored = self._check(
+            skland={"hg_token": "t"},
+            error=RuntimeError("cred 过期且重认证失败；请在本机终端运行 ... link"),
+            at=self.AT,
+        )
+        self.assertEqual(status, "notified")
+        self.assertEqual(len(notices), 1)
+        self.assertIn("过期", notices[0][0])
+        self.assertIn("maa_skland.py link", notices[0][1])
+        self.assertEqual(stored["health_checked_on"], "2026-10-12")
+        self.assertEqual(stored["hg_token"], "t")
+
+    def test_only_one_notice_per_day(self) -> None:
+        status, notices, _ = self._check(
+            skland={"hg_token": "t", "health_checked_on": "2026-10-12"},
+            error=RuntimeError("过期"), at=self.AT,
+        )
+        self.assertEqual(status, "checked")
+        self.assertEqual(notices, [])
+
+    def test_the_next_day_reminds_again(self) -> None:
+        status, notices, _ = self._check(
+            skland={"hg_token": "t", "health_checked_on": "2026-10-11"},
+            error=RuntimeError("cred 过期"), at=self.AT,
+        )
+        self.assertEqual(status, "notified")
+        self.assertEqual(len(notices), 1)
+
+    def test_a_healthy_login_stays_quiet(self) -> None:
+        status, notices, stored = self._check(skland={"hg_token": "t"}, at=self.AT)
+        self.assertEqual(status, "ok")
+        self.assertEqual(notices, [])
+        self.assertEqual(stored["health_checked_on"], "2026-10-12")
+
+    def test_a_failed_discord_post_leaves_the_day_unchecked(self) -> None:
+        import maa_skland
+
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "skland.json"
+            maa_common.atomic_write_json(path, {"hg_token": "t"})
+
+            def notify(_t, _b):
+                raise RuntimeError("discord down")
+
+            with patch.object(maa_skland, "SKLAND_PATH", path), \
+                 patch.object(maa_skland, "refresh_roster",
+                              side_effect=RuntimeError("过期")):
+                with self.assertRaises(RuntimeError):
+                    maa_skland.daily_health_check(notify, self.AT)
+            self.assertNotIn("health_checked_on", json.loads(path.read_text("utf-8")))
+
+    def test_a_successful_refresh_clears_the_stale_error(self) -> None:
+        import maa_skland
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            path = root / "skland.json"
+            maa_common.atomic_write_json(
+                path, {"hg_token": "t", "cred": "c", "sign_token": "s", "uid": "1",
+                       "last_error": "cred 过期"}
+            )
+            with patch.object(maa_skland, "SKLAND_PATH", path), \
+                 patch.object(maa_skland, "ROSTER_PATH", root / "roster.json"), \
+                 patch.object(maa_skland, "fetch_roster",
+                              return_value={"chars": {}, "activity_progress": {}}):
+                maa_skland.refresh_roster()
+            self.assertNotIn("last_error", json.loads(path.read_text("utf-8")))
+
+
+class CopilotAutoPauseCommandTests(unittest.TestCase):
+    """`copilot auto off|on|status`：Discord 里能叫停自动作业。"""
+
+    def _run(self, value, *, watch=None, rounds=None, paused=False):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            searches = root / "searches"
+            searches.mkdir()
+            for token, state in (rounds or {}).items():
+                maa_common.atomic_write_json(searches / f"{token}.json", state)
+            watch_path = root / "activity_watch.json"
+            maa_common.atomic_write_json(watch_path, watch or {})
+            pause_path = root / "auto_pause.json"
+            if paused:
+                maa_common.atomic_write_json(pause_path, {"paused": True})
+            with patch.object(maa_copilot, "SEARCHES_DIR", searches), \
+                 patch.object(maa_copilot, "AUTO_PAUSE_PATH", pause_path), \
+                 patch.object(maa_copilot, "ensure_private_dirs"), \
+                 patch.object(maa_copilot, "state_lock",
+                              return_value=contextlib.nullcontext()), \
+                 patch.object(maa_copilot, "BUTTONS_PATH", root / "buttons.json"), \
+                 patch.object(maa_action, "WATCH_PATH", watch_path), \
+                 patch.object(maa_action, "load_config", return_value={"channel_id": "1"}), \
+                 patch.object(maa_action, "retire_discord_components") as retire:
+                ok, message = maa_action.dispatch(["copilot", "auto", value])
+                paused_now = maa_copilot.auto_pause_state() is not None
+            final_rounds = {
+                path.stem: json.loads(path.read_text("utf-8"))
+                for path in searches.glob("*.json")
+            }
+            final_watch = json.loads(watch_path.read_text("utf-8"))
+        return SimpleNamespace(ok=ok, message=message, paused=paused_now,
+                               rounds=final_rounds, watch=final_watch, retire=retire)
+
+    def test_off_pauses_and_supersedes_the_scheduled_round(self) -> None:
+        token = "d" * 12
+        result = self._run(
+            "off", watch={"batch_token": token},
+            rounds={token: {"token": token, "status": "scheduled", "message_id": "5"}},
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(result.paused)
+        self.assertEqual(result.rounds[token]["status"], "superseded")
+        result.retire.assert_called_once()
+
+    def test_off_never_touches_an_executing_round(self) -> None:
+        token = "e" * 12
+        result = self._run(
+            "off", watch={"batch_token": token},
+            rounds={token: {"token": token, "status": "executing"}},
+        )
+        self.assertEqual(result.rounds[token]["status"], "executing")
+        self.assertIn("打完就停", result.message)
+
+    def test_on_resumes_and_lifts_the_prefight_block(self) -> None:
+        result = self._run(
+            "on", paused=True,
+            watch={"prefight_failures": {"date": "2026-10-11", "count": 2},
+                   "blocked_reason": "x"},
+        )
+        self.assertTrue(result.ok)
+        self.assertFalse(result.paused)
+        self.assertNotIn("prefight_failures", result.watch)
+
+    def test_status_and_bad_values(self) -> None:
+        self.assertIn("已暂停", self._run("status", paused=True).message)
+        self.assertIn("运行中", self._run("status").message)
+        self.assertFalse(self._run("maybe").ok)
+
+    def test_the_pause_buttons_survive_round_pruning(self) -> None:
+        registry = dict(maa_copilot.AUTO_BUTTON_REGISTRY)
+        maa_copilot.prune_search_buttons("a" * 12, registry)
+        self.assertEqual(registry, maa_copilot.AUTO_BUTTON_REGISTRY)
+        self.assertEqual(
+            registry[maa_copilot.AUTO_PAUSE_BUTTON_ID]["args"], ["copilot", "auto", "off"]
+        )
+
+    def test_only_auto_rounds_get_a_pause_button(self) -> None:
+        entries = [{"stage": "SR-1", "mode": "normal", "sanity_cost": 12}]
+        _e, manual, manual_reg = maa_copilot.build_scheduled_card(
+            "a" * 12, entries, title="t")
+        _e, auto, auto_reg = maa_copilot.build_scheduled_card(
+            "a" * 12, entries, title="t", pause_button=True)
+        self.assertEqual(len(manual[0]["components"]), 1)
+        self.assertEqual(len(auto[0]["components"]), 2)
+        self.assertIn(maa_copilot.AUTO_PAUSE_BUTTON_ID, auto_reg)
+        self.assertNotIn(maa_copilot.AUTO_PAUSE_BUTTON_ID, manual_reg)
+
+
 # ---------------------------------------------------------------------------
 # 四期步骤 4：肉鸽
 # ---------------------------------------------------------------------------
@@ -6896,7 +7229,7 @@ class RoguelikeTaskFileTests(unittest.TestCase):
 
         toml = maa_roguelike.render_task_toml(maa_roguelike.resolve_params(None))
         parsed = tomllib.loads(toml)
-        task = parsed["tasks"][0]
+        task = parsed["tasks"][1]
         self.assertEqual(task["type"], "Roguelike")
         params = task["params"]
         # 每局一个子进程：`starts_count = 1` 是「本局结束后再停」的全部实现。
@@ -6908,6 +7241,28 @@ class RoguelikeTaskFileTests(unittest.TestCase):
         self.assertNotIn("use_support", params)
         self.assertNotIn("use_support", toml)
         self.assertNotIn("use_nonfriend_support", toml)
+
+    def test_every_round_starts_the_game_itself(self) -> None:
+        """2026-09-11 事故：任务文件没有 StartUp，模拟器起来了但游戏没起来。
+
+        开机链（`open_emulator / wait_for_android / verify_game_installed /
+        settle_android_runtime`）只管模拟器，拉起游戏的只能是 MaaCore 的 `StartUp`。
+        """
+        import tomllib
+
+        import maa_copilot_worker
+
+        toml = maa_roguelike.render_task_toml(maa_roguelike.resolve_params(None))
+        tasks = tomllib.loads(toml)["tasks"]
+        self.assertEqual([task["type"] for task in tasks], ["StartUp", "Roguelike"])
+        startup = tasks[0]["params"]
+        self.assertEqual(startup["client_type"], "Official")
+        self.assertTrue(startup["start_game_enabled"])
+        # 和日常 / 抄作业同一段（别让三处漂移）。
+        for line in ('type = "StartUp"', 'client_type = "Official"',
+                     "start_game_enabled = true"):
+            self.assertIn(line, maa_copilot_worker.NAV_TOML_TEMPLATE)
+            self.assertIn(line, toml)
 
     def test_blackflow_modes_become_a_strategy_not_a_bare_mode(self) -> None:
         wanted = {"burn": ("burn", 0), "investment": ("investment", 1),
@@ -6990,6 +7345,62 @@ class RoguelikeOutputTests(unittest.TestCase):
         error = maa_roguelike.parse_run_output("Roguelike Error", 1)
         self.assertTrue(error["error"])
         self.assertEqual(error["outcome"], "error")
+
+    def test_the_startup_lines_do_not_disturb_any_verdict(self) -> None:
+        """任务链多了一段 `StartUp`，原有判据一个都不许被带偏。"""
+        output = (
+            "StartUp Start\n"
+            "StartUp Completed\n"
+            "Roguelike Start\n"
+            "Start exploration 1 times\n"
+            "Deposit 3 / 21 / 300 originium ingots\n"
+            "Gain 340 exp during this exploration\n"
+            "Roguelike Completed\n"
+        )
+        parsed = maa_roguelike.parse_run_output(output, 0)
+        self.assertEqual(parsed["outcome"], "settled")
+        self.assertEqual(parsed["exp"], 340)
+        self.assertTrue(parsed["clean"])
+        self.assertFalse(parsed["startup_failed"])
+
+    def test_a_failed_startup_is_an_error_not_an_unknown(self) -> None:
+        """2026-09-11 事故的放大器：游戏没起来时必须能触发连续报错收尾闸门。"""
+        parsed = maa_roguelike.parse_run_output("StartUp Start\nStartUp Error\n", 1)
+        self.assertTrue(parsed["startup_failed"])
+        self.assertEqual(parsed["outcome"], "error")
+        self.assertIn("游戏没起来", parsed["detail"])
+        # 结算过的一局不会被开头那段盖掉。
+        settled = maa_roguelike.parse_run_output(
+            "StartUp Error\nGain 340 exp during this exploration\n", 1
+        )
+        self.assertEqual(settled["outcome"], "settled")
+        self.assertTrue(settled["startup_failed"])
+
+    def test_the_summary_block_survives_the_startup_section(self) -> None:
+        """maa-cli 的结尾 summary 现在多一段 `[启动国服]`，解析不能被它带偏。"""
+        output = (
+            "Summary\n"
+            "----------------------------------------\n"
+            "[启动国服] 18:30:43 - 18:31:25 (42s) Completed\n"
+            "----------------------------------------\n"
+            "[肉鸽] 18:31:25 - 18:45:02 (13m 37s) Completed\n"
+            "Explorations:\n"
+            "1. Passed, invest 18 originium ingotes, gained 200 exp;\n"
+            "Summary:\n"
+            "Passed 1, Failed 0\n"
+            "Total invest 18 originium ingotes\n"
+            "Total gained 200 exp\n"
+        )
+        summary = maa_roguelike.parse_summary(output)
+        self.assertEqual(len(summary["explorations"]), 1)
+        self.assertEqual(summary["passed"], 1)
+        self.assertEqual(summary["total_invest"], 18)
+        self.assertEqual(summary["total_exp"], 200)
+        rendered = "\n".join(
+            field["value"] for field in maa_roguelike.summary_fields(summary)
+        )
+        self.assertIn("第 1 局 · 通关 · 投资 18 · 经验 200", rendered)
+        self.assertNotIn("启动国服", rendered)
 
     def test_the_summary_block_becomes_chinese_embed_fields(self) -> None:
         output = (

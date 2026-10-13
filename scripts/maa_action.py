@@ -818,13 +818,15 @@ def publish_round(
     title: str,
     scheduled_at: str = "",
     note: str = "",
+    pause_button: bool = False,
 ) -> str:
-    """发一张「已排程」卡并登记它**唯一**的「取消本轮」按钮，返回 message_id。
+    """发一张「已排程」卡并登记它的按钮（「取消本轮」，自动轮另有「暂停自动作业」），返回 message_id。
 
     顺序与抄作业卡一致（不变量 #14b）：先删这一 token 的旧登记，再 merge 写新登记。
     """
     embed, components, registry = maa_copilot.build_scheduled_card(
-        token, entries, title=title, scheduled_at=scheduled_at, note=note
+        token, entries, title=title, scheduled_at=scheduled_at, note=note,
+        pause_button=pause_button,
     )
     message = discord_request(
         discord_token(),
@@ -1341,6 +1343,52 @@ def roguelike_status() -> tuple[bool, str]:
     )
 
 
+def copilot_auto(value: str) -> tuple[bool, str]:
+    """`copilot auto off|on|status`：暂停 / 恢复 watcher 的自动作业。
+
+    暂停时顺手作废还没开打的那一轮；已经在打的一轮**不中断当前这一关**
+    （打到一半掐掉会白花理智），worker 每关开打前看开关，下一关就停。
+    手动 `copilot find` 不受影响。
+    """
+    value = value.strip().lower()
+    if value == "status":
+        paused = maa_copilot.auto_pause_state()
+        if paused:
+            return True, f"⏸️ 自动作业已暂停（{str(paused.get('paused_at') or '')[:16]} 起）。"
+        return True, "▶️ 自动作业运行中。"
+    if value not in {"on", "off"}:
+        return False, "用法：copilot auto <on|off|status>"
+    if value == "on":
+        maa_copilot.set_auto_paused(False)
+        # 「今天开打前失败到上限」的停排也一并解除：用户说恢复，就是修好了。
+        watch = load_json(WATCH_PATH, {})
+        if isinstance(watch, dict) and watch.pop("prefight_failures", None) is not None:
+            watch.pop("blocked_reason", None)
+            atomic_write_json(WATCH_PATH, watch)
+        return True, "▶️ 已恢复自动作业，下一次活动监控（≤15 分钟）重新排轮。"
+    maa_copilot.set_auto_paused(True)
+    watch = load_json(WATCH_PATH, {})
+    token = str(watch.get("batch_token") or "") if isinstance(watch, dict) else ""
+    note = ""
+    if token:
+        search = _load_search(token) or {}
+        status = str(search.get("status") or "")
+        if status in {"scheduled", "queued"}:
+            changed, message_id = maa_copilot.supersede_search(token)
+            if changed:
+                try:
+                    retire_discord_components(load_config(), message_id)
+                except Exception as exc:
+                    note = f"（旧卡按钮收起失败但已失效：{type(exc).__name__}）"
+                note = "已作废还没开打的一轮" + note + "。"
+        elif status == "executing":
+            note = "当前这一关打完就停，不会再开下一关。"
+    return True, (
+        "⏸️ 已暂停自动作业。" + note
+        + "恢复：说「恢复自动作业」或 `copilot auto on`。"
+    )
+
+
 def copilot_cancel(token: str) -> tuple[bool, str]:
     config = load_config()
     message_id: Any = None
@@ -1432,6 +1480,8 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return copilot_mark_cleared(argv[2], argv[3] if len(argv) == 4 else "")
     if argv[:2] == ["copilot", "unmark"] and len(argv) == 3:
         return copilot_unmark(argv[2])
+    if argv[:2] == ["copilot", "auto"] and len(argv) == 3:
+        return copilot_auto(argv[2])
     if argv == ["roguelike", "card"]:
         return roguelike_card()
     if argv[:2] == ["roguelike", "set"] and len(argv) == 4:
@@ -1448,7 +1498,7 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
         "plan skip-today <on|off> <am|pm>、plan show、run now、run start <关卡> <token>、"
         "run expire <token> [--after 秒]、run recommend <token>、log tail、"
-        "copilot card/find/cancel/status/mark-cleared/unmark、"
+        "copilot card/find/cancel/status/mark-cleared/unmark、copilot auto <on|off|status>、"
         "roguelike card/set/start/stop/abort/status。"
     )
 

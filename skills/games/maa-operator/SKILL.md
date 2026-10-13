@@ -75,6 +75,7 @@ python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
 python3 ~/.hermes/scripts/maa_action.py copilot mark-cleared <关卡> [normal|raid|all]
 python3 ~/.hermes/scripts/maa_action.py copilot unmark <关卡>
+python3 ~/.hermes/scripts/maa_action.py copilot auto <off|on|status>
 python3 ~/.hermes/scripts/maa_action.py roguelike card
 python3 ~/.hermes/scripts/maa_action.py roguelike stop
 python3 ~/.hermes/scripts/maa_action.py roguelike abort
@@ -109,6 +110,13 @@ token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑�
   ✅ 已通 / 🔁 普通已通突袭待补 / ⏳ 排程 HH:MM / 🚫 练度不满足 / ⛔ 上游无导航）
 - “这一轮到哪了” → `copilot status <token>`（token 来自「已排程」卡）
 - “不抄了 / 取消这轮” → 「已排程」卡上的 ❌ 按钮（`copilot cancel`）
+- “停掉自动作业 / 别再自动抄了 / 暂停自动作业” → `copilot auto off`（作废还没开打的
+  一轮；正在打的那一关打完就停；手动 `copilot find` 不受影响）。「已排程」卡和
+  「▶️ 开始抄作业」通知上的「⏸️ 暂停自动作业」按钮是同一个动作
+- “恢复自动作业 / 继续自动抄” → `copilot auto on`（同时解除「今天开打前失败太多次」的停排）
+- “自动作业停了没 / 自动作业开着吗” → `copilot auto status`
+- 「🔑 森空岛登录已过期」通知 → 让用户在本机终端运行
+  `python3 ~/.hermes/scripts/maa_skland.py link` 并粘贴鹰角 token；**不要**在聊天里索要 token
 - “再打一遍 SR-6” → `copilot find SR-6`，已通的关也允许重打
 - “SR-7 我自己打过了 / 别再抄 SR-7 / 这关我手动通了” → `copilot mark-cleared SR-7`
   （写进账本，自动排轮从此跳过；不传模式就按当前规则取要打的模式，用户明说
