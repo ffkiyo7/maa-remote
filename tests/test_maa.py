@@ -2860,6 +2860,33 @@ class FarmingFixture(unittest.TestCase):
             "farming_weights": {"scarcity": 0.5, "gap": 0.3, "efficiency": 0.2},
         }
         self._seed_resources()
+        # 解锁判据读的是**本机真实**的森空岛快照与账本，同样要密闭：
+        # 默认两关普通都通过，需要「没解锁」的用例自己覆盖 `self.unlock`。
+        self.unlock = (None, self.ledger_with("SR-7", "SR-8"))
+        evidence = patch.object(maa_farming, "_unlock_evidence", lambda: self.unlock)
+        evidence.start()
+        self.addCleanup(evidence.stop)
+
+    @staticmethod
+    def ledger_with(*cleared: str, key: str = "SideStory「月行水上」|SR") -> dict:
+        return {
+            "activity_key": key,
+            "stages": {
+                stage: {"normal": "2026-09-05T03:00:00+08:00", "raid": None, "attempts": []}
+                for stage in cleared
+            },
+        }
+
+    @staticmethod
+    def roster_with(cleared: int, total: int = 11) -> dict:
+        return {
+            "chars": {},
+            "activity_progress": {
+                "act54side": [
+                    {"zoneId": "act54side_zone1", "clearedStage": cleared, "totalStage": total}
+                ]
+            },
+        }
 
     # --- 上游资源（stages.json / item_index.json / 导航键） -------------------
     def _seed_resources(self) -> None:
@@ -3275,6 +3302,68 @@ class FarmingCandidateSetTests(FarmingFixture):
             activity_cache=self._activity_cache("2026/09/18 03:59:59"),
         )
         self.assertEqual(stages, {"SR-8"})
+
+    def _candidates(self, config: dict | None = None):
+        return maa_farming.candidate_stages(
+            config or {**self.config, "activity_stages": ["SR-7", "SR-8"]},
+            self.at,
+            activity_cache=self._activity_cache("2026/09/18 03:59:59"),
+        )
+
+    def test_a_stage_skland_proves_locked_is_dropped(self) -> None:
+        """2026-10-13：活动关根本没解锁，自动定关照样把理智定到它上面。"""
+        # 7/11：SR-7 证明不了没通（照排），SR-8 的普通一定没通（剔掉）。
+        self.unlock = (self.roster_with(cleared=7), self.ledger_with())
+        stages, in_activity, reason = self._candidates()
+        self.assertTrue(in_activity)
+        self.assertEqual(stages, {"SR-7"})
+        self.assertIn("SR-8", reason)
+
+    def test_every_activity_stage_locked_falls_back_to_supplies(self) -> None:
+        self.unlock = (self.roster_with(cleared=2), self.ledger_with())
+        stages, in_activity, reason = self._candidates()
+        self.assertFalse(in_activity)
+        self.assertIn("1-7", stages)
+        self.assertNotIn("SR-7", stages)
+        self.assertNotIn("SR-8", stages)
+        self.assertIn("刷不了", reason)
+
+    def test_no_progress_and_no_ledger_means_not_farmable(self) -> None:
+        """森空岛没有本期进度、账本也没记：没有任何通关证据，不押理智。"""
+        self.unlock = (None, None)
+        stages, in_activity, _reason = self._candidates()
+        self.assertFalse(in_activity)
+        self.assertNotIn("SR-8", stages)
+
+    def test_a_ledger_clear_keeps_the_stage_without_skland(self) -> None:
+        self.unlock = (None, self.ledger_with("SR-8"))
+        stages, _in_activity, _reason = self._candidates()
+        self.assertEqual(stages, {"SR-8"})
+
+    def test_another_activitys_ledger_does_not_count(self) -> None:
+        self.unlock = (None, self.ledger_with("SR-7", "SR-8", key="SideStory「旧」|YW"))
+        stages, in_activity, _reason = self._candidates()
+        self.assertFalse(in_activity)
+        self.assertNotIn("SR-8", stages)
+
+    def test_inconclusive_progress_keeps_the_stage(self) -> None:
+        """进度够序号但没全清：证明不了没通，沿用以前的口径照排。"""
+        self.unlock = (self.roster_with(cleared=9), self.ledger_with())
+        stages, _in_activity, _reason = self._candidates()
+        self.assertEqual(stages, {"SR-7", "SR-8"})
+
+    def test_auto_stage_never_picks_a_locked_stage(self) -> None:
+        self.unlock = (self.roster_with(cleared=2), self.ledger_with())
+        config = {**self.config, "farming_stage_table": {}}
+        result = maa_farming.farming_result(
+            config,
+            self.depot({"异铁组": 2.0}, {"异铁组": 0}, at=self.at),
+            at=self.at,
+            data=self.market(),
+        )
+        stage, _why = maa_farming.auto_stage(result)
+        self.assertTrue(stage)
+        self.assertNotIn(stage, {"SR-7", "SR-8"})
 
 
 class FarmingFetchTests(unittest.TestCase):

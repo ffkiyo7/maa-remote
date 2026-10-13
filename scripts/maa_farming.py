@@ -699,6 +699,60 @@ def _blend(parts: dict[str, float], weight_map: dict[str, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _unlock_evidence() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """`(练度快照, 当期活动账本)`，给 `locked_activity_stage()` 用。读不出来就是 `None`，绝不抛。"""
+    import maa_copilot
+
+    try:
+        roster = maa_copilot.load_roster()
+    except Exception:  # noqa: BLE001 - 旁路信息
+        roster = None
+    try:
+        ledger = maa_copilot.load_ledger()
+    except Exception:  # noqa: BLE001 - 旁路信息
+        ledger = None
+    return roster, ledger
+
+
+def locked_activity_stage(
+    stage: str,
+    stage_id: str,
+    roster: dict[str, Any] | None,
+    ledger: dict[str, Any] | None,
+) -> str:
+    """活动关**现在刷不了**的原因；能刷或判不了返回空串。
+
+    刷理智走代理指挥，前提是这关普通已经通过。2026-10-13：活动关根本没解锁，
+    候选集只过了导航闸门，自动定关照样把理智定到它上面。判据按证据强弱：
+
+    1. 账本记过普通通关 / 森空岛 zone 全清 → 能刷；
+    2. 活动 zone 还没开，或 `zone_progress_warning()` 能证明普通没通 → 不能刷；
+    3. 森空岛有这期活动的进度、但证明不了没通 → 当能刷（与以前一致）；
+    4. 森空岛压根没有这期活动的进度、账本也没记 → **不能刷**：没有任何通关证据时
+       宁可退回资源本，也不把一场理智押在一个可能没解锁的关上（2026-10-11 YW-4 同理）。
+
+    `stage_id` 认不出序号（EX / 剧情关）时判不了，返回空串，交给原来的口径。
+    """
+    import maa_clearing
+    import maa_copilot
+
+    if not maa_copilot.STAGE_SERIAL_RE.match(str(stage_id or "")):
+        return ""
+    if ledger is not None and maa_copilot._activity_prefix(
+        str(ledger.get("activity_key") or "")
+    ) != maa_clearing.stage_nav_prefix(stage):
+        ledger = None  # 别的活动的账：同名关不算数
+    if not maa_copilot.ledger_pending_modes(ledger, roster, stage, stage_id, ["normal"]):
+        return ""
+    if maa_copilot.zone_is_unopened(roster, stage_id):
+        return f"{stage} 所在活动区还没开放"
+    if maa_copilot.zone_progress_warning(stage, stage_id, roster):
+        return f"{stage} 森空岛进度显示普通未通关"
+    if maa_copilot.stage_zone(roster, stage_id) is not None:
+        return ""
+    return f"{stage} 没有通关记录（森空岛无本期进度、账本也没记）"
+
+
 def candidate_stages(
     config: dict[str, Any],
     at: datetime | None = None,
@@ -708,7 +762,8 @@ def candidate_stages(
     """`(候选关集合, 是不是活动期, 一句说明)`。
 
     D5：**活动期间只在活动关里选**（月卡都不开，理智必须 all in 活动才换得完代币商店），
-    集合 = `config.activity_stages ∩ 上游导航键`（与自动抄作业同一个闸门，不变量 #37）。
+    集合 = `config.activity_stages ∩ 上游导航键 ∩ 已解锁`（导航闸门与自动抄作业同一个，
+    不变量 #37；解锁判据见 `locked_activity_stage()`）。
     否则 = `1-7` + 当天开放的资源本。
 
     「是不是活动期」优先看 `StageActivityV2` 的截止时刻——`activity_stages` 是运行时
@@ -733,23 +788,42 @@ def candidate_stages(
     active = (
         any(expire > moment for _title, expire in deadlines) if deadlines else bool(stages)
     )
+    locked: list[str] = []
     if active and stages:
         try:
             nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
             navigable = [stage for stage in stages if nav_of(stage)[0]]
         except Exception:  # noqa: BLE001 - 闸门读不出来时不该整条推荐消失
             navigable = list(stages)
+        try:
+            roster, ledger = _unlock_evidence()
+            upstream = maa_plan_card.stage_drops(config)
+            verdicts = {
+                stage: locked_activity_stage(
+                    stage,
+                    str((upstream.get(stage) or {}).get("stage_id") or ""),
+                    roster,
+                    ledger,
+                )
+                for stage in navigable
+            }
+        except Exception:  # noqa: BLE001 - 判不了解锁就按原口径，不让推荐消失
+            verdicts = {}
+        locked = [why for why in verdicts.values() if why]
+        navigable = [stage for stage in navigable if not verdicts.get(stage)]
         if navigable:
-            return set(navigable), True, "活动期：候选集只有活动关（D5）"
+            note = f"；跳过未解锁：{'、'.join(locked)}" if locked else ""
+            return set(navigable), True, f"活动期：候选集只有活动关（D5）{note}"
     supplies = {
         stage
         for _label, stage, _desc in maa_plan_card.current_supply_choices(config, moment)
     }
-    reason = (
-        "活动期，但没有上游写了导航定义的活动关，退回 1-7 + 当天开放资源本"
-        if active
-        else "无活动：1-7 + 当天开放的资源本"
-    )
+    if not active:
+        reason = "无活动：1-7 + 当天开放的资源本"
+    elif locked:
+        reason = f"活动期，但活动关都还刷不了（{'、'.join(locked)}），退回 1-7 + 当天开放资源本"
+    else:
+        reason = "活动期，但没有上游写了导航定义的活动关，退回 1-7 + 当天开放资源本"
     return ({"1-7"} | supplies), False, reason
 
 
