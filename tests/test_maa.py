@@ -5512,17 +5512,28 @@ class CopilotBatchExecutionTests(unittest.TestCase):
         result = self._run(entries, lambda *a: next(outcomes))
         self.assertEqual(result.settled, ["SR-5", "SR-6"])
 
-    def test_a_failed_settle_is_reported_but_does_not_change_the_verdict(self) -> None:
+    def test_a_won_stage_whose_settle_failed_is_not_recorded_as_cleared(self) -> None:
+        """2026-10-15 YW-4：赢了但战后剧情没跳过，代理指挥没解锁。记成通关就再也不会重抄。"""
         entries = [self._entry("SR-8")]
         result = self._run(
             entries, lambda *a: ("won", ""),
             settle=lambda *a: (False, "SR-8 战后未回到主界面：x"),
         )
-        self.assertEqual(result.code, 0)
-        self.assertIn("✅ `SR-8` — SR-8 战后未回到主界面", result.results)
-        # 记账照记通关：收尾失败是收尾的事，不是这一关没打赢。
-        self.assertTrue(result.ledger["stages"]["SR-8"]["normal"])
-        self.assertIn("战后未回到主界面", result.ledger["stages"]["SR-8"]["attempts"][-1]["detail"])
+        self.assertIn("❌ `SR-8`", result.results)
+        self.assertIn("代理指挥未解锁", result.results)
+        stage = result.ledger["stages"]["SR-8"]
+        self.assertFalse(stage["normal"])
+        self.assertEqual(stage["attempts"][-1]["outcome"], "failed")
+        self.assertIn("战后未回到主界面", stage["attempts"][-1]["detail"])
+
+    def test_a_failed_settle_after_a_lost_battle_keeps_the_original_detail(self) -> None:
+        result = self._run(
+            [self._entry("SR-8")], lambda *a: ("failed", "撤退"),
+            settle=lambda *a: (False, "SR-8 战后未回到主界面：x"),
+        )
+        detail = result.ledger["stages"]["SR-8"]["attempts"][-1]["detail"]
+        self.assertTrue(detail.startswith("撤退"), detail)
+        self.assertNotIn("代理指挥", detail)
 
     def test_a_clean_round_records_every_mode_and_reports_each_stage(self) -> None:
         entries = [self._entry("SR-5"), self._entry("SR-5", "raid"), self._entry("SR-6")]
@@ -5900,6 +5911,11 @@ class CopilotSettleTests(unittest.TestCase):
         self.assertEqual(tasks["CopilotSettleSkip"]["next"], ["CopilotSettleSkipConfirm"])
         self.assertEqual(tasks["CopilotSettleSkipConfirm"]["baseTask"], "SkipBattlePlotConfirm")
         self.assertEqual(tasks["CopilotSettleSkipConfirm"]["next"], [])
+        # 派生任务不继承 `template`（10-15 YW-4：`templ not found CopilotSettleSkip.png`）。
+        self.assertEqual(tasks["CopilotSettleSkip"]["template"], "SkipThePreBattlePlot.png")
+        self.assertEqual(
+            tasks["CopilotSettleSkipConfirm"]["template"], "SkipThePreBattlePlotConfirm.png"
+        )
         # 原有的两条导航覆盖仍在同一份 tasks.json 里。
         self.assertIn("CopilotNavigationReady", tasks)
 
