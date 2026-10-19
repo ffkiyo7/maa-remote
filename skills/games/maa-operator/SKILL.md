@@ -66,6 +66,7 @@ python3 ~/.hermes/scripts/maa_action.py plan set-stage <关卡> <am|pm>
 python3 ~/.hermes/scripts/maa_action.py plan set-stage "" <am|pm>
 python3 ~/.hermes/scripts/maa_action.py plan skip-today on <am|pm>
 python3 ~/.hermes/scripts/maa_action.py plan skip-today off <am|pm>
+python3 ~/.hermes/scripts/maa_action.py plan fight <on|off> <am|pm>
 python3 ~/.hermes/scripts/maa_action.py plan show
 python3 ~/.hermes/scripts/maa_action.py run now
 python3 ~/.hermes/scripts/maa_action.py log tail
@@ -97,6 +98,8 @@ token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑�
 - “早场别跑 / 今晚跳过” → `plan skip-today on am` / `plan skip-today on pm`
   （只关掉那一场，另一场照常）
 - “恢复早场 / 晚上还是跑吧” → `plan skip-today off <am|pm>`
+- “今晚日常不清体力 / 只收菜别刷理智” → `plan fight off pm`（剿灭和刷理智都不打，基建 / 公招 /
+  商店 / 领奖照常，理智留给抄作业）；“还是刷吧” → `plan fight on <am|pm>`
 - “今天怎么跑 / 看计划” → `plan show`（一次念完两场）
 - “现在跑” / “手动跑 CE-6” → `run now`（**只发选关卡**，用户从卡上的下拉选关才开跑，
   10 分钟不选作废；带关卡名也照样只发卡、让用户点，不要替他选。手动场豁免 skip：

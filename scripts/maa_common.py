@@ -399,6 +399,9 @@ def effective_plan(
     ):
         if key in override:
             result[key] = override[key]
+    if isinstance(override.get("fight"), bool):
+        # 「这场不清理智」：剿灭和刷理智一起摘掉，基建 / 公招 / 商店 / 领奖照常。
+        result["tasks"] = {**result.get("tasks", {}), "fight": override["fight"]}
     result = normalize_plan(result)
     result["date"] = at.date().isoformat()
     return result
