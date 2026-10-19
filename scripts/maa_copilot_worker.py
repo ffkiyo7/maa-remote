@@ -31,6 +31,7 @@ from typing import Any
 import maa_action
 import maa_clearing
 import maa_copilot
+import maa_gamedata
 from maa_daily import (
     HOME_TASK_NAMES,
     capture_screenshot,
@@ -276,6 +277,9 @@ def cmd_search(token: str) -> int:
                 raise RuntimeError(f"关卡 {code} 已不在本地索引中")
             sanity_cost = maa_copilot.stage_sanity_cost(stage_id, code, config)
             if sanity_cost is None:
+                # EX 关不在上游 `stages.json` 里，游戏数据里有。
+                sanity_cost = maa_gamedata.ap_cost(maa_gamedata.load_layout(), stage_id)
+            if sanity_cost is None:
                 raise RuntimeError(f"{code} 的理智消耗尚未进入 MaaResource，拒绝执行")
 
             import maa_skland
@@ -430,6 +434,9 @@ def _run_copilot_with_watchdog(
     log_handle: Any,
     log_path: Path,
     env: dict[str, str],
+    *,
+    timeout: int | None = None,
+    stall: tuple[str, int] | None = None,
 ) -> tuple[int, int]:
     """Run maa copilot; watchdog taps the takeover popup if it appears.
 
@@ -437,13 +444,19 @@ def _run_copilot_with_watchdog(
     every run on a 代理指挥-enabled stage fails.  Poll the screen with the
     local OCR binary (deployed as ~/.hermes/scripts/ocrbox) and tap the
     confirm button when the exact popup text is seen.
+
+    `stall = (标记, 秒)` 是多作业的「无进展」超时：日志里这个标记（每开始一份作业
+    出现一次）隔这么久都没多出一个，就当它卡在地图弹窗上了，结束进程
+    （2026-09-08 SR-6 塔罗牌弹窗让列表模式空转 9 分钟）。
     """
     adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
     address = str(config.get("adb_address", "127.0.0.1:5555"))
     ocrbox = SCRIPTS_DIR / "ocrbox"
     watch_png = RUNS_DIR / ".watch.png"
     # 单关级超时：整场的长度由 `min_lead_reason()` 的时间预算约束，不在这里叠加。
-    timeout = int(config.get("maa_run_timeout", 3000))
+    if timeout is None:
+        timeout = int(config.get("maa_run_timeout", 3000))
+    start_offset = log_path.stat().st_size if log_path.exists() else 0
     proc = subprocess.Popen(
         command,
         stdout=log_handle,
@@ -452,9 +465,19 @@ def _run_copilot_with_watchdog(
     )
     taps = 0
     deadline = time.monotonic() + timeout
+    seen_marks = 0
+    stall_deadline = time.monotonic() + (stall[1] if stall else timeout)
+    next_stall_check = time.monotonic() + 30
     try:
         while proc.poll() is None:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if stall and now >= next_stall_check:
+                next_stall_check = now + 30
+                marks = _log_since(log_path, start_offset).count(stall[0])
+                if marks > seen_marks:
+                    seen_marks = marks
+                    stall_deadline = now + stall[1]
+            if now >= deadline or (stall and now >= stall_deadline):
                 proc.terminate()
                 try:
                     proc.wait(timeout=10)
@@ -462,7 +485,10 @@ def _run_copilot_with_watchdog(
                     proc.kill()
                     proc.wait(timeout=10)
                 with log_path.open("a", encoding="utf-8") as handle:
-                    handle.write("maa copilot 超时\n")
+                    handle.write(
+                        "maa copilot 超时\n" if now >= deadline
+                        else f"maa copilot 无进展超时（{stall[1]}s 没有开始下一份作业）\n"
+                    )
                 return 124, taps
             time.sleep(2)
             if not ocrbox.is_file():
@@ -524,6 +550,8 @@ def _isolated_config(
     env: dict[str, str],
     task_files: dict[str, str],
     overlay_tasks: dict[str, dict[str, Any]] | None = None,
+    *,
+    no_battle: bool = True,
 ):
     """临时 `MAA_CONFIG_DIR`，把不进战斗的覆盖与任务文件隔离在本进程内。
 
@@ -531,6 +559,7 @@ def _isolated_config(
     真正的 `maa copilot` 仍然用原配置，`~/.config/maa-cli/` 一个字节都不动。
     `overlay_tasks` 是调用方额外派生的任务（`baseTask` 继承上游、只改 `next`），
     与这里固定的 `FightBegin` / `CopilotNavigationReady` 覆盖写进同一份 tasks.json。
+    `no_battle=False` 只给多作业那一趟用：它本来就要开打，不能挡掉 `FightBegin`。
     """
     source = Path(env["MAA_CONFIG_DIR"])
     with tempfile.TemporaryDirectory(prefix="maa-copilot-nav-") as raw:
@@ -548,8 +577,9 @@ def _isolated_config(
         }
         resource = root / "resource" / "tasks" / "tasks.json"
         overlay = load_json(resource, {})
-        overlay["FightBegin"] = dict(ready)
-        overlay["CopilotNavigationReady"] = dict(ready)
+        if no_battle:
+            overlay["FightBegin"] = dict(ready)
+            overlay["CopilotNavigationReady"] = dict(ready)
         for name, task in (overlay_tasks or {}).items():
             overlay[name] = dict(task)
         atomic_write_json(resource, overlay)
@@ -796,12 +826,19 @@ def _entry_result_lines(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines) or "—"
 
 
-def _batch_run_locked(state: dict[str, Any]) -> int:
-    """锁内串行连抄：每关一次上游 Fight 导航 + 单作业 copilot（spike A 的 B 基线）。
+def _use_list_path(state: dict[str, Any]) -> bool:
+    """当期活动关（`activity_key` 非空）走多作业路径，其余走 B 基线。"""
+    return bool(str(state.get("activity_key") or ""))
 
-    `copilot_list` 那条路挂起（spike A：stdout 分不出逐关成败，且它的导航链不处理
-    首通弹窗，实测死循环 9 分钟）。B 基线的每关成败能直接从 stdout 的
-    `Copilot Completed` 判，Fight 导航链又自带 `<前缀>-TarotClose` 这类弹窗处理。
+
+def _batch_run_locked(state: dict[str, Any]) -> int:
+    """锁内连抄。两条路：
+
+    - 当期活动关（`activity_key` 非空）：锚点导航停在地图 → 剧情关 / 区域入口 →
+      `copilot_list` 多作业（`_run_activity_round()`，2026-10-19 解除 D22）。
+      spike A 挂起它的两个原因现在都有对策：逐关成败看 `-vvv` 下每份开始时的
+      `CopilotListLoadTaskFileSuccess`；地图弹窗卡死由「无进展」超时收住。
+    - 其余的关（资源本、主线）：每关一次上游 Fight 导航 + 单作业 copilot（B 基线）。
     """
     config = load_config()
     token = str(state.get("token") or "")
@@ -907,68 +944,75 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
-        raid_on = maa_clearing.raid_enabled(config)
-        for entry in entries:
-            stage = str(entry.get("stage") or "")
-            mode = str(entry.get("mode") or "normal")
-            if mode == "raid" and not raid_on:
-                # 最后一道防线：条目可能是开关关掉**之前**排的（轮次落盘后配置改了、
-                # 手动轮排在前面），照跑会打普通难度却记成突袭通关。宁可什么都不做。
-                results.append(
-                    {"stage": stage, "mode": mode, "outcome": "skipped",
-                     "detail": RAID_DISABLED_NOTICE}
-                )
-                continue
-            if stage in failed_stages:
-                # 普通没过就别去撞突袭：突袭是同一关再打一遍，普通没通它根本没解锁。
-                results.append(
-                    {"stage": stage, "mode": mode, "outcome": "skipped",
-                     "detail": "同一关的普通模式未通过"}
-                )
-                continue
-            if auto_round and maa_copilot.auto_pause_state():
-                stop_reason = "自动作业已暂停"
-                break
-            lead = maa_action.min_lead_reason(config)
-            if lead:
-                stop_reason = lead
-                break
-            ok, detail = _recheck_before_stage(config, state, entry)
-            if not ok:
-                stop_reason = detail
-                break
-            outcome, detail = _fight_one(config, entry, env, log_path)
-            if outcome != "nav":
-                # 进过战斗就要正常收尾：跳过首通剧情、回主界面，再往下走（或退游戏）。
-                # 直接 closedown 会把结算流程掐断——SR-8 三星却没解锁代理指挥（2026-09-09）。
-                settled, settle_note = settle_after_battle(config, stage, env, log_path)
-                if not settled:
-                    if outcome == "won":
-                        outcome = "failed"
-                        detail = UNSETTLED_NOTICE
-                    detail = " · ".join(part for part in (detail, settle_note) if part)[:400]
-            verdict = {"won": "won", "unknown": "unknown"}.get(outcome, "failed")
-            maa_copilot.record_copilot_attempt(
-                ledger,
-                stage,
-                mode,
-                outcome=verdict,
-                op=int((entry.get("candidate") or {}).get("id") or 0),
-                detail=detail,
-                log_name=log_path.name,
+        if _use_list_path(state):
+            # 当期活动关：一次锚点导航 + 分段多作业（`_run_activity_round()`）。
+            stop_reason = _run_activity_round(
+                config, state, entries, env, log_path, ledger, ledger_file,
+                results, auto_round,
             )
-            maa_copilot.save_ledger(ledger, ledger_file)
-            results.append(
-                {"stage": stage, "mode": mode, "outcome": verdict, "detail": detail}
-            )
-            if verdict == "won":
-                continue
-            # 突袭没过 → 这一关不算通关（D7），下一轮只排它剩下的模式。
-            failed_stages.add(stage)
-            if outcome == "nav":
-                # 导航 / 切难度失败说明环境坏了，后面几关只会一路失败。
-                stop_reason = detail
-                break
+        else:
+            raid_on = maa_clearing.raid_enabled(config)
+            for entry in entries:
+                stage = str(entry.get("stage") or "")
+                mode = str(entry.get("mode") or "normal")
+                if mode == "raid" and not raid_on:
+                    # 最后一道防线：条目可能是开关关掉**之前**排的（轮次落盘后配置改了、
+                    # 手动轮排在前面），照跑会打普通难度却记成突袭通关。宁可什么都不做。
+                    results.append(
+                        {"stage": stage, "mode": mode, "outcome": "skipped",
+                         "detail": RAID_DISABLED_NOTICE}
+                    )
+                    continue
+                if stage in failed_stages:
+                    # 普通没过就别去撞突袭：突袭是同一关再打一遍，普通没通它根本没解锁。
+                    results.append(
+                        {"stage": stage, "mode": mode, "outcome": "skipped",
+                         "detail": "同一关的普通模式未通过"}
+                    )
+                    continue
+                if auto_round and maa_copilot.auto_pause_state():
+                    stop_reason = "自动作业已暂停"
+                    break
+                lead = maa_action.min_lead_reason(config)
+                if lead:
+                    stop_reason = lead
+                    break
+                ok, detail = _recheck_before_stage(config, state, entry)
+                if not ok:
+                    stop_reason = detail
+                    break
+                outcome, detail = _fight_one(config, entry, env, log_path)
+                if outcome != "nav":
+                    # 进过战斗就要正常收尾：跳过首通剧情、回主界面，再往下走（或退游戏）。
+                    # 直接 closedown 会把结算流程掐断——SR-8 三星却没解锁代理指挥（2026-09-09）。
+                    settled, settle_note = settle_after_battle(config, stage, env, log_path)
+                    if not settled:
+                        if outcome == "won":
+                            outcome = "failed"
+                            detail = UNSETTLED_NOTICE
+                        detail = " · ".join(part for part in (detail, settle_note) if part)[:400]
+                verdict = {"won": "won", "unknown": "unknown"}.get(outcome, "failed")
+                maa_copilot.record_copilot_attempt(
+                    ledger,
+                    stage,
+                    mode,
+                    outcome=verdict,
+                    op=int((entry.get("candidate") or {}).get("id") or 0),
+                    detail=detail,
+                    log_name=log_path.name,
+                )
+                maa_copilot.save_ledger(ledger, ledger_file)
+                results.append(
+                    {"stage": stage, "mode": mode, "outcome": verdict, "detail": detail}
+                )
+                if verdict == "won":
+                    continue
+                # 突袭没过 → 这一关不算通关（D7），下一轮只排它剩下的模式。
+                failed_stages.add(stage)
+                if outcome == "nav":
+                    # 导航 / 切难度失败说明环境坏了，后面几关只会一路失败。
+                    stop_reason = detail
+                    break
     except maa_copilot.StaleActivityError as exc:
         stop_reason = str(exc)
     except PrefightError as exc:
@@ -1056,6 +1100,462 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         flush=True,
     )
     return 0 if ok else 1
+
+
+# ---------------------------------------------------------------------------
+# 活动关：锚点导航停在地图 → 剧情关 / 区域入口 → 多作业（2026-10-19）
+# ---------------------------------------------------------------------------
+
+# 下面每段任务文件都照 2026-10-19 真机跑通的那份写（Mac 上
+# `~/Developer/cc-scratch/2026-10-19-copilot-list-verify/` 的 map / story /
+# storyplay / copilot）。只有区域入口那一步没在真机上跑过（EX 还没解锁）。
+ZONE_READY_TASK = "CopilotZoneReady"
+MAP_TOML_TEMPLATE = """[[tasks]]
+name = "启动国服"
+type = "StartUp"
+[tasks.params]
+client_type = "Official"
+start_game_enabled = true
+
+[[tasks]]
+name = "回主界面"
+type = "Custom"
+[tasks.params]
+task_names = {home_names}
+
+[[tasks]]
+name = "进终端"
+type = "Custom"
+[tasks.params]
+task_names = ["Terminal-Entry"]
+
+[[tasks]]
+name = "进活动地图"
+type = "Custom"
+[tasks.params]
+task_names = [{anchor}]
+
+[[tasks]]
+name = "核对区域"
+type = "Custom"
+[tasks.params]
+task_names = ["{ready}"]
+"""
+STORY_TOML_TEMPLATE = """[[tasks]]
+name = "点剧情关"
+type = "Custom"
+[tasks.params]
+task_names = ["CopilotStoryOpen"]
+
+[[tasks]]
+name = "跳过剧情"
+type = "Custom"
+[tasks.params]
+task_names = ["CopilotStoryStart"]
+
+[[tasks]]
+name = "核对区域"
+type = "Custom"
+[tasks.params]
+task_names = ["{ready}"]
+"""
+ZONE_CHECK_TOML_TEMPLATE = """[[tasks]]
+name = "核对区域"
+type = "Custom"
+[tasks.params]
+task_names = ["{ready}"]
+"""
+# 三个降级开关一个都不写（不变量 #15）：不写就是 MaaCore 的默认值——不吃药、
+# 不借助战、不忽略练度要求。
+LIST_TOML_TEMPLATE = """[[tasks]]
+name = "多作业"
+type = "Copilot"
+[tasks.params]
+formation = true
+copilot_list = [
+{items}
+]
+"""
+LIST_ITEM_TIMEOUT = 1500
+
+
+def _recognize_only(base: str, texts: list[str]) -> dict[str, Any]:
+    return {
+        "baseTask": base, "text": list(texts), "action": "DoNothing",
+        "sub": [], "next": [], "onErrorNext": [], "exceededNext": [],
+    }
+
+
+def _zone_ready_overlay(codes: list[str]) -> dict[str, Any]:
+    """「站在这个区域的地图上」= 屏幕上认得出这个区域的任一关卡代号。"""
+    return {ZONE_READY_TASK: _recognize_only("SideStoryStage", codes)}
+
+
+def _story_overlay(code: str) -> dict[str, Any]:
+    return {
+        "CopilotStoryOpen": {"algorithm": "JustReturn",
+                             "next": ["CopilotStoryClick", "CopilotStorySwipe"]},
+        "CopilotStoryClick": {
+            "baseTask": "SideStoryStage", "text": [code], "action": "ClickSelf",
+            "postDelay": 2000, "sub": [], "next": [], "onErrorNext": [], "exceededNext": [],
+        },
+        "CopilotStorySwipe": {"baseTask": "SwipeToStage", "maxTimes": 8,
+                              "next": ["CopilotStoryClick", "CopilotStorySwipe"]},
+        "CopilotStoryStart": {
+            "algorithm": "OcrDetect", "text": ["开始剧情"], "roi": [880, 380, 200, 120],
+            "action": "ClickSelf", "postDelay": 3000, "next": ["CopilotStorySkip"],
+        },
+        "CopilotStorySkip": {"baseTask": "SkipBattlePlot",
+                             "template": "SkipThePreBattlePlot.png",
+                             "next": ["CopilotStorySkipConfirm", "CopilotStorySkip"]},
+        "CopilotStorySkipConfirm": {"baseTask": "SkipBattlePlotConfirm",
+                                    "template": "SkipThePreBattlePlotConfirm.png",
+                                    "postDelay": 4000, "next": []},
+    }
+
+
+def _run_tasks(
+    config: dict[str, Any],
+    env: dict[str, str],
+    log_path: Path,
+    name: str,
+    body: str,
+    overlay: dict[str, Any],
+    *,
+    timeout: int = 900,
+) -> tuple[bool, str]:
+    """在隔离配置里跑一份不进战斗的任务文件；每个 `[[tasks]]` 都 Completed 才算成功。"""
+    maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    labels = re.findall(r'^name = "([^"]+)"', body, flags=re.MULTILINE)
+    try:
+        with _isolated_config(env, {f"{name}.toml": body}, overlay_tasks=overlay) as run_env:
+            result = subprocess.run(
+                [maa_bin, "run", name, "--user-resource", "-v", "--batch"],
+                capture_output=True, text=True, check=False, timeout=timeout, env=run_env,
+            )
+    except subprocess.TimeoutExpired:
+        return False, f"{name} 超时（{timeout}s）"
+    output = f"{result.stdout}\n{result.stderr}"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"# {name}\n{output}")
+    done = all(
+        re.search(rf"\[{re.escape(label)}\][^\n]*Completed", output) for label in labels
+    )
+    if result.returncode != 0 or not done:
+        detail = " | ".join(output.strip().splitlines()[-3:])[-300:]
+        return False, detail
+    return True, ""
+
+
+def _screen_text(config: dict[str, Any]) -> list[str]:
+    """当前屏幕的 OCR 行（`ocrbox`：`文字\\t[x,y,w,h]`）。读不到返回空表。"""
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    ocrbox = SCRIPTS_DIR / "ocrbox"
+    shot = RUNS_DIR / ".zone.png"
+    if not ocrbox.is_file():
+        return []
+    try:
+        with shot.open("wb") as handle:
+            subprocess.run([adb, "-s", address, "exec-out", "screencap", "-p"],
+                           stdout=handle, stderr=subprocess.DEVNULL, check=False, timeout=15)
+        result = subprocess.run([str(ocrbox), str(shot)], capture_output=True,
+                                text=True, check=False, timeout=15)
+        return result.stdout.splitlines()
+    except Exception:
+        return []
+    finally:
+        try:
+            shot.unlink()
+        except OSError:
+            pass
+
+
+def _adb(config: dict[str, Any], *args: str) -> None:
+    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
+    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    subprocess.run([adb, "-s", address, "shell", *args],
+                   capture_output=True, check=False, timeout=15)
+
+
+class ActivityNavigator:
+    """一轮活动关的「站位」：保证每段开始前人站在目标区域的地图上。
+
+    `zone` 记着现在站在哪个区域的地图上；`None` = 不知道（刚开机、刚打完一张列表、
+    刚失败过），这时从主界面重新走一遍锚点导航。
+    """
+
+    def __init__(self, config, env, log_path, layout, anchor, anchor_nexts, home_zone):
+        self.config, self.env, self.log_path = config, env, log_path
+        self.layout = layout
+        self.anchor, self.anchor_nexts, self.home_zone = anchor, anchor_nexts, home_zone
+        self.zone: str | None = None
+
+    def _codes(self, zone_id: str) -> list[str]:
+        return maa_clearing.zone_codes(self.layout, zone_id)
+
+    def to_map(self) -> tuple[bool, str]:
+        """方案 B：借锚点的上游链进活动、点进普通区域，把点关那一步换成只识别。"""
+        overlay = _zone_ready_overlay(self._codes(self.home_zone))
+        for name in self.anchor_nexts:
+            overlay[name] = _recognize_only("SideStoryStage", self._codes(self.home_zone))
+        body = MAP_TOML_TEMPLATE.format(
+            home_names=json.dumps(HOME_TASK_NAMES, ensure_ascii=False),
+            anchor=json.dumps(self.anchor, ensure_ascii=False),
+            ready=ZONE_READY_TASK,
+        )
+        ok, detail = _run_tasks(self.config, self.env, self.log_path,
+                                "copilot-map", body, overlay)
+        self.zone = self.home_zone if ok else None
+        return ok, "" if ok else f"没能停在活动地图上（锚点 {self.anchor}）：{detail}"
+
+    def _enter_zone(self, zone_id: str) -> tuple[bool, str]:
+        """在当前屏幕上按区域名点入口；当前屏没有就退一步再找一次。⚠️ 未经真机验证。"""
+        name = maa_gamedata.zone_name(self.layout, zone_id)
+        act = maa_gamedata.act_id_of(zone_id)
+        others = [
+            maa_gamedata.zone_name(self.layout, other)
+            for other in (self.layout.get("zones") or {})
+            if other != zone_id and maa_gamedata.act_id_of(other) == act
+        ]
+        if not name:
+            return False, f"游戏数据里没有区域 {zone_id} 的名字"
+        for attempt in range(2):
+            point = maa_clearing.zone_button(_screen_text(self.config), name, others)
+            if point is not None:
+                _adb(self.config, "input", "tap", str(point[0]), str(point[1]))
+                with self.log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(f"# zone-entry {zone_id} {name} tap {point}\n")
+                time.sleep(5)
+                ok, detail = _run_tasks(
+                    self.config, self.env, self.log_path, "copilot-zone",
+                    ZONE_CHECK_TOML_TEMPLATE.format(ready=ZONE_READY_TASK),
+                    _zone_ready_overlay(self._codes(zone_id)), timeout=120,
+                )
+                if ok:
+                    return True, ""
+                return False, f"点了「{name}」入口，但没认出这个区域的关卡：{detail}"
+            if attempt == 0:
+                _adb(self.config, "input", "keyevent", "4")
+                time.sleep(3)
+        return False, f"屏幕上没认出区域入口「{name}」，没有乱点"
+
+    def ensure(self, zone_id: str) -> tuple[bool, str]:
+        if self.zone == zone_id:
+            return True, ""
+        if self.zone is None:
+            ok, detail = self.to_map()
+            if not ok:
+                return False, detail
+        if self.zone == zone_id:
+            return True, ""
+        ok, detail = self._enter_zone(zone_id)
+        self.zone = zone_id if ok else None
+        return ok, detail
+
+    def story(self, segment: dict[str, Any]) -> tuple[bool, str]:
+        code = str(segment.get("code") or "")
+        overlay = {**_story_overlay(code), **_zone_ready_overlay(self._codes(segment["zone_id"]))}
+        ok, detail = _run_tasks(self.config, self.env, self.log_path, "copilot-story",
+                                STORY_TOML_TEMPLATE.format(ready=ZONE_READY_TASK), overlay)
+        if not ok:
+            self.zone = None
+            return False, f"剧情关 {code} 没能点开并跳过：{detail}"
+        return True, ""
+
+
+def _prepare_list_file(candidate: dict[str, Any], stage_id: str, target: Path) -> str:
+    """下载完整作业、把关卡改成 stageId、逐份预检后写到 `target`。返回问题说明（空 = 好）。"""
+    cand_id = int(candidate.get("id") or 0)
+    try:
+        payload = maa_copilot.http_get_json(
+            f"{maa_copilot.PRTS_BASE}/copilot/get/{cand_id}", timeout=30
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"作业 {cand_id} 下载失败：{type(exc).__name__}: {exc}"
+    inner = payload.get("data") if isinstance(payload, dict) else None
+    content = inner.get("content") if isinstance(inner, dict) else None
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except ValueError:
+            content = None
+    if isinstance(content, dict):
+        content["stage_name"] = stage_id
+    problem = maa_clearing.job_file_problem(content, stage_id)
+    if problem:
+        return f"作业 {cand_id}：{problem}"
+    atomic_write_json(target, content)
+    return ""
+
+
+def _run_copilot_list(
+    config: dict[str, Any],
+    env: dict[str, str],
+    log_path: Path,
+    items: list[tuple[dict[str, Any], Path]],
+) -> list[tuple[str, str]]:
+    """一张多作业列表：返回每项的 `(结论, 明细)`，与 `items` 一一对应。"""
+    maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
+    lines = [
+        "  { filename = %s, stage_name = %s, is_raid = %s },"
+        % (
+            json.dumps(str(path), ensure_ascii=False),
+            json.dumps(str(entry.get("stage") or ""), ensure_ascii=False),
+            "true" if entry.get("mode") == "raid" else "false",
+        )
+        for entry, path in items
+    ]
+    body = LIST_TOML_TEMPLATE.format(items="\n".join(lines))
+    per_item = max(300, int(config.get("copilot_list_item_timeout", LIST_ITEM_TIMEOUT)))
+    with _isolated_config(env, {"copilot-list.toml": body}, no_battle=False) as list_env:
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"# {now_beijing().isoformat()} copilot-list "
+                         + " ".join(maa_clearing.make_entry(str(e.get("stage")), str(e.get("mode")))
+                                    for e, _p in items) + "\n")
+            handle.flush()
+            offset = os.fstat(handle.fileno()).st_size
+            return_code, _taps = _run_copilot_with_watchdog(
+                config,
+                [maa_bin, "run", "copilot-list", "--user-resource", "-vvv", "--batch"],
+                handle, log_path, list_env,
+                timeout=per_item * len(items) + 300,
+                stall=(maa_clearing.LIST_ITEM_EVENT, per_item),
+            )
+    output = _log_since(log_path, offset)
+    return maa_clearing.list_outcomes([str(path) for _e, path in items], output, return_code)
+
+
+def _run_activity_round(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    entries: list[dict[str, Any]],
+    env: dict[str, str],
+    log_path: Path,
+    ledger: dict[str, Any],
+    ledger_file: Path,
+    results: list[dict[str, Any]],
+    auto_round: bool,
+) -> str:
+    """当期活动的一轮：分段执行，返回停下的原因（空串 = 全部打完）。"""
+    prefix = maa_copilot._activity_prefix(str(state.get("activity_key") or ""))
+    layout = maa_gamedata.load_layout()
+    anchor, anchor_nexts, anchor_error = maa_clearing.pick_anchor(
+        maa_copilot._resource_dirs(config), prefix
+    )
+
+    def skip(entry: dict[str, Any], detail: str) -> None:
+        results.append({"stage": entry.get("stage"), "mode": entry.get("mode"),
+                        "outcome": "skipped", "detail": detail})
+
+    def record(entry: dict[str, Any], verdict: str, detail: str) -> None:
+        maa_copilot.record_copilot_attempt(
+            ledger, str(entry.get("stage") or ""), str(entry.get("mode") or "normal"),
+            outcome=verdict, op=int((entry.get("candidate") or {}).get("id") or 0),
+            detail=detail, log_name=log_path.name,
+        )
+        maa_copilot.save_ledger(ledger, ledger_file)
+        results.append({"stage": entry.get("stage"), "mode": entry.get("mode"),
+                        "outcome": verdict, "detail": detail})
+
+    raid_on = maa_clearing.raid_enabled(config)
+    runnable = []
+    for entry in entries:
+        if entry.get("mode") == "raid" and not raid_on:
+            skip(entry, RAID_DISABLED_NOTICE)
+        else:
+            runnable.append(entry)
+    anchor_stage = maa_copilot.resolve_copilot_stage(anchor, maa_copilot.load_stage_index(config))
+    anchor_info = maa_gamedata.stage_info(layout, anchor_stage[0]) if anchor_stage else None
+    if not anchor or anchor_info is None:
+        reason = anchor_error or f"游戏数据里没有锚点 {anchor}"
+        for entry in runnable:
+            skip(entry, reason)
+        return reason
+
+    cleared = maa_copilot.ledger_cleared_stage_ids(ledger, maa_copilot.load_stage_index(config))
+    cleared |= maa_gamedata.skland_cleared(
+        layout, maa_copilot.load_roster(), maa_gamedata.act_id_of(anchor_stage[0])
+    )
+    segments, dropped = maa_clearing.plan_segments(runnable, layout, cleared)
+    navigator = ActivityNavigator(config, env, log_path, layout, anchor, anchor_nexts,
+                                  str(anchor_info.get("zone_id") or ""))
+    stop_reason = ""
+    for index, segment in enumerate(segments):
+        pending = [item for later in segments[index:] if later["kind"] == "copilot"
+                   for item in later["items"]]
+        if auto_round and maa_copilot.auto_pause_state():
+            stop_reason = "自动作业已暂停"
+        else:
+            stop_reason = maa_action.min_lead_reason(config)
+        if not stop_reason:
+            ok, detail = navigator.ensure(str(segment["zone_id"]))
+            if ok and segment["kind"] == "story":
+                ok, detail = navigator.story(segment)
+            if not ok:
+                stop_reason = detail
+                if pending:
+                    # 导航坏了按「第一关失败」记账：计入当日上限，防止每 tick 重来一遍。
+                    record(pending[0], "failed", detail[:400])
+                    pending = pending[1:]
+        if stop_reason:
+            for entry in pending:
+                skip(entry, "本轮已停止")
+            break
+        if segment["kind"] != "copilot":
+            continue
+        items: list[tuple[dict[str, Any], Path]] = []
+        for position, entry in enumerate(segment["items"]):
+            target = maa_copilot.PREPARED_DIR / f"list-{index}-{position}-{entry.get('stage_id')}.json"
+            problem = _prepare_list_file(entry.get("candidate") or {},
+                                         str(entry.get("stage_id") or ""), target)
+            if problem:
+                # 坏文件会让整张表跑不起来；它后面的关首通时也还锁着，一起退回。
+                for rest in segment["items"][position:]:
+                    skip(rest, problem if rest is entry else "前一份作业文件无效")
+                stop_reason = problem
+                break
+            items.append((entry, target))
+        if items:
+            total = sum(int(entry.get("sanity_cost") or 0) for entry, _p in items)
+            ok, detail = _recheck_before_stage(
+                config, state, {"stage": items[0][0].get("stage"), "sanity_cost": total}
+            )
+            if not ok:
+                for entry, _path in items:
+                    skip(entry, detail)
+                stop_reason = detail
+            else:
+                outcomes = _run_copilot_list(config, env, log_path, items)
+                navigator.zone = None
+                settled, settle_note = settle_after_battle(
+                    config, str(items[-1][0].get("stage") or ""), env, log_path
+                )
+                outcomes = list(outcomes)
+                if not settled and outcomes and outcomes[-1][0] == "won":
+                    # 表里前面几关的结算 MAA 已经走完了，只有最后一关的战后剧情归收尾管：
+                    # 收尾失败时它没解锁代理指挥，同逐关路径一样不记通关。
+                    outcomes[-1] = ("failed", UNSETTLED_NOTICE)
+                for (entry, _path), (verdict, detail) in zip(items, outcomes):
+                    if verdict == "skipped":
+                        skip(entry, detail)
+                        continue
+                    if verdict != "won" and not settled:
+                        detail = " · ".join(p for p in (detail, settle_note) if p)[:400]
+                    record(entry, verdict, detail)
+                failed = next((d for v, d in outcomes if v != "won"), None)
+                if failed is not None:
+                    stop_reason = failed or "有一份作业没过"
+        if stop_reason:
+            for later in segments[index + 1:]:
+                for entry in later.get("items") or []:
+                    skip(entry, "本轮已停止")
+            break
+    for entry, reason in dropped:
+        skip(entry, reason)
+    if dropped and not stop_reason:
+        stop_reason = dropped[0][1]
+    return stop_reason
 
 
 def _log_since(log_path: Path, offset: int) -> str:

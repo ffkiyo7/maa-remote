@@ -774,6 +774,41 @@ def activity_stage_codes(index: dict[str, Any], prefix: str) -> list[str]:
     return [code for _group, _seq, code in ranked]
 
 
+def copilot_nav_checker(
+    config: dict[str, Any], activity_prefix: str, index: dict[str, Any] | None = None
+):
+    """抄作业用的导航闸门：`(关名) -> (能不能导航过去, 不能的话为什么)`。
+
+    当期活动关走多作业路径（`maa_clearing.plan_segments()`）：不再要求这关自己
+    有上游键，只要求这期活动有一个锚点、游戏数据里有这关。其余的关（资源本、主线、
+    往期活动）仍按上游键判（`maa_clearing.nav_checker()`，单作业 + Fight 导航）。
+    """
+    import maa_clearing
+    import maa_gamedata
+
+    dirs = _resource_dirs(config)
+    keyed = maa_clearing.nav_checker(dirs)
+    prefix = str(activity_prefix or "")
+    if not prefix:
+        return keyed
+    anchor, _nexts, anchor_error = maa_clearing.pick_anchor(dirs, prefix)
+    layout = maa_gamedata.load_layout()
+    stage_index = index if index is not None else load_stage_index(config)
+
+    def check(entry: str) -> tuple[bool, str]:
+        stage, _mode = maa_clearing.split_entry(entry)
+        if maa_clearing.stage_nav_prefix(stage) != prefix:
+            return keyed(entry)
+        if not anchor:
+            return False, anchor_error
+        resolved = resolve_copilot_stage(stage, stage_index)
+        if resolved is None or maa_gamedata.stage_info(layout, resolved[0]) is None:
+            return False, f"游戏数据里还没有 {stage}（缓存 {maa_gamedata.GAMEDATA_PATH.name}）"
+        return True, ""
+
+    return check
+
+
 # ---------------------------------------------------------------------------
 # 本地作业记账（四期 2a）：`copilot/ledger.json`
 # ---------------------------------------------------------------------------
@@ -935,6 +970,20 @@ def ledger_stage(ledger: dict[str, Any], stage: str) -> dict[str, Any]:
     if not isinstance(entry.get("attempts"), list):
         entry["attempts"] = []
     return entry
+
+
+def ledger_cleared_stage_ids(
+    ledger: dict[str, Any] | None, index: dict[str, Any]
+) -> set[str]:
+    """账本里普通难度已通关的关 → 它们的 stageId（多作业排段用）。"""
+    stages = (ledger or {}).get("stages") if isinstance(ledger, dict) else None
+    cleared: set[str] = set()
+    for code, entry in (stages or {}).items():
+        if isinstance(entry, dict) and entry.get("normal"):
+            resolved = resolve_copilot_stage(str(code), index)
+            if resolved is not None:
+                cleared.add(resolved[0])
+    return cleared
 
 
 def record_copilot_attempt(

@@ -1079,11 +1079,11 @@ def copilot_card_stages(
     import maa_clearing
 
     index = maa_copilot.load_stage_index(config)
-    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
     drops = stage_drops(config)
     watch = load_json(WATCH_PATH, {})
     activity_key = str(watch.get("activity_key") or "") if isinstance(watch, dict) else ""
     prefix = maa_copilot._activity_prefix(activity_key)
+    nav_of = maa_copilot.copilot_nav_checker(config, prefix, index)
     stage_state = watch.get("stage_state") if isinstance(watch, dict) else {}
     if not isinstance(stage_state, dict):
         stage_state = {}

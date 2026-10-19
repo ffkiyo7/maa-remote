@@ -17,7 +17,7 @@ from __future__ import annotations
 import fcntl
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ import maa_action
 import maa_clearing
 import maa_copilot
 import maa_farming
+import maa_gamedata
 import maa_plan_card
 from maa_common import (
     LAST_RUN_PATH,
@@ -115,14 +116,16 @@ def collect_targets(
 
     排除的四种理由各自的语义不同，卡片要分开显示：
 
-    - `no_nav`：上游没写导航定义（D8 / 不变量 #37）——**永远不会自动变好**；
+    - `no_nav`：导航不过去——当期活动是「这期在上游没有一个锚点键 / 游戏数据里还没有
+      这关」，其余的关是上游没写导航定义（D8 / 不变量 #37）；
     - `not_indexed`：有导航键但本地 Tile-Pos 索引里没有，进去也会被拒；
     - `zone_unopened`：森空岛该活动的 zone `totalStage == 0`（D9）——等热更新，不记失败；
     - `cleared`：记账齐全或 zone 全清（D10）；
     - `daily_cap`：今天已经打满 `auto_copilot_max_attempts_per_day` 次还没通，明天再说；
     - `backoff`：本轮搜过、练度不满足 / 暂无作业，还没到重试点。
     """
-    nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
+    nav_of = maa_copilot.copilot_nav_checker(config, prefix, index)
+    layout = maa_gamedata.load_layout()
     retry_minutes = max(5, int(config.get("activity_search_retry_minutes", 30)))
     targets: list[dict[str, Any]] = []
     excluded: list[dict[str, Any]] = []
@@ -136,6 +139,9 @@ def collect_targets(
             excluded.append({"stage": code, "reason": "not_indexed", "detail": ""})
             continue
         stage_id = resolved[0]
+        skland_done = maa_gamedata.skland_cleared(
+            layout, roster, maa_gamedata.act_id_of(stage_id)
+        )
         if maa_copilot.zone_is_unopened(roster, stage_id):
             excluded.append({"stage": code, "reason": "zone_unopened", "detail": ""})
             continue
@@ -146,6 +152,9 @@ def collect_targets(
             stage_id,
             maa_clearing.required_modes(code, prefix, config),
         )
+        if stage_id in skland_done:
+            # 森空岛的区域进度能精确到「链上前 N 关」时，用户手打过的关也算过了。
+            modes = [mode for mode in modes if mode != "normal"]
         if not modes:
             excluded.append({"stage": code, "reason": "cleared", "detail": ""})
             continue
@@ -198,6 +207,31 @@ def round_budget(
     return maa_clearing.sanity_budget(sanity, plan, config), sanity
 
 
+def trim_unreachable(
+    items: list[dict[str, Any]],
+    ledger: dict[str, Any],
+    roster: dict[str, Any] | None,
+    index: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """只留下这一轮**够得着**的条目，返回 `(留下的, 第一条被截掉的原因)`。
+
+    够不着 = 前置里有教学关、或有一关没过也没排（多半是没作业）。解锁是一条链，
+    这种条目送到 worker 也只会被 `plan_segments()` 截掉——但模拟器已经白开了一趟。
+    """
+    layout = maa_gamedata.load_layout()
+    cleared = maa_copilot.ledger_cleared_stage_ids(ledger, index)
+    for item in items:
+        cleared |= maa_gamedata.skland_cleared(
+            layout, roster, maa_gamedata.act_id_of(str(item.get("stage_id") or ""))
+        )
+    segments, dropped = maa_clearing.plan_segments(items, layout, cleared)
+    kept = {
+        id(entry) for segment in segments if segment["kind"] == "copilot"
+        for entry in segment["items"]
+    }
+    return [item for item in items if id(item) in kept], (dropped[0][1] if dropped else "")
+
+
 def cost_lookup(config: dict[str, Any], index: dict[str, Any]):
     """条目 → 理智消耗。突袭条目按**普通关名**查（不变量 #34）。
 
@@ -218,9 +252,13 @@ def cost_lookup(config: dict[str, Any], index: dict[str, Any]):
         if cost is not None:
             return cost
         try:
-            return maa_farming.stage_ap_cost(resolved[0], config)
+            cost = maa_farming.stage_ap_cost(resolved[0], config)
         except Exception:  # noqa: BLE001 - 兜底查表不该让整轮排程崩掉
-            return None
+            cost = None
+        # 第三级：游戏数据缓存（`maa_gamedata`），EX 关的理智只有这里有。
+        return cost if cost is not None else maa_gamedata.ap_cost(
+            maa_gamedata.load_layout(), resolved[0]
+        )
 
     return cost_of
 
@@ -407,6 +445,61 @@ def _prefight_blocked(config: dict[str, Any], state: dict[str, Any], at: datetim
 # 一 tick
 # ---------------------------------------------------------------------------
 
+# 新活动刚上线时游戏数据缓存里还没有它：缓存缺关就提前重抓，但一小时最多一次。
+GAMEDATA_MISSING_RETRY = timedelta(hours=1)
+
+
+def _refresh_gamedata(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    index: dict[str, Any],
+    prefix: str,
+    at: datetime,
+) -> None:
+    """一天一次（或缺当期关时一小时一次）重抓游戏数据；抓不到只通知、不挡排轮。"""
+    layout = maa_gamedata.load_layout()
+    missing = any(
+        maa_gamedata.stage_info(layout, str(index.get("codes", {}).get(code) or "")) is None
+        for code in maa_copilot.activity_stage_codes(index, prefix)
+    )
+    age = maa_gamedata.layout_age(layout, at)
+    force = missing and (age is None or age >= GAMEDATA_MISSING_RETRY)
+    _layout, error = maa_gamedata.refresh_layout(config, force=force)
+    if error:
+        print(error, file=sys.stderr)
+        if maa_clearing.should_notify(state, "gamedata", error):
+            _notify(
+                config,
+                "⚠️ 游戏数据没抓到",
+                f"{error}\n先用旧缓存排轮；缓存里没有的关（新活动刚上线时）这一轮不排。",
+                0xFEE75C,
+            )
+    else:
+        maa_clearing.clear_notification(state, "gamedata")
+
+
+def _reachable_targets(
+    targets: list[dict[str, Any]],
+    ledger: dict[str, Any],
+    roster: dict[str, Any] | None,
+    index: dict[str, Any],
+) -> tuple[list[dict[str, Any]], str]:
+    """目标集合按 `trim_unreachable()` 截到够得着的部分（模式逐个保留）。"""
+    items = [
+        {"stage": target["stage"], "stage_id": target["stage_id"], "mode": mode}
+        for target in targets
+        for mode in target["modes"]
+    ]
+    kept, reason = trim_unreachable(items, ledger, roster, index)
+    keep = {(item["stage"], item["mode"]) for item in kept}
+    trimmed = []
+    for target in targets:
+        modes = [mode for mode in target["modes"] if (target["stage"], mode) in keep]
+        if modes:
+            trimmed.append({**target, "modes": modes})
+    return trimmed, reason
+
+
 def run_once() -> dict[str, Any]:
     config = load_config()
     snapshot = maa_plan_card.query_activity_snapshot(config)
@@ -492,6 +585,7 @@ def run_once() -> dict[str, Any]:
 
     index = maa_copilot.load_stage_index(config)
     prefix = str(state.get("prefix") or maa_copilot._activity_prefix(target["key"]))
+    _refresh_gamedata(config, state, index, prefix, now)
     ledger, _note = maa_copilot.ensure_ledger(target["key"])
     roster = maa_copilot.load_roster()
     targets, excluded = collect_targets(
@@ -533,9 +627,21 @@ def run_once() -> dict[str, Any]:
         state["excluded"] = excluded[:40]
         return _save(state, now)
 
+    targets, chain_block = _reachable_targets(targets, ledger, roster, index)
+    if chain_block and not targets:
+        # 链上有一关挡着（教学关、没作业的关）：这一轮什么都打不了。原因变了才通知。
+        if maa_clearing.should_notify(state, "chain_block", chain_block):
+            _notify(config, "⏸️ 自动作业卡在一关上", chain_block, 0x99AAB5)
+        state["status"] = "waiting"
+        state["blocked_reason"] = chain_block
+        state["excluded"] = excluded[:40]
+        return _save(state, now)
+    maa_clearing.clear_notification(state, "chain_block")
+
     entries, scheduled_at, note = build_round(
         config, state, targets, index, roster, now
     )
+    entries, _late_block = trim_unreachable(entries, ledger, roster, index)
     if not entries:
         state["status"] = "waiting"
         state["excluded"] = excluded[:40]
