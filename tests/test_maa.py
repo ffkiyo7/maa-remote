@@ -9255,6 +9255,38 @@ class CopilotListRoundTests(unittest.TestCase):
         self.assertIn("skipped", [r["outcome"] for r in result.results if r["mode"] == "raid"])
 
 
+class PlanFightSwitchTests(unittest.TestCase):
+    """`plan fight off pm`：这一场只收菜，剿灭和刷理智都不打。"""
+
+    def _with_plan(self, argv):
+        with tempfile.TemporaryDirectory() as raw:
+            plan_path = Path(raw) / "plan.json"
+            defaults = Path(raw) / "defaults.json"
+            with patch.object(maa_common, "PLAN_PATH", plan_path), \
+                 patch.object(maa_common, "DEFAULTS_PATH", defaults), \
+                 patch.object(maa_action, "PLAN_PATH", plan_path), \
+                 patch.object(maa_action, "is_run_locked", return_value=False):
+                ok, message = maa_action.dispatch(argv)
+                return ok, message, maa_common.effective_plan(phase="pm"), \
+                    maa_common.effective_plan(phase="am")
+
+    def test_fight_off_drops_both_fight_blocks_for_that_session_only(self) -> None:
+        ok, message, pm, am = self._with_plan(["plan", "fight", "off", "pm"])
+        self.assertTrue(ok, message)
+        self.assertIn("不清理智", message)
+        self.assertFalse(pm["tasks"]["fight"])
+        self.assertTrue(pm["tasks"]["infrast"])
+        self.assertTrue(am["tasks"]["fight"])
+        toml = maa_daily.render_daily_toml(pm, {})
+        self.assertNotIn('type = "Fight"', toml)
+        self.assertIn('type = "Infrast"', toml)
+
+    def test_bad_values_are_refused(self) -> None:
+        ok, _message, pm, _am = self._with_plan(["plan", "fight", "maybe", "pm"])
+        self.assertFalse(ok)
+        self.assertTrue(pm["tasks"]["fight"])
+
+
 class ManualMultiStageTests(unittest.TestCase):
     """手动一次排多关 / 一个区域：同一轮连打，模拟器只开一次。"""
 

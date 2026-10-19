@@ -167,6 +167,11 @@ def _confirmation(plan: dict[str, Any], was_running: bool, phase: str) -> str:
             f"（本场记的关是 {stage}，恢复后生效）；"
             f"{other}不受影响，说「现在跑」也仍然可以手动开一场。"
         )
+    elif not (plan.get("tasks") or {}).get("fight", True):
+        target = (
+            f"今天（{now.month}/{now.day}）的{label}不清理智（剿灭和刷理智都不打），"
+            f"基建 / 公招 / 商店 / 领奖照常；{other}不受影响。"
+        )
     else:
         target = (
             f"今天（{now.month}/{now.day}）的{label}刷 {stage}，{medicine}；"
@@ -222,6 +227,17 @@ def skip_today(value: str, phase: str) -> tuple[bool, str]:
     return True, _confirmation(plan, was_running, phase)
 
 
+def fight_today(value: str, phase: str) -> tuple[bool, str]:
+    """`plan fight <on|off> <am|pm>`：今天这一场清不清理智（off = 只收菜）。"""
+    if value not in {"on", "off"}:
+        return False, "fight 只接受 on 或 off。"
+    if not valid_phase(phase):
+        return _reject_phase(phase)
+    was_running = is_run_locked()
+    plan = _save_override(phase, "fight", value == "on")
+    return True, _confirmation(plan, was_running, phase)
+
+
 def show_plan() -> tuple[bool, str]:
     """两场各念一遍：刷什么、关是谁定的、跳不跳。"""
     origins = {"auto": "按材料缺口自动定的", "discord": "你手动选的"}
@@ -229,7 +245,10 @@ def show_plan() -> tuple[bool, str]:
     for phase in PLAN_PHASES:
         plan = effective_plan(phase=phase)
         origin = origins.get(str(plan.get("stage_source") or ""), "默认关")
-        status = "跳过" if plan.get("skip") else "照常执行"
+        status = "跳过" if plan.get("skip") else (
+            "照常执行" if (plan.get("tasks") or {}).get("fight", True)
+            else "不清理智，只收菜（基建 / 公招 / 商店 / 领奖）"
+        )
         lines.append(
             f"· {PHASE_LABELS[phase]}：{plan_stage_label(plan)}（{origin}）；{status}"
         )
@@ -1533,6 +1552,8 @@ def copilot_status(token: str) -> tuple[bool, str]:
 def dispatch(argv: list[str]) -> tuple[bool, str]:
     if argv[:2] == ["plan", "set-stage"] and len(argv) == 4:
         return set_stage(argv[2], argv[3])
+    if argv[:2] == ["plan", "fight"] and len(argv) == 4:
+        return fight_today(argv[2], argv[3])
     if argv[:2] == ["plan", "skip-today"] and len(argv) == 4:
         return skip_today(argv[2], argv[3])
     if argv == ["plan", "show"]:
@@ -1582,7 +1603,7 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return roguelike_status()
     return False, (
         "不支持的动作；只允许 plan set-stage <关卡> <am|pm>、"
-        "plan skip-today <on|off> <am|pm>、plan show、run now、run start <关卡> <token>、"
+        "plan skip-today <on|off> <am|pm>、plan fight <on|off> <am|pm>、plan show、run now、run start <关卡> <token>、"
         "run expire <token> [--after 秒]、run recommend <token>、log tail、"
         "copilot card/find/cancel/status/mark-cleared/unmark、copilot auto <on|off|status>、"
         "roguelike card/set/start/stop/abort/status。"
