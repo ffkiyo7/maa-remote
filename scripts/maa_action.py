@@ -871,28 +871,107 @@ def new_round_token() -> str:
     return _new_search_token()
 
 
-def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
-    """手动抄一关：写一份 `pending` 搜索并派后台 worker（<20s，不变量 #6）。
+MAX_FIND_ARGS = 12
+AREA_CODE_RE = re.compile(r"^(?P<area>[A-Za-z0-9]+(?:-[A-Za-z]+)?)-(?P<num>\d+)$")
+
+
+def _area_codes(area: str, index: dict[str, Any]) -> list[str]:
+    """`YW-EX` → `YW-EX-1 … YW-EX-8`（按编号排）。只认索引里真有的代号，不猜。"""
+    area = str(area or "").strip()[:40]
+    codes = []
+    for code in (index.get("codes") or {}):
+        match = AREA_CODE_RE.fullmatch(str(code))
+        if match and match.group("area") == area:
+            codes.append((int(match.group("num")), str(code)))
+    return [code for _num, code in sorted(codes)]
+
+
+def _expand_copilot_targets(
+    names: list[str], config: dict[str, Any], prefix: str, activity_key: str
+) -> tuple[list[dict[str, Any]], str, str]:
+    """手动参数 → `(targets, 拒绝理由, 提示)`；targets 是 `{stage, stage_id, modes}`。
+
+    - 关卡代号：照原样排，已通的关也重打（「再打一遍 SR-6」）。
+    - 区域代号（`YW-EX`、`YW`）：展开成这个区域的所有关，**跳过账本里已通的模式**，
+      上游导航不到的关丢掉并写进提示。一轮里连着打，模拟器只开一次。
+    """
+    import maa_clearing
+
+    checker = maa_copilot.copilot_nav_checker(config, prefix)
+    targets: list[dict[str, Any]] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        resolved = valid_copilot_stage(name, config)
+        if resolved is not None:
+            stage_id, code = resolved
+            if code in seen:
+                continue
+            supported, detail = checker(code)
+            if not supported:
+                where = "这一关" if len(names) == 1 else code
+                return [], f"导航不到{where}，无法抄作业：{detail}", ""
+            seen.add(code)
+            targets.append({"stage": code, "stage_id": stage_id,
+                            "modes": list(maa_clearing.required_modes(code, prefix, config))})
+            continue
+        index = maa_copilot.load_stage_index(config)
+        area = _area_codes(name, index)
+        if area and activity_key:
+            ledger = maa_copilot.load_ledger(maa_copilot.ledger_path(activity_key))
+            ledger_stages = (ledger or {}).get("stages") or {}
+        else:
+            ledger_stages = {}
+        if not area:
+            return [], (
+                f"关卡 {str(name)[:40]} 不在本地关卡索引里；只接受当期活动关、主线、资源关，"
+                "或活动区域（如 YW-EX）。"
+            ), ""
+        for code in area:
+            if code in seen:
+                continue
+            seen.add(code)
+            done = ledger_stages.get(code) if isinstance(ledger_stages, dict) else None
+            modes = [
+                mode for mode in maa_clearing.required_modes(code, prefix, config)
+                if not (isinstance(done, dict) and done.get(mode))
+            ]
+            if not modes:
+                continue
+            supported, detail = checker(code)
+            if not supported:
+                notes.append(f"{code}：{detail}")
+                continue
+            targets.append({"stage": code, "stage_id": index["codes"][code], "modes": modes})
+    if not targets:
+        if notes:
+            return [], "导航不到这些关，无法抄作业：" + "；".join(notes)[:300], ""
+        return [], "这些关账本里都已经通关了，没有要打的。", ""
+    return targets, "", ("；跳过 " + "；".join(notes))[:300] if notes else ""
+
+
+def start_copilot_search(stage: str, *more: str) -> tuple[bool, str, str | None]:
+    """手动抄作业：写一份 `pending` 搜索并派后台 worker（<20s，不变量 #6）。
+
+    可以一次给多关或一个区域（`YW-EX`），它们排进**同一轮**：模拟器只开一次，
+    活动关按解锁链连着打（`_run_activity_round()`）。
 
     模式按 D7 定：当期活动关普通 + 突袭，资源本 / 主线只有普通。
     **`config.copilot_raid_switch_task` 为空时突袭功能整体关闭**，活动关也只排普通。
     """
     config = load_config()
-    resolved = valid_copilot_stage(stage, config)
-    if resolved is None:
-        return (
-            False,
-            f"关卡 {stage[:40]} 不在本地关卡索引里；只接受当期活动关、主线或资源关。",
-            None,
-        )
-    stage_id, code = resolved
-    import maa_clearing
-
     activity_key = str(load_json(WATCH_PATH, {}).get("activity_key") or "")
     prefix = maa_copilot._activity_prefix(activity_key)
-    supported, detail = maa_copilot.copilot_nav_checker(config, prefix)(code)
-    if not supported:
-        return False, f"导航不到这一关，无法抄作业：{detail}", None
+    targets, refusal, skip_note = _expand_copilot_targets(
+        [stage, *more], config, prefix, activity_key
+    )
+    if refusal:
+        return False, refusal, None
+    first = targets[0]
+    stage_id, code = first["stage_id"], first["stage"]
+    in_activity = [bool(prefix and t["stage"].startswith(f"{prefix}-")) for t in targets]
+    if len(set(in_activity)) > 1:
+        return False, "当期活动关和资源本 / 主线不能排在同一轮，请分开选。", None
     worker = SCRIPTS_DIR / "maa_copilot_worker.py"
     if not worker.is_file():
         return False, "maa_copilot_worker.py 尚未部署。", None
@@ -901,8 +980,8 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
     blocker = dispatch_blocker(config, "", now_beijing())
     if blocker:
         return False, f"{blocker}；请日常 / 对表结束后再点。", None
-    # 突袭开关为空时这里只会给出 `["normal"]`——手动路径同样不许排突袭。
-    modes = list(maa_clearing.required_modes(code, prefix, config))
+    # 突袭开关为空时 `required_modes()` 只会给出 `["normal"]`——手动路径同样不许排突袭。
+    modes = first["modes"]
     token = _new_search_token()
     maa_copilot.ensure_private_dirs()
     state = {
@@ -911,6 +990,9 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
         "stage": code,
         "stage_id": stage_id,
         "modes": modes,
+        # 一轮多关：worker 逐关匹配作业，按顺序排进同一轮（`stage` / `stage_id` /
+        # `modes` 仍是第一关，给只认单关的读者用）。
+        "targets": targets,
         "entries": [],
         "message_id": None,
         "created_at": now_beijing().isoformat(),
@@ -934,16 +1016,20 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
         detail = f"搜索进程派发失败：{type(exc).__name__}: {exc}"
         _mark_search_dispatch_failed(token, detail)
         return False, detail, None
-    mode_text = "普通 + 突袭" if len(modes) > 1 else "普通"
+    if len(targets) == 1:
+        mode_text = "普通 + 突袭" if len(modes) > 1 else "普通"
+        label = f"{code}（{mode_text}）"
+    else:
+        label = f"{len(targets)} 关（{code} … {targets[-1]['stage']}，同一轮连打）"
     return (
         True,
-        f"🔍 正在为 {code}（{mode_text}）匹配作业；搜到就直接开跑，结果发到频道。",
+        f"🔍 正在为 {label}匹配作业；搜到就直接开跑，结果发到频道{skip_note}。",
         token,
     )
 
 
-def copilot_find(stage: str) -> tuple[bool, str]:
-    ok, message, _token = start_copilot_search(stage)
+def copilot_find(stage: str, *more: str) -> tuple[bool, str]:
+    ok, message, _token = start_copilot_search(stage, *more)
     return ok, message
 
 
@@ -1470,8 +1556,8 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
         return log_tail()
     if argv == ["copilot", "card"]:
         return copilot_card()
-    if argv[:2] == ["copilot", "find"] and len(argv) == 3:
-        return copilot_find(argv[2])
+    if argv[:2] == ["copilot", "find"] and 3 <= len(argv) <= 2 + MAX_FIND_ARGS:
+        return copilot_find(*argv[2:])
     if argv[:2] == ["copilot", "cancel"] and len(argv) == 3:
         return copilot_cancel(argv[2])
     if argv[:2] == ["copilot", "status"] and len(argv) == 3:
