@@ -239,6 +239,83 @@ def _claim_search(token: str) -> dict[str, Any] | None:
         return state
 
 
+def _search_targets(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """搜索状态里的关卡列表；只有单关字段的旧状态也照读。"""
+    raw = state.get("targets")
+    if not isinstance(raw, list) or not raw:
+        raw = [{"stage": state.get("stage"), "stage_id": state.get("stage_id"),
+                "modes": state.get("modes")}]
+    targets = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        modes = [m for m in (item.get("modes") or ["normal"]) if m in ("normal", "raid")]
+        targets.append({"stage": str(item.get("stage") or ""),
+                        "stage_id": str(item.get("stage_id") or ""),
+                        "modes": modes or ["normal"]})
+    return targets
+
+
+def _stage_cost(stage_id: str, code: str, config: dict[str, Any]) -> int | None:
+    cost = maa_copilot.stage_sanity_cost(stage_id, code, config)
+    if cost is None:
+        # EX 关不在上游 `stages.json` 里，游戏数据里有。
+        cost = maa_gamedata.ap_cost(maa_gamedata.load_layout(), stage_id)
+    return cost
+
+
+def _plan_search_entries(
+    targets: list[dict[str, Any]],
+    costs: list[int | None],
+    config: dict[str, Any],
+    roster: dict[str, Any] | None,
+    code: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """逐关匹配作业，返回 `(这一轮的条目, 写在已排程卡上的补充说明)`。
+
+    第一关匹配不到照旧报错；后面的关匹配不到、理智算不出或理智不够就**从那里截断**
+    （解锁是一条链，后面的关多半也够不着），截掉的写进说明，剩下的照打。
+    理智按森空岛估算值逐项累加，第一关永远保留——够不够由开打前复核说了算。
+    """
+    snapshot = (roster or {}).get("sanity") if isinstance(roster, dict) else None
+    sanity = maa_copilot.estimated_sanity(snapshot if isinstance(snapshot, dict) else {},
+                                          now_beijing())
+    entries: list[dict[str, Any]] = []
+    spent = 0
+    cut = ""
+    for position, target in enumerate(targets):
+        cost = costs[position] if position < len(costs) else None
+        if cost is None:
+            cut = f"{target['stage']} 的理智消耗查不到"
+            break
+        candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
+            target["stage"], target["stage_id"], config, roster
+        )
+        if candidate is None:
+            detail = reason
+            if gaps:
+                detail += "\n缺：" + "；".join(gaps)
+            if not entries:
+                raise RuntimeError(detail)
+            cut = f"{target['stage']} 没有完全满足练度的作业"
+            break
+        batch = [
+            {"stage": target["stage"], "stage_id": target["stage_id"], "mode": mode,
+             "candidate": candidate, "sanity_cost": cost}
+            for mode in target["modes"]
+        ]
+        need = cost * len(batch)
+        if entries and (sanity is None or spent + need > sanity):
+            cut = f"理智不够再排 {target['stage']}" if sanity is not None else "理智估不出来"
+            break
+        entries.extend(batch)
+        spent += need
+    if len(targets) <= 1 or not cut:
+        return entries, ""
+    left = len(targets) - len({e["stage"] for e in entries})
+    return entries, f"\n后面 {left} 关这轮不打：{cut}。"
+
+
 def cmd_search(token: str) -> int:
     """手动路径：搜一关的作业，搜到就直接排程 + 派发（D6 / D13）。
 
@@ -272,15 +349,17 @@ def cmd_search(token: str) -> int:
                 maa_copilot.prune_expired_searches()
 
             index = maa_copilot.load_stage_index(config)
-            stage_id = str(state.get("stage_id") or "")
-            if not stage_id or stage_id not in index.get("stages", {}):
-                raise RuntimeError(f"关卡 {code} 已不在本地索引中")
-            sanity_cost = maa_copilot.stage_sanity_cost(stage_id, code, config)
-            if sanity_cost is None:
-                # EX 关不在上游 `stages.json` 里，游戏数据里有。
-                sanity_cost = maa_gamedata.ap_cost(maa_gamedata.load_layout(), stage_id)
-            if sanity_cost is None:
-                raise RuntimeError(f"{code} 的理智消耗尚未进入 MaaResource，拒绝执行")
+            targets = _search_targets(state)
+            # 先把每关的理智查齐再刷森空岛：第一关就查不到理智时照旧直接拒绝。
+            costs: list[int | None] = []
+            for target in targets:
+                if target["stage_id"] not in index.get("stages", {}):
+                    if not costs:
+                        raise RuntimeError(f"关卡 {target['stage']} 已不在本地索引中")
+                    break
+                costs.append(_stage_cost(target["stage_id"], target["stage"], config))
+                if costs[0] is None:
+                    raise RuntimeError(f"{code} 的理智消耗尚未进入 MaaResource，拒绝执行")
 
             import maa_skland
 
@@ -292,30 +371,9 @@ def cmd_search(token: str) -> int:
                 ) from exc
             roster = maa_copilot.load_roster()
 
-            candidate, reason, gaps = maa_copilot.pick_perfect_candidate(
-                code, stage_id, config, roster
+            entries, round_note = _plan_search_entries(
+                targets, costs, config, roster, code
             )
-            if candidate is None:
-                detail = reason
-                if gaps:
-                    detail += "\n缺：" + "；".join(gaps)
-                raise RuntimeError(detail)
-
-            modes = [
-                mode
-                for mode in (state.get("modes") or ["normal"])
-                if mode in ("normal", "raid")
-            ] or ["normal"]
-            entries = [
-                {
-                    "stage": code,
-                    "stage_id": stage_id,
-                    "mode": mode,
-                    "candidate": candidate,
-                    "sanity_cost": sanity_cost,
-                }
-                for mode in modes
-            ]
             # 搜索本身要跑 5~20s，起点合规不代表现在还合规（07:50 点的关，搜完
             # 已经 07:51 也可能刚好跨进 blackout）。派发前再过一次同一份闸门。
             blocker = maa_action.dispatch_blocker(config, "", now_beijing())
@@ -330,8 +388,9 @@ def cmd_search(token: str) -> int:
                 token,
                 entries,
                 config,
-                title=f"🤖 已排程：{code}",
-                note=note,
+                title=f"🤖 已排程：{code}" if len(entries) <= 2 else
+                f"🤖 已排程：{code} 起 {len({e['stage'] for e in entries})} 关",
+                note=note + round_note,
             )
             committed = False
             with state_lock():

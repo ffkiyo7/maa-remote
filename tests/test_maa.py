@@ -9255,6 +9255,81 @@ class CopilotListRoundTests(unittest.TestCase):
         self.assertIn("skipped", [r["outcome"] for r in result.results if r["mode"] == "raid"])
 
 
+class ManualMultiStageTests(unittest.TestCase):
+    """手动一次排多关 / 一个区域：同一轮连打，模拟器只开一次。"""
+
+    def _expand(self, names, ledger=None, nav=("SR-1", "SR-2", "SR-5", "SR-8", "SR-EX-1")):
+        index = {**SR_INDEX, "codes": {**SR_INDEX["codes"], "SR-EX-2": "act54side_ex02",
+                                       "SR-EX-3": "act54side_ex03"}}
+        with patch.object(maa_copilot, "load_stage_index", return_value=index), \
+             patch.object(maa_action, "valid_copilot_stage",
+                          side_effect=lambda n, _c: maa_copilot.resolve_copilot_stage(n, index)), \
+             patch.object(maa_copilot, "load_ledger", return_value=ledger), \
+             _nav_patch(set(nav)):
+            return maa_action._expand_copilot_targets(names, {}, "SR", SR_KEY)
+
+    def test_an_area_expands_in_number_order_and_skips_cleared_modes(self) -> None:
+        ledger = {"stages": {"SR-EX-1": {"normal": "2026-10-19T17:57", "raid": None}}}
+        targets, refusal, note = self._expand(
+            ["SR-EX"], ledger, nav=("SR-EX-1", "SR-EX-2", "SR-EX-3"))
+        self.assertEqual(refusal, "")
+        self.assertEqual([(t["stage"], t["modes"]) for t in targets],
+                         [("SR-EX-1", ["raid"]), ("SR-EX-2", ["normal", "raid"]),
+                          ("SR-EX-3", ["normal", "raid"])])
+        self.assertEqual(note, "")
+
+    def test_an_area_drops_stages_without_navigation_with_a_note(self) -> None:
+        targets, refusal, note = self._expand(["SR-EX"], nav=("SR-EX-1",))
+        self.assertEqual([t["stage"] for t in targets], ["SR-EX-1"])
+        self.assertIn("SR-EX-2", note)
+
+    def test_explicit_stages_replay_even_when_cleared(self) -> None:
+        ledger = {"stages": {"SR-1": {"normal": "x", "raid": "x"}}}
+        targets, refusal, _note = self._expand(["SR-1", "SR-2"], ledger)
+        self.assertEqual(refusal, "")
+        self.assertEqual([t["stage"] for t in targets], ["SR-1", "SR-2"])
+
+    def test_an_unknown_name_is_refused(self) -> None:
+        targets, refusal, _note = self._expand(["SR-EX", "XX-9"])
+        self.assertEqual(targets, [])
+        self.assertIn("XX-9", refusal)
+
+    def _plan(self, costs, candidates, sanity):
+        import maa_copilot_worker as worker
+
+        targets = [{"stage": f"SR-EX-{i + 1}", "stage_id": f"act54side_ex0{i + 1}",
+                    "modes": ["normal", "raid"]} for i in range(len(costs))]
+        picks = iter(candidates)
+        with patch.object(maa_copilot, "estimated_sanity", return_value=sanity), \
+             patch.object(maa_copilot, "pick_perfect_candidate",
+                          side_effect=lambda *a: next(picks)):
+            return worker._plan_search_entries(targets, costs, {}, {"sanity": {}}, "SR-EX-1")
+
+    def test_stages_are_kept_while_sanity_lasts(self) -> None:
+        ok = ({"id": 1}, "", [])
+        entries, note = self._plan([10, 10, 15], [ok, ok, ok], sanity=45)
+        self.assertEqual([(e["stage"], e["mode"]) for e in entries],
+                         [("SR-EX-1", "normal"), ("SR-EX-1", "raid"),
+                          ("SR-EX-2", "normal"), ("SR-EX-2", "raid")])
+        self.assertIn("后面 1 关", note)
+        self.assertIn("理智不够", note)
+
+    def test_a_later_stage_without_a_job_cuts_the_round_there(self) -> None:
+        ok = ({"id": 1}, "", [])
+        entries, note = self._plan([10, 10, 10], [ok, (None, "没有作业", [])], sanity=200)
+        self.assertEqual({e["stage"] for e in entries}, {"SR-EX-1"})
+        self.assertIn("SR-EX-2 没有完全满足练度的作业", note)
+
+    def test_the_first_stage_without_a_job_still_fails_loudly(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self._plan([10], [(None, "没有作业", ["缺：能天使"])], sanity=200)
+
+    def test_the_first_stage_is_kept_even_when_sanity_looks_short(self) -> None:
+        entries, note = self._plan([20], [({"id": 1}, "", [])], sanity=5)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(note, "")
+
+
 class CopilotReachableTargetTests(unittest.TestCase):
     def test_stages_behind_a_missing_job_are_not_scheduled(self) -> None:
         import maa_activity_watch as watch

@@ -70,7 +70,7 @@ python3 ~/.hermes/scripts/maa_action.py plan show
 python3 ~/.hermes/scripts/maa_action.py run now
 python3 ~/.hermes/scripts/maa_action.py log tail
 python3 ~/.hermes/scripts/maa_action.py copilot card
-python3 ~/.hermes/scripts/maa_action.py copilot find <关卡>
+python3 ~/.hermes/scripts/maa_action.py copilot find <关卡或区域> [<关卡或区域> ...]
 python3 ~/.hermes/scripts/maa_action.py copilot status <token>
 python3 ~/.hermes/scripts/maa_action.py copilot cancel <token>
 python3 ~/.hermes/scripts/maa_action.py copilot mark-cleared <关卡> [normal|raid|all]
@@ -117,6 +117,10 @@ token 形如 12 位十六进制，来自那张卡，不要猜测。已经开跑�
 - “自动作业停了没 / 自动作业开着吗” → `copilot auto status`
 - 「🔑 森空岛登录已过期」通知 → 让用户在本机终端运行
   `python3 ~/.hermes/scripts/maa_skland.py link` 并粘贴鹰角 token；**不要**在聊天里索要 token
+- “把 EX 都抄了 / 剩下的 EX 一起打” → `copilot find SR-EX`（区域代号展开成这一区的所有关，
+  跳过账本里已通的模式，**同一轮连打，模拟器只开一次**；理智不够或后面的关没作业就从那里截断，
+  已排程卡上会写明）。多关也可以直接列：`copilot find SR-7 SR-8`。**不要一关一关地连发
+  `copilot find`**——每一轮都会冷启一次模拟器
 - “再打一遍 SR-6” → `copilot find SR-6`，已通的关也允许重打
 - “SR-7 我自己打过了 / 别再抄 SR-7 / 这关我手动通了” → `copilot mark-cleared SR-7`
   （写进账本，自动排轮从此跳过；不传模式就按当前规则取要打的模式，用户明说
