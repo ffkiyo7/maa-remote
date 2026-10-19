@@ -1334,7 +1334,7 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 自动作业每 15 分钟开一次模拟器、几十秒就关，同一关反复排（2026-10-11 YW-4 空转 17 轮） | 开打前的环境故障（多半是森空岛过期）。现在会被不变量 #55 截住：`activity_watch.json` 的 `status=blocked` + `blocked_reason` / `prefight_failures` 是答案；修好后说「恢复自动作业」立刻解除，否则次日自动恢复 |
 | 想在 Discord 里叫停自动作业 | 「已排程」卡或「▶️ 开始抄作业」通知上的「⏸️ 暂停自动作业」，或直接说「暂停自动作业」（`copilot auto off`）；`copilot/auto_pause.json` 是开关本体 |
 | 某关今天不再被自动排、卡上写「🚫 今日已尝试 N 次」 | 当日上限命中（`auto_copilot_max_attempts_per_day`，默认 2）。次日自动恢复；想现在就重打，从抄作业卡的下拉手动选它（手动路径不受这条限制）。`copilot/ledger.json` 的 `attempts` 是计数依据 |
-| 突袭那次总是失败 | 现状：`copilot_raid_switch_task` 默认空串 = **突袭功能关闭**，正常不会排突袭。要重新启用先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`；2026-09-09 实测是 `Custom Error`（详情页上根本没有突袭控件），详见 §5.5 第 3 条 |
+| 突袭那次总是失败 | 现状（2026-10-19 起）：种子改回 `ChangeToRaidDifficulty`，突袭默认开启。活动关走多作业路径，难度由 `copilot_list` 的 `is_raid` 切，YW-EX-1 / EX-2 突袭真机通过；`switch_to_raid()` 那一趟只剩逐关路径在用。以前默认空串 = **突袭功能关闭**。要重新启用先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`；2026-09-09 实测是 `Custom Error`（详情页上根本没有突袭控件），详见 §5.5 第 3 条 |
 | 卡上写「✅ 已通（突袭功能未启用）」 | 不是缺陷：`copilot_raid_switch_task` 为空，这一关只按普通难度判通关。想补突袭要先把开关配好并真机验一关（清单在 `docs/PLAN_PHASE4.md`） |
 | 点了「肉鸽停」还在跑 | 这是设计（不变量 #47）：停止只在**局间**生效，当前这一局会打完。要立刻停就点「⏏️ 立即中止」——那一局作废。看 `roguelike.json` 的 `stop_requested_at` 有没有写进去 |
 | 肉鸽开始被拒「上次 X 主题没有干净结束」 | `roguelike.json` 的 `dirty = true`（不变量 #49）。用**同一个主题**跑一局，上游自己会 `Continue → ExitThenAbandon` 收掉残局，干净结束后 `dirty` 清零，就能换主题了 |
