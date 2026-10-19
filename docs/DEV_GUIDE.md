@@ -647,13 +647,19 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    `Fight Completed`、`Custom Completed` 缺一不可。临时目录在退出或异常时删除，
    日常与正式 Copilot 仍使用原配置。没有新增任何关卡选路定义。
    2026-09-08 15:17 真机通过（`runs/2026-09-08-copilot-9e14e500ac25.log`）。
-2. **多关连抄走 B 基线**（spike A 的裁定）：每关一次上游 Fight 导航 + 单文件 copilot，
-   不退模拟器。MaaCore 的 `copilot_list` 模式**挂起**，两个原因：
-   ① maa-cli 0.7.5 的 stdout 分不出逐关成败（`Copilot Start/Completed` 是任务级，
-   逐关只有重复的 `BattleFormation / MissionStart`），逐关记账得改读 `debug/asst.log`；
-   ② 它的导航链不处理首通弹窗——SR-6 的「获得了塔罗牌」让它**死循环 9 分钟不报错**，
-   直到 900s 超时。Fight 导航链自带 `<前缀>-TarotClose` 这类处理，B 基线因此更稳。
-   详见 `docs/spikes/copilot-list-2026-09-08.md`。
+2. **当期活动关走多作业（`copilot_list`），2026-10-19 解除 D22**；资源本 / 主线仍走 B 基线
+   （每关一次上游 Fight 导航 + 单文件 copilot）。spike A 挂起多作业的两个原因现在都有对策：
+   ① 逐关成败：`maa run` 加 `-vvv` 时 maa-cli 把 MaaCore 每份作业开始时的
+   `CopilotListLoadTaskFileSuccess`（带 `file_name`）原样打出来；每份都要过三星检查才开始下一份，
+   所以「第 k 份开始了」= 前 k−1 份通过（`maa_clearing.list_outcomes()`）；
+   ② 地图弹窗卡死：`_run_copilot_with_watchdog(stall=…)` 的「无进展」超时，一份作业开始后
+   `copilot_list_item_timeout`（默认 1500 s）内没有下一份开始就结束进程。
+   2026-10-19 真机核对过的事实（maa-cli 0.7.5 / MaaCore 6.20.0，YW）：打哪关**只看作业文件里的
+   `stage_name`**，列表项上的关名不起作用；一份解析失败的文件会让整张列表跑不起来，所以组表前
+   逐份预检（`job_file_problem()`）；本仓库搜索缓存里是精简版作业，执行用 `/copilot/get/<id>`
+   的完整内容。导航三小步见不变量 #57，地形（解锁链、区域名、EX 理智）来自
+   `maa_gamedata.py`（ArknightsGameData，一天抓一次，缓存 `copilot/gamedata.json`）。
+   **区域入口（EX / S）那一步还没在真机上跑过**（当时 EX 未解锁），认不准会停下通知。
 3. **突袭切换 ❌ 2026-09-09 真机验证失败，功能默认关闭**（现场与下次验证清单见
    `docs/archive/PLAN_PHASE4.md` 的「突袭切换真机验证（2026-09-09）」）。
    Fight 导航停在的是普通难度详情页，要打突袭得先切过去；MaaCore 自己在
@@ -1209,7 +1215,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 36 | 一轮里每开新的一关前检查距下一场日常是否还够 `auto_copilot_min_lead_minutes`（默认 40，比 `copilot_blackout_minutes` 宽，因为它要覆盖整关而不只是启动），不够就收尾、剩下的留给下一轮。**「能不能开」的三条闸门（blackout / Depot 窗口 / 时间预算）只有一份实现**，都在 `maa_action.py`：watcher 派发前查一次，worker 每关开始前再查一次 | `maa_action.min_lead_reason()` / `_copilot_blackout_reason()` / `depot_window_reason()` + `CopilotTimeBudgetTests` / `CopilotDispatchGateTests` |
 | 39 | **计划的覆盖是按场次的**：`plan.json` 的形状是 `{date, sessions: {am, pm}, updated_at}`，`effective_plan(at, phase)` 只叠 `sessions[phase]`。改早场绝不影响晚场（D3）。**`now` 永远叠不到任何场次**——没有写路径能产生 `sessions.now`（`plan set-stage` / `skip-today` 只接受 `am`/`pm`），所以手动场按定义走缺口默认关（D4）。磁盘上是旧的按天格式（顶层 `stage`/`skip`）时**读成空**、不迁移、不抛 | `maa_common.plan_sessions()` / `effective_plan()` / `maa_action._today_override()` + `PlanTests.test_session_overrides_apply_per_phase_and_expire_next_day` / `test_legacy_day_level_plan_reads_as_empty_and_never_raises` / `SessionDailyTests` |
 | 40 | **晚场计划卡不跟随上游更新**（D1）：`brew` / `maa update` / `maa hot-update` 只在早场卡跑。晚场卡因此也没有「上游更新」字段，`main()` 末尾那个「更新失败就 raise」只在 `update is not None` 时判。计划卡**恰好两行控件**：一个 `stage-select` 下拉 + 一个「跳过本场 / 恢复本场」按钮；登记表里不许再出现 `explain` / `log` / `farming-select` / 抄作业下拉的键 | `maa_plan_card.main()` / `build_components()` + `PlanCardPhaseTests.test_the_evening_card_never_follows_upstream` / `DiscordCardTests.test_the_card_has_exactly_one_select_and_one_button` |
-| 37 | **只跑上游 `tasks/Stages/<前缀>.json` 里已有顶层键的关**（前缀 = 关卡名第一个 `-` 之前；突袭条目按去掉 `#raid` 的普通关名查）。本项目**不再自写导航定义**，也**不读、不建** `~/.config/maa-cli/resource/tasks/Stages/`；只读 `maa_copilot._resource_dirs()` 给的上游目录，文件缺失 / 读失败 / JSON 坏 / 顶层不是对象**一律视为无键**（fail-closed，异常摘要进原因）。无键的关**不进目标集合、不进抄作业卡的下拉**，只在一览里标「⛔ 上游无导航」——它**永远不会自动变好**，等下去毫无意义，所以既不重试也不记失败 | `maa_clearing.nav_checker()` / `read_nav_keys()` / `maa_activity_watch.collect_targets()` + `CopilotTargetSetTests.test_a_stage_without_an_upstream_nav_key_never_enters_the_set` |
+| 37 | **非当期活动的关只跑上游 `tasks/Stages/<前缀>.json` 里已有顶层键的关**（前缀 = 关卡名第一个 `-` 之前；突袭条目按去掉 `#raid` 的普通关名查）。**当期活动关**（2026-10-19 用户放宽 D8）改为：这期活动在上游有**一个**普通关键（锚点）、游戏数据里有这关即可，导航走不变量 #57。两条路都**不读、不建** `~/.config/maa-cli/resource/tasks/Stages/`，只读 `maa_copilot._resource_dirs()` 给的上游目录，文件缺失 / 读失败 / JSON 坏 / 顶层不是对象**一律视为无键**（fail-closed，异常摘要进原因）。导航不过去的关**不进目标集合、不进抄作业卡的下拉**，只在一览里标「⛔」 | `maa_copilot.copilot_nav_checker()` / `maa_clearing.nav_checker()` / `read_nav_keys()` / `pick_anchor()` / `maa_activity_watch.collect_targets()` + `CopilotTargetSetTests.test_a_stage_without_an_upstream_nav_key_never_enters_the_set` / `CopilotListPrepTests` |
 | 41 | 「已排程」卡**只有一个按钮**（❌ 取消本轮）；watcher 自动排的轮**另加**一个固定 id 的「⏸️ 暂停自动作业」（不变量 #55），手动轮没有。候选卡的 ▶️ / 🔥 / 🔄 与 `copilot pick` / `copilot again` 整套在四期步骤 2 删除：选关即执行，没有可挑的候选。登记表里不许再出现 `:raid-` / `:again` / `:confirm` 的键。一轮只在 `scheduled` / `queued` 可取消（`CANCELABLE_STATUSES`），`executing` 起理智可能已经花掉 | `maa_copilot.build_scheduled_card()` / `CANCELABLE_STATUSES` + `ButtonRegistryTests.test_the_scheduled_card_carries_exactly_one_cancel_button` / `test_no_module_still_builds_candidate_buttons` |
 | 42 | **候选关集合受活动限制**（D5）：`StageActivityV2` 说活动还没结束时，`maa_farming.candidate_stages()` 只返回 `config.activity_stages ∩ 上游导航键`——理智 all in 活动才换得完代币商店，不刷主线也不刷常驻资源本。活动结束（截止时刻已过）当天就退回 `1-7` + 当天开放资源本；判「还在不在」**优先看日历而不是 `activity_stages`**（后者是运行时缓存，结束当天可能还留着上一期的关）。用户从下拉手动选资源本仍然允许——这条只管**自动定关** | `maa_farming.candidate_stages()` + `FarmingCandidateSetTests` |
 | 43 | 外部数据（一图流 / 企鹅物流）的抓取层**任何失败都不抛**，只返回缓存或空并把原因写进 `degraded_reasons`，由计划卡显示；四份缓存落 `state/maa/farming/`（0600、`atomic_write_json`），`matrix.json` 走 **ETag 条件请求**（`max-age=7200` 不可信），`stage/info` 1h TTL、`item/v7/value` 24h TTL。统一 UA `maa-remote/4 (+仓库地址)`，卡片带一行「数据来源：明日方舟一图流 / 企鹅物流（CC BY-NC 4.0）」。**数据不 vendor 进仓库**（许可），**单测一条都不许碰网**——桩数据手写 | `maa_farming.load_market_data()` / `_fetch_cached()` / `SOURCE_LINE` + `FarmingFetchTests` |
@@ -1226,6 +1232,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 54 | **手动场只由选关卡派发**（`PLAN_MANUAL_RUN.md`）：「现在跑」只发卡不开跑；`run start <关卡> <token>` 只由登记表触发，token 必须与 `manual_run.json` 匹配、`pending` 且未过期（过期就地收卡，这是硬闸门，过期哨兵只是 UI 清理）；`maa_daily.py now <token>` 再核对一次 `dispatched` + 同 token，对不上不跑、发红色告警。手动关**不进 `plan.json`**（`_today_override()` 只认 am/pm）、不带 drops 上限和后备关。选关卡用 `hermes:btn:maa-now:` 前缀，不在 `hermes:btn:maa:` / `hermes:btn:maa-copilot:` 之下，两趟清扫都碰不到；发新卡顺序同 #14b。定时场优先：距 08:00/22:00 不足 `manual_run_blackout_minutes`（默认 30）既不发卡也不派发。缺口推荐（森空岛查询）只在 `run recommend` 的脱离会话子进程里算，绝不进 20s 的 `run now` / `run start` | `maa_action.run_now()` / `run_start()` / `run_expire()` / `run_recommend()` / `manual_run_blackout_reason()` + `maa_daily.manual_run_stage()` + `ManualRunCardTests` |
 | 55 | **森空岛读不到就不自动排轮**（2026-10-11 改写：以前「刷新失败沿用缓存照排」，过期一个月的缓存里没有当期活动的 zone 进度，YW-4 没解锁也被排上）。**开打前的环境故障**（森空岛读不到、理智消耗查不到、开机 / ADB 炸了且一关都没进）worker 写进这一轮的 `prefight_error`，watcher 按北京日计数（`activity_watch.json` 的 `prefight_failures`），达到 `auto_copilot_max_prefight_failures_per_day`（默认 2）当天停排、只发一条——它们**不记账**，不另记就永远到不了 `daily_cap`。「理智不够」不是环境故障，不计数。「暂停自动作业」开关在 `copilot/auto_pause.json`：只管 `source == activity-watch` 的轮，暂停时作废 `scheduled` / `queued` 的一轮，**不中断正在打的那一关**、下一关开打前停；`copilot auto on` 同时清掉当天的开打前停排。按钮 custom_id 固定为 `hermes:btn:maa-copilot:auto:off|on`，不受按 token 清扫的影响 | `maa_activity_watch.run_once()` / `_count_prefight_failure()` / `_prefight_blocked()` + `maa_copilot_worker.PrefightError` + `maa_action.copilot_auto()` + `ActivityWatchTickTests` / `CopilotBatchExecutionTests.test_a_prefight_environment_failure_is_marked_on_the_round` / `CopilotAutoPauseCommandTests` |
 | 56 | **森空岛每日体检**挂在计划卡后面（早 07:50 / 晚 21:50，活动监控可能被暂停所以不挂那里）：每个北京日探一次，失败就发「🔑 森空岛登录已过期」（或「⚠️ 读取失败」），**一天最多一条**、恢复之前天天发；Discord 发送失败不记「今天已查」，晚场重试。体检自身的异常**不许拖垮计划卡**。`refresh_roster()` 成功一次就清掉 `skland.json` 的 `last_error` | `maa_skland.daily_health_check()` / `maa_plan_card._skland_health_notice()` + `SklandDailyHealthTests` |
+| 57 | **当期活动关的导航只有三小步自写，都只写进 `_isolated_config()` 的临时目录**：① 借锚点的上游链进活动、点进普通区域，把点关那一步换成只识别（方案 B，停在地图上）；② 剧情关挡路时在地图上点开它、跳过剧情；③ EX / S 区域按游戏数据里的区域名（`zone_table.zoneNameSecond`）在屏幕上找入口，相似度必须严格高于同活动其它区域名才点。**每一步之后都要在屏幕上认出目标区域的关卡代号**（`CopilotZoneReady`）才算到位，认不出就停下、按第一关失败记账。找关、编队、打仗全交给 MaaCore 的 `copilot_list`。教学关、没作业也没通关的关挡在前面时整轮从那里截断（`plan_segments()`），watcher 排轮前就截掉（`trim_unreachable()`），不为够不着的关开模拟器 | `maa_copilot_worker.ActivityNavigator` / `_run_activity_round()` / `maa_clearing.plan_segments()` / `zone_button()` + `CopilotListPlanTests` / `CopilotZoneEntryTests` / `CopilotListRoundTests` / `CopilotReachableTargetTests` |
 
 ---
 

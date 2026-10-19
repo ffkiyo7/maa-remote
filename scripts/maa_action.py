@@ -888,9 +888,11 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
     stage_id, code = resolved
     import maa_clearing
 
-    supported, detail = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))(code)
+    activity_key = str(load_json(WATCH_PATH, {}).get("activity_key") or "")
+    prefix = maa_copilot._activity_prefix(activity_key)
+    supported, detail = maa_copilot.copilot_nav_checker(config, prefix)(code)
     if not supported:
-        return False, f"MAA 未提供该关导航，无法抄作业：{detail}", None
+        return False, f"导航不到这一关，无法抄作业：{detail}", None
     worker = SCRIPTS_DIR / "maa_copilot_worker.py"
     if not worker.is_file():
         return False, "maa_copilot_worker.py 尚未部署。", None
@@ -899,8 +901,6 @@ def start_copilot_search(stage: str) -> tuple[bool, str, str | None]:
     blocker = dispatch_blocker(config, "", now_beijing())
     if blocker:
         return False, f"{blocker}；请日常 / 对表结束后再点。", None
-    activity_key = str(load_json(WATCH_PATH, {}).get("activity_key") or "")
-    prefix = maa_copilot._activity_prefix(activity_key)
     # 突袭开关为空时这里只会给出 `["normal"]`——手动路径同样不许排突袭。
     modes = list(maa_clearing.required_modes(code, prefix, config))
     token = _new_search_token()

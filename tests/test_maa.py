@@ -27,6 +27,7 @@ import maa_depot  # noqa: E402
 import maa_activity_watch  # noqa: E402
 import maa_daily  # noqa: E402
 import maa_farming  # noqa: E402
+import maa_gamedata  # noqa: E402
 import maa_plan_card  # noqa: E402
 import maa_roguelike  # noqa: E402
 import deploy  # noqa: E402
@@ -41,6 +42,9 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 _NO_NETWORK = None
 
 
+_GAMEDATA_PATCHES: list = []
+
+
 def setUpModule() -> None:
     global _NO_NETWORK
     _NO_NETWORK = patch.object(
@@ -49,11 +53,25 @@ def setUpModule() -> None:
         side_effect=AssertionError("单测不许访问一图流 / 企鹅物流：传 data= 或自行打桩"),
     )
     _NO_NETWORK.start()
+    # 游戏数据同理：不许抓 ArknightsGameData，也不许读写线上 `copilot/gamedata.json`。
+    # 默认给一份月行水上（SR）的小地形，要别的地形的用例自己 patch `load_layout`。
+    _GAMEDATA_PATCHES[:] = [
+        patch.object(maa_gamedata, "_fetch",
+                     side_effect=AssertionError("单测不许抓游戏数据：自行打桩")),
+        patch.object(maa_gamedata, "load_layout", side_effect=lambda: json.loads(
+            json.dumps(SR_LAYOUT))),
+        patch.object(maa_gamedata, "refresh_layout", side_effect=lambda *_a, **_k: (
+            maa_gamedata.load_layout(), "")),
+    ]
+    for item in _GAMEDATA_PATCHES:
+        item.start()
 
 
 def tearDownModule() -> None:
     if _NO_NETWORK is not None:
         _NO_NETWORK.stop()
+    for item in reversed(_GAMEDATA_PATCHES):
+        item.stop()
 
 
 
@@ -3499,8 +3517,18 @@ class FarmingExCostFallbackTests(unittest.TestCase):
         index = {"codes": {"SR-EX-1": "act54side_ex01"},
                  "stages": {"act54side_ex01": "SR-EX-1"}}
         with patch.object(maa_copilot, "stage_sanity_cost", return_value=None), \
-             patch.object(maa_farming, "stage_ap_cost", return_value=None):
+             patch.object(maa_farming, "stage_ap_cost", return_value=None), \
+             patch.object(maa_gamedata, "load_layout",
+                          return_value={"stages": {}, "zones": {}}):
             self.assertIsNone(maa_activity_watch.cost_lookup({}, index)("SR-EX-1"))
+
+    def test_game_data_is_the_third_source_for_ex_costs(self) -> None:
+        # 上游 `stages.json` 与一图流都没有 EX 关；游戏数据（`maa_gamedata`）有。
+        index = {"codes": {"SR-EX-1": "act54side_ex01"},
+                 "stages": {"act54side_ex01": "SR-EX-1"}}
+        with patch.object(maa_copilot, "stage_sanity_cost", return_value=None), \
+             patch.object(maa_farming, "stage_ap_cost", return_value=None):
+            self.assertEqual(maa_activity_watch.cost_lookup({}, index)("SR-EX-1"), 10)
 
 
 class FarmingDropsTests(unittest.TestCase):
@@ -4602,6 +4630,36 @@ SR_INDEX = {
 SR_KEY = "SideStory「月行水上」|SR"
 
 
+def _layout_stage(code, zone, unlock, *, story=False, cost=10):
+    return {"code": code, "zone_id": zone, "story": story, "ap_cost": 0 if story else cost,
+            "unlock": list(unlock)}
+
+
+# 测试用的 SR 地形：只含 `SR_INDEX` 里的关，链是 ST-1 → 1 → 2 → 5 → 6 → 8 → ST-2 → EX-1
+# → S-1。教学关挂在 SR-1 之后但不挡别的关（真实活动里它挡路，见 CopilotListPlanTests）。
+SR_LAYOUT = {
+    "stages": {
+        "act54side_st01": _layout_stage("SR-ST-1", "act54side_zone1", [], story=True),
+        "act54side_01": _layout_stage("SR-1", "act54side_zone1", ["act54side_st01"]),
+        "act54side_tr01": _layout_stage("SR-TR-1", "act54side_zone1", ["act54side_01"]),
+        "act54side_02": _layout_stage("SR-2", "act54side_zone1", ["act54side_01"]),
+        "act54side_05": _layout_stage("SR-5", "act54side_zone1", ["act54side_02"], cost=12),
+        "act54side_06": _layout_stage("SR-6", "act54side_zone1", ["act54side_05"], cost=12),
+        "act54side_08": _layout_stage("SR-8", "act54side_zone1", ["act54side_06"], cost=21),
+        "act54side_st02": _layout_stage("SR-ST-2", "act54side_zone1", ["act54side_08"],
+                                        story=True),
+        "act54side_ex01": _layout_stage("SR-EX-1", "act54side_zone2", ["act54side_st02"]),
+        "act54side_s01": _layout_stage("SR-S-1", "act54side_zone3", ["act54side_ex01"],
+                                       cost=20),
+    },
+    "zones": {
+        "act54side_zone1": {"name": "通学路", "index": 0},
+        "act54side_zone2": {"name": "殡仪堂", "index": 1},
+        "act54side_zone3": {"name": "怀旧区", "index": 2},
+    },
+}
+
+
 def _nav_patch(keys):
     """把 `maa_clearing.nav_checker` 换成一张固定的导航键表。"""
     def factory(_dirs):
@@ -4611,7 +4669,19 @@ def _nav_patch(keys):
                 return True, ""
             return False, f"上游 tasks/Stages/SR.json 里没有 {stage} 这个顶层键"
         return check
-    return patch.object(maa_clearing, "nav_checker", side_effect=factory)
+    # 活动关的闸门（`copilot_nav_checker`）在测试里用同一张键表：「在表里」= 够得着锚点。
+    return _both(
+        patch.object(maa_clearing, "nav_checker", side_effect=factory),
+        patch.object(maa_copilot, "copilot_nav_checker",
+                     side_effect=lambda *_a, **_k: factory(())),
+    )
+
+
+@contextlib.contextmanager
+def _both(*patches):
+    with contextlib.ExitStack() as stack:
+        mocks = [stack.enter_context(item) for item in patches]
+        yield mocks[0]
 
 
 def _zone(cleared: int, total: int, act: str = "act54side") -> dict:
@@ -5430,6 +5500,8 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                 patch.object(worker, "_recheck_before_stage", return_value=(True, ""),
                              side_effect=recheck),
                 *ledger_patches,
+                # 这一组验的是 B 基线（逐关 Fight 导航）；多作业路径见 CopilotListRoundTests。
+                patch.object(worker, "_use_list_path", return_value=False),
                 patch.object(worker, "_fight_one", side_effect=fight),
                 patch.object(worker, "settle_after_battle", side_effect=settle or default_settle),
                 patch.object(
@@ -6240,7 +6312,7 @@ class ManualCopilotPathTests(unittest.TestCase):
             ok, message, token = maa_action.start_copilot_search("SR-9")
         self.assertFalse(ok)
         self.assertIsNone(token)
-        self.assertIn("MAA 未提供该关导航", message)
+        self.assertIn("导航不到这一关", message)
         popen.assert_not_called()
 
     def _search(self, *, blocker=""):
@@ -6802,8 +6874,8 @@ class ActivityWatchTickTests(unittest.TestCase):
                 ]
         return SimpleNamespace(state=result, rounds=rounds, dispatch=dispatch)
 
-    TARGETS = [{"stage": "YW-4", "stage_id": "act52side_04", "modes": ["normal"]}]
-    ENTRIES = [{"stage": "YW-4", "stage_id": "act52side_04", "mode": "normal",
+    TARGETS = [{"stage": "SR-1", "stage_id": "act54side_01", "modes": ["normal"]}]
+    ENTRIES = [{"stage": "SR-1", "stage_id": "act54side_01", "mode": "normal",
                 "candidate": {"id": 1}, "sanity_cost": 12}]
 
     def test_a_skland_failure_blocks_scheduling_instead_of_using_the_cache(self) -> None:
@@ -8863,3 +8935,308 @@ class ManualRunCardTests(unittest.TestCase):
         self.assertEqual(plan["stage"], "1-7")
         self.assertEqual(plan["farming_fallback_stage"], "SR-7")
         self.assertEqual(alerts, [])
+
+
+# ---------------------------------------------------------------------------
+# 活动关多作业（2026-10-19）：游戏数据、排段、逐关事件、区域入口、执行
+# ---------------------------------------------------------------------------
+
+def _yw_layout() -> dict:
+    """照真实 ArknightsGameData 的 YW（act52side）抄的地形，只截前后几关。"""
+    zone1, zone2 = "act52side_zone1", "act52side_zone2"
+    chain = [
+        ("act52side_st01", "YW-ST-1", True), ("act52side_01", "YW-1", False),
+        ("act52side_tr01", "YW-TR-1", False), ("act52side_02", "YW-2", False),
+        ("act52side_03", "YW-3", False), ("act52side_04", "YW-4", False),
+        ("act52side_st02", "YW-ST-2", True), ("act52side_05", "YW-5", False),
+        ("act52side_06", "YW-6", False), ("act52side_st03", "YW-ST-3", True),
+    ]
+    stages = {}
+    previous = "main_01-10"
+    for stage_id, code, story in chain:
+        stages[stage_id] = _layout_stage(code, zone1, [previous], story=story)
+        previous = stage_id
+    stages["act52side_ex01"] = _layout_stage("YW-EX-1", zone2, ["act52side_st03"])
+    stages["act52side_ex02"] = _layout_stage("YW-EX-2", zone2, ["act52side_ex01"])
+    return {
+        "stages": stages,
+        "zones": {zone1: {"name": "雷亚-伊比利亚", "index": 0},
+                  zone2: {"name": "“我们的伊比利亚”", "index": 1}},
+    }
+
+
+def _yw(code: str, mode: str = "normal") -> dict:
+    stage_id = {
+        "YW-EX-1": "act52side_ex01", "YW-EX-2": "act52side_ex02",
+    }.get(code) or f"act52side_{int(code.rsplit('-', 1)[1]):02d}"
+    return {"stage": code, "stage_id": stage_id, "mode": mode,
+            "candidate": {"id": 100 + len(code)}, "sanity_cost": 12}
+
+
+class CopilotGameDataTests(unittest.TestCase):
+    def test_extract_keeps_activity_stages_and_drops_raid_variants(self) -> None:
+        stage_table = {"stages": {
+            "act52side_ex01": {"code": "YW-EX-1", "zoneId": "act52side_zone2",
+                               "isStoryOnly": False, "apCost": 10,
+                               "unlockCondition": [{"stageId": "act52side_st03"}]},
+            "act52side_ex01#f#": {"code": "YW-EX-1", "zoneId": "act52side_zone2"},
+            "main_01-07": {"code": "1-7", "zoneId": "main_1"},
+        }}
+        zone_table = {"zones": {
+            "act52side_zone2": {"zoneNameSecond": "“我们的伊比利亚”", "zoneIndex": 1},
+            "main_1": {"zoneNameSecond": "黑暗时代·下"},
+        }}
+        layout = maa_gamedata.extract_layout(stage_table, zone_table)
+        self.assertEqual(list(layout["stages"]), ["act52side_ex01"])
+        self.assertEqual(layout["stages"]["act52side_ex01"]["ap_cost"], 10)
+        self.assertEqual(layout["stages"]["act52side_ex01"]["unlock"], ["act52side_st03"])
+        self.assertEqual(maa_gamedata.zone_name(layout, "act52side_zone2"), "“我们的伊比利亚”")
+        self.assertNotIn("main_1", layout["zones"])
+
+    def test_ancestors_run_from_far_to_near_inside_one_activity(self) -> None:
+        layout = _yw_layout()
+        codes = [layout["stages"][s]["code"]
+                 for s in maa_gamedata.ancestors(layout, "act52side_ex01")]
+        self.assertEqual(codes[0], "YW-ST-1")  # 主线 1-10 不归活动管
+        self.assertEqual(codes[-1], "YW-ST-3")
+        self.assertIn("YW-TR-1", codes)
+
+    def test_skland_progress_is_trusted_only_when_the_totals_match(self) -> None:
+        layout = _yw_layout()
+        roster = {"activity_progress": {"act52side": [
+            {"zoneId": "act52side_zone1", "clearedStage": 3, "totalStage": 10},
+            {"zoneId": "act52side_zone2", "clearedStage": 1, "totalStage": 8},
+        ]}}
+        cleared = maa_gamedata.skland_cleared(layout, roster, "act52side")
+        # 区域一是链上前 3 关；区域二总数对不上（数据里只有 2 关），一关都不信。
+        self.assertEqual(cleared, {"act52side_st01", "act52side_01", "act52side_tr01"})
+
+
+class CopilotListPlanTests(unittest.TestCase):
+    """`plan_segments()`：剧情关插段、教学关 / 缺口截断、EX 换区域。"""
+
+    def test_a_fresh_activity_reads_the_first_story_and_stops_at_the_tutorial(self) -> None:
+        segments, dropped = maa_clearing.plan_segments(
+            [_yw("YW-1"), _yw("YW-2")], _yw_layout(), set()
+        )
+        self.assertEqual([s["kind"] for s in segments], ["story", "copilot"])
+        self.assertEqual(segments[0]["code"], "YW-ST-1")
+        self.assertEqual([e["stage"] for e in segments[1]["items"]], ["YW-1"])
+        self.assertEqual([e["stage"] for e, _r in dropped], ["YW-2"])
+        self.assertIn("教学关 YW-TR-1", dropped[0][1])
+
+    def test_a_story_between_two_runs_splits_the_list(self) -> None:
+        cleared = {"act52side_tr01"}  # 森空岛说教学关过了
+        segments, dropped = maa_clearing.plan_segments(
+            [_yw("YW-2"), _yw("YW-3"), _yw("YW-4"), _yw("YW-5")], _yw_layout(), cleared
+        )
+        self.assertEqual(dropped, [])
+        self.assertEqual(
+            [(s["kind"], s.get("code") or [e["stage"] for e in s["items"]]) for s in segments],
+            [("copilot", ["YW-2", "YW-3", "YW-4"]), ("story", "YW-ST-2"),
+             ("copilot", ["YW-5"])],
+        )
+        # 看过 YW-ST-1 不必再看：YW-TR-1 过了说明它前面的全过了。
+        self.assertNotIn("YW-ST-1", [s.get("code") for s in segments])
+
+    def test_ex_stages_come_after_the_last_story_in_their_own_zone(self) -> None:
+        segments, _dropped = maa_clearing.plan_segments(
+            [_yw("YW-EX-1"), _yw("YW-EX-2")], _yw_layout(), {"act52side_06"}
+        )
+        self.assertEqual([s["kind"] for s in segments], ["story", "copilot"])
+        self.assertEqual(segments[0]["zone_id"], "act52side_zone1")
+        self.assertEqual(segments[0]["code"], "YW-ST-3")
+        self.assertEqual(segments[1]["zone_id"], "act52side_zone2")
+
+    def test_an_uncleared_stage_without_a_job_cuts_the_rest(self) -> None:
+        segments, dropped = maa_clearing.plan_segments(
+            [_yw("YW-6")], _yw_layout(), {"act52side_04"}
+        )
+        self.assertEqual(segments[0]["code"], "YW-ST-2")
+        self.assertEqual(len(segments), 1)
+        self.assertIn("前置关 YW-5", dropped[0][1])
+
+    def test_raid_needs_its_normal_first(self) -> None:
+        _segments, dropped = maa_clearing.plan_segments(
+            [_yw("YW-EX-1", "raid")], _yw_layout(), {"act52side_06"}
+        )
+        self.assertIn("普通难度还没过", dropped[0][1])
+        segments, dropped = maa_clearing.plan_segments(
+            [_yw("YW-EX-1"), _yw("YW-EX-1", "raid")], _yw_layout(), {"act52side_06"}
+        )
+        self.assertEqual(dropped, [])
+        self.assertEqual([e["mode"] for e in segments[-1]["items"]], ["normal", "raid"])
+
+
+def _list_event(path: str) -> str:
+    return (
+        "[2026-10-19 13:41:01 TRACE] UnknownSubTaskExtraInfo: {\n"
+        '  "class": "asst::MultiCopilotTaskPlugin",\n'
+        f'  "details": {{\n    "file_name": "{path}",\n    "id": -1,\n'
+        '    "stage_name": "act52side_04"\n  },\n'
+        '  "what": "CopilotListLoadTaskFileSuccess"\n}\n'
+    )
+
+
+class CopilotListOutcomeTests(unittest.TestCase):
+    """逐关成败：第 k 份开始了 = 前 k−1 份三星通过（2026-10-19 真机日志的形状）。"""
+
+    FILES = ["/p/a.json", "/p/b.json", "/p/c.json"]
+
+    def test_a_completed_list_wins_every_item(self) -> None:
+        output = "".join(_list_event(f) for f in self.FILES) + "[INFO ] Copilot Completed\n"
+        self.assertEqual(maa_clearing.list_outcomes(self.FILES, output, 0),
+                         [("won", "")] * 3)
+
+    def test_the_last_started_item_takes_the_failure(self) -> None:
+        output = _list_event(self.FILES[0]) + _list_event(self.FILES[1]) + "Copilot Error\n"
+        verdicts = [v for v, _d in maa_clearing.list_outcomes(self.FILES, output, 1)]
+        self.assertEqual(verdicts, ["won", "failed", "skipped"])
+
+    def test_a_stall_timeout_fails_the_item_it_was_stuck_on(self) -> None:
+        output = _list_event(self.FILES[0]) + "maa copilot 无进展超时\n"
+        verdicts = [v for v, _d in maa_clearing.list_outcomes(self.FILES, output, 124)]
+        self.assertEqual(verdicts, ["failed", "skipped", "skipped"])
+
+    def test_events_out_of_order_never_count_as_wins(self) -> None:
+        output = _list_event(self.FILES[1]) + "Copilot Completed\n"
+        verdicts = {v for v, _d in maa_clearing.list_outcomes(self.FILES, output, 0)}
+        self.assertEqual(verdicts, {"unknown"})
+
+
+class CopilotZoneEntryTests(unittest.TestCase):
+    # 2026-10-19 真机 OCR：「我们的伊比利亚」被认成「伊比和亚」，普通区域名也在同一屏。
+    SCREEN = [
+        "雷亚-伊比利並\t[1152,926,201,37]",
+        "我们的伊比和亚\t[1506,959,201,37]",
+        "完成「雷亚-伊比利亚」后解锁\t[1459,680,323,31]",
+    ]
+
+    def test_the_closest_zone_name_wins_despite_ocr_typos(self) -> None:
+        self.assertEqual(
+            maa_clearing.zone_button(self.SCREEN, "“我们的伊比利亚”", ["雷亚-伊比利亚"]),
+            (1606, 977),
+        )
+        self.assertEqual(
+            maa_clearing.zone_button(self.SCREEN, "雷亚-伊比利亚", ["“我们的伊比利亚”"]),
+            (1252, 944),
+        )
+
+    def test_nothing_close_enough_means_no_tap(self) -> None:
+        self.assertIsNone(
+            maa_clearing.zone_button(self.SCREEN[2:], "“我们的伊比利亚”", ["雷亚-伊比利亚"])
+        )
+
+
+class CopilotListPrepTests(unittest.TestCase):
+    def test_a_job_must_target_the_stage_and_carry_actions(self) -> None:
+        good = {"stage_name": "act52side_04", "opers": [{"name": "能天使"}],
+                "actions": [{"type": "Deploy"}]}
+        self.assertEqual(maa_clearing.job_file_problem(good, "act52side_04"), "")
+        self.assertIn("不是", maa_clearing.job_file_problem(good, "act52side_05"))
+        trimmed = {**good, "actions": []}
+        self.assertIn("精简版", maa_clearing.job_file_problem(trimmed, "act52side_04"))
+        self.assertTrue(maa_clearing.job_file_problem("not json", "act52side_04"))
+
+    def test_the_anchor_is_the_lowest_numbered_normal_key_with_a_next(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            stages = Path(raw) / "tasks" / "Stages"
+            stages.mkdir(parents=True)
+            (stages / "YW.json").write_text(json.dumps({
+                "YW-OpenOpt": {"next": ["YWChapterToYW"]},
+                "YW-8": {"sub": ["YW-8@YW-OpenOpt"], "next": ["YW-8@SideStoryStage"]},
+                "YW-4": {"sub": ["YW-4@YW-OpenOpt"], "next": ["YW-4@SideStoryStage"]},
+            }), encoding="utf-8")
+            self.assertEqual(maa_clearing.pick_anchor([Path(raw)], "YW"),
+                             ("YW-4", ["YW-4@SideStoryStage"], ""))
+            anchor, _nexts, error = maa_clearing.pick_anchor([Path(raw)], "SR")
+        self.assertEqual(anchor, "")
+        self.assertIn("SR", error)
+
+
+class CopilotListRoundTests(unittest.TestCase):
+    """`_run_activity_round()`：按段执行、逐关记账、导航失败停整轮。"""
+
+    def _run(self, entries, *, outcomes=None, tasks_ok=True, prep_problem=""):
+        import maa_copilot_worker as worker
+
+        ledger = maa_copilot.new_ledger(SR_KEY)
+        results: list[dict] = []
+        calls: list[str] = []
+
+        def run_tasks(_config, _env, _log, name, _body, overlay, **_kw):
+            calls.append(name if name != "copilot-story" else
+                         f"story:{overlay['CopilotStoryClick']['text'][0]}")
+            return tasks_ok, "" if tasks_ok else "认不出关卡"
+
+        def run_list(_config, _env, _log, items):
+            calls.append("list:" + ",".join(e["stage"] for e, _p in items))
+            return outcomes or [("won", "")] * len(items)
+
+        with tempfile.TemporaryDirectory() as raw, \
+             patch.object(maa_clearing, "pick_anchor",
+                          return_value=("SR-8", ["SR-8@SideStoryStage"], "")), \
+             patch.object(maa_copilot, "load_stage_index", return_value=SR_INDEX), \
+             patch.object(maa_copilot, "load_roster", return_value=None), \
+             patch.object(maa_copilot, "PREPARED_DIR", Path(raw)), \
+             patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l), \
+             patch.object(maa_action, "min_lead_reason", return_value=""), \
+             patch.object(worker, "_run_tasks", side_effect=run_tasks), \
+             patch.object(worker, "_prepare_list_file", return_value=prep_problem), \
+             patch.object(worker, "_run_copilot_list", side_effect=run_list), \
+             patch.object(worker, "_recheck_before_stage", return_value=(True, "")), \
+             patch.object(worker, "settle_after_battle", return_value=(True, "")):
+            stop = worker._run_activity_round(
+                {"copilot_raid_switch_task": ""}, {"activity_key": SR_KEY}, entries, {},
+                Path(raw) / "run.log", ledger, Path(raw) / "ledger.json", results, False,
+            )
+        return SimpleNamespace(stop=stop, results=results, calls=calls, ledger=ledger)
+
+    def _sr(self, code, mode="normal"):
+        return {"stage": code, "stage_id": SR_INDEX["codes"][code], "mode": mode,
+                "candidate": {"id": 7}, "sanity_cost": 12}
+
+    def test_one_map_trip_then_story_then_list(self) -> None:
+        result = self._run([self._sr("SR-1"), self._sr("SR-2")])
+        self.assertEqual(result.stop, "")
+        self.assertEqual(result.calls, ["copilot-map", "story:SR-ST-1", "list:SR-1,SR-2"])
+        self.assertTrue(result.ledger["stages"]["SR-1"]["normal"])
+        self.assertTrue(result.ledger["stages"]["SR-2"]["normal"])
+
+    def test_a_failed_item_stops_and_later_items_are_not_recorded(self) -> None:
+        result = self._run(
+            [self._sr("SR-1"), self._sr("SR-2")],
+            outcomes=[("failed", "Copilot Error"), ("skipped", "前一份没过，这份没开始")],
+        )
+        self.assertEqual(result.stop, "Copilot Error")
+        self.assertEqual([r["outcome"] for r in result.results], ["failed", "skipped"])
+        self.assertNotIn("SR-2", result.ledger.get("stages", {}))
+
+    def test_a_navigation_failure_is_charged_to_the_first_stage(self) -> None:
+        result = self._run([self._sr("SR-1"), self._sr("SR-2")], tasks_ok=False)
+        self.assertIn("没能停在活动地图上", result.stop)
+        self.assertEqual([r["outcome"] for r in result.results], ["failed", "skipped"])
+        self.assertEqual(result.calls, ["copilot-map"])
+
+    def test_a_bad_job_file_never_reaches_maa(self) -> None:
+        result = self._run([self._sr("SR-1")], prep_problem="作业 7：作业没有操作步骤")
+        self.assertEqual(result.calls, ["copilot-map", "story:SR-ST-1"])
+        self.assertEqual([r["outcome"] for r in result.results], ["skipped"])
+
+    def test_raid_is_skipped_while_the_switch_is_off(self) -> None:
+        result = self._run([self._sr("SR-1"), self._sr("SR-1", "raid")])
+        self.assertEqual(result.calls[-1], "list:SR-1")
+        self.assertIn("skipped", [r["outcome"] for r in result.results if r["mode"] == "raid"])
+
+
+class CopilotReachableTargetTests(unittest.TestCase):
+    def test_stages_behind_a_missing_job_are_not_scheduled(self) -> None:
+        import maa_activity_watch as watch
+
+        targets = [
+            {"stage": "SR-1", "stage_id": "act54side_01", "modes": ["normal"]},
+            {"stage": "SR-5", "stage_id": "act54side_05", "modes": ["normal"]},
+        ]
+        kept, reason = watch._reachable_targets(targets, {}, None, SR_INDEX)
+        self.assertEqual([t["stage"] for t in kept], ["SR-1"])
+        self.assertIn("前置关 SR-2", reason)

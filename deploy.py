@@ -192,6 +192,7 @@ def deploy_scripts() -> None:
         "maa_clearing.py",
         "maa_copilot.py",
         "maa_farming.py",
+        "maa_gamedata.py",
         "maa_roguelike.py",
         "maa_copilot_worker.py",
         "maa_roguelike_worker.py",

@@ -196,6 +196,277 @@ def nav_checker(
 
 
 # ---------------------------------------------------------------------------
+# 活动关的多作业导航（2026-10-19，用户放宽 D8：只在隔离临时配置里补三小步）
+# ---------------------------------------------------------------------------
+
+# 活动关不再要求「每关都有上游键」：只要这期活动在上游有**任意一个**普通关键
+# （锚点），就借它的进活动路径走到普通区域地图上停下（方案 B），之后：
+#   - 找关、编队、打仗全部交给 MaaCore 的 `copilot_list`；
+#   - 剧情关挡路 → 在地图上点开它、跳过剧情（`story` 段）；
+#   - EX / S 关在另一个区域 → 按游戏数据里的区域名点入口（`zone` 段）。
+# 每一步之后都要在屏幕上认出目标区域的关卡代号才算到位，认不出就停下通知。
+# 这些都只写进 `maa_copilot_worker._isolated_config()` 的临时目录，不碰上游资源。
+
+def read_nav_tasks(resource_dirs: Iterable[Path], prefix: str) -> dict[str, Any]:
+    """上游 `tasks/Stages/<prefix>.json` 的完整内容（热更新覆盖本体）。读不到返回 `{}`。"""
+    merged: dict[str, Any] = {}
+    for resource_dir in reversed([Path(path) for path in resource_dirs]):
+        path = Path(resource_dir).joinpath(*NAV_STAGES_SUBDIR, f"{prefix}.json")
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            merged.update(data)
+    return merged
+
+
+def pick_anchor(
+    resource_dirs: Iterable[Path], prefix: str
+) -> tuple[str, list[str], str]:
+    """这期活动的锚点：`(锚点关名, 要改成只识别的 next 任务名, 失败原因)`。
+
+    只认 `<前缀>-<数字>` 形状的顶层键（普通区域的战斗关），取序号最小的那个——
+    方案 B 只借它「进活动、点进普通区域」那一段，锚点本身解没解锁都无所谓。
+    `next` 为空说明上游链的形状变了，fail-closed。
+    """
+    tasks = read_nav_tasks(resource_dirs, prefix)
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d{{1,2}})$")
+    keyed = sorted(
+        (int(match.group(1)), key)
+        for key in tasks
+        if (match := pattern.match(str(key)))
+    )
+    for _seq, key in keyed:
+        body = tasks.get(key)
+        nexts = [str(name) for name in (body.get("next") or [])] if isinstance(body, dict) else []
+        if nexts:
+            return key, nexts, ""
+    if keyed:
+        return "", [], f"上游 {prefix} 的导航键没有 next，链的形状可能变了"
+    return "", [], f"上游 tasks/Stages/{prefix}.json 里没有 {prefix} 普通关的导航键"
+
+
+def zone_codes(layout: dict[str, Any], zone_id: str) -> list[str]:
+    """某个区域在地图上会显示的全部关卡代号（战斗、剧情、教学关都算）。"""
+    codes = {
+        str(info.get("code") or "")
+        for info in (layout.get("stages") or {}).values()
+        if isinstance(info, dict) and info.get("zone_id") == zone_id and info.get("code")
+    }
+    return sorted(codes)
+
+
+def cleared_closure(layout: dict[str, Any], cleared: Iterable[str]) -> set[str]:
+    """已通关的关 + 它们的全部前置：解锁是一条链，打过 YW-6 就说明 YW-ST-2 看过了。"""
+    import maa_gamedata
+
+    done: set[str] = set()
+    for stage_id in cleared:
+        done.add(str(stage_id))
+        done.update(maa_gamedata.ancestors(layout, str(stage_id)))
+    return done
+
+
+def plan_segments(
+    entries: list[dict[str, Any]],
+    layout: dict[str, Any],
+    cleared: Iterable[str],
+) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+    """一轮活动条目 → 按顺序执行的段：`(段, [(没排进去的条目, 原因)])`。
+
+    段有两种，都带 `zone_id`（执行前 worker 负责先站到这个区域的地图上）：
+    `{"kind": "story", "stage_id", "code", "zone_id"}` 点开剧情关并跳过；
+    `{"kind": "copilot", "zone_id", "items": [条目...]}` 一张多作业列表。
+
+    每个条目先看它的前置关（`maa_gamedata.ancestors()`）里还有哪些没过：
+    剧情关就插一段 `story`（已经看过的剧情再点一次也无害，不耗理智）；
+    教学关、没排进本轮的战斗关挡在前面就**从这里截断**，后面的条目全部退回
+    （解锁是一条链，后面的关首通时一定还锁着）。
+    """
+    import maa_gamedata
+
+    done = cleared_closure(layout, cleared)
+    segments: list[dict[str, Any]] = []
+    dropped: list[tuple[dict[str, Any], str]] = []
+    zone = ""
+
+    def enter(target_zone: str) -> None:
+        nonlocal zone
+        if target_zone:
+            zone = target_zone
+
+    for position, entry in enumerate(entries):
+        stage_id = str(entry.get("stage_id") or "")
+        stage = str(entry.get("stage") or "")
+        info = maa_gamedata.stage_info(layout, stage_id)
+        blocker = ""
+        if info is None:
+            blocker = f"游戏数据里没有 {stage}"
+        elif str(entry.get("mode") or "normal") == "raid":
+            if stage_id not in done:
+                blocker = f"{stage} 的普通难度还没过，突袭没解锁"
+        else:
+            for parent in maa_gamedata.ancestors(layout, stage_id):
+                if parent in done:
+                    continue
+                parent_info = maa_gamedata.stage_info(layout, parent) or {}
+                code = str(parent_info.get("code") or parent)
+                kind = maa_gamedata.stage_kind(parent_info)
+                if kind == "story":
+                    enter(str(parent_info.get("zone_id") or ""))
+                    segments.append(
+                        {"kind": "story", "stage_id": parent, "code": code, "zone_id": zone}
+                    )
+                    done.add(parent)
+                    continue
+                blocker = (
+                    f"教学关 {code} 还没打（固定阵容，需要你手动打一次）"
+                    if kind == "tutorial"
+                    else f"前置关 {code} 还没通关，本轮也没排它"
+                )
+                break
+        if blocker:
+            dropped.extend((rest, blocker) for rest in entries[position:])
+            break
+        enter(str(info.get("zone_id") or ""))
+        last = segments[-1] if segments else None
+        if last and last["kind"] == "copilot" and last["zone_id"] == zone:
+            last["items"].append(entry)
+        else:
+            segments.append({"kind": "copilot", "zone_id": zone, "items": [entry]})
+        done.add(stage_id)
+    return segments, dropped
+
+
+_ZONE_NOISE_RE = re.compile(r"[\s“”\"'「」『』《》()（）\-·・—_]")
+ZONE_MATCH_MIN = 0.6
+
+
+def _zone_text(text: str) -> str:
+    return _ZONE_NOISE_RE.sub("", str(text or ""))
+
+
+def zone_button(
+    ocr_lines: Iterable[str], target: str, others: Iterable[str]
+) -> tuple[int, int] | None:
+    """在一屏 OCR（`文字\\t[x,y,w,h]`，`ocrbox` 的输出）里找区域入口，返回点击坐标。
+
+    入口按钮上的字就是游戏数据里的区域名（普通区域 2026-10-19 真机核对过），但 OCR
+    会认错字（「我们的伊比和亚」）。所以按相似度挑：和目标区域名的相似度要过
+    `ZONE_MATCH_MIN`，还必须**严格高于**它和同活动其它区域名的相似度——YW 两个区域名
+    都含「伊比利亚」，只认片段会点错。认不准返回 None，调用方停下通知。
+    """
+    from difflib import SequenceMatcher
+
+    wanted = _zone_text(target)
+    rivals = [_zone_text(name) for name in others if _zone_text(name)]
+    if not wanted:
+        return None
+    best: tuple[float, int, int] | None = None
+    for line in ocr_lines:
+        match = re.match(r"^(.*)\t\[(\d+),(\d+),(\d+),(\d+)\]\s*$", str(line))
+        if not match:
+            continue
+        text = _zone_text(match.group(1))
+        if not text:
+            continue
+        score = SequenceMatcher(None, text, wanted).ratio()
+        if score < ZONE_MATCH_MIN:
+            continue
+        if any(SequenceMatcher(None, text, rival).ratio() >= score for rival in rivals):
+            continue
+        x, y, w, h = (int(part) for part in match.groups()[1:])
+        if best is None or score > best[0]:
+            best = (score, x + w // 2, y + h // 2)
+    return (best[1], best[2]) if best else None
+
+
+def job_file_problem(content: Any, stage_id: str) -> str:
+    """一份作业文件能不能进多作业列表；能就返回空串。
+
+    MaaCore 在添加任务时就解析列表里的**全部**文件，有一份坏的整条任务直接报错
+    （2026-10-19 真机：一份旧 SR-8 作业让整张列表没跑起来），所以组表前逐份查。
+    打哪关只看文件里的 `stage_name`（列表项上的关名不起作用，同一天实测），
+    所以它必须正好是目标关。
+    """
+    if not isinstance(content, dict):
+        return "作业内容不是 JSON 对象"
+    if str(content.get("stage_name") or "") != stage_id:
+        return f"作业的关卡是 {content.get('stage_name') or '空'}，不是 {stage_id}"
+    actions = content.get("actions")
+    if not isinstance(actions, list) or not actions:
+        return "作业没有操作步骤（拿到的可能是精简版）"
+    if not any(isinstance(content.get(key), list) and content.get(key)
+               for key in ("opers", "groups")):
+        return "作业没有干员"
+    return ""
+
+
+# maa-cli 在 `-vvv` 下把 MaaCore 的 `SubTaskExtraInfo` 原样打成一个 JSON 块
+# （`UnknownSubTaskExtraInfo: {` 开头、顶格 `}` 结尾）。多作业每开始一份作业发一次
+# `CopilotListLoadTaskFileSuccess`，带这份作业的 `file_name`（2026-10-19 真机 3/3）。
+LIST_ITEM_EVENT = "CopilotListLoadTaskFileSuccess"
+_EXTRA_INFO_HEAD = re.compile(r"UnknownSubTaskExtraInfo:\s*\{\s*$")
+
+
+def list_started_files(output: str) -> list[str]:
+    """从 maa-cli 输出里按顺序取出「已开始」的作业文件路径。"""
+    started: list[str] = []
+    block: list[str] | None = None
+    for line in str(output or "").splitlines():
+        if block is None:
+            if _EXTRA_INFO_HEAD.search(line):
+                block = ["{"]
+            continue
+        block.append(line)
+        if line.rstrip() != "}":
+            continue
+        try:
+            data = json.loads("\n".join(block))
+        except ValueError:
+            data = None
+        block = None
+        if not isinstance(data, dict) or data.get("what") != LIST_ITEM_EVENT:
+            continue
+        name = str((data.get("details") or {}).get("file_name") or "")
+        if name:
+            started.append(name)
+    return started
+
+
+def list_outcomes(
+    files: list[str], output: str, return_code: int
+) -> list[tuple[str, str]]:
+    """一张多作业列表跑完后，每一项的 `(结论, 明细)`，与 `files` 一一对应。
+
+    MaaCore 每一份都要过三星检查才开始下一份，所以「第 k 份开始了」就证明
+    前 k−1 份都三星通关。整条 `Copilot Completed` 且退出码 0 → 全部通过；
+    否则最后开始的那一份记失败，没开始的记 `skipped`。
+    开始事件和文件对不上（顺序乱了、出现列表外的文件）一律 `unknown`：宁可重打。
+    """
+    started = list_started_files(output)
+    if started != files[: len(started)]:
+        return [("unknown", "逐关事件与列表对不上，本轮不记通关")] * len(files)
+    whole, detail = copilot_outcome(output, return_code)
+    if whole == "won" and len(started) == len(files):
+        return [("won", "")] * len(files)
+    if whole == "won":
+        # 整条报完成却有项没开始：不该发生，按看不懂处理。
+        whole, detail = "unknown", "列表报完成，但有作业没开始"
+    results: list[tuple[str, str]] = []
+    for index in range(len(files)):
+        if index < len(started) - 1:
+            results.append(("won", ""))
+        elif index == len(started) - 1:
+            results.append((whole if whole != "won" else "unknown", detail))
+        else:
+            results.append(("skipped", "前一份没过，这份没开始"))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 理智预算
 # ---------------------------------------------------------------------------
 
