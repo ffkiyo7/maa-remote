@@ -128,11 +128,24 @@ DEFAULT_RAID_SWITCH_TASK = maa_clearing.DEFAULT_RAID_SWITCH_TASK
 # （03:06 SR-5 → SR-6 的日志），最后一关停在结算页被关掉已验证无害。若哪一关结算页
 # 之后还有第二个弹窗 / 剧情，再回来派生 `EndOfAction`（注意上游 `ClickCorner.next` 里
 # 有 `StartButton2`，照搬会再开一局）。
+# **模板必须显式写**：MaaCore 的派生任务不继承 `template`，缺省按自己的任务名找
+# `CopilotSettleSkip.png`。2026-10-15 YW-4 的 asst.log 21 次 `templ not found`，
+# 跳过按钮一次都没匹配上，游戏停在剧情页，代理指挥没解锁。
 SETTLE_SKIP_TASK = "CopilotSettleSkip"
 SETTLE_OVERLAY_TASKS = {
-    SETTLE_SKIP_TASK: {"baseTask": "SkipBattlePlot", "next": ["CopilotSettleSkipConfirm"]},
-    "CopilotSettleSkipConfirm": {"baseTask": "SkipBattlePlotConfirm", "next": []},
+    SETTLE_SKIP_TASK: {
+        "baseTask": "SkipBattlePlot",
+        "template": "SkipThePreBattlePlot.png",
+        "next": ["CopilotSettleSkipConfirm"],
+    },
+    "CopilotSettleSkipConfirm": {
+        "baseTask": "SkipBattlePlotConfirm",
+        "template": "SkipThePreBattlePlotConfirm.png",
+        "next": [],
+    },
 }
+# 赢了但收尾失败（多半还停在战后剧情）：代理指挥没解锁，不能记成通关。
+UNSETTLED_NOTICE = "战斗已胜利，但战后剧情未跳过，代理指挥未解锁，不记通关、下轮重抄"
 SETTLE_TOML_TEMPLATE = """[[tasks]]
 name = "跳过剧情"
 type = "Custom"
@@ -644,8 +657,8 @@ def settle_after_battle(
 
     **两段任一 `Completed` 即算成功**：第一段完成 = 剧情已跳过（或本来就在能回家的
     页面），此时游戏至少到了结算页，代理指挥的记录已经落库（09-09 真机）；第二段完成
-    = 真的回到了主界面。只影响收尾质量，不改这一关的胜负判定：失败只把一句中性说明
-    带回战报。跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。
+    = 真的回到了主界面。两段都失败时，调用方把「赢了」降成 `failed`（`UNSETTLED_NOTICE`）：
+    多半还停在战后剧情，代理指挥没解锁，记成通关就再也不会重抄。跑在与导航同样隔离的临时 `MAA_CONFIG_DIR` 里。
     """
     maa_bin = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     body = SETTLE_TOML_TEMPLATE.format(
@@ -974,6 +987,9 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
                     # 直接 closedown 会把结算流程掐断——SR-8 三星却没解锁代理指挥（2026-09-09）。
                     settled, settle_note = settle_after_battle(config, stage, env, log_path)
                     if not settled:
+                        if outcome == "won":
+                            outcome = "failed"
+                            detail = UNSETTLED_NOTICE
                         detail = " · ".join(part for part in (detail, settle_note) if part)[:400]
                 verdict = {"won": "won", "unknown": "unknown"}.get(outcome, "failed")
                 maa_copilot.record_copilot_attempt(
@@ -1515,6 +1531,11 @@ def _run_activity_round(
                 settled, settle_note = settle_after_battle(
                     config, str(items[-1][0].get("stage") or ""), env, log_path
                 )
+                outcomes = list(outcomes)
+                if not settled and outcomes and outcomes[-1][0] == "won":
+                    # 表里前面几关的结算 MAA 已经走完了，只有最后一关的战后剧情归收尾管：
+                    # 收尾失败时它没解锁代理指挥，同逐关路径一样不记通关。
+                    outcomes[-1] = ("failed", UNSETTLED_NOTICE)
                 for (entry, _path), (verdict, detail) in zip(items, outcomes):
                     if verdict == "skipped":
                         skip(entry, detail)
