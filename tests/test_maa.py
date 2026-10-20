@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9253,6 +9253,25 @@ class CopilotListRoundTests(unittest.TestCase):
         result = self._run([self._sr("SR-1"), self._sr("SR-1", "raid")])
         self.assertEqual(result.calls[-1], "list:SR-1")
         self.assertIn("skipped", [r["outcome"] for r in result.results if r["mode"] == "raid"])
+
+
+class SklandSanityEstimateTests(unittest.TestCase):
+    def test_regeneration_counts_from_the_last_change_not_from_the_read(self) -> None:
+        """2026-10-20：06:30 读到 current=28、lastApAddTime=前一天 18:24，实际是 164。"""
+        tz = timezone(timedelta(hours=8))
+        last_add = datetime(2026, 10, 19, 18, 24, 58, tzinfo=tz)
+        read_at = datetime(2026, 10, 20, 6, 30, 0, tzinfo=tz)
+        snapshot = {"current": 28, "max": 208,
+                    "last_ap_add_at": int(last_add.timestamp()),
+                    "server_current_at": int(read_at.timestamp())}
+        self.assertEqual(maa_copilot.estimated_sanity(snapshot, read_at), 28 + 120)
+        at_eight = datetime(2026, 10, 20, 8, 1, 10, tzinfo=tz)  # MAA 读到 164 的时刻
+        self.assertEqual(maa_copilot.estimated_sanity(snapshot, at_eight), 164)
+        self.assertTrue(maa_copilot.sanity_preflight({"sanity": snapshot}, 30, read_at)["enough"])
+
+    def test_the_estimate_never_exceeds_the_cap(self) -> None:
+        snapshot = {"current": 200, "max": 208, "last_ap_add_at": 1, "server_current_at": 2}
+        self.assertEqual(maa_copilot.estimated_sanity(snapshot), 208)
 
 
 class PlanFightSwitchTests(unittest.TestCase):

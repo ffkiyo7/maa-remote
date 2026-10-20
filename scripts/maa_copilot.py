@@ -1647,10 +1647,12 @@ def estimated_sanity(snapshot: dict[str, Any], at: datetime | None = None) -> in
         return None
     if current >= maximum:
         return current
+    # 森空岛的 `ap.current` 是 **`lastApAddTime` 那一刻**的值，不是 `currentTs` 时的：
+    # 之后回复的每 6 分钟 1 点都要自己加上。以前把它当成「读取时的实时值」，只补了
+    # 读取之后的那段——2026-10-20 06:30 读到 28（上次变动在前一天 18:24），实际是 164，
+    # 早场前那一轮因此误判理智不足。
     now_epoch = int((at or now_beijing()).timestamp())
-    observed_bucket = max(0, (observed - last_add) // SANITY_RECOVERY_SECONDS)
-    current_bucket = max(0, (now_epoch - last_add) // SANITY_RECOVERY_SECONDS)
-    regenerated = max(0, current_bucket - observed_bucket)
+    regenerated = max(0, (now_epoch - last_add) // SANITY_RECOVERY_SECONDS)
     return min(maximum, current + regenerated)
 
 
