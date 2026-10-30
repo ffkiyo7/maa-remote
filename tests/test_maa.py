@@ -450,6 +450,21 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("⚔️ 刷理智：❌ 未完成（关卡 1-7；3 次；掉落 固源岩 ×3）", summary)
         self.assertNotIn("合成玉 ×1800", summary)
 
+    def test_annihilation_error_without_fights_hints_uncleared_map(self) -> None:
+        # 2026-10-26 起真机日志：新剿灭图没首通，Fight Error 10 秒就退出。
+        lines = [
+            "Fight Start",
+            "Fight Error",
+            "[每日剿灭] 08:02:01 - 08:02:11 (10s) Error",
+            "[刷理智] 08:02:12 - 08:05:35 (3m 23s) Completed",
+            "Fight SK-5 3 times, drops:",
+        ]
+        plan = maa_common.normalize_plan({"stage": "SK-5"})
+        plan["annihilation"] = True
+        summary = maa_daily.extract_summary(lines, [], plan=plan, ok=True)
+        self.assertIn("☄️ 每日剿灭：❌ 未完成（一场都没开", summary)
+        self.assertIn("400 杀", summary)
+
     def test_summary_notes_annihilation_already_done(self) -> None:
         plan = maa_common.normalize_plan({"stage": "1-7"})
         plan["annihilation"] = False

@@ -812,6 +812,10 @@ def extract_summary(
                     break
             annihilation_lines = annihilation_lines or lines
             count = _fight_times(annihilation_lines)
+            if state == "failed" and not count:
+                # 一场没开就 Error（约 10 秒）：全权委托只对 400 杀首通过的图开放，
+                # 剿灭轮换出新图后没人工打过一次，代理卡就用不了，每天都会卡在这。
+                details.append("一场都没开：多半是本期新剿灭图还没手动打满 400 杀，全权委托没解锁")
             details.append(
                 f"当期剿灭 {count} 次；代理卡全权委托；满 {ANNIHILATION_WEEKLY_ORUNDUM} 合成玉/周后停止"
                 if count
