@@ -10,5 +10,132 @@
       "InfrastDormDoubleConfirmButton",
       "Stop"
     ]
+  },
+  "Friends-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [300, 550, 128, 41],
+      "mask": []
+    },
+    "next": ["FriendsDefault", "FriendsSanrio"],
+    "onErrorNext": ["Friends-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "FriendsSanrio": {
+    "baseTask": "FriendsDefault",
+    "template": "Sanrio/Friends.png"
+  },
+  "Mall-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [822, 457, 86, 71],
+      "mask": []
+    },
+    "next": ["MallDefault", "MallSanrio"],
+    "onErrorNext": ["Mall-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "MallSanrio": {
+    "baseTask": "MallDefault",
+    "template": "Sanrio/Mall.png"
+  },
+  "Task-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [720, 553, 75, 70],
+      "mask": []
+    },
+    "next": ["TaskDefault", "TaskSanrio"],
+    "onErrorNext": ["Task-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "TaskSanrio": {
+    "baseTask": "TaskDefault",
+    "template": "Sanrio/Task.png"
+  },
+  "Terminal-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "doc": "Heads up: YostarEN needs 133 of 'y' instead of 120",
+      "roi": [903, 120, 97, 58],
+      "mask": []
+    },
+    "next": ["TerminalDefault", "TerminalSanrio"],
+    "onErrorNext": ["Terminal-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "TerminalSanrio": {
+    "baseTask": "TerminalDefault",
+    "template": "Sanrio/Terminal.png"
+  },
+  "Recruit-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [935, 480, 145, 61],
+      "mask": [125, 0, 25, 20]
+    },
+    "next": ["RecruitDefault", "RecruitSanrio"],
+    "onErrorNext": ["Recruit-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "RecruitSanrio": {
+    "baseTask": "RecruitDefault",
+    "template": "Sanrio/Recruit.png"
+  },
+  "Infrast-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [935, 570, 85, 75],
+      "mask": []
+    },
+    "next": ["InfrastDefault", "InfrastSanrio"],
+    "onErrorNext": ["Infrast-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "InfrastSanrio": {
+    "baseTask": "InfrastDefault",
+    "template": "Sanrio/EnterInfrast.png"
+  },
+  "Depot-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [1153, 606, 77, 79],
+      "mask": []
+    },
+    "next": ["DepotDefault", "DepotSanrio"],
+    "onErrorNext": ["Depot-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "DepotSanrio": {
+    "baseTask": "DepotDefault",
+    "template": "Sanrio/DepotEnter.png"
+  },
+  "OperBox-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [945, 301, 85, 78],
+      "mask": []
+    },
+    "next": ["OperBoxDefault", "OperBoxSanrio"],
+    "onErrorNext": ["OperBox-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "OperBoxSanrio": {
+    "baseTask": "OperBoxDefault",
+    "template": "Sanrio/OperBoxEnter.png"
+  },
+  "Gacha-Entry": {
+    "algorithm": "JustReturn",
+    "action": "DoNothing",
+    "crop_doc": {
+      "roi": [1095, 497, 167, 56],
+      "mask": []
+    },
+    "next": ["GachaDefault", "GachaSanrio"],
+    "onErrorNext": ["Gacha-Entry@SwitchTheme@ToggleSettingsMenu"]
+  },
+  "GachaSanrio": {
+    "baseTask": "GachaDefault",
+    "template": "Sanrio/GachaEnter.png"
   }
 }

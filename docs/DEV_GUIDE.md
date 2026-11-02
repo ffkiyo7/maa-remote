@@ -1352,6 +1352,8 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 截图失败 | ADB 断了或返回非 PNG；不阻断主流程，看 Embed 备注 |
 | 战报说「截图不是游戏主页」 | 看 `runs/<date>-<phase>.png` 到底停在哪一页；`last_run.home_verify_detail` 有命中了几个标识。UI 改版导致误杀就调 `HOME_MARKERS` |
 | `返回主界面` 报 Error 但截图确实在主页 | `maa update` 后 QuickSwitch 任务图变了 → 翻 `asst.log` 里 `taskchain":"Custom"` 的 `to_be_recognized`，对照资源 json 看少了哪一项 |
+| 启动 / 信用商店 / 领取奖励 / 返回主界面一起 Error，截图在主页 | 主页标识 `SwitchTheme@ToggleSettingsMenu` 没命中：`asst.log` 里它的 `match_templ` 分数卡在 0.7 左右。2026-11-02 就是游戏 26.11.1 主页改版、MaaCore 还停在旧版（计划卡停着 = 没人跑 `maa update`）。先 `maa update` 到带新模板的版本 |
+| 主页入口（信用商店 / 任务 / 好友…）没命中，MAA 去切界面主题 | 上游 26.11.1 起只认日间主题入口，认不出就把主题切回日间。三丽鸥联动主题由用户资源层的 `<入口>Sanrio` + `resource/template/UiTheme/Sanrio/*.png` 兜住；换了别的联动主题就照样从 `debug/interface/*_raw.png` 截新的入口模板（避开动画和角标） |
 | 基建在制造站或宿舍停住，截图显示“撤下宿舍锁定位置的干员”或“预设队列中的干员撤下” | 检查 profile 的 `user_resource = true`，以及 `~/.config/maa-cli/resource/tasks/tasks.json` 是否部署；诊断任务应出现 `InfrastDormDoubleConfirmed` 后继续到 `Infrast Completed` |
 | 计划卡红「MAA 上游更新失败」，`last_run.resource_update_detail` 里是 `SecureTransport error: connection closed via error; class=Net (12)` | 失败的是 `maa hot-update`（MaaResource 的 git fetch），不是 `maa update`——判据：detail 里**没有**「MaaCore 更新失败，未更新热更新资源」那一行，说明 core 那步过了。根因见 §11.18：`cli.toml` 的 `backend` 必须是 `git`，`libgit2` 会绕开代理直连 GitHub。手动复现：`MAA_CONFIG_DIR=~/.config/maa-cli maa hot-update --batch -vv` |
 | `deploy.py` 报 “no longer matches baseline” | Hermes 升级动了 adapter → 按 §7 更新补丁串 |

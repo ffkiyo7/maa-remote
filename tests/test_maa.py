@@ -1158,8 +1158,8 @@ Opening mini games:
                 checked = deploy.maa_config_content_checked_pairs()
                 self.assertEqual(deploy.content_mismatches(checked), [])
                 # Every config is still deployed and existence-checked.
-                self.assertEqual(len(deploy.maa_config_file_pairs()), 7)
-                self.assertEqual(len(checked), 6)
+                self.assertEqual(len(deploy.maa_config_file_pairs()), 16)
+                self.assertEqual(len(checked), 15)
 
                 daily = runtime / "tasks" / "daily.toml"
                 daily.write_bytes(b"rewritten by render_daily_toml\n")
@@ -2421,6 +2421,27 @@ class HomeScreenshotTests(unittest.TestCase):
                 ],
             },
         )
+
+    def test_sanrio_theme_entries_fall_back_to_upstream_and_ship_their_templates(self) -> None:
+        resource = ROOT / "config" / "maa-cli" / "resource"
+        override = json.loads((resource / "tasks" / "tasks.json").read_text(encoding="utf-8"))
+        deployed = set(deploy.MAA_CONFIG_RELATIVE_PATHS)
+        entries = [key for key in override if key.endswith("-Entry")]
+        self.assertEqual(len(entries), 9)
+        for entry in entries:
+            name = entry.removesuffix("-Entry")
+            # Upstream's day-theme template stays first, and a miss still ends
+            # in upstream's own theme switch rather than a dead end.
+            self.assertEqual(override[entry]["next"], [f"{name}Default", f"{name}Sanrio"])
+            self.assertEqual(
+                override[entry]["onErrorNext"],
+                [f"{entry}@SwitchTheme@ToggleSettingsMenu"],
+            )
+            sanrio = override[f"{name}Sanrio"]
+            self.assertEqual(sanrio["baseTask"], f"{name}Default")
+            template = Path("resource/template/UiTheme") / sanrio["template"]
+            self.assertTrue((resource.parent / template).is_file(), template)
+            self.assertIn(template, deployed)
 
 
 class DepotTests(unittest.TestCase):
