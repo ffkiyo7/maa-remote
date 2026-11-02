@@ -110,6 +110,21 @@ MAA_CONFIG_RELATIVE_PATHS = (
     Path("tasks/infrast-smoke.toml"),
     Path("cli.toml"),
     Path("resource/tasks/tasks.json"),
+    # 三丽鸥联动界面主题的主页入口模板，由 tasks.json 里的 `<入口>Sanrio` 引用。
+    *(
+        Path("resource/template/UiTheme/Sanrio") / name
+        for name in (
+            "Friends.png",
+            "Mall.png",
+            "Task.png",
+            "Terminal.png",
+            "Recruit.png",
+            "EnterInfrast.png",
+            "DepotEnter.png",
+            "OperBoxEnter.png",
+            "GachaEnter.png",
+        )
+    ),
 )
 
 # `maa_daily.render_daily_toml()` rewrites the deployed `tasks/daily.toml` in
