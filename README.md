@@ -10,7 +10,8 @@
 这是我自己每天在用的项目，开源出来是觉得对同样在折腾这条链路的人可能有点参考价值。
 有几件事想先说在前面，免得你抱着不太合适的期待：
 
-- 它**只在一种环境里跑过**：Apple Silicon Mac + macOS + BlueStacks Air + 明日方舟国服。
+- 它**只在一种环境里跑过**：Apple Silicon Mac + macOS + 自制模拟器 Landship + 明日方舟国服
+  （2026-11 之前用的是 BlueStacks Air，换回去只需改配置，见[环境要求](#环境要求)）。
   日服 / 美服、MuMu / 雷电、Windows / Linux 都还没适配，短期内大概也不会有。
 - 开发时我会优先保证自己那台机器稳定，所以**配置项、状态文件格式、任务链结构都可能变动**，
   没有版本号，也不会写迁移脚本。跟进的话留意一下 diff 就好。
@@ -74,7 +75,7 @@
    ~/.hermes/state/maa/{config,defaults,plan,last_run,activity_watch}.json + run.lock + runs/
                         │   effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次> 的覆盖
                         ▼
-   maa_daily.py ── flock ── 探模拟器 ── 快照本场计划 ── 起 BlueStacks ── 等 ADB
+   maa_daily.py ── flock ── 探模拟器 ── 快照本场计划 ── 起模拟器 ── 等 ADB
         └─ 渲染 daily.toml ── maa run ── 每 5s 编辑子区里的同一条进度消息
               └─ 返回主界面 ── Vision OCR 核对 ── 截图 ── closedown ── 战报
 ```
@@ -321,13 +322,21 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 | 硬件 / 系统 | Apple Silicon Mac，macOS（开发机为 M4 / macOS 26.6 / 16GB） |
 | 运行时依赖 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateway 常驻，且已连上 Discord |
 | Python | 开发机为 3.12。**零第三方依赖**，全部 stdlib（`zoneinfo` 需要 3.9+，但更低版本没验证过） |
-| 模拟器 | BlueStacks Air，实例 4 核 / 4GB / **1920×1080 横屏**（默认实例是竖屏，不改 MAA 必然识别不到） |
-| ADB | BlueStacks 自带的 `hd-adb`，`127.0.0.1:5555` |
+| 模拟器 | Landship（自制、未开源的 Google Android Emulator 前端，Android 14 arm64，**1920×1080 原生横屏**），bundle id `com.wadorudi.landship` |
+| ADB | 模拟器库目录里的 `sdk/platform-tools/adb`，`127.0.0.1:5585`。**路径不能带空格**：MaaCore 经 shell 调 adb 不加引号 |
 | MAA | maa-cli（Homebrew tap `MaaAssistantArknights/tap/maa-cli`）+ MaaCore，`touch_mode = "MaaTouch"` |
 | 游戏 | 明日方舟**国服** `com.hypergryph.arknights`，已侧载并登录到主页面 |
 | 可选 | `swiftc`（编译 ocrbox；缺了抄作业的接管弹窗 watchdog 不可用）、森空岛账号 |
 
-MAA 官方文档明确支持 BlueStacks Air（M 系列）+ `127.0.0.1:5555` + MaaTouch，这是整条链路成立的前提。
+脚本对模拟器只有几条假设：`open -a <emulator_app>` 即启动实例并在 180 秒内 adb 可连、
+`sys.boot_completed=1`；没在跑时进程不存在、地址也连不上；按 bundle id 请求退出后能自己停干净，
+`pgrep -f <emulator_app>` 复核无残留。满足这些的模拟器只需改 `state/config.json` 的
+`emulator_app` / `emulator_bundle_id` / `emulator_process_ignore_case` / `adb_path` / `adb_address`
+和 maa-cli profile 的 `[connection]`。
+
+想用 BlueStacks Air：MAA 官方文档明确支持它（M 系列）+ `127.0.0.1:5555` + MaaTouch。实例要设成
+4 核 / 4GB / **1920×1080 横屏**（默认实例是竖屏，不改 MAA 必然识别不到），ADB 用它自带的
+`/Applications/BlueStacks.app/Contents/MacOS/hd-adb`，`emulator_process_ignore_case` 设 `true`。
 
 ## 部署
 
@@ -431,7 +440,9 @@ maa_action.py roguelike status                  # 「肉鸽到哪了」
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `channel_id` | 占位符 | 部署时由 `MAA_CHANNEL_ID` 或本机已有配置解析，**不入库** |
-| `adb_path` / `adb_address` | BlueStacks `hd-adb` / `127.0.0.1:5555` | 换模拟器时这里和 maa-cli profile 两处都要改 |
+| `emulator_app` / `emulator_bundle_id` | `Landship` / `com.wadorudi.landship` | `open -a`、`pgrep` / `pkill -f` 用前者，`osascript quit` 用后者。名字要选不会出现在其他进程命令行里的 |
+| `emulator_process_ignore_case` | `false`（代码默认 `true`） | 残留复核用 `pgrep -fi` 还是 `pgrep -f`。Landship 必须 `false`，否则带 `landship-derived` 路径的其他进程会被当成残留 |
+| `adb_path` / `adb_address` | Landship 库内 `sdk/platform-tools/adb` / `127.0.0.1:5585` | 换模拟器时这里和 maa-cli profile 两处都要改；路径不能带空格 |
 | `maa_run_timeout` | `3000`（50 分钟） | 为 Hermes 外层 1 小时上限预留清理时间 |
 | `emulator_settle_quiet_seconds` | `8` | 冷启后等 `app_process` 安静多久再交给 MaaCore |
 | `connect_retry_limit` | `2` | 连接阶段崩溃的重开次数，共用同一个超时预算 |
@@ -546,7 +557,7 @@ python3 -m unittest discover -s tests -v
 ## 已知限制
 
 - **只测过一种环境**（见[自用优先](#自用优先)）。国服以外的服务器、其他模拟器都还没有适配。
-- **BlueStacks 需要活跃的图形会话**——锁屏 / 关显示器没问题，注销或切换用户会失败。
+- **模拟器需要活跃的图形会话**——锁屏 / 关显示器没问题，注销或切换用户会失败。
 - **macOS 上 maa-cli 的默认配置目录**是 `~/Library/Application Support/com.loong.maa/config`，
   与本项目约定不同，所以每个子进程都显式注入 `MAA_CONFIG_DIR`。新增调用 maa-cli 的代码
   一定要走 `maa_subprocess_env()`，不要裸 `subprocess.run`。
@@ -560,7 +571,7 @@ python3 -m unittest discover -s tests -v
   见 [docs/archive/PLAN_CLEARING.md](./docs/archive/PLAN_CLEARING.md) 步骤 2）。
 - **活动监控依赖本机 MAA 热更新资源**。资源还没包含新活动时不会猜活动；07:50 更新资源后，
   watcher 才能按资源内的开放时间识别。自动作业只取上游第一推荐关，不代替前置关卡通关。
-- **动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带的 LaunchDaemon
+- **（用 BlueStacks 时）动它的三件套里的任何一个，整套会被连坐删除**——安装包附带的 LaunchDaemon
   盯着三个 app 路径，少任何一个就 `rm -rf` 全部（含实例数据）。要卸载捆绑的 BlueAI
   **必须先 bootout 并删掉那个 plist**。详见 DEV_GUIDE §11.12。
 - 熔断后的补跑逻辑有单元测试和真实日志回放，但「StartUp 能否从结算页把游戏带回主界面」

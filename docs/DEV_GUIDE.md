@@ -51,7 +51,7 @@
    ~/.hermes/state/maa/{config,defaults,plan,last_run}.json + run.lock + runs/
                         │  effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次>
                         ▼
-   maa_daily.py ── flock ── 探模拟器 ── 快照 runs/<date>-<phase>.json ── 起 BlueStacks
+   maa_daily.py ── flock ── 探模拟器 ── 快照 runs/<date>-<phase>.json ── 起模拟器
         └─ 渲染 daily.toml ─ maa run daily ─ 5s 一次编辑子区消息
                                  └─ 截图 ─ closedown/退出/断 ADB ─ 战报 embed
 ```
@@ -371,7 +371,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    `pgrep -f <emulator_app>` **或** `adb connect` + `getprop sys.boot_completed == 1`，
    任一命中即算「用户正在玩」，`report_emulator_busy()` 发灰色「已跳过」Embed、写
    `status=skipped` / `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
-   起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把 BlueStacks
+   起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把模拟器
    关掉，等于把正在玩的用户踢出游戏。`now` 不走这条闸门（用户明确要求照跑）。
    探测预算 5s、失败按离线处理照常执行——**宁可误抢一次设备，也不能因为探测自己坏了
    就永久停摆**（不变量 #24）。
@@ -381,7 +381,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    > 别和第 8 步的 `settle_android_runtime()` 搞混：那个在**开机之后**跑，等 `app_process`
    > 别抖；这个在**开机之前**跑，问的是"设备现在是不是别人的"。
 5. **预检 → 起模拟器** — `require_executable` 校验 maa/adb 可执行（**在开模拟器之前**）→
-   `open -a BlueStacks` → 轮询 `adb connect` + `getprop sys.boot_completed`（超时 180s）→
+   `open -a <emulator_app>` → 轮询 `adb connect` + `getprop sys.boot_completed`（超时 180s）→
    `pm path com.hypergryph.arknights` 确认国服客户端已装。任一步失败且此时还没建子区，
    走 `send_direct_failure()` 直接在频道发红色告警。
 6. **发开跑消息 → 建子区 → 发进度占位消息**，thread_id 记进 `last_run.threads`（供 24h 清理）。
@@ -1312,8 +1312,8 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 
 | 症状 | 先看 |
 |---|---|
-| 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fi bluestacks`；或 cron 被 pause |
-| 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `open_emulator()` 还早 → `ls /Applications/BlueStacks.app`。整个 bundle 不见了就是 §11.12 的自杀式清理 |
+| 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fl Landship`；或 cron 被 pause |
+| 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `open_emulator()` 还早 → `ls -l` 一下 `config.json` 的 `adb_path` 和 `maa_bin`（Landship 的 adb 在外置盘上，盘没挂载就会这样） |
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
 | 场次 30～40 秒就红，日志只有五行且有 `TouchModeNotAvailable`，截图是模拟器桌面 | 没连上模拟器，MaaCore 在 StartUp 里 SIGSEGV 了 → §11.14。看 `last_run.connect_retries` 确认重试有没有接上；`com.loong.maa/crash.log` 是第二现场 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
@@ -1321,7 +1321,7 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 早场改的关晚上也生效了 / 改一场把另一场也改了 | 看 `plan.json` 的 `sessions`：是不是被写成了旧的顶层 `stage`。写路径只有 `maa_action._save_override(phase, …)` 和 `maa_plan_card.apply_auto_stage(result, phase)` 两处 |
 | 卡片上没有「活动截止」这一行 | 是设计：`~/Library/Caches/com.loong.maa/StageActivityV2.json` 读不出来就整行不显示。跑一次 `maa activity Official` 让它刷出来，或用 `config.maa_activity_cache` 指到别处 |
 | 说「抄作业」发的卡下拉是空的 | 一览里每关都标了「⛔ 上游无导航」——下拉只放上游写了导航定义的关（不变量 #37）。等热更新带来导航定义，或改抄资源本 / 主线 |
-| 日常/抄作业/Depot 报「模拟器正在使用」 | 探测命中了（不变量 #24）。`pgrep -fi bluestacks` 看是不是真有残留进程；确实是残留就 `pkill` 掉再重试。日常想强行跑就说「现在跑」 |
+| 日常/抄作业/Depot 报「模拟器正在使用」 | 探测命中了（不变量 #24）。`pgrep -fl Landship` 看是不是真有残留进程；确实是残留就 `pkill` 掉再重试。日常想强行跑就说「现在跑」 |
 | 卡片「为什么」写着「⚠️ 降级：… 抓取失败」 | 一图流 / 企鹅都没连上。`ls -l ~/.hermes/state/maa/farming/` 看缓存的 `fetched_at` 有多旧；本机手验：`curl -sI https://cos.yituliu.cn/arknights/stage-drop/matrix.json` 与 `curl -sS -X POST https://backend.yituliu.cn/item/v7/value -H 'Content-Type: application/json' -d '{}' \| head -c 200`。**抓不到不会让卡片消失**，只会让稀缺 / 效率两项退化 |
 | 活动期间卡片说资源本「不在本场候选集里」 | 这是设计（D5 / 不变量 #42）：活动期理智 all in 活动关。想刷资源本就从下拉手动选，手动选的关不受这条限制、也不带 `drops` 上限 |
 | 一场日常里只看到一个 Fight 段 | `runs/<date>-<phase>.json` 里 `plan.farming_drops` 是不是空的。冷启动、缺口 ≤ 0、或者用户手动选过关时**本来就不写上限**，第二个块也就不渲染（不变量 #44） |
@@ -1373,12 +1373,14 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
 
 ## 11. 已知坑
 
-1. **BlueStacks 需要活跃图形会话**——锁屏/关显示器没问题，注销或切换用户会失败。
+1. **模拟器需要活跃图形会话**——锁屏/关显示器没问题，注销或切换用户会失败。
 2. **`hermes update` 会覆盖 adapter 补丁**——升级后必须重跑 `deploy.py` 并复验按钮。
 3. **Beta MaaCore 的连战重识别**：有限 `times` 下改选倍率后偶发识别不到，可能多起一批。
    生产用 `times=2147483647` + `series=0` 规避（README「本机落地状态」有实测记录）。
-4. **本机 ADB 是 BlueStacks 自带的 `hd-adb`**（Homebrew 那份校验和对不上未装），
-   `config.json` 和 maa-cli profile 都指向它，换模拟器时两处都要改。
+4. **本机 ADB 是 Landship 库内的 `sdk/platform-tools/adb`**（Homebrew 那份校验和对不上未装），
+   `config.json` 和 maa-cli profile 都指向它，换模拟器时两处都要改。**路径不能带空格**：
+   MaaCore 经 shell 调 adb 不加引号，所以 `~/Library/Application Support/Landship/bin/adb`
+   用不了。2026-11-03 之前是 BlueStacks 自带的 `hd-adb`（`127.0.0.1:5555`）。
 5. **macOS 上 maa-cli 的默认配置目录是 `~/Library/Application Support/com.loong.maa/config`**，
    与本项目约定不同，所以每个子进程都要显式注入 `MAA_CONFIG_DIR`——新增调用 maa-cli 的代码时
    一定要用 `maa_subprocess_env()`，不要裸 `subprocess.run`。
@@ -1401,7 +1403,7 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
     **原因通常不是"关卡未解锁"**。这样的关既不进自动目标集合、也不进抄作业卡的下拉，
     只在一览里标「⛔ 上游无导航」（不变量 #37）。出路是等热更新带来导航定义、
     自己在游戏里手打、或改抄资源本 / 主线（2026-09-05 决定：不自写导航定义）。
-12. **动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带 LaunchDaemon
+12. **（BlueStacks 时期）动 BlueStacks 三件套里的任何一个，整套会被连坐删除**——安装包附带 LaunchDaemon
     `/Library/LaunchDaemons/com.now.gg.BlueStacks.cleanup.plist`，`WatchPaths` 盯着
     `/Applications/BlueStacks.app`、`/Applications/BlueAI.app`、
     `/Applications/BlueStacks Air multi-instance manager.app`。任一路径变动即触发
@@ -1414,7 +1416,7 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
 
     - **症状**：场次 0.x 秒内 `return_code=1`、`runs/<date>-<phase>.log` 根本没生成、
       `last_run.thread_id=null`、战报七项全「未执行」。因为 `adb_path` 指向
-      `/Applications/BlueStacks.app/Contents/MacOS/hd-adb`（见 §11.4），bundle 一没
+      `/Applications/BlueStacks.app/Contents/MacOS/hd-adb`（当时的配置），bundle 一没
       `require_executable()` 就抛，比 `open_emulator()` 还早一步。
     - **要卸 BlueAI 就先拆引信**：`sudo launchctl bootout system
       /Library/LaunchDaemons/com.now.gg.BlueStacks.cleanup.plist` 并删掉该 plist，再动 app。
@@ -1509,7 +1511,7 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
       重试那一层只有单元测试（`ConnectFailureTests`、`ConnectRetryTests`，用当天的真实
       五行日志回放），因为这个崩溃没法按需复现；下次再撞上要盯一眼第二趟是否接上。
 
-15. **BlueStacks 的“有可用更新”弹窗会卡死自动启动**——宿主进程已经打开，`open -a`
+15. **（BlueStacks 时期）BlueStacks 的“有可用更新”弹窗会卡死自动启动**——宿主进程已经打开，`open -a`
     也返回成功，但弹窗关闭前 Android 虚拟机根本不会启动，ADB 5555 因而持续拒绝连接。
     `Player.log` 的本次 session 会停在 `/bs3/check_upgrade`，看不到正常启动必有的
     `[QTUI] Start Virtual Machine`。`maa_daily.py` 超时后会据此给出明确诊断，并把原始
