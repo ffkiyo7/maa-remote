@@ -3,7 +3,7 @@
   "emulator_app": "Landship",
   "emulator_bundle_id": "com.wadorudi.landship",
   "emulator_process_ignore_case": false,
-  "adb_path": "/Users/wadorudi/Library/Application Support/Landship/bin/adb",
+  "adb_path": "/Volumes/GM7/smlt-lab.noindex/sdk/platform-tools/adb",
   "adb_address": "127.0.0.1:5585",
   "game_package": "com.hypergryph.arknights",
   "maa_bin": "/opt/homebrew/bin/maa",

@@ -1,5 +1,5 @@
 [connection]
-adb_path = "/Users/wadorudi/Library/Application Support/Landship/bin/adb"
+adb_path = "/Volumes/GM7/smlt-lab.noindex/sdk/platform-tools/adb"
 address = "127.0.0.1:5585"
 
 [resource]
