@@ -520,6 +520,31 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(run.call_count, 6)
 
+    def test_cleanup_residue_check_can_be_case_sensitive(self) -> None:
+        results = [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=1, stdout="", stderr=""),
+        ]
+        with patch.object(maa_daily.subprocess, "run", side_effect=results) as run, patch.object(
+            maa_daily.time, "sleep"
+        ):
+            errors = maa_daily.close_everything(
+                {
+                    "maa_bin": "/maa",
+                    "adb_path": "/adb",
+                    "emulator_app": "Landship",
+                    "emulator_bundle_id": "com.wadorudi.landship",
+                    "emulator_process_ignore_case": False,
+                    "quit_grace_seconds": 0,
+                }
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(run.call_args_list[2].args[0], ["pkill", "-f", "Landship"])
+        self.assertEqual(run.call_args_list[-1].args[0], ["pgrep", "-f", "[L]andship"])
+
     def test_game_package_preflight(self) -> None:
         config = {
             "adb_path": "/adb",

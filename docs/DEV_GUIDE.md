@@ -368,7 +368,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    `sessions.<phase>`，关掉早场不影响晚场；手动场是用户当场下的明确指令，
    本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会列出哪几场设了跳过）。
 4.5. **探模拟器（只对 `am`/`pm`）** — `maa_common.emulator_is_online()`：
-   `pgrep -f BlueStacks` **或** `adb connect` + `getprop sys.boot_completed == 1`，
+   `pgrep -f <emulator_app>` **或** `adb connect` + `getprop sys.boot_completed == 1`，
    任一命中即算「用户正在玩」，`report_emulator_busy()` 发灰色「已跳过」Embed、写
    `status=skipped` / `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
    起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把 BlueStacks
@@ -499,8 +499,10 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    - 这条闸门只挂在日常链上。抄作业结束在战斗结算界面而不是主页，`maa_copilot_worker`
      仍然直接调 `capture_screenshot()`，不受影响。
 10. **`close_everything()`**（在 `finally` 里）— `maa closedown Official` →
-    `osascript quit`（bundle id）→ sleep `quit_grace_seconds` → `pkill -f BlueStacks` 兜底 →
+    `osascript quit`（bundle id）→ sleep `quit_grace_seconds` → `pkill -f <emulator_app>` 兜底 →
     `adb disconnect` → 用 `[B]lueStacks` 这种加方括号的模式 `pgrep` 复核残留（防止匹配到自己）。
+    复核默认 `pgrep -fi`；`emulator_process_ignore_case: false` 时用 `pgrep -f`。Landship 必须关掉：
+    带 `--add-dir=…/landship-derived` 的 Claude 会话会被 `-fi` 当成残留，每场判红。
 11. **判定与上报** — `ok = (return_code == 0 and not cleanup_errors and home_verified is not False)`。最后编辑一次子区消息
     （✅/❌ + 总耗时），然后往频道发战报 Embed + `attachment://shot.png` 单条多段消息；
     多段上传失败时降级成「无图 Embed + `hermes send MEDIA:`」两条。最后写 `last_run.json`。

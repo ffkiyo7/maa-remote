@@ -1,6 +1,6 @@
 [connection]
-adb_path = "/Applications/BlueStacks.app/Contents/MacOS/hd-adb"
-address = "127.0.0.1:5555"
+adb_path = "/Users/wadorudi/Library/Application Support/Landship/bin/adb"
+address = "127.0.0.1:5585"
 
 [resource]
 user_resource = true

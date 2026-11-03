@@ -1209,12 +1209,15 @@ def close_everything(config: dict[str, Any]) -> list[str]:
         # A bracketed first character still matches the target but prevents
         # pgrep from matching its own command line.
         process_pattern = f"[{re.escape(app[0])}]{re.escape(app[1:])}"
+        # Landship 要大小写敏感：带 `--add-dir=…/landship-derived` 的 Claude 会话
+        # 会被 `-fi` 当成残留，每场都判红。
+        pgrep_flags = "-fi" if config.get("emulator_process_ignore_case", True) else "-f"
         verify_deadline = time.monotonic() + max(
             1, int(config.get("cleanup_verify_timeout", 10))
         )
         while True:
             remaining = subprocess.run(
-                ["pgrep", "-fi", process_pattern],
+                ["pgrep", pgrep_flags, process_pattern],
                 capture_output=True,
                 text=True,
                 check=False,
