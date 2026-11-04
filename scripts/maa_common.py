@@ -100,8 +100,6 @@ PLAN_SESSION_FIELDS = (
     "farming_drops",
     "farming_fallback_stage",
 )
-# 传给 `open -a` / `pgrep -f` 的模拟器名白名单：任何子进程都不接受未校验的名字。
-SAFE_APP_RE = re.compile(r"^[A-Za-z0-9 ._+-]{1,80}$")
 # 上游 itemId 的字符集（`30013` / `mod_unlock_token`）。它会原样变成 `daily.toml`
 # 里 `drops` 表的键，所以在写进计划之前就校验，不留「渲染时再说」的口子。
 SAFE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -276,7 +274,7 @@ def require_executable(
     default: str,
     label: str,
 ) -> str:
-    """Resolve one configured executable or fail before opening the emulator."""
+    """Resolve one configured executable or fail before launching the game."""
     configured = str(config.get(key, default)).strip()
     resolved = configured if os.path.isabs(configured) else shutil.which(configured)
     if not resolved or not Path(resolved).is_file() or not os.access(resolved, os.X_OK):
@@ -630,101 +628,10 @@ def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 模拟器占用探测（四期 D18）：所有自动行为开模拟器前都走这一份实现
+# 「你在玩」跳过的统一出口（四期 D18）。探测本身在 `maa_playcover.game_is_online()`。
 # ---------------------------------------------------------------------------
 
-def emulator_is_online(config: dict[str, Any]) -> tuple[bool, str]:
-    """模拟器是不是已经开着——也就是「用户此刻在玩」？
-
-    在**每一条自动链路**抢到 `run.lock` 之后、`open_emulator()` 之前调用
-    （日常 am/pm、抄作业 `run-batch`、Depot）。动机是 `PLAN_NAV_GATE.md`
-    结论 3：任何失败路径都会 `close_everything()` 直接退掉 BlueStacks，
-    等于把正在玩的用户踢出游戏。用户的决定是「先探，不改清理逻辑」。
-
-    **这不是 `settle_android_runtime()`**：那个在我们开完模拟器、安卓起来之后跑，
-    等 `app_process` 别抖，免得 MaaTouch 超时（DEV_GUIDE §11.14）。也不是
-    `wait_for_android()`：那个为刚启动的设备等 180 秒；这个必须在几秒内回答
-    一台**不是我们启动**的设备的状态。
-
-    两个信号取或——命中任一即「在线」：
-
-      1. 模拟器进程存在（`pgrep -f`）
-      2. adb 连得上且 `sys.boot_completed` 是 `1`
-
-    单独哪个都不够：刚拉起的 BlueStacks 还没有安卓，adb 会漏掉用户明明在用的设备；
-    而挂死的进程能比它的设备活得久，pgrep 会在什么都不工作时命中。
-
-    **永不抛异常。** 探测本身出错或超时一律报离线、照常执行：误抢一次设备远比
-    「探测坏了导致日常永久停摆」便宜（B-4）。总预算 `emulator_probe_timeout`
-    （默认 5s），不会吃掉运行时间，也守得住 <20s 的按钮预算（不变量 #6）。
-    """
-    budget = max(0.0, float(config.get("emulator_probe_timeout", 5)))
-    if not budget:
-        return False, "探测已禁用（emulator_probe_timeout = 0）"
-    deadline = time.monotonic() + budget
-
-    def remaining(cap: float) -> float:
-        return min(cap, deadline - time.monotonic())
-
-    app = str(config.get("emulator_app", "BlueStacks"))
-    if not SAFE_APP_RE.fullmatch(app):
-        # Same guard as open_emulator(): never hand an unvalidated name to a
-        # subprocess. Refusing to probe is not refusing to run.
-        return False, "emulator_app 名称含非法字符，跳过探测"
-    notes: list[str] = []
-    slice_ = remaining(2.0)
-    if slice_ > 0:
-        try:
-            found = subprocess.run(
-                ["pgrep", "-f", app],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=slice_,
-            )
-            if found.returncode == 0 and found.stdout.strip():
-                return True, f"{app} 进程在跑"
-            notes.append(f"{app} 进程不在")
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            notes.append(f"进程探测失败（{type(exc).__name__}）")
-    else:
-        notes.append("进程探测超预算未跑")
-
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    slice_ = remaining(3.0)
-    if slice_ <= 0:
-        notes.append("ADB 探测超预算未跑")
-        return False, "；".join(notes)
-    try:
-        subprocess.run(
-            [adb, "connect", address],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=slice_,
-        )
-        slice_ = remaining(3.0)
-        if slice_ <= 0:
-            notes.append("ADB getprop 超预算未跑")
-            return False, "；".join(notes)
-        boot = subprocess.run(
-            [adb, "-s", address, "shell", "getprop", "sys.boot_completed"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=slice_,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        notes.append(f"ADB 探测失败（{type(exc).__name__}）")
-        return False, "；".join(notes)
-    if boot.returncode == 0 and boot.stdout.strip() == "1":
-        return True, f"ADB {address} 已就绪（sys.boot_completed = 1）"
-    notes.append("ADB 未连上或系统未就绪")
-    return False, "；".join(notes)
-
-
-def report_emulator_busy(
+def report_game_busy(
     config: dict[str, Any],
     *,
     title: str,
@@ -735,7 +642,7 @@ def report_emulator_busy(
     token: str = "",
     channel_id: str = "",
 ) -> None:
-    """探到模拟器在用 → 写 `last_run.json` + 发一张灰卡。
+    """探到游戏在跑 → 写 `last_run.json` + 发一张灰卡。
 
     每条自动链路的「已在线」分支都走这里：跳过必须**看得见**，
     静默 return 是 PLAN_CLEARING 护栏 4 明令禁止的（不变量 #24）。

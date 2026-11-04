@@ -16,13 +16,21 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import maa_depot
+from maa_playcover import (
+    capture_screenshot,
+    close_game,
+    game_is_online,
+    launch_game,
+    settle_game_window,
+    verify_game_installed,
+    wait_for_game,
+)
 from maa_common import (
     BEIJING,
     LAST_RUN_PATH,
     MAA_CONFIG_DIR,
     MANUAL_RUN_PATH,
     RUNS_DIR,
-    SAFE_APP_RE,
     SAFE_ITEM_ID_RE,
     SCRIPTS_DIR,
     atomic_write_json,
@@ -33,7 +41,6 @@ from maa_common import (
     discord_token,
     discord_upload,
     effective_plan,
-    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -41,7 +48,7 @@ from maa_common import (
     merge_last_run,
     now_beijing,
     plan_stage_label,
-    report_emulator_busy as common_report_emulator_busy,
+    report_game_busy as common_report_game_busy,
     require_executable,
     run_lock,
     state_lock,
@@ -49,7 +56,6 @@ from maa_common import (
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 # 信用商店 `buy_first` / `blacklist` 的物品名白名单（四期步骤 5）。这两个列表来自
 # `config.json`，会**原样变成 TOML 字符串**交给 MaaCore 去 OCR 比对，所以渲染器
 # 只接受「中日文字 + 拉丁字母 + 数字 + 少数分隔符」，长度 ≤ 20。校验不过的项
@@ -57,7 +63,7 @@ SAFE_BUNDLE_ID_RE = re.compile(r"^[A-Za-z0-9.-]{1,128}$")
 # 　-鿿 = CJK 标点 + 假名 + 汉字；· / ・ 是「技能概要·卷1」的中点。
 SAFE_MALL_ITEM_RE = re.compile(r"^[　-鿿·・A-Za-z0-9 \-_]{1,20}$")
 PHASE_LABELS = {"am": "早", "pm": "晚", "now": "手动"}
-# Only the cron-driven phases defer to a running emulator. `now` is the user
+# Only the cron-driven phases defer to a running game. `now` is the user
 # saying "run it right now" and must never be probe-skipped (PLAN_NAV_GATE B-1).
 AUTO_PHASES = frozenset({"am", "pm"})
 TASK_STEPS = (
@@ -92,10 +98,23 @@ HOME_TASK_NAMES = [
     "Home@FromStageSN",
     "Home@FromAnnihilation",
 ]
-# 主页面独有的界面文案，用本机 Vision OCR（ocrbox）核对截图确实停在主页。
-# 只取在实机截图里稳定读出的词：任务列表页也有「好友」，所以单个命中不算数。
-HOME_MARKERS = ("终端", "编队", "采购中心", "公开招募", "基建", "好友", "档案", "SANITY")
-HOME_MARKER_MIN = 4
+# 主页面独有的入口，用本机 Vision OCR（ocrbox）核对截图确实停在主页。每个入口认中文或
+# 英文副标题之一（英文不分大小写），按**入口**计数：联动界面主题会把中文换成花字，
+# OCR 读成碎字（2026-11-04 三丽鸥主题下「终端」→「TERMiN」、「采购中心」→「…葉购中心」，
+# 旧的 8 个词只命中 3 个，好好的主页被判红），英文副标题却还在。
+# 「任务」「干员」不收：任务列表页满屏都是这两个词；那一页也有「好友」，所以要过半才算数。
+HOME_MARKERS = (
+    ("终端", "TERMIN"),
+    ("编队", "SQUADS", "SOUADS"),
+    ("采购中心", "STORE"),
+    ("公开招募", "RECRUIT"),
+    ("干员寻访", "HEADHUNT"),
+    ("基建", "BASE"),
+    ("好友", "FRIENDS"),
+    ("档案", "ARCHIVES"),
+    ("理智", "SANITY"),
+)
+HOME_MARKER_MIN = 5
 
 # 代理指挥失误时游戏结算页写「本场战斗已视为单次作战结算，未进行作战的理智已返还」，
 # 并把返还的理智画成一个道具图标。MaaCore 照单全收，于是日志里出现
@@ -106,17 +125,24 @@ HOME_MARKER_MIN = 4
 SANITY_REFUND_ITEM = "理智"
 # maa run 被熔断中止时的返回码，跟超时的 124、人工中止的 130 区分开。
 PROXY_BREAK_CODE = 125
-# MaaCore 连接阶段就失败的标记。MaaTouch 的握手要 `app_process` 现开一个 ART 虚拟机，
-# 而 MaaCore 给这个握手的窗口写死 3 秒；模拟器冷启后头几十秒 system_server 还在忙，
-# 偶发就是卡过 3 秒 → 报 TouchModeNotAvailable、connect 返回失败。偏偏 maa-cli 不看
-# 这个返回值，照样 Assistant::start()，StartUpTask 拿着没连上的 controller 直接
-# SIGSEGV，maa run 秒退 1。此时一个键都没点过，重开一趟是安全的。见 DEV_GUIDE §11.14。
-CONNECT_FAILURE_MARKERS = ("TouchModeNotAvailable", "ConnectFailed", "Connect failed")
+# MaaCore 连接阶段就失败的标记。PlayCover 下 MaaCore 直连游戏进程里的 MaaTools
+# （127.0.0.1:1717）：游戏刚拉起时端口可能还没监听，或者游戏窗口被台前调度收进
+# 侧边栏、SCRN 回 0 字节 → 报 ConnectFailed / ScreencapFailed。maa-cli 不看 connect
+# 的返回值，照样 Assistant::start()，maa run 很快退出。此时一个键都没点过，先把窗口
+# 摆回台前再重开一趟是安全的。
+CONNECT_FAILURE_MARKERS = (
+    "TouchModeNotAvailable",
+    "ConnectFailed",
+    "Connect failed",
+    "ScreencapFailed",
+)
 # 这几个返回码是本脚本自己写上去的，不是「没连上」——重开一趟只会重复同一件事。
 SELF_ASSIGNED_CODES = (124, PROXY_BREAK_CODE, 130)
 # 进度消息的编辑节流，同时也是熔断的采样间隔——扫一遍全部日志行不便宜，
 # 不能放进 0.25 秒的主循环里跑。
 PROGRESS_INTERVAL_SECONDS = 5
+# 跑到一半截图失败时，两次「把游戏窗口摆回台前」之间至少隔这么久。
+SCREENCAP_SETTLE_INTERVAL = 30
 # maa run 的最短存活时间：配置写歪了也不能让整条链条秒退。
 MIN_RUN_TIMEOUT_SECONDS = 60
 # 国服日刷新 04:00。剿灭按游戏日只进一次，避免早晚场各刷一轮。
@@ -746,7 +772,7 @@ def progress_content(
     if refresh:
         status_lines.append(f"🔄 公招已刷新：{refresh.group(1)} 次")
     if not status_lines:
-        status_lines.append("⏳ 正在连接模拟器并准备任务…")
+        status_lines.append("⏳ 正在连接游戏并准备任务…")
     return (heading + "\n" + "\n".join(status_lines))[:1990]
 
 
@@ -797,13 +823,13 @@ def extract_summary(
         status = {"completed": "✅ 完成", "failed": "❌ 未完成", "running": "❌ 中断", "pending": "⏸️ 未执行"}[state]
         details: list[str] = []
         if key == "StartUp" and state != "completed":
-            # 「启动游戏 ❌ 中断」看着像游戏那头的事，其实多半是根本没连上模拟器。
-            # 把 MaaCore 的原始标记摊开，省得每次都去翻 asst.log。见 §11.14。
+            # 「启动游戏 ❌ 中断」看着像游戏那头的事，其实多半是 MaaTools 没连上或截图
+            # 拿不到（窗口被台前调度收走）。把 MaaCore 的原始标记摊开，省得去翻 asst.log。
             marker = next(
                 (m for m in CONNECT_FAILURE_MARKERS if any(m in line for line in lines)), ""
             )
             if marker:
-                details.append(f"没连上模拟器（{marker}），游戏里一个键都没点")
+                details.append(f"没连上游戏（{marker}），检查 MaaTools 与 MAA-Game 虚拟屏")
         elif key == "Annihilation":
             annihilation_lines = []
             for name in ANNIHILATION_TASK_NAMES:
@@ -910,16 +936,7 @@ def _reader(
     stream.close()
 
 
-def open_emulator(config: dict[str, Any]) -> None:
-    app = str(config.get("emulator_app", "BlueStacks"))
-    if not SAFE_APP_RE.fullmatch(app):
-        raise RuntimeError("emulator_app 名称含非法字符")
-    result = subprocess.run(["open", "-a", app], capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"无法启动 {app}: {(result.stderr or result.stdout).strip()}")
-
-
-def report_emulator_busy(
+def report_game_busy(
     config: dict[str, Any],
     token: str,
     channel_id: str,
@@ -929,9 +946,9 @@ def report_emulator_busy(
 ) -> None:
     """Announce a probe-skipped automatic run. Never a silent return (护栏 4)."""
     reason = (
-        "检测到模拟器正在运行，判定你在玩，本场不抢设备。需要照跑就说「现在跑」。"
+        "检测到明日方舟（PlayCover）正在运行，判定你在玩，本场不抢游戏。需要照跑就说「现在跑」。"
     )
-    common_report_emulator_busy(
+    common_report_game_busy(
         config,
         title=f"⏭️ MAA 日常·{PHASE_LABELS[phase]}场已跳过",
         reason=reason,
@@ -940,167 +957,14 @@ def report_emulator_busy(
         state_update={
             "status": "skipped",
             "phase": phase,
-            "skip_reason": "emulator_busy",
+            "skip_reason": "game_busy",
             "summary": reason,
-            "emulator_probe": detail,
+            "game_probe": detail,
             "finished_at": attempted_at.isoformat(),
         },
         token=token,
         channel_id=channel_id,
     )
-
-
-def emulator_boot_diagnostic(config: dict[str, Any]) -> str:
-    """Explain the BlueStacks host-open/Android-not-started failure mode.
-
-    BlueStacks checks for host updates before it starts the Android VM.  When
-    an update is available it opens a modal dialog and does not emit the usual
-    ``[QTUI] Start Virtual Machine`` line until somebody closes that dialog.
-    ``open -a`` still returns success, so ADB alone can only report a vague
-    connection refusal.  Read only the current Player.log session and turn
-    that otherwise invisible host-side state into an actionable error.
-    """
-    configured = str(config.get("emulator_player_log", "")).strip()
-    player_log = Path(configured) if configured else Path(
-        "/Users/Shared/Library/Application Support/BlueStacks/Logs/Player.log"
-    )
-    try:
-        text = player_log.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    marker = "=================== xlogStart"
-    current = text.rsplit(marker, 1)[-1]
-    if "/bs3/check_upgrade" in current and "[QTUI] Start Virtual Machine" not in current:
-        return (
-            "BlueStacks 宿主已打开，但升级检查没有放行 Android 虚拟机；"
-            "通常是“有可用更新”弹窗正在等待关闭"
-        )
-    return ""
-
-
-def wait_for_android(config: dict[str, Any]) -> None:
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    timeout = int(config.get("emulator_boot_timeout", 180))
-    deadline = time.monotonic() + timeout
-    last_error = ""
-    while time.monotonic() < deadline:
-        try:
-            connect = subprocess.run(
-                [adb, "connect", address],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-            boot = subprocess.run(
-                [adb, "-s", address, "shell", "getprop", "sys.boot_completed"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-        except subprocess.TimeoutExpired:
-            last_error = "ADB 命令超时"
-            time.sleep(3)
-            continue
-        if connect.returncode == 0 and boot.returncode == 0 and boot.stdout.strip() == "1":
-            return
-        last_error = (boot.stderr or connect.stderr or connect.stdout).strip()
-        time.sleep(3)
-    diagnostic = emulator_boot_diagnostic(config)
-    detail = diagnostic or last_error or "设备未就绪"
-    raise RuntimeError(f"ADB 等待 {timeout}s 超时：{detail}")
-
-
-def settle_android_runtime(config: dict[str, Any]) -> str:
-    """等 `app_process` 的冷启抖动过去，再把场子交给 MaaCore。
-
-    `sys.boot_completed=1` 只说明系统起来了，不代表安静：BlueStacks 冷启后头几十秒
-    system_server 还在装自家 launcher，这期间任何 `app_process` 调用都可能卡上几秒。
-    MaaCore 起 MaaTouch 走的正是 `app_process`，而它只等 3 秒——撞上就判
-    TouchModeNotAvailable（§11.14）。这里用同样走 `app_process` 的只读命令
-    `am get-current-user` 探路，连着 quiet_seconds 秒都够快才放行。
-
-    2026-08-08 实测：冷启后 `sys.boot_completed=1` 在 +7.5s，探针在 +0…+4.3s 全是
-    35ms，+5.4s 突然卡了 2.8s，+9.2s 恢复——所以只看「连着几次快」不够，必须要求一段
-    连续安静的窗口。探不出安静窗口也不阻断：连接重试兜底比在这儿空等值钱。
-    """
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    budget = max(0, int(config.get("emulator_settle_timeout", 40)))
-    quiet_needed = max(0.0, float(config.get("emulator_settle_quiet_seconds", 8)))
-    slow = max(0.1, float(config.get("emulator_settle_slow_seconds", 1.0)))
-    if not budget or not quiet_needed:
-        return ""
-    deadline = time.monotonic() + budget
-    quiet_since = time.monotonic()
-    slowest = 0.0
-    while time.monotonic() < deadline:
-        begin = time.monotonic()
-        try:
-            probe = subprocess.run(
-                [adb, "-s", address, "shell", "am", "get-current-user"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=max(5, int(slow * 5)),
-            )
-            responsive = probe.returncode == 0
-        except subprocess.TimeoutExpired:
-            responsive = False
-        cost = time.monotonic() - begin
-        slowest = max(slowest, cost)
-        if not responsive or cost >= slow:
-            quiet_since = time.monotonic()
-        elif time.monotonic() - quiet_since >= quiet_needed:
-            return ""
-        time.sleep(0.5)
-    return f"模拟器 app_process 未在 {budget}s 内稳定下来（最慢 {slowest:.1f}s），照常开跑。"
-
-
-def verify_game_installed(config: dict[str, Any]) -> None:
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    package = str(config.get("game_package", "com.hypergryph.arknights")).strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.]{3,160}", package):
-        raise RuntimeError("game_package 格式非法")
-    result = subprocess.run(
-        [adb, "-s", address, "shell", "pm", "path", package],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
-    )
-    if result.returncode != 0 or not result.stdout.strip().startswith("package:"):
-        raise RuntimeError(f"未检测到明日方舟国服客户端（{package}）")
-
-
-def capture_screenshot(config: dict[str, Any], path: Path) -> tuple[bool, str]:
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    try:
-        with path.open("wb") as handle:
-            result = subprocess.run(
-                [adb, "-s", address, "exec-out", "screencap", "-p"],
-                stdout=handle,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=30,
-            )
-        if result.returncode != 0 or path.stat().st_size < 8:
-            raise RuntimeError(result.stderr.decode("utf-8", errors="replace").strip())
-        with path.open("rb") as handle:
-            if handle.read(8) != b"\x89PNG\r\n\x1a\n":
-                raise RuntimeError("ADB 返回的不是 PNG")
-        os.chmod(path, 0o600)
-        return True, ""
-    except Exception as exc:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        return False, f"{type(exc).__name__}: {exc}"
 
 
 def verify_home_screenshot(path: Path) -> tuple[bool | None, str]:
@@ -1130,7 +994,8 @@ def verify_home_screenshot(path: Path) -> tuple[bool | None, str]:
         return None, f"OCR 失败：{result.stderr.strip()[:120]}"
     # ocrbox prints "文本\t[x,y,w,h]" per line; only the text column matters.
     text = "\n".join(line.split("\t", 1)[0] for line in result.stdout.splitlines())
-    hits = [marker for marker in HOME_MARKERS if marker in text]
+    upper = text.upper()
+    hits = [group[0] for group in HOME_MARKERS if any(m in text or m in upper for m in group)]
     detail = (
         f"识别到 {len(hits)}/{len(HOME_MARKERS)} 个主页标识"
         + (f"（{'、'.join(hits)}）" if hits else "")
@@ -1158,81 +1023,6 @@ def capture_home_screenshot(
         if verified is not False:
             break
     return ok, error, verified, detail
-
-
-def close_everything(config: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
-    maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    app = str(config.get("emulator_app", "BlueStacks"))
-    bundle_id = str(config.get("emulator_bundle_id", "com.now.gg.BlueStacks"))
-    if not SAFE_APP_RE.fullmatch(app):
-        return ["emulator_app 名称含非法字符，拒绝清理"]
-    if not SAFE_BUNDLE_ID_RE.fullmatch(bundle_id):
-        return ["emulator_bundle_id 含非法字符，拒绝清理"]
-    try:
-        closedown = subprocess.run(
-            [maa, "closedown", "Official"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-            env=maa_subprocess_env(config),
-        )
-        if closedown.returncode != 0:
-            errors.append("maa closedown 失败")
-    except Exception as exc:
-        errors.append(f"maa closedown 异常：{type(exc).__name__}")
-    graceful_error = ""
-    try:
-        quit_result = subprocess.run(
-            ["osascript", "-e", f'tell application id "{bundle_id}" to quit'],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if quit_result.returncode != 0:
-            graceful_error = "模拟器正常退出请求失败"
-    except Exception as exc:
-        graceful_error = f"模拟器正常退出异常：{type(exc).__name__}"
-    time.sleep(max(0, int(config.get("quit_grace_seconds", 10))))
-    try:
-        subprocess.run(["pkill", "-f", app], capture_output=True, check=False)
-    except Exception as exc:
-        errors.append(f"模拟器兜底退出异常：{type(exc).__name__}")
-    try:
-        subprocess.run([adb, "disconnect", address], capture_output=True, check=False)
-    except Exception as exc:
-        errors.append(f"ADB 断开异常：{type(exc).__name__}")
-    try:
-        # A bracketed first character still matches the target but prevents
-        # pgrep from matching its own command line.
-        process_pattern = f"[{re.escape(app[0])}]{re.escape(app[1:])}"
-        # Landship 要大小写敏感：带 `--add-dir=…/landship-derived` 的 Claude 会话
-        # 会被 `-fi` 当成残留，每场都判红。
-        pgrep_flags = "-fi" if config.get("emulator_process_ignore_case", True) else "-f"
-        verify_deadline = time.monotonic() + max(
-            1, int(config.get("cleanup_verify_timeout", 10))
-        )
-        while True:
-            remaining = subprocess.run(
-                ["pgrep", pgrep_flags, process_pattern],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if remaining.returncode == 1 or not remaining.stdout.strip():
-                break
-            if time.monotonic() >= verify_deadline:
-                if graceful_error:
-                    errors.append(graceful_error)
-                errors.append(f"仍有 {app} 进程存活")
-                break
-            time.sleep(0.5)
-    except Exception as exc:
-        errors.append(f"进程清理确认异常：{type(exc).__name__}")
-    return errors
 
 
 def run_maa(
@@ -1297,6 +1087,11 @@ def run_maa(
         timed_out = False
         interrupted = False
         proxy_tripped = 0
+        # 跑到一半 SCRN 回空（游戏窗口被台前调度收进侧边栏）时 MaaCore 会报
+        # ScreencapFailed 并自己重连；重连前把窗口摆回 MAA-Game 台前才救得回来。
+        # 节流 30 秒，免得 MaaCore 连着报错时一直 `open -a`。
+        screencap_failures = 0
+        last_settle = 0.0
         try:
             while process.poll() is None:
                 now = time.monotonic()
@@ -1322,6 +1117,18 @@ def run_maa(
                                 process.kill()
                                 process.wait(timeout=5)
                             break
+                    failures = sum("ScreencapFailed" in line for line in live)
+                    if failures > screencap_failures and now - last_settle >= SCREENCAP_SETTLE_INTERVAL:
+                        last_settle = now
+                        try:
+                            warning = settle_game_window(config)
+                        except Exception as exc:  # 救场是尽力而为，不能拖垮主循环
+                            warning = f"摆回游戏窗口失败：{exc}"
+                        note = f"截图失败，已尝试把游戏窗口摆回台前。{warning}".strip()
+                        stderr_lines.append(note)
+                        with log_lock:
+                            log_handle.write(note + "\n")
+                    screencap_failures = failures
                     content = progress_content(prefix + live, plan=plan)
                     if content != previous:
                         try:
@@ -1386,9 +1193,10 @@ def run_maa_resilient(
 ) -> tuple[int, list[str], list[str], int]:
     """跑 maa run；在连接阶段就崩掉的那种失败上重开。末位返回重试次数。
 
-    只重试 `connect_failed()` 认定的那一类：MaaTouch 没握上手 → MaaCore SIGSEGV，
-    一个键都没点过、一批理智都没花。所有重试共用同一个超时预算，绝不额外撑长
-    Hermes 那一小时；日志追加进同一个文件，不覆盖上一趟的现场。
+    只重试 `connect_failed()` 认定的那一类：MaaTools 没连上或截图拿不到，没有任何
+    任务跑到 Completed、一批理智都没花。每趟重开前先把游戏窗口摆回 MAA-Game 台前、
+    等 MaaTools 就绪。所有重试共用同一个超时预算，绝不额外撑长 Hermes 那一小时；
+    日志追加进同一个文件，不覆盖上一趟的现场。
     """
     budget = int(config.get("maa_run_timeout", 3000) if timeout is None else timeout)
     limit = max(0, int(config.get("connect_retry_limit", 2)))
@@ -1417,18 +1225,26 @@ def run_maa_resilient(
             return code, stdout_all, stderr_all, retries
         spent = int(time.monotonic() - started)
         if retries >= limit or budget - spent - delay < MIN_RUN_TIMEOUT_SECONDS:
-            note = f"模拟器连接失败（{marker}），重试 {retries} 次仍未连上。"
+            note = f"游戏连接失败（{marker}），重试 {retries} 次仍未连上。"
             stderr_all.append(note)
             _append_log(log_path, note)
             return code, stdout_all, stderr_all, retries
         retries += 1
         note = (
-            f"模拟器连接失败（{marker}）：MaaTouch 没在 MaaCore 的 3 秒窗口内握上手，"
-            f"游戏里一个键都没点过。等 {delay}s 重开第 {retries} 趟。"
+            f"游戏连接失败（{marker}）：MaaTools 没连上或截图为空，没有任务跑完。"
+            f"等 {delay}s、把游戏窗口摆回台前后重开第 {retries} 趟。"
         )
         stderr_all.append(note)
         _append_log(log_path, note)
         time.sleep(delay)
+        try:
+            warning = settle_game_window(config)
+            wait_for_game(config)
+        except Exception as exc:  # 下一趟 maa run 自己会再报连接失败
+            warning = f"重开前准备游戏失败：{exc}"
+        if warning:
+            stderr_all.append(warning)
+            _append_log(log_path, warning)
 
 
 def _append_log(log_path: Path, message: str) -> None:
@@ -1589,8 +1405,8 @@ def report_payload(
     notes: list[str] = []
     if connect_retries:
         notes.append(
-            f"模拟器连接失败（MaaTouch 握手超时），已重开 {connect_retries} 趟 maa run。"
-            "偶发可以不管；每天都撞上就把 emulator_settle_quiet_seconds 调大。"
+            f"游戏连接失败（MaaTools 没连上或截图为空），已重开 {connect_retries} 趟 maa run。"
+            "偶发可以不管；每天都撞上就检查游戏窗口是否独占 MAA-Game 虚拟屏。"
         )
     if proxy_batches:
         notes.append(
@@ -1620,7 +1436,7 @@ def report_payload(
             {"name": "总耗时", "value": _format_duration(duration), "inline": True},
             {"name": "📋 执行结果", "value": summary[:1024], "inline": False},
         ],
-        "footer": {"text": "模拟器与 ADB 已执行清理"},
+        "footer": {"text": "游戏进程已执行清理"},
         "timestamp": now_beijing().isoformat(),
     }
     if notes:
@@ -1700,7 +1516,7 @@ def send_direct_failure(
 
 
 def should_skip(plan: dict[str, Any], phase: str) -> bool:
-    """Whether this run bails out before touching the emulator.
+    """Whether this run bails out before touching the game.
 
     `skip` is now **per session** (四期 D2): it comes from `sessions.<phase>`,
     so silencing 08:00 leaves 22:00 alone.  A manual run is the user asking for
@@ -1718,7 +1534,7 @@ def report_lock_conflict(
     attempted_at: datetime,
 ) -> None:
     """Make a rejected daily run visible without clobbering the active run."""
-    reason = "run.lock 被另一场 MAA 占用，本场没有启动模拟器或执行任何任务"
+    reason = "run.lock 被另一场 MAA 占用，本场没有启动游戏或执行任何任务"
     # Another runner may currently own last_run.status=running. Keep its state
     # intact and append conflict-specific observation fields instead.
     errors: list[str] = []
@@ -1786,7 +1602,7 @@ def report_manual_run_mismatch(
                     "title": "❌ MAA 日常·手动未启动",
                     "description": (
                         f"选关请求 `{manual_token}` 与 manual_run.json 对不上"
-                        "（已过期、已作废或已被另一次派发消费），本场没有启动模拟器或执行任何任务。"
+                        "（已过期、已作废或已被另一次派发消费），本场没有启动游戏或执行任何任务。"
                         "重新说「现在跑」再选一次。"
                     ),
                     "color": 0xED4245,
@@ -1876,7 +1692,7 @@ def execute(phase: str, manual_token: str = "") -> int:
                     "embeds": [
                         {
                             "title": f"⏭️ MAA 日常·{PHASE_LABELS[phase]}已跳过",
-                            "description": "计划卡上把**本场**设成了跳过；未启动模拟器。"
+                            "description": "计划卡上把**本场**设成了跳过；未启动游戏。"
                             "今天的另一场和手动开跑（「现在跑」）都不受影响。",
                             "color": 0x99AAB5,
                             "timestamp": started.isoformat(),
@@ -1890,16 +1706,16 @@ def execute(phase: str, manual_token: str = "") -> int:
 
         # PLAN_NAV_GATE B: the automatic phases must not take the device away
         # from a user who is playing — every failure path here would quit their
-        # emulator (结论 3). `now` is an explicit "run it anyway" and skips this.
+        # game (结论 3). `now` is an explicit "run it anyway" and skips this.
         if phase in AUTO_PHASES:
-            online, probe_detail = emulator_is_online(config)
+            online, probe_detail = game_is_online(config)
             if online:
-                report_emulator_busy(
+                report_game_busy(
                     config, token, channel_id, phase, probe_detail, now_beijing()
                 )
                 return 0
 
-        emulator_opened = False
+        game_opened = False
         thread_id = ""
         progress_message_id = ""
         stdout_lines: list[str] = []
@@ -1916,11 +1732,10 @@ def execute(phase: str, manual_token: str = "") -> int:
         startup_error = ""
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-            require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
-            open_emulator(config)
-            emulator_opened = True
-            wait_for_android(config)
             verify_game_installed(config)
+            launch_game(config)
+            game_opened = True
+            wait_for_game(config)
             opening = discord_request(
                 token,
                 "POST",
@@ -1964,9 +1779,9 @@ def execute(phase: str, manual_token: str = "") -> int:
             )
             task_path = Path(str(config.get("maa_config_dir", MAA_CONFIG_DIR))) / "tasks" / "daily.toml"
             atomic_write_text(task_path, render_daily_toml(plan, config))
-            # 最后一道门：`sys.boot_completed` 之后 app_process 还会抖，撞上 MaaCore
-            # 那 3 秒的 MaaTouch 窗口就是一场空跑（§11.14）。探不出安静窗口不阻断。
-            settle_warning = settle_android_runtime(config)
+            # 最后一道门：游戏窗口必须在 MAA-Game 虚拟屏的台前，否则 MaaTools 截图为空、
+            # 整场空跑。摆不回来只记一条警告，不阻断（maa run 自己会报连接失败并重开）。
+            settle_warning = settle_game_window(config)
             if settle_warning:
                 stderr_lines.append(settle_warning)
             prior_errors = list(stderr_lines)
@@ -2043,9 +1858,9 @@ def execute(phase: str, manual_token: str = "") -> int:
                 except Exception:
                     pass
         finally:
-            if emulator_opened:
+            if game_opened:
                 try:
-                    cleanup_errors = close_everything(config)
+                    cleanup_errors = close_game(config)
                 except Exception as exc:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 

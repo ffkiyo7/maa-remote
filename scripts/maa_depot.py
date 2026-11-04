@@ -12,18 +12,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import maa_copilot
+import maa_playcover
+from maa_playcover import game_is_online
 from maa_common import (
     STATE_DIR,
     atomic_write_json,
     discord_request,
     discord_token,
-    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
     merge_last_run,
     now_beijing,
-    report_emulator_busy,
+    report_game_busy,
     run_lock,
 )
 
@@ -516,7 +517,7 @@ def record_drops(
 def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str, Any]:
     """Run one real Depot scan; install it only after the whole flow succeeds.
 
-    模拟器已经在用时**什么都不做**（D18）：写一条灰卡与 `depot_status`，
+    游戏已经在跑时**什么都不做**（D18）：写一条灰卡与 `depot_status`，
     `snapshot_at` 原样不动，明天 04:30 那趟自然重试。返回的 dict 带
     `status = "skipped_busy"`，由 `run_if_due()` 原样传给 `main()`。
     """
@@ -527,13 +528,13 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
     with run_lock(blocking=False) as acquired:
         if not acquired:
             raise RuntimeError("另一个 MAA 任务正在运行，Depot 对表未执行")
-        online, probe_detail = emulator_is_online(config)
+        online, probe_detail = game_is_online(config)
         if online:
             reason = (
-                "检测到模拟器正在使用，本次仓库对表未执行，也没有碰设备；"
+                "检测到明日方舟正在运行，本次仓库对表未执行，也没有碰游戏；"
                 "明天 04:30 会自然重试。"
             )
-            report_emulator_busy(
+            report_game_busy(
                 config,
                 title="⏭️ MAA 仓库对表已跳过",
                 reason=reason,
@@ -543,22 +544,21 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
                     "depot_status": "skipped_busy",
                     "depot_attempted_at": observed_at.isoformat(),
                     "depot_error": None,
-                    "emulator_probe": probe_detail,
+                    "game_probe": probe_detail,
                 },
             )
             return {"status": "skipped_busy", "probe": probe_detail}
-        emulator_opened = False
+        game_opened = False
         error: Exception | None = None
         items: dict[str, dict[str, Any]] | None = None
         operbox_note = ""
         try:
             maa_daily.require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-            maa_daily.require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
-            maa_daily.open_emulator(config)
-            emulator_opened = True
-            maa_daily.wait_for_android(config)
-            maa_daily.verify_game_installed(config)
-            maa_daily.settle_android_runtime(config)
+            maa_playcover.verify_game_installed(config)
+            maa_playcover.launch_game(config)
+            game_opened = True
+            maa_playcover.wait_for_game(config)
+            maa_playcover.settle_game_window(config)
             env = maa_subprocess_env(config)
             env["MAA_LOG_PREFIX"] = "Never"
             result = subprocess.run(
@@ -578,7 +578,7 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
             if "Depot Completed" not in output:
                 raise RuntimeError("maa Depot 未报告 Completed")
             items = parse_depot_output(output, config)
-            # 练度后备（四期步骤 5）：森空岛不可用时，趁这台已经开好的模拟器顺手
+            # 练度后备（四期步骤 5）：森空岛不可用时，趁已经开好的游戏顺手
             # 跑一趟 OperBox。**放在 Depot 之后**——仓库对表是这趟的正事，
             # 练度快照失败一个字都不许影响它（不变量 #22）。
             operbox_reason = skland_unavailable(config, at=observed_at)
@@ -594,7 +594,7 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
                 print(operbox_note, flush=True)
         except Exception as exc:
             error = exc
-        cleanup_errors = maa_daily.close_everything(config) if emulator_opened else []
+        cleanup_errors = maa_playcover.close_game(config) if game_opened else []
         if cleanup_errors:
             cleanup_detail = "；".join(cleanup_errors)
             if error is not None:

@@ -7,7 +7,7 @@
 2. 排目标集合：当期前缀在本地关卡索引里的全部关 ∩ 上游导航键 − 已通关 − 退避中；
 3. 按理智预算排出这一轮的 `(关, 模式)` 条目，写 `searches/<token>.json` 并发一张
    「已排程」卡（只有一个「取消本轮」按钮）；
-4. 到点、不在 blackout、`run.lock` 空闲、模拟器离线时派 `run-batch`。
+4. 到点、不在 blackout、`run.lock` 空闲、游戏没在跑时派 `run-batch`。
 
 **静默执行、事后汇报**（D11）：不等用户确认，跑完发一条多关战报。
 """
@@ -216,7 +216,7 @@ def trim_unreachable(
     """只留下这一轮**够得着**的条目，返回 `(留下的, 第一条被截掉的原因)`。
 
     够不着 = 前置里有教学关、或有一关没过也没排（多半是没作业）。解锁是一条链，
-    这种条目送到 worker 也只会被 `plan_segments()` 截掉——但模拟器已经白开了一趟。
+    这种条目送到 worker 也只会被 `plan_segments()` 截掉——但游戏已经白开了一趟。
     """
     layout = maa_gamedata.load_layout()
     cleared = maa_copilot.ledger_cleared_stage_ids(ledger, index)
@@ -601,7 +601,7 @@ def run_once() -> dict[str, Any]:
         except Exception as exc:
             # **读不到就不排**（fail-closed）。以前是「沿用缓存照排」：2026-10-11
             # 森空岛过期一个月，缓存里根本没有当期活动的 zone 进度，YW-4 没解锁也
-            # 被排上，每 15 分钟开一次模拟器。登录过期由计划卡每天提醒一次
+            # 被排上，每 15 分钟开一次游戏。登录过期由计划卡每天提醒一次
             # （`maa_skland.daily_health_check()`），这里只在原因变化时发一条。
             detail = f"{type(exc).__name__}: {exc}"
             print(f"森空岛刷新失败，本轮不排：{detail}", file=sys.stderr)

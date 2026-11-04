@@ -1318,7 +1318,7 @@ def supersede_search(token: str) -> tuple[bool, Any]:
 
 
 def recover_stale_dispatch(token: str, state: dict[str, Any]) -> dict[str, Any] | None:
-    """派出去的 worker 在碰模拟器之前就失联时，把这一轮放回 `scheduled`。
+    """派出去的 worker 在碰游戏之前就失联时，把这一轮放回 `scheduled`。
 
     只处理 `queued`（动作脚本已原子接单、worker 还没抢到锁）这一种；`executing`
     起就可能已经消耗理智，绝不自动重排。
@@ -1343,7 +1343,7 @@ def recover_stale_dispatch(token: str, state: dict[str, Any]) -> dict[str, Any] 
         ):
             return None
         fresh["status"] = "scheduled"
-        fresh["last_prepare_error"] = "执行进程在启动模拟器前失联；本轮已放回排程。"
+        fresh["last_prepare_error"] = "执行进程在启动游戏前失联；本轮已放回排程。"
         fresh["last_prepare_failed_at"] = now_beijing().isoformat()
         fresh.pop("execution_requested_at", None)
         atomic_write_json(path, fresh)
@@ -1701,7 +1701,7 @@ def sanity_preflight(
 def sanity_status_text(result: dict[str, Any]) -> str:
     if not result.get("known"):
         reason = str(result.get("reason") or "暂时无法读取")
-        return f"🧠 理智：{reason}；确认后会实时核验，失败不会启动模拟器。"
+        return f"🧠 理智：{reason}；确认后会实时核验，失败不会启动游戏。"
     current = int(result["current"])
     maximum = int(result["max"])
     cost = int(result["cost"])

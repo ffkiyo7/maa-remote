@@ -353,8 +353,8 @@ def _toml_value(value: Any) -> str:
 
 # **每局的任务链必须以 `StartUp` 开头**（2026-09-11 线上事故）：`maa roguelike`
 # 预设和我们这份任务文件都**不会自己启动游戏**（spike C 第 6.1 节），而项目的开机链
-#（`open_emulator / wait_for_android / verify_game_installed / settle_android_runtime`）
-# 只负责把**模拟器**拉起来，从来没有一步去起明日方舟。首轮真机现象：模拟器停在
+#（`launch_game / wait_for_game / verify_game_installed / settle_game_window`）
+# 只负责把设备拉起来，登录要靠 `StartUp`。首轮真机现象（模拟器版）：模拟器停在
 # Android 桌面，MaaCore 直接 `Roguelike Start → Roguelike Error`，37 秒退出码 1，
 # 两局连挂后 worker 判失败。日常 `config/maa-cli/tasks/daily.toml` 与抄作业的
 # `maa_copilot_worker.NAV_TOML_TEMPLATE` 都是靠这一段把游戏拉起来并登录到主界面的。

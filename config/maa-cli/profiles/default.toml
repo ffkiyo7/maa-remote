@@ -1,12 +1,13 @@
+# PlayCover 原生明日方舟：MaaCore 直连游戏进程里的 MaaTools（PlayCover 分支的
+# 「MaaTools」开关，端口与 state/config.json 的 maatools_address 一致）。
+# 截图走 MaaTools 的 SCRN，游戏窗口必须在 MAA-Game 虚拟屏的台前（见 README）。
 [connection]
-adb_path = "/Volumes/GM7/smlt-lab.noindex/sdk/platform-tools/adb"
-address = "127.0.0.1:5585"
+preset = "PlayCover"
+address = "127.0.0.1:1717"
 
 [resource]
 user_resource = true
 
 [instance_options]
-touch_mode = "MaaTouch"
+touch_mode = "MacPlayTools"
 deployment_with_pause = false
-adb_lite_enabled = false
-kill_adb_on_exit = false

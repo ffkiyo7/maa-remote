@@ -1,8 +1,8 @@
-# maa-remote
+# maa-remote-playcover
 
 在 macOS 上用 Discord 遥控 [MAA](https://github.com/MaaAssistantArknights/MaaAssistantArknights)
 跑《明日方舟》国服日常：每天早上收一张计划卡，早晚各自动跑一遍完整任务链，跑完发中文战报和主界面截图，
-再把模拟器和游戏进程清干净。新活动上线后会自动从 prts.plus 选好一份作业，Discord 只需确认是否执行；
+再把游戏进程清干净。新活动上线后会自动从 prts.plus 选好一份作业，Discord 只需确认是否执行；
 也可以在聊天里说一句「抄 TO-9」手动匹配。
 
 ## 自用优先
@@ -10,8 +10,8 @@
 这是我自己每天在用的项目，开源出来是觉得对同样在折腾这条链路的人可能有点参考价值。
 有几件事想先说在前面，免得你抱着不太合适的期待：
 
-- 它**只在一种环境里跑过**：Apple Silicon Mac + macOS + 自制模拟器 Landship + 明日方舟国服
-  （2026-11 之前用的是 BlueStacks Air，换回去只需改配置，见[环境要求](#环境要求)）。
+- 它**只在一种环境里跑过**：Apple Silicon Mac + macOS + PlayCover 原生明日方舟国服
+  （2026-11-04 之前用安卓模拟器，那一版留在姊妹仓库 `maa-remote`，见[环境要求](#环境要求)）。
   日服 / 美服、MuMu / 雷电、Windows / Linux 都还没适配，短期内大概也不会有。
 - 开发时我会优先保证自己那台机器稳定，所以**配置项、状态文件格式、任务链结构都可能变动**，
   没有版本号，也不会写迁移脚本。跟进的话留意一下 diff 就好。
@@ -75,7 +75,7 @@
    ~/.hermes/state/maa/{config,defaults,plan,last_run,activity_watch}.json + run.lock + runs/
                         │   effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次> 的覆盖
                         ▼
-   maa_daily.py ── flock ── 探模拟器 ── 快照本场计划 ── 起模拟器 ── 等 ADB
+   maa_daily.py ── flock ── 探游戏进程 ── 快照本场计划 ── 开游戏 ── 等 MaaTools
         └─ 渲染 daily.toml ── maa run ── 每 5s 编辑子区里的同一条进度消息
               └─ 返回主界面 ── Vision OCR 核对 ── 截图 ── closedown ── 战报
 ```
@@ -182,13 +182,14 @@
 任务仍匹配旧蓝色按钮。本项目通过 maa-cli 用户资源层只覆盖这一项识别：复用资源内现成的
 `PopupConfirm.png`，点击范围限制在右侧确认对勾；其余基建任务继续使用上游实现。
 
-跑完按 bundle ID 请求模拟器正常退出，`pkill` 兜底，再用不会自匹配的进程模式复核，最后断开 ADB。
+跑完经 MaaTools 发 `TERM` 让游戏自己退出，`pkill -f <游戏可执行文件完整路径>` 兜底，再用不会自匹配的
+进程模式复核。PlayCover 本体不动。
 
 **「跳过」只关掉设它的那一场**（早场跳过不影响晚场）；说「现在跑」派发的手动场豁免 skip，照跑。
 启动时快照当场计划，运行中改计划不影响本场。
 
-**开跑前先探模拟器**：08:00 / 22:00、抄作业、仓库对表这些自动行为在拿到 `run.lock`
-之后、开模拟器**之前**都会探一次——模拟器已经开着就判定「你在玩」，发一条灰卡说明并退出，
+**开跑前先探游戏**：08:00 / 22:00、抄作业、仓库对表、肉鸽这些自动行为在拿到 `run.lock`
+之后、开游戏**之前**都会探一次——明日方舟已经开着就判定「你在玩」，发一条灰卡说明并退出，
 不会把你踢出游戏。探测预算 5 秒、永不抛异常、失败按离线处理照常执行。手动场「现在跑」豁免。
 
 ### 两条从实战里长出来的容错
@@ -197,10 +198,10 @@
   照样判 Completed。战报把返还的理智剔出掉落；整场一关没打成时刷理智翻红、写「实际完成 0 次」，
   并提示去手动重打三星刷新录像。**连续 2 批失误就熔断 `maa run`**，再补跑一趟去掉 Fight 的链条，
   把基建 / 公招 / 商店 / 奖励捞回来（两趟共用同一个超时预算）。详见 DEV_GUIDE §11.13。
-- **模拟器冷启动竞态**：MaaCore 起 MaaTouch 只给 3 秒握手窗口，撞上开机抖动就报
-  `TouchModeNotAvailable`，而 maa-cli 会带着没连上的 controller 继续跑，直接 SIGSEGV、
-  整场 35 秒暴毙。所以冷启后先等 `app_process` 安静下来再交给 MaaCore；闸门之外还有一层重试，
-  认出「连接阶段就崩、一条任务链都没 Completed」才重开 `maa run`，最多 2 次。详见 DEV_GUIDE §11.14。
+- **游戏窗口被挤出台前**：MaaTools 截图只在窗口在屏上时有画面（见[环境要求](#环境要求)）。开跑前先确认
+  窗口在屏、不在就 `open -a` 激活一次；跑到一半 MaaCore 报 `ScreencapFailed` 时每 30 秒最多再救一次；
+  认出「连接阶段就失败（`ConnectFailed` / `ScreencapFailed`）、一条任务链都没 Completed」才重开
+  `maa run`，重开前先摆回窗口、等 MaaTools 就绪，最多 2 次。
 
 ### 抄作业（prts.plus）
 
@@ -226,9 +227,9 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 3. 按理智预算（当前理智 − 今天还要打的剿灭）排出这一轮的 `(关, 模式)` 条目：
    数字关升序 → EX → S，每关先普通后突袭。排不满就只排第一条并算出它的
    「理智够了的时刻」，写进卡片。
-4. 到点 + 不在 08:00 / 22:00 前的黑名单 + `run.lock` 空闲 + 模拟器离线，才派发执行。
+4. 到点 + 不在 08:00 / 22:00 前的黑名单 + `run.lock` 空闲 + 游戏没在跑，才派发执行。
 
-**执行链**（`maa_copilot_worker.py run-batch`）：抢锁 → 探模拟器 → 开机 →
+**执行链**（`maa_copilot_worker.py run-batch`）：抢锁 → 探游戏进程 → 开游戏 →
 **循环**每个条目（活动 + 理智复核 → 上游导航 → 突袭则先切难度 →
 `maa copilot --formation --batch --raid <mode>` → 判胜负 → 记账）→ 截图 → 清理 →
 一条多关战报。**一关失败继续下一关**；导航 / 切难度这类环境失败则停止整轮。
@@ -305,8 +306,8 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 
 - `maa_action.py` 是**唯一**状态变更入口。技能文件（`SKILL.md`）明确禁止 LLM 直接写
   `plan.json` / `defaults.json` / `config.json` / 按钮登记表，也禁止直接调用 runner。
-- LLM 能改的只有**今天某一场的关卡**和**那一场是否跳过**，其余（任务链、次数、吃药、ADB、
-  模拟器、Discord 配置）一律拒绝。碎石**永久关闭**，不提供入口、脚本级硬拒。
+- LLM 能改的只有**今天某一场的关卡**和**那一场是否跳过**，其余（任务链、次数、吃药、
+  设备连接、Discord 配置）一律拒绝。碎石**永久关闭**，不提供入口、脚本级硬拒。
 - 场次参数只接受 `am` / `pm`，非法值脚本层拒绝；卡片上的场次由按钮登记表写死，不从 Discord 直通。
 - 技能明确要求**绝不索取、接收、复述或写入森空岛 / 鹰角 token**；用户想在聊天里贴，引导去本机终端。
 - Discord 侧永不展示 maa-cli 的原始 stdout/stderr，只展示中文步骤和战报；CLI 原文只写本地日志。
@@ -322,21 +323,34 @@ MaaCore v6.17.2 会跳过整项任务，不能用来导航。
 | 硬件 / 系统 | Apple Silicon Mac，macOS（开发机为 M4 / macOS 26.6 / 16GB） |
 | 运行时依赖 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) gateway 常驻，且已连上 Discord |
 | Python | 开发机为 3.12。**零第三方依赖**，全部 stdlib（`zoneinfo` 需要 3.9+，但更低版本没验证过） |
-| 模拟器 | Landship（自制、未开源的 Google Android Emulator 前端，Android 14 arm64，**1920×1080 原生横屏**），bundle id `com.wadorudi.landship` |
-| ADB | 模拟器库目录里的 `sdk/platform-tools/adb`，`127.0.0.1:5585`。**路径不能带空格**：MaaCore 经 shell 调 adb 不加引号 |
-| MAA | maa-cli（Homebrew tap `MaaAssistantArknights/tap/maa-cli`）+ MaaCore，`touch_mode = "MaaTouch"` |
-| 游戏 | 明日方舟**国服** `com.hypergryph.arknights`，已侧载并登录到主页面 |
-| 可选 | `swiftc`（编译 ocrbox；缺了抄作业的接管弹窗 watchdog 不可用）、森空岛账号 |
+| 游戏 | 明日方舟**国服** iOS 版，用 [PlayCover 的 MAA 分支](https://github.com/hguandl/PlayCover)（开发机为 `4.0.0.maa`）原生跑在 macOS 上，已登录过一次 |
+| MaaTools | PlayCover 里明日方舟的设置 → 绕过 → **启用 MaaTools**，端口 `1717`（与 `maatools_address`、maa-cli profile 一致） |
+| MAA | maa-cli（Homebrew tap `MaaAssistantArknights/tap/maa-cli`）+ MaaCore，profile `preset = "PlayCover"`、`touch_mode = "MacPlayTools"` |
+| 虚拟屏 | [BetterDisplay](https://github.com/waydabber/BetterDisplay) 建一块 1920×1080 的虚拟屏（开发机叫 `MAA-Game`），**游戏窗口独占这块屏**；BetterDisplay 要开机自启 |
+| 可选 | `swiftc`（编译 ocrbox / winmove；缺了前者抄作业的接管弹窗 watchdog 不可用，缺了后者游戏窗口挪不回虚拟屏）、森空岛账号 |
+| 权限 | Hermes gateway 的 Python：**辅助功能**（winmove 挪窗口）；可选「录屏与系统录音」（兜底截图） |
 
-脚本对模拟器只有几条假设：`open -a <emulator_app>` 即启动实例并在 180 秒内 adb 可连、
-`sys.boot_completed=1`；没在跑时进程不存在、地址也连不上；按 bundle id 请求退出后能自己停干净，
-`pgrep -f <emulator_app>` 复核无残留。满足这些的模拟器只需改 `state/config.json` 的
-`emulator_app` / `emulator_bundle_id` / `emulator_process_ignore_case` / `adb_path` / `adb_address`
-和 maa-cli profile 的 `[connection]`。
+**为什么要虚拟屏**：MaaCore 经 MaaTools 的 `SCRN` 截图，而 `SCRN` 只在游戏窗口「在屏上」时有画面——
+窗口被最小化、隐藏，或被台前调度（Stage Manager）收进侧边栏时回 0 字节，MaaCore 只会刷
+`ScreencapFailed`。游戏**不需要是前台 App**，只要它的窗口在某块屏的台前就行。所以给它单独一块
+虚拟屏：主屏上你干什么都不影响它。台前调度开着也没关系，前提是**别的窗口不要开到 MAA-Game 上**
+（会把游戏挤进侧边栏）。
 
-想用 BlueStacks Air：MAA 官方文档明确支持它（M 系列）+ `127.0.0.1:5555` + MaaTouch。实例要设成
-4 核 / 4GB / **1920×1080 横屏**（默认实例是竖屏，不改 MAA 必然识别不到），ADB 用它自带的
-`/Applications/BlueStacks.app/Contents/MacOS/hd-adb`，`emulator_process_ignore_case` 设 `true`。
+PlayCover 每次拉起游戏都把窗口开在**当前活动的那块屏**上，不会自己回到 MAA-Game。所以
+`settle_game_window()` 发现窗口不在 `game_display_name` 那块屏上，就用 `winmove`（`deploy.py`
+编译的 Swift 小工具，走辅助功能接口）把它挪过去居中。**这要给 Hermes gateway 那个 Python
+可执行文件开「辅助功能」权限**；没开只会在战报里记一句警告——游戏留在主屏上也能跑，
+只是主屏上一有别的窗口盖过来，截图就会断。
+
+脚本对游戏的假设：`open -a <playcover_app_path>` 能拉起或激活游戏，120 秒内 MaaTools 端口可连；
+MaaTools 的 `TERM` 能让游戏自己退出，`pkill -f <可执行文件完整路径>` 兜底后复核无残留。
+PlayCover 本体从不启停。
+
+可选的兜底截图：MaaTools 截不到画面时，战报截图 / 看门狗会退到 `screencapture -l<窗口号>`，
+这需要给 Hermes gateway 那个 Python 可执行文件开「录屏与系统录音」权限；不开只是兜底不可用。
+
+模拟器版（Landship / BlueStacks Air + ADB + MaaTouch）在姊妹仓库 `maa-remote`，2026-11-04 起
+本仓库只支持 PlayCover。
 
 ## 部署
 
@@ -360,7 +374,7 @@ SKLAND_HG_TOKEN=<token> MAA_CHANNEL_ID=<频道数字ID> python3 deploy.py
 
 也可以事后单独在本机终端跑 `python3 ~/.hermes/scripts/maa_skland.py link`，从 stdin 粘贴。
 
-然后建六条 cron。Depot 每天 04:30 只检查是否满 7 天，未到期不会启动模拟器；
+然后建六条 cron。Depot 每天 04:30 只检查是否满 7 天，未到期不会启动游戏；
 **计划卡和日常都用不同工作目录传递场次标记**（`…/maa/am`、`…/maa/pm`），
 因为 Hermes 的 `--script` 不支持 argv：
 
@@ -440,14 +454,15 @@ maa_action.py roguelike status                  # 「肉鸽到哪了」
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `channel_id` | 占位符 | 部署时由 `MAA_CHANNEL_ID` 或本机已有配置解析，**不入库** |
-| `emulator_app` / `emulator_bundle_id` | `Landship` / `com.wadorudi.landship` | `open -a`、`pgrep` / `pkill -f` 用前者，`osascript quit` 用后者。名字要选不会出现在其他进程命令行里的 |
-| `emulator_process_ignore_case` | `false`（代码默认 `true`） | 残留复核用 `pgrep -fi` 还是 `pgrep -f`。Landship 必须 `false`，否则带 `landship-derived` 路径的其他进程会被当成残留 |
-| `adb_path` / `adb_address` | Landship 库内 `sdk/platform-tools/adb` / `127.0.0.1:5585` | 换模拟器时这里和 maa-cli profile 两处都要改；路径不能带空格 |
+| `game_bundle_id` | `com.hypergryph.arknights` | PlayCover 设置文件 `App Settings/<bundle id>.plist` 的文件名 |
+| `playcover_app_path` | `~/Library/Containers/io.playcover.PlayCover/Applications/com.hypergryph.arknights.app` | `open -a` 拉起 / 激活游戏；`pgrep` / `pkill -f` 用它里面可执行文件的完整路径 |
+| `maatools_address` | `127.0.0.1:1717` | 只接受本机回环地址；和 PlayCover 里的端口、maa-cli profile 三处一致 |
+| `game_display_name` | `MAA-Game` | 游戏窗口常驻的虚拟屏名字（系统设置里显示器的名字）；窗口不在这块屏上就挪过来。空串 = 不管 |
+| `game_launch_timeout` / `game_quit_timeout` | `120` / `30` | 等 MaaTools 就绪 / 等 `TERM` 后进程退出的秒数，后者超时才 `pkill` |
 | `maa_run_timeout` | `3000`（50 分钟） | 为 Hermes 外层 1 小时上限预留清理时间 |
-| `emulator_settle_quiet_seconds` | `8` | 冷启后等 `app_process` 安静多久再交给 MaaCore |
 | `connect_retry_limit` | `2` | 连接阶段崩溃的重开次数，共用同一个超时预算 |
 | `medicine_expire_days` | `2` | 只吃这个窗口内即将过期的理智药 |
-| `emulator_probe_timeout` | `5`（不在种子里，代码默认） | 开模拟器前那次「你是不是在玩」探测的总预算（秒）；设 `0` 关闭探测 |
+| `game_probe_timeout` | `5` | 开游戏前那次「你是不是在玩」探测的总预算（秒）；设 `0` 关闭探测 |
 | `maa_activity_cache` | 不在种子里 | 覆盖 `StageActivityV2.json` 的路径（默认 `~/Library/Caches/com.loong.maa/StageActivityV2.json`），只用于卡片上的「活动截止」 |
 | `fight_times` | `2147483647` | 生产值。配合 `series = 0` 一直打到理智不足 |
 | `report_drops` | `true` | 日常三个 Fight 块（剿灭 + 两个刷理智）**匿名上报掉落**给一图流与企鹅物流；两个上报 ID 都写空串，不带任何账号标识。关掉就一行都不写 |
@@ -535,7 +550,8 @@ task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]
 python3 -m unittest discover -s tests -v
 ```
 
-现有 stdlib 单测约 10 秒，不碰模拟器。**必须在仓库根目录跑。**
+现有 stdlib 单测约 5 秒，不碰游戏（`test_maa.py` 在模块级把设备层的 `subprocess` / `socket`
+换成一碰就炸的桩）。**必须在仓库根目录跑。**
 
 改完代码要跑 `deploy.py` 才生效；改了 adapter / `config.yaml` / `.env` / `SKILL.md` 还要重启 gateway。
 
@@ -556,8 +572,10 @@ python3 -m unittest discover -s tests -v
 
 ## 已知限制
 
-- **只测过一种环境**（见[自用优先](#自用优先)）。国服以外的服务器、其他模拟器都还没有适配。
-- **模拟器需要活跃的图形会话**——锁屏 / 关显示器没问题，注销或切换用户会失败。
+- **只测过一种环境**（见[自用优先](#自用优先)）。国服以外的服务器都还没有适配。
+- **游戏需要活跃的图形会话和一块在线的虚拟屏**——注销、切换用户、BetterDisplay 没开都会失败。
+- **PlayCover 没有安卓返回键**：MaaCore 的 PlayTools 控制器不支持 back，抄作业的区域入口
+  找不到时不再「退一步重找」，只等一下再找一次。
 - **macOS 上 maa-cli 的默认配置目录**是 `~/Library/Application Support/com.loong.maa/config`，
   与本项目约定不同，所以每个子进程都显式注入 `MAA_CONFIG_DIR`。新增调用 maa-cli 的代码
   一定要走 `maa_subprocess_env()`，不要裸 `subprocess.run`。
@@ -571,9 +589,6 @@ python3 -m unittest discover -s tests -v
   见 [docs/archive/PLAN_CLEARING.md](./docs/archive/PLAN_CLEARING.md) 步骤 2）。
 - **活动监控依赖本机 MAA 热更新资源**。资源还没包含新活动时不会猜活动；07:50 更新资源后，
   watcher 才能按资源内的开放时间识别。自动作业只取上游第一推荐关，不代替前置关卡通关。
-- **（用 BlueStacks 时）动它的三件套里的任何一个，整套会被连坐删除**——安装包附带的 LaunchDaemon
-  盯着三个 app 路径，少任何一个就 `rm -rf` 全部（含实例数据）。要卸载捆绑的 BlueAI
-  **必须先 bootout 并删掉那个 plist**。详见 DEV_GUIDE §11.12。
 - 熔断后的补跑逻辑有单元测试和真实日志回放，但「StartUp 能否从结算页把游戏带回主界面」
   只在真机上才算数，尚未实机验收。
 

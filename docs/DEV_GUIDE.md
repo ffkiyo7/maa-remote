@@ -26,6 +26,67 @@
 
 ---
 
+## 0.5 设备层：PlayCover（2026-11-04 起）
+
+本仓库从模拟器版 `maa-remote` 复制而来，**设备层整个换成了 PlayCover 原生明日方舟**，
+全部收在 `scripts/maa_playcover.py`（只用 stdlib）。下文凡是写模拟器 / ADB / MaaTouch /
+`emulator_*` 的地方，按这张表读；§11.12、§11.14、§11.15 是模拟器时期的踩坑记录，留作参考。
+
+| 模拟器时期 | PlayCover |
+|---|---|
+| `open -a <emulator_app>` 开机，等 `sys.boot_completed`（180s） | `launch_game()`：`open -a <playcover_app_path>`（容器里那个 `.app`，**不用** `open -b`：游戏在跑时 -10670）；`wait_for_game()` 轮询 MaaTools `SIZE`（`game_launch_timeout`，120s） |
+| `pm path` 确认装了国服 | `verify_game_installed()`：可执行文件存在 + `App Settings/<bundle>.plist` 里 `maaTools = true` 且端口一致 |
+| `settle_android_runtime()` 等 `app_process` 安静 | `settle_game_window()`：窗口不在 `game_display_name` 那块虚拟屏上就用 `winmove` 挪过去（PlayCover 每次都把窗口开在当前活动的屏上）；还不在屏上就 `open -a` 激活一次，再查；查不出不阻断 |
+| `emulator_is_online()`：`pgrep` 或 `adb getprop` | `game_is_online()`：只看 `pgrep -f <可执行文件完整路径>`（MaaTools 在游戏进程里，进程不在端口必然不在）。预算 `game_probe_timeout` |
+| `adb exec-out screencap -p` | `capture_geometry()`：MaaTools `SCRN`（RGBA，Retina 3840×2160 降采样到 1920 宽）；回 0 字节时退到 `screencapture -l<窗口号>`（要录屏权限，图里带标题栏，`top` 记它的高度） |
+| `adb shell input tap x y` | `tap()`：1920×1080 游戏坐标按 `SIZE` 换算，MaaTools `TUCH` Began + Ended |
+| `adb shell input keyevent 4` | **没有**。MaaCore 的 PlayTools 控制器也不支持 back |
+| `maa closedown` + `osascript quit` + `pkill` + `adb disconnect` | `close_game()`：MaaTools `TERM`（游戏自己退出，实测 20 多秒）→ 等 `game_quit_timeout`（30s）→ `pkill -f <完整路径>` 兜底 → 复核。PlayCover 本体不动 |
+| maa-cli profile `adb_path` / `MaaTouch` | `preset = "PlayCover"`、`address = "127.0.0.1:1717"`、`touch_mode = "MacPlayTools"` |
+
+**MaaTools 协议**（PlayCover MAA 分支 `4.0.0.maa`，`VERN` = 4）：连 `127.0.0.1:1717`，先发
+`MAA\0` 收 `OKAY`；之后每条请求是 `>H` 长度（4 + 负载）+ 4 字节命令。`SIZE` 回 `>HH`；
+`SCRN` 回 `>I` 长度 + RGBA；`TUCH` 负载 `>BHH`（phase 0 = Began、1 = Moved、3 = Ended，坐标是
+`SIZE` 空间）；`TERM` 结束游戏。抄作业的看门狗会在 MaaCore 连着时另开一条连接截图、点击——
+**「MaaCore 连着时第二条连接能不能点」还没在真机上验证过**，第一次碰上接管弹窗时留意日志里的
+`# watchdog:` 行和那一关的结果。
+
+**截图为空 = 窗口不在台前**。`SCRN` 只在游戏窗口在某块屏的台前时有画面；最小化、隐藏、
+被台前调度收进侧边栏时回 0 字节，MaaCore 只会刷 `ScreencapFailed`。游戏**不需要是前台
+App**。所以运行环境给它一块 BetterDisplay 虚拟屏（`MAA-Game`，1920×1080）独占；台前调度
+开着时，**任何别的窗口开到这块屏上都会把游戏挤走**。
+
+**窗口不会可靠地回到虚拟屏**（2026-11-04 实测）：`open -a` 拉起的游戏多半开在当前活动的
+那块屏上；偶尔直接开在虚拟屏上，却偏到右下、一截伸出屏外。`settle_game_window()` 先
+`move_to_game_display()`：JXA 读 `NSScreen` 找到 `game_display_name`（默认 `MAA-Game`）的范围，
+窗口没有**整个**落在里面就调 `~/.hermes/scripts/winmove
+<pid> <x> <y>`（`scripts/winmove.swift`，`deploy.py` 编译，AX `kAXPositionAttribute`）挪过去居中。
+winmove 要调用方有**辅助功能**权限，线上是 Hermes gateway 那个 Python；没有就退出码 3、
+只记一条警告，不阻断。System Events / JXA 直接设 AX 位置都不行（前者要自动化权限，
+后者 `AXValueCreate` 的结构体桥接回 -25200）。
+
+三道防线：
+
+1. 开跑前 `settle_game_window()`（含挪屏）；
+2. `run_maa()` 每 5 秒看一次日志，`ScreencapFailed` 变多就再 `settle_game_window()`
+   （`SCREENCAP_SETTLE_INTERVAL` = 30s 节流）；
+3. `run_maa_resilient()` 认出连接阶段就失败（`CONNECT_FAILURE_MARKERS` 含 `ScreencapFailed`、
+   一条任务链都没 Completed）才重开，重开前先摆回窗口、`wait_for_game()`。
+
+**没用 MacSCK**：MaaCore 的 `config = "MacSCK"`（ScreenCaptureKit 截图）在 maa-cli 里会撞
+`CGS_REQUIRE_INIT` 断言（进程没初始化 CoreGraphics 会话就调 SCK），要 DYLD 注入一个先调
+`CGMainDisplayID()` 的 shim 才能跑；而且要给 maa 进程开录屏权限。虚拟屏 + `SCRN` 更简单。
+
+**单测碰不到真游戏**：`tests/test_maa.py` 的 `setUpModule()` 把 `maa_playcover.subprocess` /
+`socket` 换成一碰就抛 `RealGameTouched`（BaseException，`except Exception` 吞不掉）的桩。
+2026-11-04 就是 Depot 用例桩了 `maa_daily.launch_game`、实际调的是 `maa_playcover.launch_game`，
+整套单测真的开关了一次游戏。设备层自己的行为在 `tests/test_playcover.py` 里对着一个本机
+假 MaaTools 服务端测。**桩设备函数时桩调用方实际引用的那个名字**：`maa_daily` / 两个 worker
+是 `from maa_playcover import …`（桩 `maa_daily.launch_game`），`maa_depot` / `maa_action`
+是 `maa_playcover.launch_game(…)`（桩 `maa_playcover.launch_game`）。
+
+---
+
 ## 1. 全链路总图
 
 ```
@@ -35,7 +96,7 @@
    ┌────┴──────────────────────────────┐      ┌────┴─────────────────────────┐
    │ */15 * * * * maa_activity_watch  │      │                              │
    │ 30 20 * * *  maa_depot.py         │      │                              │
-   │ (京 04:30；到期才开模拟器)       │      │                              │
+   │ (京 04:30；到期才开游戏)         │      │                              │
    │ 50 23 * * *  maa_plan_card.py am  │      │ 组件交互 hermes:btn:maa:*    │
    │ (京 07:50, workdir=…/maa/am)      │      │   → buttons.json 查登记      │
    │ 50 13 * * *  maa_plan_card.py pm  │      │   → exec 白名单校验          │
@@ -51,9 +112,9 @@
    ~/.hermes/state/maa/{config,defaults,plan,last_run}.json + run.lock + runs/
                         │  effective_plan(at, phase) = defaults ⊕ 当天 sessions.<场次>
                         ▼
-   maa_daily.py ── flock ── 探模拟器 ── 快照 runs/<date>-<phase>.json ── 起模拟器
+   maa_daily.py ── flock ── 探游戏进程 ── 快照 runs/<date>-<phase>.json ── 开游戏
         └─ 渲染 daily.toml ─ maa run daily ─ 5s 一次编辑子区消息
-                                 └─ 截图 ─ closedown/退出/断 ADB ─ 战报 embed
+                                 └─ 截图 ─ MaaTools TERM / pkill ─ 战报 embed
 ```
 
 六条 cron 全是 `--no-agent --deliver local` 的**短命进程**：跑完即退，不常驻，
@@ -65,11 +126,11 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 
 | 文件 | 角色 | 触发方式 | 典型耗时 |
 |---|---|---|---|
-| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry`、**场次级计划求值**（`plan_sessions` / `effective_plan`）、**模拟器占用探测**（`emulator_is_online` / `report_emulator_busy`） | 被其他几个 import | — |
+| `scripts/maa_common.py` | 无第三方依赖的公共层：时区、三把锁、原子写、Discord REST/multipart、清理、`prune_button_registry`、**场次级计划求值**（`plan_sessions` / `effective_plan`）、**「你在玩」跳过的统一出口**（`report_game_busy`；探测本身在 `maa_playcover.game_is_online`） | 被其他几个 import | — |
 | `scripts/maa_plan_card.py` | 早晚两张计划卡 + 抄作业卡的渲染层；早场卡还先检查/跟随 maa-cli 与 MaaCore；刷新活动关；写按钮登记；清理旧子区/旧卡片/旧产物 | cron 京 07:50（am）/ 21:50（pm）；抄作业卡由 `maa_action.py` 调 | 早场数秒～5 分钟（含 `maa update` / `brew`），晚场数秒 |
-| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率；**森空岛不可用时顺手跑一趟 `OperBox` 拿练度后备** | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动模拟器 |
+| `scripts/maa_depot.py` | 每周仓库对表；只接纳 MaaCore `done=true` 的完整 Depot 结果，计算本地掉落增量与账号消耗率；**森空岛不可用时顺手跑一趟 `OperBox` 拿练度后备** | cron 京 04:30 每日检查，满 7 天才执行 | 到期时数分钟；未到期不启动游戏 |
 | `scripts/maa_activity_watch.py` | 轮询 MAA 活动视图；排目标集合、按理智排一轮 `(关, 模式)`、发「已排程」卡、到点派 `run-batch` | cron 每 15 分钟 | 通常 <1s；要现搜作业时每关 5~20s（每 tick ≤6 关） |
-| `scripts/maa_daily.py` | 执行主体：模拟器 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；选关卡 `run start` 派发 `now <token>` | 10～50 分钟 |
+| `scripts/maa_daily.py` | 执行主体：开游戏 → maa-cli → 流式进度 → 截图 → 清进程 → 战报 | cron 京 08:00 / 22:00；选关卡 `run start` 派发 `now <token>` | 10～50 分钟 |
 | `scripts/maa_action.py` | **唯一**状态变更与派发入口（按钮、下拉、聊天共用） | Discord 组件交互；agent 用 terminal 调用 | < 1s（硬性要求） |
 | `scripts/maa_copilot.py` | 抄作业领域层（纯函数）：关卡索引、prts 客户端、匹配打分、目标集合、**本地作业记账**（`ledger.json`）、已排程卡 | 被 action/watch/worker/plan_card import | — |
 | `scripts/maa_copilot_worker.py` | 抄作业后台：`search <token>` 手动搜一关并直接排程；`run-batch <token>` **一条执行链**串行连抄一轮 | 仅由 `maa_action.py` / `maa_activity_watch.py` 派发 | 搜索 5~20s；一关 8~15 分钟 |
@@ -81,7 +142,8 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `scripts/ocrbox.swift` | macOS Vision OCR 小工具（编译为 `~/.hermes/scripts/ocrbox`），watchdog 识别接管弹窗 | 被 worker 调用 | <1s/次 |
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
-| `tests/test_maa.py` + `tests/test_copilot.py` | stdlib 单测，不碰模拟器 | 人工 | 约 10s |
+| `scripts/maa_playcover.py` | **设备层**（§0.5）：探测、开游戏、等 MaaTools、摆窗口、截图、点击、关游戏 | 被日常 / Depot / 抄作业 / 肉鸽 import | — |
+| `tests/test_maa.py` + `tests/test_copilot.py` + `tests/test_playcover.py` | stdlib 单测，不碰游戏（§0.5） | 人工 | 约 5s |
 
 ---
 
@@ -295,7 +357,7 @@ maa activity Official ── activity_snapshot() ── activity_target() ──
         build_round()      plan_round(条目, 预算, 理智查表) → 现搜作业（≤6 关/tick）
                            排得满 → 现在打；排不满 → 只排第一条 + `sanity_preflight().ready_at`
         写 searches/<token>.json（status=scheduled）→ publish_round() 发「已排程」卡
-        dispatch_blocker()  到点？blackout？Depot 窗口？时间预算？run.lock？模拟器在线？
+        dispatch_blocker()  到点？blackout？Depot 窗口？时间预算？run.lock？游戏在跑？
 ```
 
 **判定「空窗」还是「格式变了」只有一个判据**：`is_side_story_heading()`，闸门与
@@ -364,26 +426,26 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    > 快照是「跑起来之后再改计划不影响本场」的实现基础——后续对 `plan.json` 的写入
    > 既改不了内存里这个 dict，也改不了这个文件。
 4. `plan.skip` 为真**且 `phase != "now"`** → 发一条灰色「已跳过」Embed，`status=skipped`，
-   结束。**不开模拟器。** skip 现在是**按场次**的（四期 D2）：它来自
+   结束。**不开游戏。** skip 现在是**按场次**的（四期 D2）：它来自
    `sessions.<phase>`，关掉早场不影响晚场；手动场是用户当场下的明确指令，
    本身就是对今天这条计划的推翻，照跑（`run_now()` 的回执会列出哪几场设了跳过）。
-4.5. **探模拟器（只对 `am`/`pm`）** — `maa_common.emulator_is_online()`：
-   `pgrep -f <emulator_app>` **或** `adb connect` + `getprop sys.boot_completed == 1`，
-   任一命中即算「用户正在玩」，`report_emulator_busy()` 发灰色「已跳过」Embed、写
-   `status=skipped` / `skip_reason=emulator_busy`，结束。**不开模拟器、不抢设备。**
-   起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_everything()` 把模拟器
+4.5. **探游戏（只对 `am`/`pm`）** — `maa_playcover.game_is_online()`：
+   `pgrep -f <游戏可执行文件完整路径>` 命中即算「用户正在玩」，`report_game_busy()` 发灰色
+   「已跳过」Embed、写 `status=skipped` / `skip_reason=game_busy`，结束。**不开游戏、不抢游戏。**
+   起因是 `PLAN_NAV_GATE.md` 结论 3：任何失败路径都会 `close_game()` 把游戏
    关掉，等于把正在玩的用户踢出游戏。`now` 不走这条闸门（用户明确要求照跑）。
    探测预算 5s、失败按离线处理照常执行——**宁可误抢一次设备，也不能因为探测自己坏了
    就永久停摆**（不变量 #24）。
-   **实现只有一份**，在 `maa_common.py`：日常、抄作业 `run-batch`、Depot 三条自动
-   链路共用它（四期 D18）。`maa_daily.report_emulator_busy()` 只是把日常的文案与
-   `last_run` 字段套进 `maa_common.report_emulator_busy()` 的薄封装。
-   > 别和第 8 步的 `settle_android_runtime()` 搞混：那个在**开机之后**跑，等 `app_process`
-   > 别抖；这个在**开机之前**跑，问的是"设备现在是不是别人的"。
-5. **预检 → 起模拟器** — `require_executable` 校验 maa/adb 可执行（**在开模拟器之前**）→
-   `open -a <emulator_app>` → 轮询 `adb connect` + `getprop sys.boot_completed`（超时 180s）→
-   `pm path com.hypergryph.arknights` 确认国服客户端已装。任一步失败且此时还没建子区，
-   走 `send_direct_failure()` 直接在频道发红色告警。
+   **实现只有一份**，在 `maa_playcover.py`：日常、抄作业 `run-batch`、Depot、肉鸽四条自动
+   链路共用它（四期 D18）。`maa_daily.report_game_busy()` 只是把日常的文案与
+   `last_run` 字段套进 `maa_common.report_game_busy()` 的薄封装。
+   > 别和第 7 步之后的 `settle_game_window()` 搞混：那个在**开游戏之后**跑，确认窗口在台前；
+   > 这个在**开游戏之前**跑，问的是"游戏现在是不是别人在玩"。
+5. **预检 → 开游戏** — `require_executable` 校验 maa 可执行 → `verify_game_installed()`
+   （PlayCover 里有游戏、MaaTools 开着、端口一致；**在开游戏之前**）→ `launch_game()`
+   （`open -a <playcover_app_path>`）→ `wait_for_game()` 轮询 MaaTools 就绪（超时 120s）。
+   任一步失败且此时还没建子区，走 `send_direct_failure()` 直接在频道发红色告警。
+   渲染完 `daily.toml`、开 `maa run` 之前再 `settle_game_window()` 一次（§0.5）。
 6. **发开跑消息 → 建子区 → 发进度占位消息**，thread_id 记进 `last_run.threads`（供 24h 清理）。
 7. **渲染 `daily.toml`** — `render_daily_toml(plan, config)` 把本场快照渲染成 TOML 并
    `atomic_write_text` 覆盖 `~/.config/maa-cli/tasks/daily.toml`。任务链固定：
@@ -488,7 +550,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
      外层 Hermes cron 的上限是 3600s，这 10 分钟余量留给截图与清理。
    - `KeyboardInterrupt` → 返回码 **130**。
 9. **截图 + 主页校验**（`capture_home_screenshot()`）— 等 `home_screenshot_delay` 秒让动画
-   稳定 → `adb exec-out screencap -p` → 校验 PNG magic 后 chmod 600 → 用本机 Vision OCR
+   稳定 → `maa_playcover.capture_screenshot()`（MaaTools `SCRN` 编码成 PNG，见 §0.5）→ chmod 600 → 用本机 Vision OCR
    （`~/.hermes/scripts/ocrbox`）核对画面里有没有 `HOME_MARKERS`（终端/编队/采购中心/
    公开招募/基建/好友/档案/SANITY），命中 ≥ `HOME_MARKER_MIN`（4）才算真在主页；
    不在就重截，最多 `home_screenshot_attempts`（默认 3）次。
@@ -498,11 +560,10 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
      `last_run.home_verify_detail`——宁可漏报也不能凭一个不确定的信号误杀好场次。
    - 这条闸门只挂在日常链上。抄作业结束在战斗结算界面而不是主页，`maa_copilot_worker`
      仍然直接调 `capture_screenshot()`，不受影响。
-10. **`close_everything()`**（在 `finally` 里）— `maa closedown Official` →
-    `osascript quit`（bundle id）→ sleep `quit_grace_seconds` → `pkill -f <emulator_app>` 兜底 →
-    `adb disconnect` → 用 `[B]lueStacks` 这种加方括号的模式 `pgrep` 复核残留（防止匹配到自己）。
-    复核默认 `pgrep -fi`；`emulator_process_ignore_case: false` 时用 `pgrep -f`。Landship 必须关掉：
-    带 `--add-dir=…/landship-derived` 的 Claude 会话会被 `-fi` 当成残留，每场判红。
+10. **`close_game()`**（在 `finally` 里，只要 `launch_game()` 被调过）— MaaTools `TERM` →
+    等进程消失（`game_quit_timeout`）→ `pkill -f <可执行文件完整路径>` 兜底 → 用首字符加方括号的
+    同一模式 `pgrep -f` 复核残留（防止匹配到自己；用完整路径是因为别的进程命令行里也可能
+    出现游戏名）。PlayCover 本体不动。
 11. **判定与上报** — `ok = (return_code == 0 and not cleanup_errors and home_verified is not False)`。最后编辑一次子区消息
     （✅/❌ + 总耗时），然后往频道发战报 Embed + `attachment://shot.png` 单条多段消息；
     多段上传失败时降级成「无图 Embed + `hermes send MEDIA:`」两条。最后写 `last_run.json`。
@@ -596,7 +657,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
 `maa_action.dispatch_blocker()`（不变量 #13）。
 
 **手动路径被闸门挡下时不排程**：blackout / Depot 窗口 / 时间预算（以及 `run.lock`、
-模拟器在线）任意一条命中，`copilot find` 当场返回拒绝——不写 `searches/<token>.json`、
+游戏在跑）任意一条命中，`copilot find` 当场返回拒绝——不写 `searches/<token>.json`、
 不派 worker。已经搜完才跨进 blackout 的那一轮停在 `scheduled` 并在卡上写明
 「本轮未启动：<原因>」；**手动轮不自动重试**（watcher 只跟踪自己的 `batch_token`），
 用户日常结束后重新选关即可，旧轮点 ❌ 收起或等 `prune_expired_searches()` 按 TTL 清掉。
@@ -623,8 +684,8 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    ├─ run_lock(blocking=False)：抢不到 → 放回 scheduled + 发通知
    ├─ 三条时间闸门再查一次（blackout / Depot 窗口 / 时间预算）：命中 → 放回 scheduled
    │    + 灰卡「本轮未启动：<原因>」，不碰设备（自动轮下一 tick 重派，手动轮不重试）
-   ├─ emulator_is_online()：在线 → 放回 scheduled + 「模拟器正在使用」，什么都不碰
-   ├─ status=executing → 收掉「取消本轮」按钮 → 开机链（StartUp/ADB/settle）
+   ├─ game_is_online()：在跑 → 放回 scheduled + 「明日方舟正在运行」，什么都不碰
+   ├─ status=executing → 收掉「取消本轮」按钮 → 开游戏链（verify/launch/wait/settle）
    ├─ 循环每个条目：
    │    mode == "raid" 且突袭开关为空 → 该条目 skipped，绝不跑 maa copilot（最后一道防线）
    │    maa_action.min_lead_reason()  距下一场日常不足 auto_copilot_min_lead_minutes → 收尾
@@ -680,7 +741,7 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    `maa_clearing.required_modes()` 不产生 `raid` 条目 → worker `_batch_run_locked()`
    拿到 `raid` 条目判 `skipped` → `switch_to_raid()` 直接拒绝。仓库种子是 `""`。
 4. **代理指挥开关**：点开始行动时代理开着会弹「确认要接管作战吗？」，MaaCore 的
-   copilot 链不处理 → 必失败。worker 内置 watchdog（`ocrbox` OCR + ADB tap）在弹窗
+   copilot 链不处理 → 必失败。worker 内置 watchdog（MaaTools 截图 + `ocrbox` OCR + MaaTools 点击，坐标换算见 §0.5）在弹窗
    出现时点确认。正常路径（游戏新会话代理默认关）watchdog 不会触发。
 5. **prts 的 `-1` 是「无要求」哨兵**：requirements 的 elite/level/skill_level/module
    为 -1 时视为无要求（实测踩坑：module=-1 曾导致 `module_levels[-1]` 越界）。
@@ -1201,7 +1262,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 21 | 森空岛失败文案必须带原始错误：`link` 修不了网络故障，不能让用户照着错的指引跑 | `fetch_roster()` 的 `detail` + `test_link_guidance_keeps_the_original_failure_cause` |
 | 22 | Depot 只有退出成功、任务 Completed、存在 `done=true` 非空库存且模拟器清理成功时才可替换真值；过程回调、识别失败和清理失败都不得污染旧快照 | `maa_depot.run_depot()` / `parse_depot_output()` + Depot 回归测试 |
 | 23 | Depot 不得在计划卡链路内运行；独立 cron 每日只做 7 天到期检查。任何日常抢锁失败都必须写 `last_lock_conflict_*`、发 Discord 并返回失败；`merge_last_run()` 必须持专用锁，不能用陈旧整份文件覆盖持锁任务的新状态 | `maa_depot.main()` / `maa_daily.report_lock_conflict()` / `maa_common.last_run_lock()` + 调度与锁冲突回归测试 |
-| 24 | **每一条自动链路**（日常 `am`/`pm`、抄作业 `run-batch`、Depot）在拿到 `run.lock` 之后、`open_emulator()` 之前探测模拟器：在线即判定「用户正在玩」并跳过本次，且**必须发 Discord 并写 `last_run.json`**（日常写 `status=skipped` + `skip_reason=emulator_busy`，Depot 写 `depot_status="skipped_busy"` 且**不动 `snapshot_at`**，抄作业把这一轮放回 `scheduled` 让 watcher 稍后重试），文案要给出出路。日常的 `now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `emulator_probe_timeout` 默认 5s，且**不得复用** `wait_for_android()`（180s）或 `settle_android_runtime()`（那是开机后的稳定性探测，用途不同）。**实现只允许有一份**，在 `maa_common.py`；`maa_daily` 那个同名函数只是薄封装 | `maa_common.emulator_is_online()` / `report_emulator_busy()` + `maa_daily.AUTO_PHASES` + `EmulatorProbeTests` / `EmulatorProbeSharedTests.test_a_busy_emulator_stops_the_copilot_round_before_it_opens_anything` |
+| 24 | **每一条自动链路**（日常 `am`/`pm`、抄作业 `run-batch`、Depot、肉鸽）在拿到 `run.lock` 之后、`launch_game()` 之前探测游戏进程：在跑即判定「用户正在玩」并跳过本次，且**必须发 Discord 并写 `last_run.json`**（日常写 `status=skipped` + `skip_reason=game_busy`，Depot 写 `depot_status="skipped_busy"` 且**不动 `snapshot_at`**，抄作业把这一轮放回 `scheduled` 让 watcher 稍后重试），文案要给出出路。日常的 `now` **永不**被探测跳过。探测**永不抛异常**（失败按离线处理照常执行）、总预算 `game_probe_timeout` 默认 5s，且**不得复用** `wait_for_game()`（120s）或 `settle_game_window()`（那是开游戏后的窗口体检，用途不同）。**实现只允许有一份**，在 `maa_playcover.py` | `maa_playcover.game_is_online()` + `maa_common.report_game_busy()` + `maa_daily.AUTO_PHASES` + `test_playcover.ProbeTests` / `GameProbeTests` / `EmulatorProbeSharedTests.test_there_is_exactly_one_probe_implementation` |
 | 25 | `state/config.json` 里**由线上进程写回的运行时缓存键**（当前 `maa_core_version`、`maa_cli_version`、`activity_stages`）必须列入 `deploy.PRESERVED_RUNTIME_CACHE_KEYS`：线上已有值一律保留，仓库种子**只在首次部署时兜底**。**新增此类键时必须同步加进这个元组**，否则每次 `deploy.py` 都会用种子盖掉线上真值（2026-09-02 已实际发生过一次） | `deploy.PRESERVED_RUNTIME_CACHE_KEYS` / `deploy_state()` + `test_every_known_runtime_cache_key_is_preserved_on_deploy`（手工清单比对，漏加即红）、`test_deploy_keeps_live_runtime_caches_and_seeds_only_when_absent` |
 | 26 | 「刷理智」与「每日剿灭」是 `render_daily_toml()` 里**两个独立开关**（`plan["farming"]` / `plan["annihilation"]`，`tasks.fight` 仍是二者的总开关）。理智让路**只摘刷理智、永远保留剿灭**（周上限 1800 合成玉、代理卡驱动，摘掉纯亏）。**估算失败一律照常刷**——宁可多刷一场，也不能因为读不出数就一整天什么都不打 | `render_daily_toml` 的两个 `if` + `attach_sanity_yield()` + `SanityYieldTests` |
 | 27 | 理智让路的判据**只有一条**：估算理智 < 默认关 `apCost`。森空岛不可用、关卡不在 `stages.json`、任何异常 → `farming = True`。让路时必须在开跑消息里写明理由（`farming_skip_reason`），不许静默 | `maa_daily.attach_sanity_yield()` + `SanityYieldTests.test_an_unreadable_estimate_farms_as_usual` / `test_a_throwing_probe_never_takes_the_farming_block_away` |
@@ -1251,7 +1312,7 @@ hermes gateway restart
 # 5. 真机验证（cron run 是在下一个调度 tick 触发，不是立即执行）
 hermes cron run 03d5e98ce8d4          # 早场计划卡（workdir=…/maa/am）
 python3 ~/.hermes/scripts/maa_action.py plan show     # 一次念完两场
-hermes cron run 50cd1fb095f2          # 完整早场（会真的开模拟器、真的耗理智）
+hermes cron run 50cd1fb095f2          # 完整早场（会真的开游戏、真的耗理智）
 ```
 
 ### 单测必须离线可跑
@@ -1312,16 +1373,16 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 
 | 症状 | 先看 |
 |---|---|
-| 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fl Landship`；或 cron 被 pause |
-| 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `open_emulator()` 还早 → `ls -l` 一下 `config.json` 的 `adb_path` 和 `maa_bin`（Landship 的 adb 在外置盘上，盘没挂载就会这样） |
+| 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fl com.hypergryph.arknights.app`；或 cron 被 pause |
+| 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `launch_game()` 还早 → `ls -l` 一下 `config.json` 的 `maa_bin`；或 `verify_game_installed()` 拒了（PlayCover 里 MaaTools 被关掉 / 端口改了） |
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
-| 场次 30～40 秒就红，日志只有五行且有 `TouchModeNotAvailable`，截图是模拟器桌面 | 没连上模拟器，MaaCore 在 StartUp 里 SIGSEGV 了 → §11.14。看 `last_run.connect_retries` 确认重试有没有接上；`com.loong.maa/crash.log` 是第二现场 |
+| 场次很快就红，日志里一串 `ScreencapFailed` / `ConnectFailed` | 游戏窗口不在台前（被挤进台前调度侧边栏、被最小化、MAA-Game 虚拟屏没了）或 MaaTools 没开 → §0.5。`BetterDisplay get -nameLike=MAA -connected` 看虚拟屏在不在；看 `last_run.connect_retries` 确认重试有没有接上 |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
 | 点按钮/下拉没反应或报未登记 | 卡片过期（07:50 与 21:50 各清一次 `hermes:btn:maa:` 前缀并重写，所以 21:50 之后早场卡必然点不动）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
 | 早场改的关晚上也生效了 / 改一场把另一场也改了 | 看 `plan.json` 的 `sessions`：是不是被写成了旧的顶层 `stage`。写路径只有 `maa_action._save_override(phase, …)` 和 `maa_plan_card.apply_auto_stage(result, phase)` 两处 |
 | 卡片上没有「活动截止」这一行 | 是设计：`~/Library/Caches/com.loong.maa/StageActivityV2.json` 读不出来就整行不显示。跑一次 `maa activity Official` 让它刷出来，或用 `config.maa_activity_cache` 指到别处 |
 | 说「抄作业」发的卡下拉是空的 | 一览里每关都标了「⛔ 上游无导航」——下拉只放上游写了导航定义的关（不变量 #37）。等热更新带来导航定义，或改抄资源本 / 主线 |
-| 日常/抄作业/Depot 报「模拟器正在使用」 | 探测命中了（不变量 #24）。`pgrep -fl Landship` 看是不是真有残留进程；确实是残留就 `pkill` 掉再重试。日常想强行跑就说「现在跑」 |
+| 日常/抄作业/Depot/肉鸽报「明日方舟正在运行」 | 探测命中了（不变量 #24）。`pgrep -fl com.hypergryph.arknights.app` 看是不是真有残留进程；确实是残留就退出游戏再重试。日常想强行跑就说「现在跑」 |
 | 卡片「为什么」写着「⚠️ 降级：… 抓取失败」 | 一图流 / 企鹅都没连上。`ls -l ~/.hermes/state/maa/farming/` 看缓存的 `fetched_at` 有多旧；本机手验：`curl -sI https://cos.yituliu.cn/arknights/stage-drop/matrix.json` 与 `curl -sS -X POST https://backend.yituliu.cn/item/v7/value -H 'Content-Type: application/json' -d '{}' \| head -c 200`。**抓不到不会让卡片消失**，只会让稀缺 / 效率两项退化 |
 | 活动期间卡片说资源本「不在本场候选集里」 | 这是设计（D5 / 不变量 #42）：活动期理智 all in 活动关。想刷资源本就从下拉手动选，手动选的关不受这条限制、也不带 `drops` 上限 |
 | 一场日常里只看到一个 Fight 段 | `runs/<date>-<phase>.json` 里 `plan.farming_drops` 是不是空的。冷启动、缺口 ≤ 0、或者用户手动选过关时**本来就不写上限**，第二个块也就不渲染（不变量 #44） |
@@ -1329,18 +1390,18 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | EX 关排不进自动作业轮 | 理智算不出来（不变量 #28 fail-closed）。上游 `stages.json` 没有 EX 条目，兜底靠 `farming/stage_info.json` 缓存——但**一图流也不收 EX 关**（spike B §1），所以这条兜底现在只能捞到「一图流有、上游 `stages.json` 没有」的关，EX 仍是已知缺口 |
 | 下拉里没有活动关 | `maa activity Official` 的输出变了 → 看 `activity_snapshot()` / `parse_activity_events()` 的分区解析与正则 |
 | 新活动上线后没有「已排程」卡 | `hermes cron list` 看“MAA 活动作业监控”；再看 `activity_watch.json`：`status=done` 说明目标集合是空的（看 `excluded` 里每关的理由），`waiting` 说明这一轮排不出条目，`scheduled` 说明排出来了但派发闸门没过 |
-| 「已排程」卡发了但一直不开跑 | `activity_watch.json` 的 `status` 停在 `scheduled`。原因按 `dispatch_blocker()` 的顺序看：还没到 `scheduled_at`（等理智）/ blackout / Depot 窗口 / `run.lock` 被占 / 模拟器在线 |
+| 「已排程」卡发了但一直不开跑 | `activity_watch.json` 的 `status` 停在 `scheduled`。原因按 `dispatch_blocker()` 的顺序看：还没到 `scheduled_at`（等理智）/ blackout / Depot 窗口 / `run.lock` 被占 / 游戏在跑 |
 | 某关一直不被自动抄 | 抄作业卡的一览就是答案：⛔ 上游无导航（**永远不会变好**，只能手动打或等热更新）、🚫 练度不满足（缺什么写在括号里）、✅ 已通（记账或森空岛 zone 全清）。`copilot/ledger.json` 是记账真值 |
 | 战报里某关 ❓ 未确认 | `copilot_outcome()` 返回 `unknown`：退出码 0 但没有 `Copilot Completed`。**不记通关**，下一轮会重打。日志文件名写在记账 `attempts[].detail` 里。上游改措辞了就改 `maa_clearing.COPILOT_VICTORY_MARKERS` |
 | 战报全 ❓、记账全 `unknown`，日志里却明明有 `Copilot Completed` | **看标记行 `# <时刻> copilot <关> mode=…` 是不是排在这一关的输出之后**。是的话就是逐关标记没 `flush()` 就把句柄交给了子进程（§5.5 关键事实 9 / 不变量 #33），切出来的「本关输出」是空段。2026-09-09 03:30 那轮就是这样，连带触发了 30 分钟退避后的重打 |
-| 自动作业每 15 分钟开一次模拟器、几十秒就关，同一关反复排（2026-10-11 YW-4 空转 17 轮） | 开打前的环境故障（多半是森空岛过期）。现在会被不变量 #55 截住：`activity_watch.json` 的 `status=blocked` + `blocked_reason` / `prefight_failures` 是答案；修好后说「恢复自动作业」立刻解除，否则次日自动恢复 |
+| 自动作业每 15 分钟开一次游戏、几十秒就关，同一关反复排（2026-10-11 YW-4 空转 17 轮） | 开打前的环境故障（多半是森空岛过期）。现在会被不变量 #55 截住：`activity_watch.json` 的 `status=blocked` + `blocked_reason` / `prefight_failures` 是答案；修好后说「恢复自动作业」立刻解除，否则次日自动恢复 |
 | 想在 Discord 里叫停自动作业 | 「已排程」卡或「▶️ 开始抄作业」通知上的「⏸️ 暂停自动作业」，或直接说「暂停自动作业」（`copilot auto off`）；`copilot/auto_pause.json` 是开关本体 |
 | 某关今天不再被自动排、卡上写「🚫 今日已尝试 N 次」 | 当日上限命中（`auto_copilot_max_attempts_per_day`，默认 2）。次日自动恢复；想现在就重打，从抄作业卡的下拉手动选它（手动路径不受这条限制）。`copilot/ledger.json` 的 `attempts` 是计数依据 |
 | 突袭那次总是失败 | 现状（2026-10-19 起）：种子改回 `ChangeToRaidDifficulty`，突袭默认开启。活动关走多作业路径，难度由 `copilot_list` 的 `is_raid` 切，YW-EX-1 / EX-2 突袭真机通过；`switch_to_raid()` 那一趟只剩逐关路径在用。以前默认空串 = **突袭功能关闭**。要重新启用先看 `runs/<date>-copilot-<token>.log` 里 `# raid-switch` 那段有没有 `Custom Completed`；2026-09-09 实测是 `Custom Error`（详情页上根本没有突袭控件），详见 §5.5 第 3 条 |
 | 卡上写「✅ 已通（突袭功能未启用）」 | 不是缺陷：`copilot_raid_switch_task` 为空，这一关只按普通难度判通关。想补突袭要先把开关配好并真机验一关（清单在 `docs/PLAN_PHASE4.md`） |
 | 点了「肉鸽停」还在跑 | 这是设计（不变量 #47）：停止只在**局间**生效，当前这一局会打完。要立刻停就点「⏏️ 立即中止」——那一局作废。看 `roguelike.json` 的 `stop_requested_at` 有没有写进去 |
 | 肉鸽开始被拒「上次 X 主题没有干净结束」 | `roguelike.json` 的 `dirty = true`（不变量 #49）。用**同一个主题**跑一局，上游自己会 `Continue → ExitThenAbandon` 收掉残局，干净结束后 `dirty` 清零，就能换主题了 |
-| 肉鸽一局都没跑就收尾了 | 战报的「停止原因」是答案：blackout（距 08:00 / 22:00 不足 `copilot_blackout_minutes`）、Depot 对表窗口（京 04:20–05:00）、模拟器在用。肉鸽不耗理智，所以**不会**是理智问题 |
+| 肉鸽一局都没跑就收尾了 | 战报的「停止原因」是答案：blackout（距 08:00 / 22:00 不足 `copilot_blackout_minutes`）、Depot 对表窗口（京 04:20–05:00）、游戏在跑。肉鸽不耗理智，所以**不会**是理智问题 |
 | 肉鸽说「已经在跑了」但频道里什么都没发生 | worker 进程没了。`roguelike.json` 的 `status` 停在 `running` 而 `run.lock` 是空的、且 `updated_at` 超过 10 分钟时，再点一次「▶️ 开始」就会按新的一轮重开（`round_is_stale()`）。**不要手改状态文件**——等这 10 分钟或直接再点一次 |
 | 肉鸽每局 35~40 秒就 `Roguelike Error`、收尾截图是模拟器桌面 | 游戏根本没被拉起来：任务文件少了开头那段 `StartUp`（2026-09-11 事故，已修）。确认 `maa_roguelike.render_task_toml()` 渲染的第一个任务是 `type = "StartUp"` + `start_game_enabled = true`，并跑一次 `deploy.py --check` 看线上是不是旧版本。日志里的特征是 `Connected` 之后直接 `Roguelike Start → Roguelike Error`，中间没有 `StartUp Completed` |
 | 肉鸽一直点空 / 进错主题 | 手册要求把目标主题**置顶在终端**，自动导航「不保证长期可用」（社区 issue #13245 就是界园被认成萨卡兹）。先在游戏里置顶，再看 `runs/<date>-roguelike-<token>.log` |
@@ -1351,7 +1412,7 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 | 信用商店没按 `mall_buy_first` 买 | 先看渲染出的 `~/.config/maa-cli/tasks/daily.toml` 里 `buy_first` 是不是空的：白名单（`SAFE_MALL_ITEM_RE`）会**静默丢弃**带引号、换行、超长（>20 字）的物品名。名字要和游戏里一模一样 |
 | 聊天改计划无效 | 看 agent 是否真的调了 `maa_action.py`；`plan.json` 的 `date` 是否是今天 |
 | 战报里步骤全是「未执行」 | maa-cli 输出格式变了 → 改 `_task_state()` / `TASK_STEPS` |
-| 截图失败 | ADB 断了或返回非 PNG；不阻断主流程，看 Embed 备注 |
+| 截图失败 | MaaTools 没连上，或 `SCRN` 为空且兜底的 `screencapture` 没录屏权限（§0.5）；不阻断主流程，看 Embed 备注 |
 | 战报说「截图不是游戏主页」 | 看 `runs/<date>-<phase>.png` 到底停在哪一页；`last_run.home_verify_detail` 有命中了几个标识。UI 改版导致误杀就调 `HOME_MARKERS` |
 | `返回主界面` 报 Error 但截图确实在主页 | `maa update` 后 QuickSwitch 任务图变了 → 翻 `asst.log` 里 `taskchain":"Custom"` 的 `to_be_recognized`，对照资源 json 看少了哪一项 |
 | 启动 / 信用商店 / 领取奖励 / 返回主界面一起 Error，截图在主页 | 主页标识 `SwitchTheme@ToggleSettingsMenu` 没命中：`asst.log` 里它的 `match_templ` 分数卡在 0.7 左右。2026-11-02 就是游戏 26.11.1 主页改版、MaaCore 还停在旧版（计划卡停着 = 没人跑 `maa update`）。先 `maa update` 到带新模板的版本 |
@@ -1373,7 +1434,7 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
 
 ## 11. 已知坑
 
-1. **模拟器需要活跃图形会话**——锁屏/关显示器没问题，注销或切换用户会失败。
+1. **游戏需要活跃图形会话和在线的 MAA-Game 虚拟屏**——注销、切换用户、BetterDisplay 没开都会失败（§0.5）。
 2. **`hermes update` 会覆盖 adapter 补丁**——升级后必须重跑 `deploy.py` 并复验按钮。
 3. **Beta MaaCore 的连战重识别**：有限 `times` 下改选倍率后偶发识别不到，可能多起一批。
    生产用 `times=2147483647` + `series=0` 规避（README「本机落地状态」有实测记录）。

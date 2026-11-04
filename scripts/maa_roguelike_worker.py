@@ -6,7 +6,7 @@
   用尽时干净停在主题入口页，子进程正常退出，worker 看到标志就不再派下一局。
 - **立即中止** = 轮询到 `abort_requested_at` 时对子进程 `terminate()`（SIGTERM），
   maa-cli 收到后 `bail!`，当前这一局作废。**绝不用 `subprocess.run(timeout=)`**：
-  那条路超时走 `kill()`（SIGKILL），MaaCore 来不及 destroy，模拟器会留在地图里。
+  那条路超时走 `kill()`（SIGKILL），MaaCore 来不及 destroy，游戏会留在地图里。
 
 Deliberately NOT in the Hermes button whitelist; only maa_action.py may spawn it.
 """
@@ -22,13 +22,14 @@ from typing import Any
 
 import maa_action
 import maa_roguelike
-from maa_daily import (
+from maa_playcover import (
     capture_screenshot,
-    close_everything,
-    open_emulator,
-    settle_android_runtime,
+    close_game,
+    game_is_online,
+    launch_game,
+    settle_game_window,
     verify_game_installed,
-    wait_for_android,
+    wait_for_game,
 )
 # 这三个是抄作业 worker 里已经在线上跑过的通用件：隔离临时 `MAA_CONFIG_DIR`、
 # 灰卡通知、带截图的战报上传。复制一份只会多出第二处要维护的实现，
@@ -37,7 +38,6 @@ from maa_copilot_worker import _isolated_config, _notice, _post_report
 from maa_common import (
     RUNS_DIR,
     cleanup_run_files,
-    emulator_is_online,
     load_config,
     maa_subprocess_env,
     merge_last_run,
@@ -55,8 +55,8 @@ TERMINATE_GRACE = 10
 # 上游连续报错就收摊：再跑下去只是反复空转、白占 run.lock。
 ERROR_STREAK_LIMIT = 2
 
-EMULATOR_BUSY_NOTICE = (
-    "检测到模拟器正在使用（多半是你在玩，或上一个任务没退干净），本轮肉鸽未执行，"
+GAME_BUSY_NOTICE = (
+    "检测到明日方舟正在运行（多半是你在玩，或上一个任务没退干净），本轮肉鸽未执行，"
     "也没有碰设备。等你退出后再点一次「▶️ 开始」。"
 )
 
@@ -189,7 +189,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     log_path = RUNS_DIR / f"{stem}.log"
     png_path = RUNS_DIR / f"{stem}.png"
     started = time.monotonic()
-    emulator_touched = False
+    game_touched = False
     dirty = bool(state.get("dirty"))
     last_theme = str(state.get("last_theme") or "")
     runs: list[dict[str, Any]] = []
@@ -197,33 +197,33 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     cleanup_errors: list[str] = []
     last_output = ""
 
-    # 不变量 #24：抢到 `run.lock` 之后、`open_emulator()` 之前探一次。
-    # 在线就什么都不碰——任何失败路径都会 `close_everything()` 退掉 BlueStacks，
+    # 不变量 #24：抢到 `run.lock` 之后、`launch_game()` 之前探一次。
+    # 在线就什么都不碰——任何失败路径都会 `close_game()` 退掉 BlueStacks，
     # 等于把正在玩的用户踢出游戏。
-    online, probe_detail = emulator_is_online(config)
+    online, probe_detail = game_is_online(config)
     if online:
         _finish(token, dirty=dirty, theme=last_theme)
         _notice(
             config,
             "⏸️ 肉鸽本轮未启动",
-            f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}",
+            f"{GAME_BUSY_NOTICE}\n探测：{probe_detail}",
             0x99AAB5,
         )
         merge_last_run(
             {
                 "status": "skipped",
                 "phase": f"roguelike-{token}",
-                "skip_reason": "emulator_busy",
-                "summary": EMULATOR_BUSY_NOTICE,
-                "emulator_probe": probe_detail,
+                "skip_reason": "game_busy",
+                "summary": GAME_BUSY_NOTICE,
+                "game_probe": probe_detail,
                 "finished_at": now_beijing().isoformat(),
             }
         )
         return 0
 
-    # 任务文件以 `StartUp` 开头（`maa_roguelike.STARTUP_TOML`）：下面的开机链只拉
-    # **模拟器**，拉起**游戏**的是 MaaCore 的 `StartUp`。2026-09-11 那次事故就是任务文件
-    # 里少了它，模拟器停在 Android 桌面、`Roguelike` 直接 Error。
+    # 任务文件以 `StartUp` 开头（`maa_roguelike.STARTUP_TOML`）：下面的开机链只把
+    # 游戏进程拉起来，登录、过首登弹窗靠的是 MaaCore 的 `StartUp`。2026-09-11（模拟器版）
+    # 那次事故就是任务文件里少了它，`Roguelike` 直接 Error。
     # 任务文件整轮只渲染一次：参数在 `roguelike start` 那一刻就冻结了，
     # 中途改卡改不动这一轮（`roguelike set` 在 running 时直接拒绝）。
     # 卡片**不收**：开跑之后「⏹️ / ⏏️」两个按钮正是要一直可点的。
@@ -231,7 +231,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     error_streak = 0
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+        verify_game_installed(config)
         merge_last_run(
             {
                 "status": "running",
@@ -242,7 +242,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
             }
         )
         # 开机是**懒的**：闸门 / 停止标志都在循环头上查，过了才碰设备。
-        # 从前是先开机再进循环，首局就被挡时白开一次模拟器——开机加清理好几分钟，
+        # 从前是先开机再进循环，首局就被挡时白开一次游戏——开游戏加清理好几分钟，
         # 全程还占着 run.lock，正是它要让路的那个 Depot / 日常在等的锁。
         env: dict[str, str] = {}
         while True:
@@ -255,7 +255,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
             blocker = _next_round_blocker(config)
             if blocker:
                 stop_reason = blocker
-                if not emulator_touched:
+                if not game_touched:
                     # 一局都没开成：灰卡说清楚为什么（护栏 4，跳过必须可见）。
                     # 第 N+1 局被挡则只写进下面的战报，不再多发一张。
                     _notice(
@@ -265,7 +265,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
                         0x99AAB5,
                     )
                 break
-            if not emulator_touched:
+            if not game_touched:
                 _notice(
                     config,
                     "▶️ 开始刷肉鸽",
@@ -273,13 +273,11 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
                     "每打完一局发一条进度；说「肉鸽停」会在本局结束后退出。",
                     0x9B59B6,
                 )
-                open_emulator(config)
-                emulator_touched = True
-                wait_for_android(config)
-                verify_game_installed(config)
-                # 冷启模拟器同样会撞上 MaaCore 那 3 秒的 MaaTouch 窗口
-                #（DEV_GUIDE §11.14）。
-                settle_android_runtime(config)
+                launch_game(config)
+                game_touched = True
+                wait_for_game(config)
+                # 游戏窗口必须在 MAA-Game 虚拟屏台前，否则 MaaTools 截图为空。
+                settle_game_window(config)
                 env = maa_subprocess_env(config)
                 env["MAA_LOG_PREFIX"] = "Never"
             index = len(runs) + 1
@@ -345,13 +343,13 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
         stop_reason = f"{type(exc).__name__}: {exc}"
         print(f"roguelike EXCEPTION: {stop_reason}", flush=True)
     finally:
-        if emulator_touched:
+        if game_touched:
             try:
                 capture_screenshot(config, png_path)
             except Exception:
                 pass
             try:
-                cleanup_errors = close_everything(config)
+                cleanup_errors = close_game(config)
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
@@ -369,8 +367,8 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
             {"name": "总耗时", "value": f"{duration / 60:.0f} 分钟", "inline": True},
         ],
         "footer": {"text": "肉鸽不消耗理智 · "
-                           + ("模拟器与 ADB 已执行清理" if emulator_touched
-                              else "全程没有碰设备")},
+                           + ("游戏进程已执行清理" if game_touched
+                              else "全程没有碰游戏")},
         "timestamp": now_beijing().isoformat(),
     }
     embed["fields"].extend(
@@ -394,7 +392,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
         embed["fields"].append(
             {"name": "清理异常", "value": "; ".join(cleanup_errors)[:1024], "inline": False}
         )
-    _post_report(config, embed, png_path if emulator_touched else None)
+    _post_report(config, embed, png_path if game_touched else None)
 
     merge_last_run(
         {

@@ -29,6 +29,7 @@ import maa_daily  # noqa: E402
 import maa_farming  # noqa: E402
 import maa_gamedata  # noqa: E402
 import maa_plan_card  # noqa: E402
+import maa_playcover  # noqa: E402
 import maa_roguelike  # noqa: E402
 import deploy  # noqa: E402
 
@@ -45,8 +46,34 @@ _NO_NETWORK = None
 _GAMEDATA_PATCHES: list = []
 
 
+class RealGameTouched(BaseException):
+    """单测碰到了真游戏。继承 BaseException：设备层里的 `except Exception` 吞不掉它。"""
+
+
+class _NoRealGame:
+    """顶替 `maa_playcover` 里的 `subprocess` / `socket`：开游戏、TERM、点屏幕、pgrep
+    一律当场炸。2026-11-04 Depot 用例桩错了模块（桩的 `maa_daily.*`、调的是
+    `maa_playcover.*`），整套单测真的把正在跑的明日方舟关掉了。设备层自己的行为在
+    `test_playcover.py` 里测，那里自己给假的 subprocess / socket。"""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attr: str):
+        raise RealGameTouched(f"单测碰到了真游戏：maa_playcover.{self._name}.{attr}——自行打桩")
+
+
+_DEVICE_GUARDS: list = []
+
+
 def setUpModule() -> None:
     global _NO_NETWORK
+    _DEVICE_GUARDS[:] = [
+        patch.object(maa_playcover, "subprocess", _NoRealGame("subprocess")),
+        patch.object(maa_playcover, "socket", _NoRealGame("socket")),
+    ]
+    for item in _DEVICE_GUARDS:
+        item.start()
     _NO_NETWORK = patch.object(
         maa_farming,
         "_http_json",
@@ -71,6 +98,8 @@ def tearDownModule() -> None:
     if _NO_NETWORK is not None:
         _NO_NETWORK.stop()
     for item in reversed(_GAMEDATA_PATCHES):
+        item.stop()
+    for item in reversed(_DEVICE_GUARDS):
         item.stop()
 
 
@@ -462,119 +491,6 @@ class RenderingTests(unittest.TestCase):
         self.assertIn("☄️ 每日剿灭：⏭️ 今日已刷过，本场跳过", summary)
         self.assertNotIn("每日剿灭：⏸️ 未执行", summary)
 
-    def test_cleanup_continues_after_closedown_is_missing(self) -> None:
-        results = [
-            FileNotFoundError("maa"),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=1, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=1, stdout="", stderr=""),
-        ]
-
-        def fake_run(*_args, **_kwargs):
-            result = results.pop(0)
-            if isinstance(result, Exception):
-                raise result
-            return result
-
-        with patch.object(maa_daily.subprocess, "run", side_effect=fake_run) as run, patch.object(
-            maa_daily.time, "sleep"
-        ):
-            errors = maa_daily.close_everything(
-                {
-                    "maa_bin": "/missing/maa",
-                    "adb_path": "/missing/adb",
-                    "emulator_app": "BlueStacks",
-                    "quit_grace_seconds": 0,
-                }
-            )
-        self.assertEqual(run.call_count, 5)
-        self.assertTrue(any("closedown" in item for item in errors))
-        self.assertEqual(
-            run.call_args_list[-1].args[0],
-            ["pgrep", "-fi", "[B]lueStacks"],
-        )
-
-    def test_cleanup_waits_for_processes_to_exit_after_fallback(self) -> None:
-        results = [
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=1, stdout="", stderr="cancelled"),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="123\n", stderr=""),
-            SimpleNamespace(returncode=1, stdout="", stderr=""),
-        ]
-        with patch.object(maa_daily.subprocess, "run", side_effect=results) as run, patch.object(
-            maa_daily.time, "sleep"
-        ):
-            errors = maa_daily.close_everything(
-                {
-                    "maa_bin": "/maa",
-                    "adb_path": "/adb",
-                    "emulator_app": "BlueStacks",
-                    "emulator_bundle_id": "com.now.gg.BlueStacks",
-                    "quit_grace_seconds": 0,
-                    "cleanup_verify_timeout": 2,
-                }
-            )
-        self.assertEqual(errors, [])
-        self.assertEqual(run.call_count, 6)
-
-    def test_cleanup_residue_check_can_be_case_sensitive(self) -> None:
-        results = [
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=0, stdout="", stderr=""),
-            SimpleNamespace(returncode=1, stdout="", stderr=""),
-        ]
-        with patch.object(maa_daily.subprocess, "run", side_effect=results) as run, patch.object(
-            maa_daily.time, "sleep"
-        ):
-            errors = maa_daily.close_everything(
-                {
-                    "maa_bin": "/maa",
-                    "adb_path": "/adb",
-                    "emulator_app": "Landship",
-                    "emulator_bundle_id": "com.wadorudi.landship",
-                    "emulator_process_ignore_case": False,
-                    "quit_grace_seconds": 0,
-                }
-            )
-        self.assertEqual(errors, [])
-        self.assertEqual(run.call_args_list[2].args[0], ["pkill", "-f", "Landship"])
-        self.assertEqual(run.call_args_list[-1].args[0], ["pgrep", "-f", "[L]andship"])
-
-    def test_game_package_preflight(self) -> None:
-        config = {
-            "adb_path": "/adb",
-            "adb_address": "127.0.0.1:5555",
-            "game_package": "com.hypergryph.arknights",
-        }
-        installed = SimpleNamespace(
-            returncode=0,
-            stdout="package:/data/app/com.hypergryph.arknights/base.apk\n",
-            stderr="",
-        )
-        with patch.object(maa_daily.subprocess, "run", return_value=installed) as run:
-            maa_daily.verify_game_installed(config)
-        self.assertEqual(
-            run.call_args.args[0],
-            [
-                "/adb",
-                "-s",
-                "127.0.0.1:5555",
-                "shell",
-                "pm",
-                "path",
-                "com.hypergryph.arknights",
-            ],
-        )
-
-        missing = SimpleNamespace(returncode=0, stdout="", stderr="")
-        with patch.object(maa_daily.subprocess, "run", return_value=missing):
-            with self.assertRaisesRegex(RuntimeError, "未检测到"):
-                maa_daily.verify_game_installed(config)
 
     def test_maa_run_timeout_terminates_and_returns_124(self) -> None:
         class FakeProcess:
@@ -671,33 +587,6 @@ class RenderingTests(unittest.TestCase):
         self.assertTrue(any("人工指令" in line for line in stderr))
         self.assertIn("maa run 已按人工指令终止", log)
 
-
-class EmulatorBootDiagnosticTests(unittest.TestCase):
-    def test_reports_upgrade_gate_before_vm_start(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            player_log = Path(raw) / "Player.log"
-            player_log.write_text(
-                "old session\n[QTUI] Start Virtual Machine\n"
-                "=================== xlogStart [5.21] =================\n"
-                'cldDoPostRequest url: "https://cloud.bluestacks.com/bs3/check_upgrade"\n'
-            )
-            detail = maa_daily.emulator_boot_diagnostic(
-                {"emulator_player_log": str(player_log)}
-            )
-        self.assertIn("升级检查没有放行", detail)
-
-    def test_ignores_session_that_started_the_vm(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            player_log = Path(raw) / "Player.log"
-            player_log.write_text(
-                "=================== xlogStart [5.21] =================\n"
-                'cldDoPostRequest url: "https://cloud.bluestacks.com/bs3/check_upgrade"\n'
-                "[QTUI] Start Virtual Machine\n"
-            )
-            detail = maa_daily.emulator_boot_diagnostic(
-                {"emulator_player_log": str(player_log)}
-            )
-        self.assertEqual(detail, "")
 
 
 class DiscordCardTests(unittest.TestCase):
@@ -1616,8 +1505,8 @@ class ConnectFailureTests(unittest.TestCase):
             home_verified=False,
             home_verify_detail="识别到 0/8 个主页标识",
         )
-        self.assertIn("🚀 登录与首登领取：❌ 中断（没连上模拟器（TouchModeNotAvailable）", summary)
-        self.assertIn("一个键都没点", summary)
+        self.assertIn("🚀 登录与首登领取：❌ 中断（没连上游戏（TouchModeNotAvailable）", summary)
+        self.assertIn("MaaTools", summary)
 
     def test_report_note_explains_the_retries(self) -> None:
         payload = maa_daily.report_payload(
@@ -1659,6 +1548,8 @@ class ConnectRetryTests(unittest.TestCase):
             with (
                 patch.object(maa_daily, "run_maa", side_effect=attempts) as runner,
                 patch.object(maa_daily.time, "sleep"),
+                patch.object(maa_daily, "settle_game_window", return_value="") as settle,
+                patch.object(maa_daily, "wait_for_game") as wait,
             ):
                 result = maa_daily.run_maa_resilient(
                     {"maa_run_timeout": 3000, **config},
@@ -1668,7 +1559,7 @@ class ConnectRetryTests(unittest.TestCase):
                     "2",
                     maa_common.normalize_plan({"stage": "TO-9"}),
                 )
-            self.runner = runner
+            self.runner, self.settle, self.wait = runner, settle, wait
             self.log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         return result
 
@@ -1686,8 +1577,12 @@ class ConnectRetryTests(unittest.TestCase):
         self.assertIn("Fight Completed", out)
         self.assertFalse(self.runner.call_args_list[0].kwargs["append"])
         self.assertTrue(self.runner.call_args_list[1].kwargs["append"])
-        self.assertIn("等 8s 重开第 1 趟", "".join(err))
+        self.assertIn("等 8s", "".join(err))
+        self.assertIn("重开第 1 趟", "".join(err))
         self.assertIn("重开第 1 趟", self.log_text)
+        # 重开之前先把游戏窗口摆回台前、等 MaaTools 就绪。
+        self.settle.assert_called_once()
+        self.wait.assert_called_once()
 
     def test_a_healthy_run_is_never_retried(self) -> None:
         code, _out, err, retries = self._resilient([(0, ["Custom Completed"], [])], {})
@@ -1736,47 +1631,6 @@ class ConnectRetryTests(unittest.TestCase):
         carried = self.runner.call_args_list[1].kwargs["carry_lines"]
         self.assertIn("TouchModeNotAvailable", carried)
 
-
-class SettleTests(unittest.TestCase):
-    def _settle(self, costs: list[float], config: dict) -> tuple[str, float]:
-        """用假时钟跑闸门，返回 (告警, 花掉的秒数)。costs 是每次探针的耗时。"""
-        clock = {"now": 0.0}
-        sequence = list(costs)
-
-        def fake_run(*_args, **_kwargs):
-            clock["now"] += sequence.pop(0) if sequence else 0.02
-            return SimpleNamespace(returncode=0, stdout="0", stderr="")
-
-        def fake_sleep(seconds: float) -> None:
-            clock["now"] += seconds
-
-        with (
-            patch.object(maa_daily.subprocess, "run", side_effect=fake_run),
-            patch.object(maa_daily.time, "monotonic", side_effect=lambda: clock["now"]),
-            patch.object(maa_daily.time, "sleep", side_effect=fake_sleep),
-        ):
-            warning = maa_daily.settle_android_runtime({"adb_path": "/adb", **config})
-        return warning, clock["now"]
-
-    def test_a_quiet_emulator_is_handed_over_after_one_quiet_window(self) -> None:
-        warning, spent = self._settle([0.03] * 40, {})
-        self.assertEqual(warning, "")
-        self.assertLess(spent, 12)
-
-    def test_a_stall_restarts_the_quiet_window(self) -> None:
-        # 2026-08-08 实测的形状：安静 4 秒 → 突然卡 2.8 秒 → 恢复。卡顿必须把安静
-        # 计时清零，否则闸门会在 8 秒刚过时开门，正好把场子交在抖动上。
-        warning, spent = self._settle([0.03] * 8 + [2.8] + [0.03] * 60, {})
-        self.assertEqual(warning, "")
-        self.assertGreater(spent, 15)
-
-    def test_a_permanently_busy_emulator_warns_but_does_not_block(self) -> None:
-        warning, _spent = self._settle([2.0] * 200, {"emulator_settle_timeout": 20})
-        self.assertIn("未在 20s 内稳定", warning)
-
-    def test_the_gate_can_be_turned_off(self) -> None:
-        self.assertEqual(self._settle([], {"emulator_settle_quiet_seconds": 0}), ("", 0.0))
-        self.assertEqual(self._settle([], {"emulator_settle_timeout": 0}), ("", 0.0))
 
 
 class ProxyFailureTests(unittest.TestCase):
@@ -2242,6 +2096,28 @@ HOME_OCR = "\n".join(
         "档案\t[605,948,33,22]",
     ]
 )
+SANRIO_HOME_OCR = "\n".join(
+    [
+        "wado\t[97,583,131,47]",
+        "FRIENDS\t[527,803,80,25]",
+        "•好友\t[560,826,47,22]",
+        "TTGR ARCHIKE\t[454,881,156,50]",
+        "•档案\t[560,906,47,17]",
+        "TERMiN\t[1375,210,215,74]",
+        "理智/208\t[1191,373,106,28]",
+        "•SQUADS‘\t[1230,501,145,36]",
+        "•编\t[1264,546,33,22]",
+        "2013天葉购中心\t[1112,603,222,66]",
+        "OPERATOR：\t[1579,503,181,41]",
+        "RECRUIT\t[1501,711,100,33]",
+        "公开招募\t[1497,740,86,33]",
+        "NSTORE\t[1210,740,140,38]",
+        "MISSION\t[1272,856,103,39]",
+        "BASE\t[1640,930,80,40]",
+        "甚建\t[1650,975,55,30]",
+        "HEADHUNT\t[1700,711,140,33]",
+    ]
+)
 # The 任务 (mission) list page — where a broken return-to-home chain leaves us.
 # It also says 好友, which is why a single marker must never be enough.
 MISSION_OCR = "\n".join(
@@ -2285,6 +2161,13 @@ class HomeScreenshotTests(unittest.TestCase):
         self.assertIs(verified, True)
         self.assertIn("终端", detail)
         self.assertIn(f"/{len(maa_daily.HOME_MARKERS)}", detail)
+
+    def test_a_themed_home_page_is_accepted_from_its_english_labels(self) -> None:
+        # 2026-11-04 三丽鸥联动主题下的真机 OCR（PlayCover，节选）：中文入口名大多读碎了，
+        # 旧的 8 个词只命中 3 个，好好的主页被判红。
+        verified, detail = self._verify(SANRIO_HOME_OCR)
+        self.assertIs(verified, True, detail)
+        self.assertIn("终端", detail)
 
     def test_mission_page_and_splash_are_rejected(self) -> None:
         for sample in (MISSION_OCR, SPLASH_OCR):
@@ -2565,16 +2448,16 @@ class DepotTests(unittest.TestCase):
         context.__enter__.return_value = True
         context.__exit__.return_value = False
         failed = SimpleNamespace(returncode=1, stdout="", stderr="recognition failed")
-        config = {"maa_bin": "/maa", "adb_path": "/adb"}
+        config = {"maa_bin": "/maa"}
         with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-            maa_depot, "emulator_is_online", return_value=(False, "离线")
+            maa_depot, "game_is_online", return_value=(False, "离线")
         ), patch.object(maa_daily, "require_executable"), patch.object(
-            maa_daily, "open_emulator"
+            maa_playcover, "launch_game"
         ), patch.object(
-            maa_daily, "wait_for_android"
-        ), patch.object(maa_daily, "verify_game_installed"), patch.object(
-            maa_daily, "settle_android_runtime"
-        ), patch.object(maa_daily, "close_everything", return_value=[]), patch.object(
+            maa_playcover, "wait_for_game"
+        ), patch.object(maa_playcover, "verify_game_installed"), patch.object(
+            maa_playcover, "settle_game_window"
+        ), patch.object(maa_playcover, "close_game", return_value=[]), patch.object(
             maa_depot.subprocess, "run", return_value=failed
         ), patch.object(maa_depot, "reconcile") as writer:
             with self.assertRaisesRegex(RuntimeError, "recognition failed"):
@@ -2655,86 +2538,13 @@ class LockConflictTests(unittest.TestCase):
         )
 
 
-class EmulatorProbeTests(unittest.TestCase):
-    """PLAN_NAV_GATE B: automatic phases must not steal a device in use.
+class GameProbeTests(unittest.TestCase):
+    """PLAN_NAV_GATE B: automatic phases must not steal a game in use.
 
-    实现自四期 1d 起在 `maa_common`，四条自动链路共用（D18）；
-    这里直接测那一份，`maa_daily.emulator_is_online` 只是同一个对象。
+    探测本身在 `maa_playcover.game_is_online`（`test_playcover.py` 里测），
+    这里只测日常 `execute()` 怎么用它。
     """
 
-    @staticmethod
-    def _completed(returncode: int, stdout: str = "") -> SimpleNamespace:
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
-
-    def test_probe_reports_online_from_the_process_signal_alone(self) -> None:
-        # A freshly launched BlueStacks has no Android yet, so the process
-        # signal must be able to answer "online" without asking ADB at all.
-        with patch.object(
-            maa_common.subprocess, "run", return_value=self._completed(0, "4242\n")
-        ) as run:
-            online, detail = maa_common.emulator_is_online({})
-        self.assertTrue(online)
-        self.assertIn("进程在跑", detail)
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][:2], ["pgrep", "-f"])
-
-    def test_probe_reports_online_when_adb_says_boot_completed(self) -> None:
-        # A hung process can outlive its device and vice versa, so ADB is the
-        # second half of the OR.
-        results = [self._completed(1), self._completed(0), self._completed(0, "1\n")]
-        with patch.object(maa_common.subprocess, "run", side_effect=results):
-            online, detail = maa_common.emulator_is_online({})
-        self.assertTrue(online)
-        self.assertIn("sys.boot_completed", detail)
-
-    def test_probe_reports_offline_when_both_signals_miss(self) -> None:
-        results = [self._completed(1), self._completed(0), self._completed(0, "\n")]
-        with patch.object(maa_common.subprocess, "run", side_effect=results):
-            online, detail = maa_common.emulator_is_online({})
-        self.assertFalse(online)
-        self.assertIn("未连上", detail)
-
-    def test_a_broken_probe_falls_back_to_offline_and_never_raises(self) -> None:
-        # Grabbing the device once by mistake is far cheaper than a daily that
-        # stops forever because the probe itself broke (B-4).
-        for failure in (
-            maa_common.subprocess.TimeoutExpired(cmd="pgrep", timeout=2),
-            OSError("adb missing"),
-        ):
-            with self.subTest(failure=type(failure).__name__):
-                with patch.object(maa_common.subprocess, "run", side_effect=failure):
-                    online, detail = maa_common.emulator_is_online({})
-                self.assertFalse(online)
-                self.assertTrue(detail)
-
-    def test_the_probe_budget_is_bounded_and_disablable(self) -> None:
-        # `wait_for_android` 要等 180s、`settle_android_runtime` 是开机后的稳定性探测，
-        # 复用任何一个都会撑爆运行预算和不变量 #6。公共层不 import `maa_daily`，
-        # 结构上就够不着它们。
-        source = (ROOT / "scripts" / "maa_common.py").read_text(encoding="utf-8")
-        self.assertNotIn("import maa_daily", source)
-        with patch.object(maa_common.subprocess, "run") as run:
-            online, detail = maa_common.emulator_is_online({"emulator_probe_timeout": 0})
-        self.assertFalse(online)
-        self.assertIn("探测已禁用", detail)
-        run.assert_not_called()
-        timeouts = []
-        with patch.object(
-            maa_common.subprocess,
-            "run",
-            side_effect=lambda *a, **k: timeouts.append(k["timeout"])
-            or self._completed(1),
-        ):
-            maa_common.emulator_is_online({})
-        self.assertTrue(timeouts)
-        self.assertLessEqual(sum(timeouts), 8.0)
-
-    def test_probe_refuses_an_unvalidated_app_name_without_blocking_the_run(self) -> None:
-        with patch.object(maa_common.subprocess, "run") as run:
-            online, detail = maa_common.emulator_is_online({"emulator_app": "evil; rm -rf /"})
-        self.assertFalse(online)
-        self.assertIn("非法字符", detail)
-        run.assert_not_called()
 
     def _execute(self, phase: str, *, online: bool, probe=None):
         """Drive execute() far enough to observe the probe branch."""
@@ -2754,7 +2564,7 @@ class EmulatorProbeTests(unittest.TestCase):
         ), patch.object(maa_daily, "atomic_write_json"), patch.object(
             maa_daily, "should_skip", return_value=False
         ), patch.object(
-            maa_daily, "emulator_is_online", probe
+            maa_daily, "game_is_online", probe
         ), patch.object(maa_daily, "merge_last_run") as merge, patch.object(
             maa_daily, "discord_request"
         ) as request, patch.object(
@@ -2766,7 +2576,7 @@ class EmulatorProbeTests(unittest.TestCase):
         ) as common_request, patch.object(
             maa_common, "discord_token", return_value="token"
         ), patch.object(maa_daily, "require_executable"), patch.object(
-            maa_daily, "open_emulator", side_effect=RuntimeError("STOP: probe passed")
+            maa_daily, "launch_game", side_effect=RuntimeError("STOP: probe passed")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
         merge.call_args_list = merge.call_args_list + common_merge.call_args_list
@@ -2784,11 +2594,11 @@ class EmulatorProbeTests(unittest.TestCase):
 
                 # 护栏 4: a skip that nobody can see is a permanent silent stall.
                 records = [call.args[0] for call in result.merge.call_args_list]
-                skipped = [r for r in records if r.get("skip_reason") == "emulator_busy"]
+                skipped = [r for r in records if r.get("skip_reason") == "game_busy"]
                 self.assertEqual(len(skipped), 1)
                 self.assertEqual(skipped[0]["status"], "skipped")
                 self.assertEqual(skipped[0]["phase"], phase)
-                self.assertEqual(skipped[0]["emulator_probe"], "探测明细")
+                self.assertEqual(skipped[0]["game_probe"], "探测明细")
                 self.assertTrue(skipped[0]["finished_at"])
 
                 payloads = [
@@ -4271,11 +4081,11 @@ class SessionDailyTests(unittest.TestCase):
         ), patch.object(maa_daily, "run_lock", return_value=lock), patch.object(
             maa_daily, "cleanup_run_files"
         ), patch.object(maa_daily, "atomic_write_json") as snapshot, patch.object(
-            maa_daily, "emulator_is_online", return_value=(False, "离线")
+            maa_daily, "game_is_online", return_value=(False, "离线")
         ), patch.object(maa_daily, "merge_last_run"), patch.object(
             maa_daily, "discord_request"
         ) as request, patch.object(maa_daily, "require_executable"), patch.object(
-            maa_daily, "open_emulator", side_effect=RuntimeError("STOP: 已越过跳过闸门")
+            maa_daily, "launch_game", side_effect=RuntimeError("STOP: 已越过跳过闸门")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
         return SimpleNamespace(
@@ -4511,15 +4321,21 @@ class EmulatorProbeSharedTests(unittest.TestCase):
     """四期 1d：一份探测实现，四条自动链路共用（D18 / 不变量 #24）。"""
 
     def test_there_is_exactly_one_probe_implementation(self) -> None:
-        self.assertIs(maa_daily.emulator_is_online, maa_common.emulator_is_online)
-        self.assertIs(maa_depot.emulator_is_online, maa_common.emulator_is_online)
+        self.assertIs(maa_daily.game_is_online, maa_playcover.game_is_online)
+        self.assertIs(maa_depot.game_is_online, maa_playcover.game_is_online)
+        self.assertIs(maa_action.game_is_online, maa_playcover.game_is_online)
         import maa_copilot_worker
+        import maa_roguelike_worker
 
         self.assertIs(
-            maa_copilot_worker.emulator_is_online, maa_common.emulator_is_online
+            maa_copilot_worker.game_is_online, maa_playcover.game_is_online
         )
-        source = (ROOT / "scripts" / "maa_daily.py").read_text(encoding="utf-8")
-        self.assertNotIn("def emulator_is_online", source)
+        self.assertIs(
+            maa_roguelike_worker.game_is_online, maa_playcover.game_is_online
+        )
+        for name in ("maa_daily.py", "maa_common.py"):
+            source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+            self.assertNotIn("def game_is_online", source)
 
     def test_a_busy_emulator_stops_the_copilot_round_before_it_opens_anything(self) -> None:
         import maa_copilot_worker as worker
@@ -4546,23 +4362,23 @@ class EmulatorProbeSharedTests(unittest.TestCase):
             ), patch.object(
                 worker, "load_config", return_value={"channel_id": "1"}
             ), patch.object(
-                worker, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
+                worker, "game_is_online", return_value=(True, "游戏进程在跑")
             ), patch.object(
                 worker, "_notice",
                 side_effect=lambda c, t, b, col: notices.append((t, b)),
             ), patch.object(worker, "merge_last_run") as merge, patch.object(
                 worker, "_fight_one"
-            ) as fight, patch.object(worker, "open_emulator") as open_emulator:
+            ) as fight, patch.object(worker, "launch_game") as launch_game:
                 code = worker._batch_run_locked(queued)
             restored = json.loads((searches / f"{token}.json").read_text("utf-8"))
         self.assertEqual(code, 0)
-        open_emulator.assert_not_called()
+        launch_game.assert_not_called()
         fight.assert_not_called()
         # 这一轮放回排程，watcher 下一 tick 再试；跳过必须可见（护栏 4）。
         self.assertEqual(restored["status"], "scheduled")
-        self.assertIn("模拟器正在使用", notices[0][1])
-        self.assertIn("BlueStacks 进程在跑", notices[0][1])
-        self.assertEqual(merge.call_args.args[0]["skip_reason"], "emulator_busy")
+        self.assertIn("明日方舟正在运行", notices[0][1])
+        self.assertIn("游戏进程在跑", notices[0][1])
+        self.assertEqual(merge.call_args.args[0]["skip_reason"], "game_busy")
 
 
     def test_a_busy_emulator_leaves_the_depot_snapshot_untouched(self) -> None:
@@ -4581,12 +4397,12 @@ class EmulatorProbeSharedTests(unittest.TestCase):
                 "_state",
                 side_effect=lambda path=depot_path: maa_common.load_json(path, {}),
             ), patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-                maa_depot, "emulator_is_online", return_value=(True, "BlueStacks 进程在跑")
+                maa_depot, "game_is_online", return_value=(True, "游戏进程在跑")
             ), patch.object(
-                maa_depot, "report_emulator_busy"
+                maa_depot, "report_game_busy"
             ) as report, patch.object(
                 maa_depot, "reconcile"
-            ) as writer, patch.object(maa_daily, "open_emulator") as open_emulator:
+            ) as writer, patch.object(maa_daily, "launch_game") as launch_game:
                 result = maa_depot.run_if_due({"channel_id": "1"}, at=at)
             after = json.loads(depot_path.read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "skipped_busy")
@@ -4595,7 +4411,7 @@ class EmulatorProbeSharedTests(unittest.TestCase):
         self.assertEqual(result["snapshot_at"], previous)
         self.assertEqual(after["snapshot_at"], previous)
         writer.assert_not_called()
-        open_emulator.assert_not_called()
+        launch_game.assert_not_called()
         self.assertEqual(
             report.call_args.kwargs["state_update"]["depot_status"], "skipped_busy"
         )
@@ -4605,7 +4421,7 @@ class EmulatorProbeSharedTests(unittest.TestCase):
         with patch.object(maa_common, "merge_last_run") as merge, patch.object(
             maa_common, "discord_request"
         ) as request:
-            maa_common.report_emulator_busy(
+            maa_common.report_game_busy(
                 {"channel_id": "123"},
                 title="⏭️ 测试已跳过",
                 reason="模拟器在用",
@@ -4626,7 +4442,7 @@ class EmulatorProbeSharedTests(unittest.TestCase):
             maa_common, "discord_request", side_effect=OSError("net")
         ):
             with self.assertRaises(RuntimeError) as caught:
-                maa_common.report_emulator_busy(
+                maa_common.report_game_busy(
                     {"channel_id": "1"},
                     title="t",
                     reason="r",
@@ -5338,7 +5154,7 @@ class CopilotDispatchGateTests(unittest.TestCase):
         with patch.object(maa_action, "_copilot_blackout_reason", return_value=blackout), \
              patch.object(maa_action, "depot_window_reason", return_value=depot), \
              patch.object(maa_action, "is_run_locked", return_value=locked), \
-             patch.object(maa_action, "emulator_is_online", return_value=online):
+             patch.object(maa_action, "game_is_online", return_value=online):
             return maa_action.dispatch_blocker({}, scheduled_at, self.at)
 
     def test_the_gate_has_exactly_one_implementation(self) -> None:
@@ -5366,7 +5182,7 @@ class CopilotDispatchGateTests(unittest.TestCase):
             ({"blackout": "距 08:00 日常场次不足 25 分钟"}, "08:00"),
             ({"depot": "处于 Depot 对表窗口"}, "Depot"),
             ({"locked": True}, "run.lock"),
-            ({"online": (True, "BlueStacks 进程在跑")}, "模拟器正在使用"),
+            ({"online": (True, "游戏进程在跑")}, "明日方舟正在运行"),
         ]
         for kwargs, expected in cases:
             with self.subTest(expected=expected):
@@ -5529,17 +5345,17 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                     worker, "load_config",
                     return_value={"channel_id": "1", **(config or {})},
                 ),
-                patch.object(worker, "emulator_is_online", return_value=(False, "")),
+                patch.object(worker, "game_is_online", return_value=(False, "")),
                 patch.object(worker, "_retire_round_controls"),
                 patch.object(worker, "_notice"),
                 patch.object(worker, "require_executable"),
-                patch.object(worker, "open_emulator"),
-                patch.object(worker, "wait_for_android"),
+                patch.object(worker, "launch_game"),
+                patch.object(worker, "wait_for_game"),
                 patch.object(worker, "verify_game_installed"),
-                patch.object(worker, "settle_android_runtime"),
+                patch.object(worker, "settle_game_window"),
                 patch.object(worker, "maa_subprocess_env", return_value={}),
                 patch.object(worker, "capture_screenshot", return_value=(True, "")),
-                patch.object(worker, "close_everything", return_value=[]),
+                patch.object(worker, "close_game", return_value=[]),
                 patch.object(worker, "merge_last_run"),
                 patch.object(worker, "cleanup_run_files"),
                 patch.object(maa_action, "min_lead_reason", return_value=lead),
@@ -6357,7 +6173,7 @@ class ManualCopilotPathTests(unittest.TestCase):
         for blocker in ("处于 Depot 对表窗口（北京时间 04:20–05:00）",
                         "距 22:00 日常场次不足 40 分钟",
                         "另一场 MAA 正在运行（run.lock 被占）",
-                        "模拟器正在使用：BlueStacks 进程在跑"):
+                        "明日方舟正在运行：游戏进程在跑"):
             with self.subTest(blocker=blocker):
                 result = self._start("SR-8", {"activity_key": SR_KEY}, blocker=blocker)
                 self.assertFalse(result.ok)
@@ -6478,8 +6294,8 @@ class ManualCopilotPathTests(unittest.TestCase):
                      patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
                      patch.object(worker, "run_lock",
                                   return_value=contextlib.nullcontext(True)), \
-                     patch.object(worker, "open_emulator") as open_emulator, \
-                     patch.object(worker, "emulator_is_online",
+                     patch.object(worker, "launch_game") as launch_game, \
+                     patch.object(worker, "game_is_online",
                                   return_value=(False, "")) as probe, \
                      patch.object(worker, "_notice",
                                   side_effect=lambda c, t, b, k: notices.append(b)), \
@@ -6496,7 +6312,7 @@ class ManualCopilotPathTests(unittest.TestCase):
                 self.assertEqual(rc, 1)
                 self.assertEqual(state["status"], "scheduled")
                 self.assertEqual(state["last_prepare_error"], "本轮未启动：闸门拦下了")
-                open_emulator.assert_not_called()
+                launch_game.assert_not_called()
                 probe.assert_not_called()
                 run_locked.assert_not_called()
                 self.assertTrue(any("闸门拦下了" in body for body in notices))
@@ -6638,7 +6454,10 @@ class DeployPromptPatchTests(unittest.TestCase):
 
     def test_retired_clearing_keys_are_swept_from_the_live_config(self) -> None:
         self.assertIn("clearing_enabled", deploy.RETIRED_CONFIG_KEYS)
-        self.assertEqual(len(deploy.RETIRED_CONFIG_KEYS), 5)
+        # 模拟器 → PlayCover 退役的设备键也在这里扫掉。
+        for key in ("adb_path", "adb_address", "emulator_app", "game_package"):
+            self.assertIn(key, deploy.RETIRED_CONFIG_KEYS)
+        self.assertEqual(len(set(deploy.RETIRED_CONFIG_KEYS)), len(deploy.RETIRED_CONFIG_KEYS))
         repo = json.loads((ROOT / "state" / "config.json").read_text("utf-8"))
         for key in deploy.RETIRED_CONFIG_KEYS:
             self.assertNotIn(key, repo)
@@ -7379,8 +7198,8 @@ class RoguelikeTaskFileTests(unittest.TestCase):
     def test_every_round_starts_the_game_itself(self) -> None:
         """2026-09-11 事故：任务文件没有 StartUp，模拟器起来了但游戏没起来。
 
-        开机链（`open_emulator / wait_for_android / verify_game_installed /
-        settle_android_runtime`）只管模拟器，拉起游戏的只能是 MaaCore 的 `StartUp`。
+        开机链（`launch_game / wait_for_game / verify_game_installed /
+        settle_game_window`）只管模拟器，拉起游戏的只能是 MaaCore 的 `StartUp`。
         """
         import tomllib
 
@@ -7838,7 +7657,7 @@ class RoguelikeWorkerTests(unittest.TestCase):
         calls: list[int] = []
         notices: list[tuple[str, str]] = []
         reports: list[dict] = []
-        open_emulator = unittest.mock.MagicMock()
+        launch_game = unittest.mock.MagicMock()
 
         def fake_run(config, env, log_path, index):
             calls.append(index)
@@ -7864,15 +7683,15 @@ class RoguelikeWorkerTests(unittest.TestCase):
             patch.object(worker, "load_config",
                          return_value={"channel_id": "1",
                                        "roguelike_run_timeout": 3600}),
-            patch.object(worker, "emulator_is_online", return_value=online),
+            patch.object(worker, "game_is_online", return_value=online),
             patch.object(worker, "require_executable"),
-            patch.object(worker, "open_emulator", open_emulator),
-            patch.object(worker, "wait_for_android"),
+            patch.object(worker, "launch_game", launch_game),
+            patch.object(worker, "wait_for_game"),
             patch.object(worker, "verify_game_installed"),
-            patch.object(worker, "settle_android_runtime"),
+            patch.object(worker, "settle_game_window"),
             patch.object(worker, "maa_subprocess_env", return_value={}),
             patch.object(worker, "capture_screenshot", return_value=(True, "")),
-            patch.object(worker, "close_everything", return_value=[]),
+            patch.object(worker, "close_game", return_value=[]),
             patch.object(worker, "merge_last_run"),
             patch.object(worker, "cleanup_run_files"),
             patch.object(worker, "_isolated_config",
@@ -7898,7 +7717,7 @@ class RoguelikeWorkerTests(unittest.TestCase):
         return SimpleNamespace(
             code=code, calls=calls, notices=notices,
             report=reports[0] if reports else None,
-            open_emulator=open_emulator,
+            launch_game=launch_game,
             state=json.loads(self.state_path.read_text(encoding="utf-8")),
         )
 
@@ -7997,7 +7816,7 @@ class RoguelikeWorkerTests(unittest.TestCase):
             [self.CLEAN], blackout="距 22:00 日常场次不足 25 分钟"
         )
         self.assertEqual(result.calls, [])
-        result.open_emulator.assert_not_called()
+        result.launch_game.assert_not_called()
         self.assertIn("25 分钟", self._field(result.report, "停止原因"))
         self.assertTrue(any("未启动" in title for title, _body in result.notices))
         self.assertEqual(result.state["status"], "idle")
@@ -8005,7 +7824,7 @@ class RoguelikeWorkerTests(unittest.TestCase):
     def test_the_depot_window_stops_it_before_the_emulator_is_opened(self) -> None:
         result = self._run([self.CLEAN], depot=lambda: "处于 Depot 对表窗口")
         self.assertEqual(result.calls, [])
-        result.open_emulator.assert_not_called()
+        result.launch_game.assert_not_called()
         self.assertIn("Depot", self._field(result.report, "停止原因"))
 
     def test_a_gate_that_closes_mid_round_stops_the_next_run(self) -> None:
@@ -8020,15 +7839,15 @@ class RoguelikeWorkerTests(unittest.TestCase):
             blackout=blackout,
         )
         self.assertEqual(result.calls, [1])
-        result.open_emulator.assert_called_once()
+        result.launch_game.assert_called_once()
         self.assertIn("25 分钟", self._field(result.report, "停止原因"))
         self.assertFalse([t for t, _b in result.notices if "未启动" in t])
         self.assertEqual(result.state["status"], "idle")
 
     def test_a_busy_emulator_touches_nothing(self) -> None:
-        result = self._run([self.CLEAN], online=(True, "BlueStacks 进程在跑"))
+        result = self._run([self.CLEAN], online=(True, "游戏进程在跑"))
         self.assertEqual(result.calls, [])
-        result.open_emulator.assert_not_called()
+        result.launch_game.assert_not_called()
         self.assertIsNone(result.report)
         self.assertEqual(result.state["status"], "idle")
         self.assertTrue(any("未启动" in title for title, _body in result.notices))
@@ -8481,16 +8300,16 @@ class OperBoxFallbackTests(unittest.TestCase):
             maa_common.atomic_write_json(
                 root / "item_index.json", {"30012": {"name": "固源岩组"}}
             )
-            config = {"maa_bin": "/maa", "adb_path": "/adb", "maa_resource_dir": str(root)}
+            config = {"maa_bin": "/maa", "maa_resource_dir": str(root)}
             operbox_roster = root / "roster-operbox.json"
             with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-                maa_depot, "emulator_is_online", return_value=(False, "离线")
+                maa_depot, "game_is_online", return_value=(False, "离线")
             ), patch.object(maa_daily, "require_executable"), patch.object(
-                maa_daily, "open_emulator"
-            ), patch.object(maa_daily, "wait_for_android"), patch.object(
-                maa_daily, "verify_game_installed"
-            ), patch.object(maa_daily, "settle_android_runtime"), patch.object(
-                maa_daily, "close_everything", return_value=[]
+                maa_playcover, "launch_game"
+            ), patch.object(maa_playcover, "wait_for_game"), patch.object(
+                maa_playcover, "verify_game_installed"
+            ), patch.object(maa_playcover, "settle_game_window"), patch.object(
+                maa_playcover, "close_game", return_value=[]
             ), patch.object(maa_depot, "maa_subprocess_env", return_value={}), patch.object(
                 maa_depot.subprocess, "run", side_effect=fake_run
             ), patch.object(

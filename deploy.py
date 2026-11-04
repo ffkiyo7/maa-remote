@@ -98,6 +98,19 @@ RETIRED_CONFIG_KEYS = (
     "clearing_annihilation_sanity",
     "clearing_ex_stage_count",
     "clearing_sanity_ocr_roi",
+    # 模拟器 → PlayCover：设备层换成 `maa_playcover.py`，这些模拟器 / ADB 键没人读了。
+    "emulator_app",
+    "emulator_bundle_id",
+    "emulator_process_ignore_case",
+    "adb_path",
+    "adb_address",
+    "game_package",
+    "emulator_boot_timeout",
+    "emulator_settle_timeout",
+    "emulator_settle_quiet_seconds",
+    "emulator_settle_slow_seconds",
+    "quit_grace_seconds",
+    "emulator_probe_timeout",
 )
 
 MAA_CONFIG_RELATIVE_PATHS = (
@@ -199,6 +212,7 @@ def deploy_scripts() -> None:
     ensure_dir(target, 0o700)
     for name in (
         "maa_common.py",
+        "maa_playcover.py",
         "maa_plan_card.py",
         "maa_activity_watch.py",
         "maa_depot.py",
@@ -227,8 +241,23 @@ def deploy_skland_token() -> None:
 
 def deploy_ocrbox() -> None:
     """Compile the Vision-based OCR helper (macOS) into ~/.hermes/scripts/."""
-    source = ROOT / "scripts" / "ocrbox.swift"
-    target = HERMES_HOME / "scripts" / "ocrbox"
+    _compile_swift(
+        "ocrbox",
+        "接管弹窗 watchdog 将不可用，代理指挥开着的关卡会全部失败！",
+    )
+
+
+def deploy_winmove() -> None:
+    """Compile the window mover `maa_playcover.settle_game_window()` uses."""
+    _compile_swift(
+        "winmove",
+        "游戏窗口开在别的屏上时挪不回 MAA-Game，台前调度一挤它就截不到图！",
+    )
+
+
+def _compile_swift(name: str, consequence: str) -> None:
+    source = ROOT / "scripts" / f"{name}.swift"
+    target = HERMES_HOME / "scripts" / name
     if not source.is_file() or shutil.which("swiftc") is None:
         return
     if target.is_file() and target.stat().st_mtime >= source.stat().st_mtime:
@@ -247,8 +276,7 @@ def deploy_ocrbox() -> None:
         changed.append(str(target))
     except Exception as exc:
         print(
-            f"ocrbox 编译失败（{type(exc).__name__}: {exc}）——"
-            "接管弹窗 watchdog 将不可用，代理指挥开着的关卡会全部失败！",
+            f"{name} 编译失败（{type(exc).__name__}: {exc}）——{consequence}",
             file=sys.stderr,
         )
 
@@ -657,6 +685,7 @@ def main() -> int:
             HERMES_HOME / "scripts" / name
             for name in (
                 "maa_common.py",
+                "maa_playcover.py",
                 "maa_plan_card.py",
                 "maa_activity_watch.py",
                 "maa_depot.py",
@@ -665,11 +694,13 @@ def main() -> int:
                 "maa_clearing.py",
                 "maa_copilot.py",
                 "maa_farming.py",
+                "maa_gamedata.py",
                 "maa_roguelike.py",
                 "maa_copilot_worker.py",
                 "maa_roguelike_worker.py",
                 "maa_skland.py",
                 "ocrbox",
+                "winmove",
             )
         ]
         checks.extend(target for _source, target in maa_config_file_pairs())
@@ -691,6 +722,7 @@ def main() -> int:
     deploy_skill()
     deploy_skland_token()
     deploy_ocrbox()
+    deploy_winmove()
     patch_adapter()
     patch_local_patches()
     patch_env(channel_id)

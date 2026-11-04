@@ -15,6 +15,8 @@ from typing import Any
 
 import maa_copilot
 import maa_roguelike
+import maa_playcover
+from maa_playcover import game_is_online
 from maa_common import (
     BUTTONS_PATH,
     DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES,
@@ -31,7 +33,6 @@ from maa_common import (
     discord_request,
     discord_token,
     effective_plan,
-    emulator_is_online,
     is_run_locked,
     load_config,
     load_json,
@@ -458,7 +459,7 @@ def run_now() -> tuple[bool, str]:
         return False, "maa_daily.py 尚未部署。"
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+        maa_playcover.verify_game_installed(config)
     except RuntimeError as exc:
         return False, f"暂时不能运行：{exc}"
     channel_id = str(config.get("channel_id", "")).strip()
@@ -557,7 +558,7 @@ def run_start(stage: str, token: str) -> tuple[bool, str]:
         return False, "maa_daily.py 尚未部署。"
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+        maa_playcover.verify_game_installed(config)
     except RuntimeError as exc:
         return False, f"暂时不能运行：{exc}"
 
@@ -823,9 +824,9 @@ def dispatch_blocker(
             return reason
     if is_run_locked():
         return "另一场 MAA 正在运行（run.lock 被占）"
-    online, detail = emulator_is_online(config)
+    online, detail = game_is_online(config)
     if online:
-        return f"模拟器正在使用：{detail}"
+        return f"明日方舟正在运行：{detail}"
     return ""
 
 
@@ -912,7 +913,7 @@ def _expand_copilot_targets(
 
     - 关卡代号：照原样排，已通的关也重打（「再打一遍 SR-6」）。
     - 区域代号（`YW-EX`、`YW`）：展开成这个区域的所有关，**跳过账本里已通的模式**，
-      上游导航不到的关丢掉并写进提示。一轮里连着打，模拟器只开一次。
+      上游导航不到的关丢掉并写进提示。一轮里连着打，游戏只开一次。
     """
     import maa_clearing
 
@@ -972,7 +973,7 @@ def _expand_copilot_targets(
 def start_copilot_search(stage: str, *more: str) -> tuple[bool, str, str | None]:
     """手动抄作业：写一份 `pending` 搜索并派后台 worker（<20s，不变量 #6）。
 
-    可以一次给多关或一个区域（`YW-EX`），它们排进**同一轮**：模拟器只开一次，
+    可以一次给多关或一个区域（`YW-EX`），它们排进**同一轮**：游戏只开一次，
     活动关按解锁链连着打（`_run_activity_round()`）。
 
     模式按 D7 定：当期活动关普通 + 突袭，资源本 / 主线只有普通。
@@ -1361,7 +1362,7 @@ def roguelike_start() -> tuple[bool, str]:
     if conflict:
         return False, conflict
     config = load_config()
-    # 肉鸽不耗理智，但它一样要开模拟器、一样持 run.lock，所以照样过这道闸门。
+    # 肉鸽不耗理智，但它一样要开游戏、一样持 run.lock，所以照样过这道闸门。
     blocker = dispatch_blocker(config, "", now_beijing())
     if blocker:
         return False, f"{blocker}；肉鸽本轮未排程，日常 / 对表结束后再点「开始」。"
@@ -1412,7 +1413,7 @@ def _request_roguelike_stop(abort: bool) -> tuple[bool, str]:
     if abort:
         return True, (
             "⏏️ 正在中止：当前这一局作废（分数与源石锭都不算），"
-            "模拟器随后会关干净。下次开始必须还是同一个主题，上游才会自己收掉残局。"
+            "游戏随后会关干净。下次开始必须还是同一个主题，上游才会自己收掉残局。"
         )
     return True, (
         "⏹️ 收到；这一局会打完再退出，进度不丢。"

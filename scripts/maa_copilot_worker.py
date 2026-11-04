@@ -32,14 +32,16 @@ import maa_action
 import maa_clearing
 import maa_copilot
 import maa_gamedata
-from maa_daily import (
-    HOME_TASK_NAMES,
+import maa_playcover
+from maa_daily import HOME_TASK_NAMES
+from maa_playcover import (
     capture_screenshot,
-    close_everything,
-    open_emulator,
-    settle_android_runtime,
+    close_game,
+    game_is_online,
+    launch_game,
+    settle_game_window,
     verify_game_installed,
-    wait_for_android,
+    wait_for_game,
 )
 from maa_common import (
     BUTTONS_PATH,
@@ -50,7 +52,6 @@ from maa_common import (
     cleanup_run_files,
     discord_request,
     discord_token,
-    emulator_is_online,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -62,9 +63,9 @@ from maa_common import (
     state_lock,
 )
 
-# 探到模拟器在用时的统一说法（D18）。抄作业还没碰设备，说清楚「未执行」。
-EMULATOR_BUSY_NOTICE = (
-    "检测到模拟器正在使用（多半是你在玩，或上一个任务没退干净），本次未执行，"
+# 探到游戏在跑时的统一说法（D18）。抄作业还没碰游戏，说清楚「未执行」。
+GAME_BUSY_NOTICE = (
+    "检测到明日方舟正在运行（多半是你在玩，或上一个任务没退干净），本次未执行，"
     "也没有碰设备。等你退出后再试一次即可。"
 )
 
@@ -114,7 +115,7 @@ DEFAULT_RAID_SWITCH_TASK = maa_clearing.DEFAULT_RAID_SWITCH_TASK
 
 # 战后收尾（2026-09-09 加）：**先跳掉首通剧情，再回主界面，然后才许退游戏**。
 # 现场：SR-8 两次抄作业（09-08 15:22、09-09 03:47）`Copilot Completed` 之后 5 秒
-# `close_everything()` 就 `maa closedown` 把游戏杀了，两张收尾截图都停在战后剧情页
+# `close_game()` 就 `maa closedown` 把游戏杀了，两张收尾截图都停在战后剧情页
 # （右上「自动 OFF / 跳过 ▶」）。结果是三星记上了、**代理指挥没解锁**——早场日常
 # 点 SR-8 的代理指挥 10 次点不亮，`Fight Error` 空跑一场。
 # 09-09 08:59 真机验证（`runs/2026-09-09-copilot-71bfa8404dbe.log`）：剧情跳过成功，
@@ -508,8 +509,6 @@ def _run_copilot_with_watchdog(
     出现一次）隔这么久都没多出一个，就当它卡在地图弹窗上了，结束进程
     （2026-09-08 SR-6 塔罗牌弹窗让列表模式空转 9 分钟）。
     """
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
     ocrbox = SCRIPTS_DIR / "ocrbox"
     watch_png = RUNS_DIR / ".watch.png"
     # 单关级超时：整场的长度由 `min_lead_reason()` 的时间预算约束，不在这里叠加。
@@ -553,16 +552,7 @@ def _run_copilot_with_watchdog(
             if not ocrbox.is_file():
                 continue
             try:
-                with watch_png.open("wb") as handle:
-                    subprocess.run(
-                        [adb, "-s", address, "exec-out", "screencap", "-p"],
-                        stdout=handle,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                        timeout=15,
-                    )
-                if watch_png.stat().st_size < 8:
-                    continue
+                geometry = maa_playcover.capture_geometry(config, watch_png)
                 result = subprocess.run(
                     [str(ocrbox), str(watch_png)],
                     capture_output=True,
@@ -581,15 +571,12 @@ def _run_copilot_with_watchdog(
             if not match:
                 continue
             x, y, w, h = (int(part) for part in match.groups())
-            tap_x = x + w + POPUP_CONFIRM_X_OFFSET
-            tap_y = y + h + POPUP_CONFIRM_Y_OFFSET
+            # ocrbox 给的是截图像素；偏移量是 1920×1080 游戏坐标，先换算再加。
+            right, bottom = maa_playcover.image_to_base(geometry, x + w, y + h)
+            tap_x = round(right + POPUP_CONFIRM_X_OFFSET)
+            tap_y = round(bottom + POPUP_CONFIRM_Y_OFFSET)
             try:
-                subprocess.run(
-                    [adb, "-s", address, "shell", "input", "tap", str(tap_x), str(tap_y)],
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                )
+                maa_playcover.tap(config, tap_x, tap_y)
                 taps += 1
             except Exception:
                 pass
@@ -753,7 +740,7 @@ class PrefightError(RuntimeError):
     """开打前的**环境**故障（森空岛读不到、理智消耗查不到）。
 
     和「理智不够」分开：后者等一会儿自己会好，前者不修就每 15 分钟开一次
-    模拟器白跑一趟（2026-10-11 森空岛过期，YW-4 空转 17 轮）。worker 把它记进
+    白开一趟游戏（2026-10-11 森空岛过期，YW-4 空转 17 轮）。worker 把它记进
     这一轮的 `prefight_error`，watcher 按天计数、到上限当天停排。
     """
 
@@ -850,11 +837,11 @@ def cmd_run_batch(token: str) -> int:
             _notice(load_config(), "⏸️ 自动作业本轮未启动", message, 0x99AAB5)
             return 1
         # 最后一道防线（不变量 #13）：派发与真正开跑之间可能隔了很久（worker 排队、
-        # 锁等待），这里再过一次三条**时间**闸门。run.lock 与模拟器不再查——锁刚
-        # 被自己拿在手上，再查只会自相矛盾；模拟器由 `_batch_run_locked()` 探。
+        # 锁等待），这里再过一次三条**时间**闸门。run.lock 与游戏进程不再查——锁刚
+        # 被自己拿在手上，再查只会自相矛盾；游戏进程由 `_batch_run_locked()` 探。
         config = load_config()
         if state.get("source") == "activity-watch" and maa_copilot.auto_pause_state():
-            # 派发之后才按的暂停：还没碰设备，直接作废，不开模拟器。
+            # 派发之后才按的暂停：还没碰游戏，直接作废，不开游戏。
             print("copilot run-batch SKIPPED: 自动作业已暂停")
             _set_status(token, {"queued"}, "superseded", superseded_at=now_beijing().isoformat())
             return 1
@@ -907,29 +894,29 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
     log_path = RUNS_DIR / f"{stem}.log"
     png_path = RUNS_DIR / f"{stem}.png"
     started = time.monotonic()
-    emulator_touched = False
+    game_touched = False
     results: list[dict[str, Any]] = []
     stop_reason = ""
     cleanup_errors: list[str] = []
 
     # D18：抢到锁之后、碰设备之前先探一次。在线就把这一轮放回排程，什么都不做——
-    # 任何失败路径都会 `close_everything()` 退掉 BlueStacks，等于把人踢出游戏。
-    online, probe_detail = emulator_is_online(config)
+    # 任何失败路径都会 `close_game()` 退掉 BlueStacks，等于把人踢出游戏。
+    online, probe_detail = game_is_online(config)
     if online:
-        _set_status(token, {"queued"}, "scheduled", last_prepare_error=EMULATOR_BUSY_NOTICE)
+        _set_status(token, {"queued"}, "scheduled", last_prepare_error=GAME_BUSY_NOTICE)
         _notice(
             config,
             "⏸️ 自动作业本轮未启动",
-            f"{EMULATOR_BUSY_NOTICE}\n探测：{probe_detail}",
+            f"{GAME_BUSY_NOTICE}\n探测：{probe_detail}",
             0x99AAB5,
         )
         merge_last_run(
             {
                 "status": "skipped",
                 "phase": f"copilot-{token}",
-                "skip_reason": "emulator_busy",
-                "summary": EMULATOR_BUSY_NOTICE,
-                "emulator_probe": probe_detail,
+                "skip_reason": "game_busy",
+                "summary": GAME_BUSY_NOTICE,
+                "game_probe": probe_detail,
                 "finished_at": now_beijing().isoformat(),
             }
         )
@@ -962,7 +949,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             print(f"pause button register failed: {type(exc).__name__}: {exc}", flush=True)
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        require_executable(config, "adb_path", "/opt/homebrew/bin/adb", "ADB")
+        verify_game_installed(config)
         atomic_write_json(
             RUNS_DIR / f"{stem}.json",
             {
@@ -993,13 +980,12 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             start_components,
         )
 
-        open_emulator(config)
-        emulator_touched = True
-        wait_for_android(config)
-        verify_game_installed(config)
-        # 抄作业开的是同一台冷启模拟器，同样会撞上 MaaCore 那 3 秒的 MaaTouch 窗口
-        # （DEV_GUIDE §11.14）。这里没有日常那层重试兜底，闸门更不能省。
-        settle_android_runtime(config)
+        launch_game(config)
+        game_touched = True
+        wait_for_game(config)
+        # 游戏窗口必须在 MAA-Game 虚拟屏台前，否则 MaaTools 截图为空。这里没有
+        # 日常那层重试兜底，这一步更不能省。
+        settle_game_window(config)
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
@@ -1081,17 +1067,17 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         stop_reason = f"{type(exc).__name__}: {exc}"
         print(f"copilot run-batch EXCEPTION: {stop_reason}", flush=True)
         if not any(r["outcome"] in ("won", "failed", "unknown") for r in results):
-            # 一关都没进就炸（开机、ADB、游戏没装）：同样是环境故障，
+            # 一关都没进就炸（开游戏、MaaTools、游戏没装）：同样是环境故障，
             # 不记账就永远到不了 daily_cap，watcher 会每 tick 重派。
             prefight_error = stop_reason
     finally:
-        if emulator_touched:
+        if game_touched:
             try:
                 capture_screenshot(config, png_path)
             except Exception:
                 pass
             try:
-                cleanup_errors = close_everything(config)
+                cleanup_errors = close_game(config)
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
@@ -1107,7 +1093,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             {"name": "逐关结果", "value": _entry_result_lines(results)[:1024], "inline": False},
             {"name": "总耗时", "value": f"{duration:.0f}s", "inline": True},
         ],
-        "footer": {"text": "模拟器与 ADB 已执行清理 · 不吃药不碎石"},
+        "footer": {"text": "游戏进程已执行清理 · 不吃药不碎石"},
         "timestamp": now_beijing().isoformat(),
     }
     if stop_reason:
@@ -1116,7 +1102,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         embed["fields"].append(
             {"name": "清理异常", "value": "; ".join(cleanup_errors)[:1024], "inline": False}
         )
-    _post_report(config, embed, png_path if emulator_touched else None)
+    _post_report(config, embed, png_path if game_touched else None)
 
     merge_last_run(
         {
@@ -1306,21 +1292,41 @@ def _run_tasks(
     return True, ""
 
 
+OCR_BOX_RE = re.compile(r"^(.*)\t\[(-?\d+),(-?\d+),(\d+),(\d+)\]$")
+
+
+def _base_box_lines(lines: list[str], geometry: dict[str, Any]) -> list[str]:
+    """把 ocrbox 的截图像素框换成 1920×1080 游戏坐标框，格式不变。"""
+    converted: list[str] = []
+    for line in lines:
+        match = OCR_BOX_RE.match(line)
+        if not match:
+            converted.append(line)
+            continue
+        text, x, y, w, h = match.group(1), *(int(part) for part in match.groups()[1:])
+        left, top = maa_playcover.image_to_base(geometry, x, y)
+        right, bottom = maa_playcover.image_to_base(geometry, x + w, y + h)
+        left, top = max(0, round(left)), max(0, round(top))
+        converted.append(
+            f"{text}\t[{left},{top},{max(0, round(right) - left)},{max(0, round(bottom) - top)}]"
+        )
+    return converted
+
+
 def _screen_text(config: dict[str, Any]) -> list[str]:
-    """当前屏幕的 OCR 行（`ocrbox`：`文字\\t[x,y,w,h]`）。读不到返回空表。"""
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
+    """当前屏幕的 OCR 行（`ocrbox`：`文字\\t[x,y,w,h]`，已换成 1920×1080 游戏坐标）。
+
+    读不到返回空表。
+    """
     ocrbox = SCRIPTS_DIR / "ocrbox"
     shot = RUNS_DIR / ".zone.png"
     if not ocrbox.is_file():
         return []
     try:
-        with shot.open("wb") as handle:
-            subprocess.run([adb, "-s", address, "exec-out", "screencap", "-p"],
-                           stdout=handle, stderr=subprocess.DEVNULL, check=False, timeout=15)
+        geometry = maa_playcover.capture_geometry(config, shot)
         result = subprocess.run([str(ocrbox), str(shot)], capture_output=True,
                                 text=True, check=False, timeout=15)
-        return result.stdout.splitlines()
+        return _base_box_lines(result.stdout.splitlines(), geometry)
     except Exception:
         return []
     finally:
@@ -1328,13 +1334,6 @@ def _screen_text(config: dict[str, Any]) -> list[str]:
             shot.unlink()
         except OSError:
             pass
-
-
-def _adb(config: dict[str, Any], *args: str) -> None:
-    adb = str(config.get("adb_path", "/opt/homebrew/bin/adb"))
-    address = str(config.get("adb_address", "127.0.0.1:5555"))
-    subprocess.run([adb, "-s", address, "shell", *args],
-                   capture_output=True, check=False, timeout=15)
 
 
 class ActivityNavigator:
@@ -1369,7 +1368,10 @@ class ActivityNavigator:
         return ok, "" if ok else f"没能停在活动地图上（锚点 {self.anchor}）：{detail}"
 
     def _enter_zone(self, zone_id: str) -> tuple[bool, str]:
-        """在当前屏幕上按区域名点入口；当前屏没有就退一步再找一次。⚠️ 未经真机验证。"""
+        """在当前屏幕上按区域名点入口；当前屏没有就等一下再找一次。⚠️ 未经真机验证。
+
+        PlayCover 没有安卓返回键，所以不再像模拟器版那样「退一步再找」。
+        """
         name = maa_gamedata.zone_name(self.layout, zone_id)
         act = maa_gamedata.act_id_of(zone_id)
         others = [
@@ -1382,7 +1384,10 @@ class ActivityNavigator:
         for attempt in range(2):
             point = maa_clearing.zone_button(_screen_text(self.config), name, others)
             if point is not None:
-                _adb(self.config, "input", "tap", str(point[0]), str(point[1]))
+                try:
+                    maa_playcover.tap(self.config, point[0], point[1])
+                except Exception as exc:
+                    return False, f"点「{name}」入口失败：{exc}"
                 with self.log_path.open("a", encoding="utf-8") as handle:
                     handle.write(f"# zone-entry {zone_id} {name} tap {point}\n")
                 time.sleep(5)
@@ -1395,7 +1400,6 @@ class ActivityNavigator:
                     return True, ""
                 return False, f"点了「{name}」入口，但没认出这个区域的关卡：{detail}"
             if attempt == 0:
-                _adb(self.config, "input", "keyevent", "4")
                 time.sleep(3)
         return False, f"屏幕上没认出区域入口「{name}」，没有乱点"
 
