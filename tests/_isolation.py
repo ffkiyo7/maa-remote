@@ -169,6 +169,11 @@ os.environ["MAA_CONFIG_DIR"] = str(TEMP_HOME / ".config" / "maa-cli")
 # deploy 读这两个变量决定频道和森空岛 token；开发机 shell 里设过就会改变用例行为。
 for _name in ("MAA_CHANNEL_ID", "SKLAND_HG_TOKEN"):
     os.environ.pop(_name, None)
+# 用例起的 Python 子进程（`sys.executable`）不写 `.pyc`：macOS 自带的 3.9 按 `$HOME` 算
+# `sys.pycache_prefix`，子进程继承了上面的临时 HOME，就会把标准库的 `.pyc` 写进共享 HOME 的
+# `Library/Caches/com.apple.python/`，被 `assert_shared_home_clean()` 当成泄漏（2026-11-04 实测
+# 系统 python3 跑整套 11 个 tearDownModule 报错）。只影响子进程；本进程的设置启动时就定了。
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 sys.addaudithook(_audit)
 

@@ -1482,6 +1482,17 @@ import 时就算死了，每用例换 HOME 得有一个 helper 统一重绑全�
 HOME 而不是「本模块新增的」：discover 按文件名顺序跑模块，前一个模块漏下的文件最晚在下一个
 模块收尾时被抓到，报错路径对应哪个常量，就去找写它的用例。
 
+用例起的 Python 子进程（`sys.executable`）同样会往共享 HOME 写东西：macOS 自带的 3.9 按 `$HOME`
+算 `sys.pycache_prefix`，子进程继承临时 HOME 后把标准库 `.pyc` 写进
+`Library/Caches/com.apple.python/`（2026-11-04 系统 `python3` 跑整套报 11 个 `tearDownModule` 错误，
+3.11 / 3.12 不受影响，所以只跑这两个版本的验收和 CI 都发现不了）。`_isolation` 因此设了
+`PYTHONDONTWRITEBYTECODE=1`。**验收时系统 `python3` 也要跑一遍**，且要在没设这个变量的 shell 里跑
+（有的工具链会预先设上它，那样就测不出来）：
+
+```bash
+env -u PYTHONDONTWRITEBYTECODE /usr/bin/python3 -m unittest discover -s tests
+```
+
 **测试文件布局**（2026-11-04 起；之前是一个九千多行的 `test_maa.py`）：按领域一个文件，类名和
 方法名拆分时一个没改。新测试模块照抄任一 `test_*.py` 的开头：先 `sys.path` 加 `scripts/` 和
 `tests/`，**第一个** `import _isolation`，再 `import _helpers` 和 scripts 模块；`setUpModule()` 里

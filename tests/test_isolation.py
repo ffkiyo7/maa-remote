@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -112,6 +113,18 @@ class SharedHomeCleanTests(unittest.TestCase):
         self.touch(".hermes/state/maa/run.lock")
         with self.assertRaises(AssertionError):
             _isolation.assert_shared_home_clean(frozenset(), root=self.root)
+
+    def test_a_python_child_leaves_nothing_in_the_shared_home(self) -> None:
+        # macOS 自带 3.9 的子进程会把 `.pyc` 写进 `$HOME/Library/Caches/com.apple.python/`；
+        # 其它解释器上这条天然成立，在 3.9 上才真正有区分度。
+        self.assertEqual(os.environ.get("PYTHONDONTWRITEBYTECODE"), "1")
+        before = _isolation.shared_home_files()
+        subprocess.run(
+            [sys.executable, "-c", "import json, email.parser, http.client"],
+            check=True,
+            capture_output=True,
+        )
+        self.assertEqual(_isolation.shared_home_files(), before)
 
     def test_the_default_root_is_the_shared_temp_home(self) -> None:
         self.assertEqual(
