@@ -6,6 +6,7 @@ import os
 import io
 import json
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1527,6 +1528,44 @@ class DeployCheckTests(unittest.TestCase):
         self.fake_python(self.venv_python, "3.11.15")
         self.write_plist(str(self.venv_python))
 
+        # 组件版本探测全部桩掉：默认装的正好是记录里的版本。app 是假的 Info.plist，
+        # 走真 `bundle_short_version()`；maa / git 子进程换成 Mock。
+        self.verified = deploy.load_verified_versions()
+        apps = Path(tmp.name) / "Applications"
+        self.playcover_app = apps / "PlayCover.app"
+        self.betterdisplay_app = apps / "BetterDisplay.app"
+        self.arknights_app = self.user_home / deploy.ARKNIGHTS_APP_RELATIVE_PATH
+        self.write_app_version(self.playcover_app / "Contents", self.verified["PlayCover"])
+        self.write_app_version(self.betterdisplay_app / "Contents", self.verified["BetterDisplay"])
+        self.write_app_version(self.arknights_app, self.verified["Arknights"])
+        for item in (
+            patch.object(deploy, "PLAYCOVER_APP", self.playcover_app),
+            patch.object(deploy, "BETTERDISPLAY_APP", self.betterdisplay_app),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+        self.real_probe_maa_versions = deploy.probe_maa_versions
+        self.real_probe_hermes_commit = deploy.probe_hermes_commit
+        maa_probe = patch.object(
+            deploy,
+            "probe_maa_versions",
+            return_value=(self.verified["maa-cli"], self.verified["MaaCore"]),
+        )
+        git_probe = patch.object(deploy, "probe_hermes_commit", return_value=self.verified["Hermes"])
+        self.maa_probe = maa_probe.start()
+        self.git_probe = git_probe.start()
+        self.addCleanup(maa_probe.stop)
+        self.addCleanup(git_probe.stop)
+
+    @staticmethod
+    def write_app_version(directory: Path, version: str | None) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        document: dict = {"CFBundleIdentifier": "example.app"}
+        if version is not None:
+            document["CFBundleShortVersionString"] = version
+        with (directory / "Info.plist").open("wb") as handle:
+            plistlib.dump(document, handle)
+
     @staticmethod
     def fake_python(path: Path, version: str, exit_code: int = 0) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1588,7 +1627,7 @@ class DeployCheckTests(unittest.TestCase):
         report = json.loads(output)
         self.assertEqual(
             list(report),
-            ["ok", "missing", "mismatched", "adapter", "gateway_python", "venvs", "warnings"],
+            ["ok", "missing", "mismatched", "adapter", "gateway_python", "venvs", "versions", "warnings"],
         )
         self.assertTrue(report["ok"])
         self.assertEqual(report["missing"], [])
@@ -1605,7 +1644,151 @@ class DeployCheckTests(unittest.TestCase):
             },
         )
         self.assertEqual(report["venvs"], {"venv": "3.11.15", ".venv": None})
+        self.assertEqual(
+            report["versions"],
+            {
+                name: {"installed": self.verified[name], "verified": self.verified[name], "match": True}
+                for name in deploy.CHECKED_COMPONENTS
+            },
+        )
+        self.assertEqual(list(report["versions"]), list(deploy.CHECKED_COMPONENTS))
         self.assertEqual(report["warnings"], [])
+
+    def test_the_verified_versions_record_is_well_formed(self) -> None:
+        document = json.loads(deploy.VERIFIED_VERSIONS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(document["schema_version"], 1)
+        components = document["components"]
+        self.assertEqual(
+            set(components),
+            {"maa-cli", "MaaCore", "PlayCover", "MaaTools", "Hermes", "BetterDisplay", "Arknights"},
+        )
+        for name, entry in components.items():
+            with self.subTest(component=name):
+                self.assertIsInstance(entry["version"], str)
+                self.assertTrue(entry["version"])
+                datetime.strptime(entry["verified_at"], "%Y-%m-%d")
+        self.assertEqual(components["PlayCover"]["branch"], "maa")
+        self.assertTrue(components["PlayCover"]["version"].endswith(".maa"))
+        # VERN 要游戏在跑才读得到：只记录，不进 --check。
+        self.assertIs(components["MaaTools"]["checked_by_deploy"], False)
+        self.assertNotIn("MaaTools", deploy.CHECKED_COMPONENTS)
+        self.assertEqual(set(deploy.CHECKED_COMPONENTS), set(components) - {"MaaTools"})
+        self.assertGreaterEqual(
+            int(components["MaaTools"]["version"]), maa_playcover.MIN_MAATOOLS_VERSION
+        )
+
+    def test_version_drift_only_warns_and_the_check_writes_nothing(self) -> None:
+        self.write_app_version(self.playcover_app / "Contents", "4.1.0.maa")
+        self.write_app_version(self.arknights_app, "2.8.01")
+        self.maa_probe.return_value = ("v0.8.0", self.verified["MaaCore"])
+        self.git_probe.return_value = "0" * 40
+        before = self.snapshot()
+        code, output = self.run_check()
+        self.assertEqual(self.snapshot(), before)
+        report = json.loads(output)
+        self.assertEqual(code, 0)
+        self.assertTrue(report["ok"])
+        versions = report["versions"]
+        self.assertEqual(
+            versions["PlayCover"],
+            {"installed": "4.1.0.maa", "verified": self.verified["PlayCover"], "match": False},
+        )
+        self.assertEqual(versions["maa-cli"]["installed"], "v0.8.0")
+        self.assertFalse(versions["maa-cli"]["match"])
+        self.assertTrue(versions["MaaCore"]["match"])
+        self.assertFalse(versions["Hermes"]["match"])
+        self.assertFalse(versions["Arknights"]["match"])
+        self.assertTrue(versions["BetterDisplay"]["match"])
+        self.assertEqual(len(report["warnings"]), 1, report["warnings"])
+        warning = report["warnings"][0]
+        self.assertIn(f"maa-cli {self.verified['maa-cli']} → v0.8.0", warning)
+        self.assertIn(f"PlayCover {self.verified['PlayCover']} → 4.1.0.maa", warning)
+        self.assertIn("Arknights", warning)
+        self.assertIn("Hermes", warning)
+        self.assertNotIn("MaaCore", warning)
+        self.assertNotIn("BetterDisplay", warning)
+
+    def test_unavailable_versions_are_null_and_warned_without_raising(self) -> None:
+        shutil.rmtree(self.betterdisplay_app)
+        self.write_app_version(self.arknights_app, None)
+        self.maa_probe.return_value = ("v0.7.5", "")
+        self.git_probe.side_effect = RuntimeError("git rev-parse 失败（exit 128）：not a git repository")
+        report = deploy.check_deployment()
+        self.assertTrue(report["ok"])
+        versions = report["versions"]
+        for name in ("MaaCore", "Hermes", "BetterDisplay", "Arknights"):
+            with self.subTest(component=name):
+                self.assertEqual(
+                    versions[name],
+                    {"installed": None, "verified": self.verified[name], "match": None},
+                )
+        self.assertTrue(versions["maa-cli"]["match"])
+        self.assertTrue(versions["PlayCover"]["match"])
+        warnings = report["warnings"]
+        self.assertIn("MaaCore 版本取不到：maa version 没有输出这一项", warnings)
+        self.assertIn("Hermes 版本取不到：git rev-parse 失败（exit 128）：not a git repository", warnings)
+        self.assertIn(f"BetterDisplay 版本取不到：{self.betterdisplay_app} 下没有 Info.plist", warnings)
+        self.assertIn(
+            f"Arknights 版本取不到：{self.arknights_app / 'Info.plist'} 里没有 CFBundleShortVersionString",
+            warnings,
+        )
+        self.assertEqual(len(warnings), 4, warnings)
+
+        # maa 本身起不来（探测抛任何异常）也只是两项取不到。
+        self.maa_probe.side_effect = OSError("No such file or directory: maa")
+        self.maa_probe.return_value = None
+        versions = deploy.check_deployment()["versions"]
+        self.assertIsNone(versions["maa-cli"]["installed"])
+        self.assertIsNone(versions["MaaCore"]["installed"])
+
+    def test_a_missing_record_warns_and_reports_installed_versions_only(self) -> None:
+        with patch.object(deploy, "VERIFIED_VERSIONS_PATH", self.user_home / "nope.json"):
+            report = deploy.check_deployment()
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            report["versions"]["PlayCover"],
+            {"installed": self.verified["PlayCover"], "verified": None, "match": None},
+        )
+        self.assertEqual(len(report["warnings"]), 1, report["warnings"])
+        self.assertTrue(report["warnings"][0].startswith("真机验证版本记录不可用："))
+
+        bad = self.user_home / "bad.json"
+        bad.write_text(json.dumps({"schema_version": 2, "components": {}}), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "schema_version 不是 1"):
+            deploy.load_verified_versions(bad)
+
+    def test_hermes_commit_matches_by_prefix(self) -> None:
+        full = "f6b3e394b7c9e5219fbea7281f65e01b48402631"
+        self.assertTrue(deploy.version_matches("Hermes", full, "f6b3e394b7"))
+        self.assertTrue(deploy.version_matches("Hermes", full, full.upper()))
+        self.assertFalse(deploy.version_matches("Hermes", full, "f6b3e3"))
+        self.assertFalse(deploy.version_matches("Hermes", full, "a6b3e394b7"))
+        self.assertFalse(deploy.version_matches("PlayCover", "4.0.0.maa", "4.0.0"))
+
+    def test_maa_versions_are_probed_through_the_plan_card_parser(self) -> None:
+        config_path = self.hermes / "state" / "maa" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"maa_bin": "/fake/maa"}), encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def fake_run(argv, *, env, timeout):
+            calls.append(argv)
+            return 0, "maa-cli v0.7.6\nMaaCore v6.22.0", ""
+
+        with patch.object(maa_plan_card, "_run_captured", side_effect=fake_run):
+            self.assertEqual(self.real_probe_maa_versions(), ("v0.7.6", "v6.22.0"))
+        self.assertEqual(calls, [["/fake/maa", "version"]])
+
+    def test_hermes_commit_is_read_with_git_rev_parse(self) -> None:
+        repo = self.hermes / "hermes-agent"
+        completed = subprocess.CompletedProcess([], 0, stdout="abc1234def\n", stderr="")
+        with patch.object(deploy.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(self.real_probe_hermes_commit(), "abc1234def")
+        self.assertEqual(run.call_args.args[0], ["git", "-C", str(repo), "rev-parse", "HEAD"])
+        failed = subprocess.CompletedProcess([], 128, stdout="", stderr="fatal: not a git repository")
+        with patch.object(deploy.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "exit 128"):
+                self.real_probe_hermes_commit()
 
     def test_script_and_skill_drift_is_mismatched_but_helpers_are_only_existence_checked(self) -> None:
         script = self.hermes / "scripts" / "maa_daily.py"

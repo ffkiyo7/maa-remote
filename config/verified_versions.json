@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "about": "最后一次真机跑通时各组件的版本。只做记录和漂移检测（deploy.py --check 的 versions 键），不锁版本。更新流程见 docs/DEV_GUIDE.md §7.1。",
+  "components": {
+    "maa-cli": {
+      "version": "v0.7.5",
+      "verified_at": "2026-11-04",
+      "source": "maa version"
+    },
+    "MaaCore": {
+      "version": "v6.21.3",
+      "verified_at": "2026-11-04",
+      "source": "maa version"
+    },
+    "PlayCover": {
+      "version": "4.0.0.maa",
+      "branch": "maa",
+      "verified_at": "2026-11-04",
+      "source": "/Applications/PlayCover.app/Contents/Info.plist CFBundleShortVersionString"
+    },
+    "MaaTools": {
+      "version": "4",
+      "verified_at": "2026-11-04",
+      "source": "docs/DEV_GUIDE.md §0.5（VERN 协议版本；2026-11-04 游戏没在跑，未真机读回）",
+      "checked_by_deploy": false
+    },
+    "Hermes": {
+      "version": "f6b3e394b7c9e5219fbea7281f65e01b48402631",
+      "verified_at": "2026-11-04",
+      "source": "git -C ~/.hermes/hermes-agent rev-parse HEAD"
+    },
+    "BetterDisplay": {
+      "version": "5.0.1",
+      "verified_at": "2026-11-04",
+      "source": "/Applications/BetterDisplay.app/Contents/Info.plist CFBundleShortVersionString"
+    },
+    "Arknights": {
+      "version": "2.7.91",
+      "verified_at": "2026-11-04",
+      "source": "~/Library/Containers/io.playcover.PlayCover/Applications/com.hypergryph.arknights.app/Info.plist CFBundleShortVersionString"
+    }
+  }
+}

@@ -822,6 +822,151 @@ def check_venvs() -> tuple[dict[str, str | None], list[str]]:
     return versions, warnings
 
 
+# 最后一次真机跑通时的组件版本（DEV_GUIDE §7.1）。`--check` 只报告漂移，不影响 `ok`。
+VERIFIED_VERSIONS_PATH = ROOT / "config" / "verified_versions.json"
+VERIFIED_VERSIONS_SCHEMA = 1
+PLAYCOVER_APP = Path("/Applications/PlayCover.app")
+BETTERDISPLAY_APP = Path("/Applications/BetterDisplay.app")
+ARKNIGHTS_APP_RELATIVE_PATH = (
+    Path("Library") / "Containers" / "io.playcover.PlayCover" / "Applications"
+    / "com.hypergryph.arknights.app"
+)
+GIT_TIMEOUT = 10.0
+# `--check` 比对的组件，顺序即输出顺序。MaaTools 的 VERN 要游戏在跑才读得到，只记录不比对。
+CHECKED_COMPONENTS = ("maa-cli", "MaaCore", "PlayCover", "Hermes", "BetterDisplay", "Arknights")
+
+
+def load_verified_versions(path: Path | None = None) -> dict[str, str]:
+    """`{组件: 记录的版本}`；文件缺失、格式或 schema 不对抛 RuntimeError。"""
+    path = VERIFIED_VERSIONS_PATH if path is None else path
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RuntimeError(f"{path} 读不出：{type(exc).__name__}: {exc}") from exc
+    if not isinstance(document, dict) or document.get("schema_version") != VERIFIED_VERSIONS_SCHEMA:
+        raise RuntimeError(f"{path} 的 schema_version 不是 {VERIFIED_VERSIONS_SCHEMA}")
+    components = document.get("components")
+    if not isinstance(components, dict):
+        raise RuntimeError(f"{path} 里没有 components 对象")
+    verified: dict[str, str] = {}
+    for name, entry in components.items():
+        if isinstance(entry, dict) and isinstance(entry.get("version"), str):
+            verified[name] = entry["version"]
+    return verified
+
+
+def bundle_short_version(app: Path) -> str:
+    """`<app>/Contents/Info.plist`（iOS 包没有 Contents 层）的 `CFBundleShortVersionString`。"""
+    candidates = [app / "Contents" / "Info.plist", app / "Info.plist"]
+    plist = next((path for path in candidates if path.is_file()), None)
+    if plist is None:
+        raise RuntimeError(f"{app} 下没有 Info.plist")
+    try:
+        with plist.open("rb") as handle:
+            document = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        raise RuntimeError(f"{plist} 读不出：{type(exc).__name__}: {exc}") from exc
+    version = document.get("CFBundleShortVersionString") if isinstance(document, dict) else None
+    if not isinstance(version, str) or not version.strip():
+        raise RuntimeError(f"{plist} 里没有 CFBundleShortVersionString")
+    return version.strip()
+
+
+def probe_maa_versions() -> tuple[str, str]:
+    """`(maa-cli, MaaCore)`，取不到的为空串。复用计划卡的 `maa version` 解析，避免两套。"""
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import maa_plan_card
+
+    config = load_json(HERMES_HOME / "state" / "maa" / "config.json", {})
+    return maa_plan_card.read_maa_versions(config if isinstance(config, dict) else {})
+
+
+def probe_hermes_commit() -> str:
+    repo = HERMES_HOME / "hermes-agent"
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    commit = result.stdout.strip()
+    if result.returncode != 0 or not commit:
+        raise RuntimeError(f"git rev-parse 失败（exit {result.returncode}）：{result.stderr.strip()[-200:]}")
+    return commit
+
+
+def installed_versions() -> tuple[dict[str, str | None], dict[str, str]]:
+    """`({组件: 版本或 None}, {组件: 取不到的原因})`。各探测失败互不影响，不抛。"""
+    installed: dict[str, str | None] = {name: None for name in CHECKED_COMPONENTS}
+    errors: dict[str, str] = {}
+    try:
+        cli, core = probe_maa_versions()
+    except Exception as exc:  # 探测失败只记原因；--check 不能因为某个组件探测出错就整个崩掉
+        errors["maa-cli"] = errors["MaaCore"] = f"{type(exc).__name__}: {exc}"
+    else:
+        for name, value in (("maa-cli", cli), ("MaaCore", core)):
+            if value:
+                installed[name] = value
+            else:
+                errors[name] = "maa version 没有输出这一项"
+    probes = {
+        "PlayCover": lambda: bundle_short_version(PLAYCOVER_APP),
+        "Hermes": probe_hermes_commit,
+        "BetterDisplay": lambda: bundle_short_version(BETTERDISPLAY_APP),
+        "Arknights": lambda: bundle_short_version(USER_HOME / ARKNIGHTS_APP_RELATIVE_PATH),
+    }
+    for name, probe in probes.items():
+        try:
+            installed[name] = probe()
+        except RuntimeError as exc:
+            errors[name] = str(exc)
+    return installed, errors
+
+
+def version_matches(name: str, installed: str, verified: str) -> bool:
+    if name == "Hermes":
+        # 记录里可以是短 hash；rev-parse 给的是完整 hash。
+        return len(verified) >= 7 and installed.lower().startswith(verified.lower())
+    return installed == verified
+
+
+def check_versions() -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """`({组件: {installed, verified, match}}, warnings)`。漂移、取不到都只进 warnings。"""
+    warnings: list[str] = []
+    try:
+        verified = load_verified_versions()
+    except RuntimeError as exc:
+        verified = {}
+        warnings.append(f"真机验证版本记录不可用：{exc}")
+    installed, errors = installed_versions()
+    report: dict[str, dict[str, Any]] = {}
+    drifted: list[str] = []
+    for name in CHECKED_COMPONENTS:
+        have = installed.get(name)
+        want = verified.get(name)
+        match = None if have is None or want is None else version_matches(name, have, want)
+        report[name] = {"installed": have, "verified": want, "match": match}
+        if have is None:
+            warnings.append(f"{name} 版本取不到：{errors.get(name, '未知原因')}")
+        elif want is None and verified:
+            warnings.append(f"{name} 在 {VERIFIED_VERSIONS_PATH.name} 里没有记录")
+        elif match is False:
+            drifted.append(f"{name} {want} → {have}")
+    if drifted:
+        warnings.append(
+            "组件版本与最后一次真机验证不同（"
+            + "；".join(drifted)
+            + "）：跑通一次真机后按 DEV_GUIDE §7.1 更新 config/verified_versions.json"
+        )
+    return report, warnings
+
+
 def check_deployment() -> dict[str, Any]:
     """`--check` 的报告。只读：不写任何文件。"""
     skill = skill_file_pair()
@@ -836,6 +981,8 @@ def check_deployment() -> dict[str, Any]:
     adapter = check_adapter()
     gateway_python = check_gateway_python()
     venvs, warnings = check_venvs()
+    versions, version_warnings = check_versions()
+    warnings.extend(version_warnings)
     ok = (
         not missing
         and not mismatched
@@ -849,6 +996,7 @@ def check_deployment() -> dict[str, Any]:
         "adapter": adapter,
         "gateway_python": gateway_python,
         "venvs": venvs,
+        "versions": versions,
         "warnings": warnings,
     }
 

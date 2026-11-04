@@ -1143,7 +1143,7 @@ result = normalize_plan(result)             ← 再规范化一次
 ```bash
 python3 -m unittest discover -s tests -v   # 必须在仓库根目录跑（测试要 import 根目录的 deploy.py）
 python3 deploy.py                          # 幂等；输出 {"ok":true,"changed":[…],"backup":"…"}
-python3 deploy.py --check                  # 只读：脚本/技能/maa-cli 配置逐字节、adapter 补丁、gateway 解释器、venv
+python3 deploy.py --check                  # 只读：脚本/技能/maa-cli 配置逐字节、adapter 补丁、gateway 解释器、venv、组件版本漂移
 ```
 
 `--check` **只读**（不写文件、不打补丁；`DeployCheckTests` 用目录快照守着），输出一行 JSON，
@@ -1156,10 +1156,39 @@ python3 deploy.py --check                  # 只读：脚本/技能/maa-cli 配�
 | `adapter` | 线上 `hermes-agent/plugins/platforms/discord/adapter.py` 在内存里跑 `patch_adapter_source()`：`patched`（结果不变）/ `needs_patch` / `anchor_mismatch: <异常>`（Hermes 升级后锚点对不上，要改补丁）/ `missing` | 非 `patched` 即假 |
 | `gateway_python` | `{plist, program, version, expected, matches}`：`~/Library/LaunchAgents/ai.hermes.gateway.plist` 的 `ProgramArguments[0]`、它自己报的版本、`deploy.HERMES_VENV_PYTHON`、两者是否一致。路径字符串相同算一致；否则要求文件 realpath **且**所在目录 realpath 都相同（不同 venv 的 `bin/python` 常指向同一个 uv 解释器，只比文件 realpath 会误判）。plist 缺失/读不出、取版本失败记在 `error`，不抛 | `matches` 假即假 |
 | `venvs` | `hermes-agent/venv` 与 `.venv` 各自的版本（不存在为 `null`） | 不影响 |
-| `warnings` | 目前只有一条：`venv` 与 `.venv` 并存 | 不影响 |
+| `versions` | `{组件: {installed, verified, match}}`，组件见 `deploy.CHECKED_COMPONENTS`：本机装的版本 vs `config/verified_versions.json` 记的最后真机验证版本（§7.1）。取不到 `installed: null`、没记录 `verified: null`，两种都 `match: null` | 不影响 |
+| `warnings` | `venv` 与 `.venv` 并存；组件版本漂移（汇成一条）；某组件版本取不到；版本记录文件不可用 | 不影响 |
 
 脚本名单只在 `deploy.SCRIPT_NAMES` 一处，`deploy_scripts()` 与 `--check` 共用；新增脚本要加进去，
 `test_script_names_match_the_repository_scripts` 会拦。
+
+### 7.1 版本记录（`config/verified_versions.json`）
+
+记的是**最后一次真机跑通**时各组件的版本（`schema_version: 1`，每项 `version` + `verified_at` + `source`）。
+它只用于记录和漂移检测：`--check` 的 `versions` 键逐项比对，不一致只进 `warnings`，**不让 `ok` 变假**——
+上游正常升级不该把部署检查弄红，但出了怪问题时第一眼就能看到「哪个组件跟最后一次跑通时不一样」。
+这个文件不部署到 `~/.hermes`，只在仓库里。
+
+| 组件 | 本机取值（`deploy.py` 里的探测函数） |
+| --- | --- |
+| `maa-cli` / `MaaCore` | `probe_maa_versions()`：跑 `maa version`，**复用** `maa_plan_card.read_maa_versions()` / `parse_maa_versions()`（`maa_bin` 取线上 `state/maa/config.json`） |
+| `PlayCover` | `/Applications/PlayCover.app/Contents/Info.plist` 的 `CFBundleShortVersionString`（MAA 分支形如 `4.0.0.maa`，记录里另有 `branch: "maa"`） |
+| `Hermes` | `git -C ~/.hermes/hermes-agent rev-parse HEAD`；记录可以是短 hash（≥ 7 位），按前缀比 |
+| `BetterDisplay` | `/Applications/BetterDisplay.app/Contents/Info.plist` |
+| `Arknights` | `~/Library/Containers/io.playcover.PlayCover/Applications/com.hypergryph.arknights.app/Info.plist` |
+| `MaaTools` | **只记录，不进 `--check`**：VERN 要游戏在跑才读得到（§0.5）。记录里 `checked_by_deploy: false` |
+
+**更新流程**（每次真机跑通一场日常 / 抄作业 / 肉鸽之后）：
+
+1. `python3 deploy.py --check`，看 `versions` 里哪些 `match: false`；
+2. 确认这次跑通用的就是这些版本，把 `config/verified_versions.json` 对应项的 `version` 改成 `installed`、
+   `verified_at` 改成当天（北京时间）；
+3. 游戏开着时顺便确认 MaaTools 版本：`maatools_ready(config)` 的说明里有 `MaaTools v<N> 就绪`，
+   有变化就改 `MaaTools` 项和它的 `source`；
+4. 单独提交（`docs:` 或 `chore:`），提交信息写清这次真机验证了什么。
+
+「锁版本」只做到这一步。要真的不让组件升级（`brew pin maa-cli`、关 PlayCover / BetterDisplay 自动更新、
+不跑 `hermes update` 等）会改系统状态，由用户自己决定，脚本和 `deploy.py` 都不做。
 
 做的事：
 

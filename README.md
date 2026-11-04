@@ -409,7 +409,8 @@ hermes cron create "0 14 * * *" --name "MAA 日常·晚" --script maa_daily.py -
 > `--workdir ~/.hermes/state/maa/am`，或者删了按上面重建，否则场次只能靠小时兜底判断。
 
 检查部署是否完整（只读；脚本 / 技能 / maa-cli 配置逐字节比对、adapter 补丁是否在位、
-gateway 是否跑在 `hermes-agent/venv` 的解释器上，字段说明见 `docs/DEV_GUIDE.md` §7）：
+gateway 是否跑在 `hermes-agent/venv` 的解释器上；另外报告各组件版本与 `config/verified_versions.json`
+记录的最后真机验证版本是否一致，漂移只告警。字段说明见 `docs/DEV_GUIDE.md` §7 / §7.1）：
 
 ```bash
 python3 deploy.py --check
