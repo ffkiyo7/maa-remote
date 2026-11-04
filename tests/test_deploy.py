@@ -466,6 +466,21 @@ class DeployCheckTests(unittest.TestCase):
         self.assertTrue(report["gateway_python"]["error"].startswith("取版本失败：exit 3"))
         self.assertTrue(report["gateway_python"]["matches"])
         self.assertTrue(report["venvs"]["venv"].startswith("error: exit 3"))
+        # 路径一致但解释器跑不起来：gateway 实际已经起不来，`ok` 必须是假。
+        self.assertFalse(report["ok"])
+
+    def test_a_dangling_venv_python_fails_the_check_even_though_the_path_matches(self) -> None:
+        # uv 升级 Python 删掉旧解释器后，venv/bin/python 成了断链：路径照样一致。
+        self.venv_python.unlink()
+        self.venv_python.symlink_to(self.user_home / "uv-python-removed" / "python3.11")
+        code, output = self.run_check()
+        report = json.loads(output)
+        gateway = report["gateway_python"]
+        self.assertTrue(gateway["matches"])
+        self.assertIsNone(gateway["version"])
+        self.assertTrue(gateway["error"].startswith("取版本失败："), gateway["error"])
+        self.assertFalse(report["ok"])
+        self.assertEqual(code, 1)
 
         with self.assertRaisesRegex(RuntimeError, "FileNotFoundError"):
             deploy.python_version(self.user_home / "no-such-python")

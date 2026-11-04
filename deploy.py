@@ -1018,11 +1018,14 @@ def check_deployment() -> dict[str, Any]:
     venvs, warnings = check_venvs()
     versions, version_warnings = check_versions()
     warnings.extend(version_warnings)
+    # 路径对得上还不够：uv 升级删掉旧解释器后 `venv/bin/python` 是断链，gateway 已经起不来，
+    # 路径却照样一致。所以还要求它真能跑起来报出版本号。
     ok = (
         not missing
         and not mismatched
         and adapter == "patched"
         and gateway_python["matches"] is True
+        and gateway_python["version"] is not None
     )
     return {
         "ok": ok,

@@ -1195,7 +1195,7 @@ python3 deploy.py --check                  # 只读：脚本/技能/maa-cli 配�
 | `missing` | 下列文件不存在：`deploy.SCRIPT_NAMES` 的 15 个脚本、`ocrbox` / `winmove`、`skills/games/maa-operator/SKILL.md`、全部 maa-cli 配置 | 非空即假 |
 | `mismatched` | 存在但与仓库字节不同：15 个脚本、`SKILL.md`、maa-cli 配置（`tasks/daily.toml` 豁免，见下）。`ocrbox` / `winmove` 是编译产物，只查存在 | 非空即假 |
 | `adapter` | 线上 `hermes-agent/plugins/platforms/discord/adapter.py` 在内存里跑 `patch_adapter_source()`：`patched`（结果不变）/ `needs_patch` / `anchor_mismatch: <异常>`（Hermes 升级后锚点对不上，要改补丁）/ `missing` | 非 `patched` 即假 |
-| `gateway_python` | `{plist, program, version, expected, matches}`：`~/Library/LaunchAgents/ai.hermes.gateway.plist` 的 `ProgramArguments[0]`、它自己报的版本、`deploy.HERMES_VENV_PYTHON`、两者是否一致。路径字符串相同算一致；否则要求文件 realpath **且**所在目录 realpath 都相同（不同 venv 的 `bin/python` 常指向同一个 uv 解释器，只比文件 realpath 会误判）。plist 缺失/读不出、取版本失败记在 `error`，不抛 | `matches` 假即假 |
+| `gateway_python` | `{plist, program, version, expected, matches}`：`~/Library/LaunchAgents/ai.hermes.gateway.plist` 的 `ProgramArguments[0]`、它自己报的版本、`deploy.HERMES_VENV_PYTHON`、两者是否一致。路径字符串相同算一致；否则要求文件 realpath **且**所在目录 realpath 都相同（不同 venv 的 `bin/python` 常指向同一个 uv 解释器，只比文件 realpath 会误判）。plist 缺失/读不出、取版本失败记在 `error`，不抛 | `matches` 假即假；取不到 `version`（解释器起不来，例如 uv 升级后 `venv/bin/python` 断链）也假 |
 | `venvs` | `hermes-agent/venv` 与 `.venv` 各自的版本（不存在为 `null`） | 不影响 |
 | `versions` | `{组件: {installed, verified, match}}`，组件见 `deploy.CHECKED_COMPONENTS`：本机装的版本 vs `config/verified_versions.json` 记的最后真机验证版本（§7.1）。取不到 `installed: null`、没记录 `verified: null`，两种都 `match: null` | 不影响 |
 | `warnings` | `venv` 与 `.venv` 并存；组件版本漂移（汇成一条）；某组件版本取不到；版本记录文件不可用 | 不影响 |
