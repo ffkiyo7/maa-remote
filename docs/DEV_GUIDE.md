@@ -77,7 +77,8 @@ winmove 要调用方有**辅助功能**权限，线上是 Hermes gateway 那个 
 `CGS_REQUIRE_INIT` 断言（进程没初始化 CoreGraphics 会话就调 SCK），要 DYLD 注入一个先调
 `CGMainDisplayID()` 的 shim 才能跑；而且要给 maa 进程开录屏权限。虚拟屏 + `SCRN` 更简单。
 
-**单测碰不到真游戏**：`tests/test_maa.py` 的 `setUpModule()` 把 `maa_playcover.subprocess` /
+**单测碰不到真游戏**：`tests/test_maa.py` / `tests/test_copilot.py` 的 `setUpModule()` 调
+`_isolation.guard_devices()`，把 `maa_playcover.subprocess` /
 `socket` 换成一碰就抛 `RealGameTouched`（BaseException，`except Exception` 吞不掉）的桩。
 2026-11-04 就是 Depot 用例桩了 `maa_daily.launch_game`、实际调的是 `maa_playcover.launch_game`，
 整套单测真的开关了一次游戏。设备层自己的行为在 `tests/test_playcover.py` 里对着一个本机
@@ -1331,23 +1332,35 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开游戏、真�
 不会让测试变红，所以这道模块级闸门是唯一的防线。
 （另：`_cache_age()` 把「未来的 `fetched_at`」一律当成不新鲜，写坏的缓存最多多抓一次。）
 
-改完测试用这条**断网复核**，必须仍然全绿：
+**断网复核不用再手动跑**：`tests/_isolation.py` 装了一个常驻的审计钩子
+（`sys.addaudithook`），解析或连接任何非回环地址都抛 `RealNetworkTouched`
+（BaseException，`except Exception` 吞不掉）。回环地址放行，`test_playcover.py` 的
+假 MaaTools 服务端照常可用；以前那条手动断网复核会把回环一起封掉，和设备层测试冲突。
+
+### 单测必须和线上状态隔离
+
+每个测试文件**第一个** import `_isolation`，必须先于任何 `scripts/` 模块
+（`maa_common` / `deploy` / `maa_copilot` 在 import 时就按 HOME 算好路径常量）：
+
+- 把 `HOME` / `HERMES_HOME` / `MAA_CONFIG_DIR` 换成进程级临时目录，跑完删掉；
+  清掉 `MAA_CHANNEL_ID` / `SKLAND_HG_TOKEN`。
+- 同一个审计钩子守住真实 home 下的 `.hermes` / `.config/maa-cli` / `Library`：
+  打开、列目录、建删改名、chmod 一律抛 `RealHomeTouched`。
+- 本解释器没有 PyYAML 时，deploy 的 YAML 用例借 Hermes venv 的解释器**只做解析**；
+  两边都没有就跳过（`needs_yaml`）。要 `tomllib` 的用例在 3.11 以下跳过（`needs_tomllib`）。
+
+起因（2026-11-04 用干净 HOME 复核）：开发机上的「全绿」靠真实 `~/.hermes`，换台机器
+就红 24 条；用例每跑一次往 `~/.hermes/backups/maa-setup/` 留一个目录（当时 361 个里
+271 个是单测留的）；计划卡用例走到森空岛体检，北京时间 07:50 前跑会拿真 token 打森空岛、
+并把当天记成「已体检」，真计划卡那天就不再提醒过期。
+
+写新用例时：路径一律从 `maa_common` / `deploy` 的常量来，或 patch 到
+`tempfile.TemporaryDirectory()`；要本机资源（MaaResource、PlayCover 安装、Hermes）的
+一律打桩。验收：干净 HOME 下的结果必须和真实 HOME 下一致。
 
 ```bash
-python3 -c "
-import socket, ssl, unittest
-def blocked(*a, **k):
-    raise RuntimeError('network access attempted during unit tests')
-socket.socket.connect = blocked
-socket.socket.connect_ex = blocked
-socket.create_connection = blocked
-socket.getaddrinfo = blocked
-unittest.main(module=None, argv=['nonet', 'discover', '-s', 'tests'])
-"
+HOME="$(mktemp -d)" python3 -m unittest discover -s tests
 ```
-
-> 注意是 patch `socket.socket.connect` 而不是 `socket.socket` 本身——
-> 后者会把 `ssl.SSLSocket` 的继承搞崩，测试还没跑就 ImportError。
 
 **线上契约冒烟**（默认跳过，故意要连真网的那一条）：
 

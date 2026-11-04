@@ -22,8 +22,14 @@ HERMES_HOME = USER_HOME / ".hermes"
 MAA_CONFIG_HOME = USER_HOME / ".config" / "maa-cli"
 CHANNEL_PLACEHOLDER = "REPLACE_WITH_DISCORD_CHANNEL_ID"
 changed: list[str] = []
-backup_root = HERMES_HOME / "backups" / "maa-setup" / datetime.now().strftime("%Y%m%dT%H%M%S")
+BACKUP_STAMP = datetime.now().strftime("%Y%m%dT%H%M%S")
 backed_up: set[Path] = set()
+
+
+def backup_root() -> Path:
+    """本次部署的备份目录。调用时才按 `HERMES_HOME` 算：import 时算死的话，
+    单测 patch 了 `HERMES_HOME` 备份也照样写进线上 `~/.hermes/backups/`。"""
+    return HERMES_HOME / "backups" / "maa-setup" / BACKUP_STAMP
 
 
 def ensure_dir(path: Path, mode: int = 0o700) -> None:
@@ -35,7 +41,7 @@ def backup(path: Path) -> None:
     if not path.exists() or path in backed_up:
         return
     relative = Path(str(path).lstrip("/"))
-    target = backup_root / relative
+    target = backup_root() / relative
     ensure_dir(target.parent)
     shutil.copy2(path, target)
     os.chmod(target, 0o600)
@@ -727,7 +733,7 @@ def main() -> int:
     patch_local_patches()
     patch_env(channel_id)
     patch_config_yaml(channel_id)
-    print(json.dumps({"ok": True, "changed": changed, "backup": str(backup_root)}, ensure_ascii=False))
+    print(json.dumps({"ok": True, "changed": changed, "backup": str(backup_root())}, ensure_ascii=False))
     return 0
 
 

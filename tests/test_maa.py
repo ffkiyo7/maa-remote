@@ -18,7 +18,10 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
+# 必须先于任何 scripts/ 模块：把 HOME 换成临时目录，碰真实 home / 外网当场炸。
+import _isolation  # noqa: E402
 import maa_action  # noqa: E402
 import maa_clearing  # noqa: E402
 import maa_common  # noqa: E402
@@ -45,35 +48,27 @@ _NO_NETWORK = None
 
 _GAMEDATA_PATCHES: list = []
 
-
-class RealGameTouched(BaseException):
-    """单测碰到了真游戏。继承 BaseException：设备层里的 `except Exception` 吞不掉它。"""
-
-
-class _NoRealGame:
-    """顶替 `maa_playcover` 里的 `subprocess` / `socket`：开游戏、TERM、点屏幕、pgrep
-    一律当场炸。2026-11-04 Depot 用例桩错了模块（桩的 `maa_daily.*`、调的是
-    `maa_playcover.*`），整套单测真的把正在跑的明日方舟关掉了。设备层自己的行为在
-    `test_playcover.py` 里测，那里自己给假的 subprocess / socket。"""
-
-    def __init__(self, name: str) -> None:
-        self._name = name
-
-    def __getattr__(self, attr: str):
-        raise RealGameTouched(f"单测碰到了真游戏：maa_playcover.{self._name}.{attr}——自行打桩")
-
-
+# 设备层桩见 `_isolation.NoRealGame`：开游戏、TERM、点屏幕、pgrep 一律当场炸。
 _DEVICE_GUARDS: list = []
+
+# deploy 校验 config.yaml 要 PyYAML。本解释器没有时 `parse_yaml()` 会去找
+# `deploy.HERMES_VENV_PYTHON`——那是临时 HOME 下的路径，不存在；这里指到
+# `_isolation.yaml_python()` 找到的解释器（只做解析，不读状态）。都没有就跳过，
+# 不能让「缺 PyYAML 的 RuntimeError」冒充用例期望的 RuntimeError 混过去。
+_YAML_PYTHON = _isolation.yaml_python()
+_YAML_PATCHES: list = []
+needs_yaml = unittest.skipUnless(
+    _YAML_PYTHON is not None, "需要 PyYAML：本解释器和 Hermes venv 都没有"
+)
 
 
 def setUpModule() -> None:
     global _NO_NETWORK
-    _DEVICE_GUARDS[:] = [
-        patch.object(maa_playcover, "subprocess", _NoRealGame("subprocess")),
-        patch.object(maa_playcover, "socket", _NoRealGame("socket")),
-    ]
-    for item in _DEVICE_GUARDS:
-        item.start()
+    _DEVICE_GUARDS[:] = _isolation.guard_devices()
+    if _YAML_PYTHON is not None:
+        _YAML_PATCHES[:] = [patch.object(deploy, "HERMES_VENV_PYTHON", _YAML_PYTHON)]
+        for item in _YAML_PATCHES:
+            item.start()
     _NO_NETWORK = patch.object(
         maa_farming,
         "_http_json",
@@ -98,6 +93,8 @@ def tearDownModule() -> None:
     if _NO_NETWORK is not None:
         _NO_NETWORK.stop()
     for item in reversed(_GAMEDATA_PATCHES):
+        item.stop()
+    for item in reversed(_YAML_PATCHES):
         item.stop()
     for item in reversed(_DEVICE_GUARDS):
         item.stop()
@@ -940,6 +937,7 @@ Opening mini games:
         "      '1531685973501542422': '你是领读老师。'\n"
     )
 
+    @needs_yaml
     def test_channel_prompt_lands_in_channel_prompts_whatever_the_key_order(self) -> None:
         patched = deploy.patch_config_yaml_text(self.CONFIG_SAMPLE, "1533066727313637457")
         parsed = deploy.parse_yaml(patched)
@@ -955,6 +953,7 @@ Opening mini games:
             discord["channel_skill_bindings"],
         )
 
+    @needs_yaml
     def test_channel_prompt_is_not_duplicated_and_old_wording_is_rewritten(self) -> None:
         once = deploy.patch_config_yaml_text(self.CONFIG_SAMPLE, "1533066727313637457")
         self.assertEqual(deploy.patch_config_yaml_text(once, "1533066727313637457"), once)
@@ -989,6 +988,7 @@ Opening mini games:
             deploy.MAA_CHANNEL_PROMPT,
         )
 
+    @needs_yaml
     def test_unparsable_result_raises_before_the_file_is_written(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             home = Path(raw)
@@ -1010,6 +1010,7 @@ Opening mini games:
                     deploy.patch_config_yaml("1533066727313637457")
             self.assertEqual(config.read_text(encoding="utf-8"), self.CONFIG_SAMPLE)
 
+    @needs_yaml
     def test_an_already_broken_config_is_refused_instead_of_patched(self) -> None:
         broken = self.CONFIG_SAMPLE.replace(
             "timezone: Etc/UTC\n",
@@ -2576,6 +2577,9 @@ class GameProbeTests(unittest.TestCase):
         ) as common_request, patch.object(
             maa_common, "discord_token", return_value="token"
         ), patch.object(maa_daily, "require_executable"), patch.object(
+            # 不桩它就会真去读 PlayCover 里明日方舟的安装和 MaaTools 设置。
+            maa_daily, "verify_game_installed"
+        ), patch.object(
             maa_daily, "launch_game", side_effect=RuntimeError("STOP: probe passed")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
@@ -4085,6 +4089,8 @@ class SessionDailyTests(unittest.TestCase):
         ), patch.object(maa_daily, "merge_last_run"), patch.object(
             maa_daily, "discord_request"
         ) as request, patch.object(maa_daily, "require_executable"), patch.object(
+            maa_daily, "verify_game_installed"
+        ), patch.object(
             maa_daily, "launch_game", side_effect=RuntimeError("STOP: 已越过跳过闸门")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
@@ -4159,6 +4165,10 @@ class PlanCardPhaseTests(unittest.TestCase):
             maa_plan_card, "cleanup_old_threads", return_value={"failed": 0}
         ), patch.object(maa_plan_card, "cleanup_run_files"), patch.object(
             maa_plan_card, "retire_old_plan_cards", return_value={"failed": 0}
+        ), patch.object(
+            # 计划卡末尾的森空岛体检：不桩就拿 skland.json 里的 token 打森空岛、
+            # 还把当天记成「已体检」。体检本身在 SklandDailyHealthTests 里测。
+            maa_plan_card, "_skland_health_notice"
         ), patch.object(maa_plan_card, "discord_request") as request:
             code = maa_plan_card.main(argv)
         return SimpleNamespace(code=code, upstream=upstream, request=request)
@@ -4402,7 +4412,9 @@ class EmulatorProbeSharedTests(unittest.TestCase):
                 maa_depot, "report_game_busy"
             ) as report, patch.object(
                 maa_depot, "reconcile"
-            ) as writer, patch.object(maa_daily, "launch_game") as launch_game:
+            ) as writer, patch.object(maa_playcover, "launch_game") as launch_game:
+                # Depot 调的是 `maa_playcover.launch_game`；桩在 `maa_daily` 上
+                # 下面的 assert_not_called() 就永远成立，什么也证明不了。
                 result = maa_depot.run_if_due({"channel_id": "1"}, at=at)
             after = json.loads(depot_path.read_text(encoding="utf-8"))
         self.assertEqual(result["status"], "skipped_busy")
@@ -6416,6 +6428,7 @@ class DeployPromptPatchTests(unittest.TestCase):
             "      '456': '别的频道'\n"
         )
 
+    @needs_yaml
     def test_a_reflowed_two_line_prompt_is_replaced_in_place(self) -> None:
         # 实例：Hermes 把这一条重排成无引号、在 `maa-operator` 后折行的 plain scalar。
         head, _space, tail = self.OLD.rpartition(" ")
@@ -6430,22 +6443,26 @@ class DeployPromptPatchTests(unittest.TestCase):
         self.assertNotIn("只处理今天的关卡", patched)
         self.assertEqual(len(patched.splitlines()), len(text.splitlines()) - 1)
 
+    @needs_yaml
     def test_a_single_quoted_prompt_is_still_replaced(self) -> None:
         text = self._document(f"      '123': '{self.OLD}'\n")
         patched = deploy.patch_config_yaml_text(text, "123")
         prompts = deploy.parse_yaml(patched)["platforms"]["discord"]["channel_prompts"]
         self.assertEqual(prompts["123"], deploy.MAA_CHANNEL_PROMPT)
 
+    @needs_yaml
     def test_an_already_current_prompt_is_left_alone(self) -> None:
         text = self._document(f"      '123': '{deploy.MAA_CHANNEL_PROMPT}'\n")
         self.assertEqual(deploy.patch_config_yaml_text(text, "123"), text)
 
+    @needs_yaml
     def test_an_unexpected_prompt_still_refuses_to_deploy(self) -> None:
         text = self._document("      '123': 别人手工写的文案\n")
         with self.assertRaises(RuntimeError) as caught:
             deploy.patch_config_yaml_text(text, "123")
         self.assertIn("非预期文案", str(caught.exception))
 
+    @needs_yaml
     def test_a_missing_prompt_is_inserted(self) -> None:
         text = self._document("")
         patched = deploy.patch_config_yaml_text(text, "123")
@@ -7177,6 +7194,7 @@ class RoguelikeDictionaryTests(unittest.TestCase):
 class RoguelikeTaskFileTests(unittest.TestCase):
     """执行路线是 `maa run` 任务文件，不是 `maa roguelike` 子命令（spike C 第 6.7 节）。"""
 
+    @_isolation.needs_tomllib
     def test_the_rendered_params_carry_the_stop_primitives_and_no_support(self) -> None:
         import tomllib
 
@@ -7195,6 +7213,7 @@ class RoguelikeTaskFileTests(unittest.TestCase):
         self.assertNotIn("use_support", toml)
         self.assertNotIn("use_nonfriend_support", toml)
 
+    @_isolation.needs_tomllib
     def test_every_round_starts_the_game_itself(self) -> None:
         """2026-09-11 事故：任务文件没有 StartUp，模拟器起来了但游戏没起来。
 
@@ -8463,6 +8482,9 @@ class ManualRunCardTests(unittest.TestCase):
             patch.object(maa_action, "load_config", return_value=config or {"channel_id": "123"})
         )
         stack.enter_context(patch.object(maa_action, "require_executable", lambda *a: None))
+        stack.enter_context(
+            patch.object(maa_playcover, "verify_game_installed", lambda *a: None)
+        )
         stack.enter_context(patch.object(maa_action, "discord_token", return_value="t"))
         stack.enter_context(patch.object(maa_action, "discord_request", side_effect=self._discord))
         stack.enter_context(patch.object(maa_action.subprocess, "Popen", side_effect=self._popen))

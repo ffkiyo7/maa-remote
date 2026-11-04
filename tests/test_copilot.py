@@ -16,13 +16,28 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
+# 必须先于任何 scripts/ 模块：把 HOME 换成临时目录，碰真实 home / 外网当场炸。
+import _isolation  # noqa: E402
 import deploy  # noqa: E402
 import maa_action  # noqa: E402
 import maa_common  # noqa: E402
 import maa_copilot  # noqa: E402
 
 BEIJING = ZoneInfo("Asia/Shanghai")
+
+# 这里的用例会走到 maa_action 的派发链，设备层同 test_maa 一样封死。
+_DEVICE_GUARDS: list = []
+
+
+def setUpModule() -> None:
+    _DEVICE_GUARDS[:] = _isolation.guard_devices()
+
+
+def tearDownModule() -> None:
+    for item in reversed(_DEVICE_GUARDS):
+        item.stop()
 
 
 def op_item(item_id: int, stage_name: str, *, opers=None, groups=None,
@@ -1280,6 +1295,7 @@ class DeployTokenTests(unittest.TestCase):
 class ReviewFixTests(unittest.TestCase):
     """Regression tests for REVIEW_PHASE2.md findings (P0/P1/P2)."""
 
+    @_isolation.needs_tomllib
     def test_navigation_config_is_isolated_and_never_clicks_start(self) -> None:
         import maa_copilot_worker as worker
         import tomllib
@@ -1490,16 +1506,18 @@ class ReviewFixTests(unittest.TestCase):
         normalized = maa_skland._normalize_chars(chars, battle)
         self.assertEqual(normalized["char_350_surtr"]["module_levels"], [0, 3])
         r = roster(normalized)
-        satisfied, score, hard, soft = maa_copilot.check_op_requirements(
-            {"name": "史尔特尔", "requirements": {"module": 1}}, r, {}
-        )
+        # 名字 → charId 要查 battle_data；不桩就去读本机 MaaResource，干净机器上查不到。
+        with patch.object(maa_copilot, "battle_data", return_value=battle):
+            satisfied, score, hard, soft = maa_copilot.check_op_requirements(
+                {"name": "史尔特尔", "requirements": {"module": 1}}, r, {}
+            )
+            satisfied2, _score2, hard2, _soft2 = maa_copilot.check_op_requirements(
+                {"name": "史尔特尔", "requirements": {"module": 2}}, r, {}
+            )
         # module is a soft constraint: satisfied stays True but score halves
         self.assertTrue(satisfied)
         self.assertEqual(score, 0.5)
         self.assertTrue(any("模组1" in gap for gap in soft))
-        satisfied2, _score2, hard2, _soft2 = maa_copilot.check_op_requirements(
-            {"name": "史尔特尔", "requirements": {"module": 2}}, r, {}
-        )
         self.assertTrue(satisfied2)
         self.assertEqual(hard2, [])
         self.assertEqual(_soft2, [])
