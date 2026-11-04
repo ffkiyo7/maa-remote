@@ -28,11 +28,15 @@ import maa_playcover  # noqa: E402
 
 
 class FakeMaaTools:
-    """最小的 MaaTools 服务端：握手、SIZE、SCRN、TUCH、TERM，记下收到的命令。"""
+    """最小的 MaaTools 服务端：握手、VERN、SIZE、SCRN、TUCH、TERM，记下收到的命令。
+
+    `version` 是 VERN 回的协议版本；设成 `None` 时收到 VERN 就断开（模拟不认 VERN 的旧版）。
+    """
 
     def __init__(self, size=(3840, 2160), frame: bytes | None = None) -> None:
         self.size = size
         self.frame = frame
+        self.version: int | None = maa_playcover.MIN_MAATOOLS_VERSION
         self.commands: list[tuple[bytes, bytes]] = []
         self.handlers: list[threading.Thread] = []
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -83,7 +87,11 @@ class FakeMaaTools:
                     body = self._recv(conn, length)
                     command, payload = body[:4], body[4:]
                     self.commands.append((command, payload))
-                    if command == b"SIZE":
+                    if command == b"VERN":
+                        if self.version is None:
+                            return
+                        conn.sendall(struct.pack(">I", self.version))
+                    elif command == b"SIZE":
                         conn.sendall(struct.pack(">HH", *self.size))
                     elif command == b"SCRN":
                         frame = self.frame or b""
@@ -118,6 +126,71 @@ class MaaToolsProtocolTests(unittest.TestCase):
         ready, detail = maa_playcover.maatools_ready(self.fake.config)
         self.assertTrue(ready)
         self.assertIn("3840x2160", detail)
+        self.assertIn("v4", detail)
+
+    def test_handshake_reads_the_protocol_version_before_any_command(self) -> None:
+        self.fake.version = 5
+        with maa_playcover.MaaTools(self.fake.config) as tools:
+            self.assertEqual(tools.version, 5)
+            tools.size()
+        commands = [command for command, _ in self.fake.drained()]
+        self.assertEqual(commands, [b"VERN", b"SIZE"])
+        self.assertEqual(self.fake.commands[0], (b"VERN", b""))
+
+    def test_an_old_protocol_version_is_refused_and_the_socket_closed(self) -> None:
+        self.fake.version = 3
+        tools = maa_playcover.MaaTools(self.fake.config)
+        with self.assertRaises(maa_playcover.MaaToolsError) as caught:
+            tools.__enter__()
+        message = str(caught.exception)
+        self.assertIn("v3", message)
+        self.assertIn("v4", message)
+        self.assertIn("升级 PlayCover MAA 分支", message)
+        self.assertIsNone(tools.sock)
+        self.assertIsNone(tools.version)
+        ready, detail = maa_playcover.maatools_ready(self.fake.config)
+        self.assertFalse(ready)
+        self.assertIn("低于要求", detail)
+        # 版本不够就不该再发任何命令。
+        self.assertNotIn(b"SIZE", [command for command, _ in self.fake.drained()])
+
+    def test_a_peer_that_hangs_up_on_vern_gets_its_own_error(self) -> None:
+        self.fake.version = None
+        tools = maa_playcover.MaaTools(self.fake.config)
+        with self.assertRaises(maa_playcover.MaaToolsError) as caught:
+            tools.__enter__()
+        message = str(caught.exception)
+        self.assertIn("VERN", message)
+        self.assertIn("对端关闭", message)
+        self.assertIsNone(tools.sock)
+        ready, detail = maa_playcover.maatools_ready(self.fake.config)
+        self.assertFalse(ready)
+        self.assertIn("VERN", detail)
+
+    def test_a_silent_peer_on_vern_times_out_with_a_clear_error(self) -> None:
+        # 回了 OKAY 却对 VERN 一声不吭：超时也要报成 VERN 读不到，而不是挂住。
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        held: list[socket.socket] = []
+
+        def serve() -> None:
+            conn, _ = server.accept()
+            held.append(conn)
+            conn.recv(4)
+            conn.sendall(b"OKAY")
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        config = {"maatools_address": f"127.0.0.1:{server.getsockname()[1]}"}
+        tools = maa_playcover.MaaTools(config, timeout=0.3)
+        with self.assertRaisesRegex(maa_playcover.MaaToolsError, "读不到 VERN"):
+            tools.__enter__()
+        self.assertIsNone(tools.sock)
+        thread.join(timeout=2)
+        for conn in held:
+            conn.close()
 
     def test_ready_is_false_when_nothing_listens(self) -> None:
         self.fake.close()

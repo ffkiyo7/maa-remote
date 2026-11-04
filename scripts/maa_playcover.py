@@ -8,7 +8,7 @@ MaaCore 自己的连接由 maa-cli profile 的 `[connection] preset = "PlayCover
 | 模拟器时代 | PlayCover |
 |---|---|
 | `open -a <模拟器>` | `open -a <PlayCover 容器里的 .app>`：直接拉起游戏进程 |
-| `adb connect` + `sys.boot_completed` | MaaTools 握手 `MAA\\0` → `OKAY`，`SIZE` 非零 |
+| `adb connect` + `sys.boot_completed` | MaaTools 握手 `MAA\\0` → `OKAY`、`VERN` ≥ 4，`SIZE` 非零 |
 | `pm path <包名>` | PlayCover 容器里的 `.app` 在、它的 App Settings 开了 MaaTools 且端口对得上 |
 | `adb exec-out screencap` | MaaTools `SCRN`（游戏在前台时）→ 退回 `screencapture -l <窗口>` |
 | `adb shell input tap` | MaaTools `TUCH`（Began + Ended） |
@@ -66,6 +66,9 @@ BASE_WIDTH, BASE_HEIGHT = 1920, 1080
 MAX_SHOT_WIDTH = 1920
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 TOUCH_BEGAN, TOUCH_ENDED = 0, 3
+# 握手后 `VERN` 回的 MaaTools 协议版本下限。上游 MaaMacGui 对 SIZE/SCRN/TUCH/TERM 要求 ≥ 2、
+# RECT/BNDL/BGR 要求 ≥ 3；这里只认真机用过的 4（PlayCover MAA 分支 4.0.0.maa）。
+MIN_MAATOOLS_VERSION = 4
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +157,8 @@ class MaaTools:
         self.address = maatools_address(config)
         self.timeout = timeout
         self.sock: socket.socket | None = None
+        # 握手时 `VERN` 读回的协议版本；`__enter__` 成功后才有值。
+        self.version: int | None = None
 
     def __enter__(self) -> "MaaTools":
         try:
@@ -166,6 +171,28 @@ class MaaTools:
         if reply != b"OKAY":
             self.close()
             raise MaaToolsError(f"MaaTools 握手回包异常：{reply!r}")
+        try:
+            self._send(b"VERN")
+            (version,) = struct.unpack(">I", self._recv(4))
+        except MaaToolsError as exc:
+            self.close()
+            raise MaaToolsError(
+                f"MaaTools 握手后读 VERN 时对端关闭（{exc}）：PlayCover 的 MaaTools 可能太旧、"
+                "不认 VERN，升级 PlayCover MAA 分支"
+            ) from exc
+        except OSError as exc:
+            self.close()
+            raise MaaToolsError(
+                f"MaaTools 握手后读不到 VERN（{exc}）：检查 PlayCover 的 MaaTools 是否正常，"
+                "必要时重开游戏或升级 PlayCover MAA 分支"
+            ) from exc
+        if version < MIN_MAATOOLS_VERSION:
+            self.close()
+            raise MaaToolsError(
+                f"MaaTools 协议版本 v{version} 低于要求的 v{MIN_MAATOOLS_VERSION}："
+                "升级 PlayCover MAA 分支（本仓库验证过的是 4.0.0.maa）"
+            )
+        self.version = version
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -221,11 +248,12 @@ def maatools_ready(config: dict[str, Any], timeout: float = 2.0) -> tuple[bool, 
     try:
         with MaaTools(config, timeout=timeout) as tools:
             width, height = tools.size()
+            version = tools.version
     except (MaaToolsError, OSError, struct.error) as exc:
         return False, str(exc)
     if not width or not height:
         return False, "MaaTools 已连上，但游戏窗口尺寸还是 0"
-    return True, f"MaaTools 就绪（{width}x{height}）"
+    return True, f"MaaTools v{version} 就绪（{width}x{height}）"
 
 
 # ---------------------------------------------------------------------------

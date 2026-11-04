@@ -45,7 +45,16 @@
 | maa-cli profile `adb_path` / `MaaTouch` | `preset = "PlayCover"`、`address = "127.0.0.1:1717"`、`touch_mode = "MacPlayTools"` |
 
 **MaaTools 协议**（PlayCover MAA 分支 `4.0.0.maa`，`VERN` = 4）：连 `127.0.0.1:1717`，先发
-`MAA\0` 收 `OKAY`；之后每条请求是 `>H` 长度（4 + 负载）+ 4 字节命令。`SIZE` 回 `>HH`；
+`MAA\0` 收 `OKAY`；之后每条请求是 `>H` 长度（4 + 负载）+ 4 字节命令。`MaaTools.__enter__`
+握手后**先发 `VERN`**，收 4 字节 `>I` 协议版本（依据上游 MaaMacGui `MaaToolsClient.swift`：
+VERN 回包与 `SCRN` 长度用同一个 `ByteReader` 读 `UInt32`，即大端），存进 `tools.version`，
+`maatools_ready()` 的说明带出 `v<版本>`。低于 `MIN_MAATOOLS_VERSION`（= 4，只认真机用过的版本；
+上游自己对 SIZE/SCRN/TUCH/TERM 只要求 ≥ 2、RECT/BNDL/BGR ≥ 3）、VERN 时对端断开、VERN 读超时，
+各报一条带处理办法的 `MaaToolsError`（升级 PlayCover MAA 分支 / 检查 MaaTools），并关掉 socket——
+`wait_for_game()` 照常轮询到 `game_launch_timeout`，超时报错里带着最后一条说明。
+**VERN 的回包格式还没在真机上验证过**（2026-11-04 改动时游戏没在跑，按规定没去开）；
+若部署后每场都报「读不到 VERN」/「对端关闭」或版本号离谱（如 `v67108864` = 字节序读反了），先怀疑这里。
+`SIZE` 回 `>HH`；
 `SCRN` 回 `>I` 长度 + RGBA；`TUCH` 负载 `>BHH`（phase 0 = Began、1 = Moved、3 = Ended，坐标是
 `SIZE` 空间）；`TERM` 结束游戏。抄作业的看门狗会在 MaaCore 连着时另开一条连接截图、点击——
 **「MaaCore 连着时第二条连接能不能点」还没在真机上验证过**，第一次碰上接管弹窗时留意日志里的
