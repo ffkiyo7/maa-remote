@@ -494,7 +494,7 @@ def run_now() -> tuple[bool, str]:
     # 先收旧卡（状态 → 登记 → 组件），再写新登记、再发新卡（不变量 #14b）。
     try:
         _retire_manual_run(config, "superseded", "已被新的选关卡取代")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 收旧选关卡尽力而为，失败只附在回执里
         warning = f"；上一张选关卡收起失败：{type(exc).__name__}: {exc}"
 
     now = now_beijing()
@@ -566,7 +566,7 @@ def run_start(stage: str, token: str) -> tuple[bool, str]:
         warning = ""
         try:
             _retire_manual_run(config, "expired", "⌛ 已过期，重新说「现在跑」")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (c) 过期卡收起尽力而为，失败只附在回执里
             warning = f"（卡片收起失败：{type(exc).__name__}: {exc}）"
         return False, f"⌛ 这张选关卡已过期（{expires_at:%H:%M}），请再说一次「现在跑」。{warning}"
     if not valid_stage(stage, config):
@@ -614,7 +614,7 @@ def run_start(stage: str, token: str) -> tuple[bool, str]:
                 "components": [],
             },
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 收卡尽力而为，手动场照样派发，失败只附在回执里
         warning = f"；卡片收起失败：{type(exc).__name__}: {exc}"
     subprocess.Popen(
         [sys.executable, str(script), "now", token],
@@ -668,7 +668,7 @@ def run_recommend(token: str) -> tuple[bool, str]:
             text = f"推荐暂不可用（{why or '缺口算不出来'}）"
         if note:
             text = f"{text}\n{note}"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 推荐是旁路信息（森空岛 / 缺口计算，失败形态不定），失败写成「暂不可用」
         text = f"推荐暂不可用（{type(exc).__name__}: {exc}）"
     with state_lock():
         state = _load_manual_run()
@@ -760,7 +760,7 @@ def _invalidate_search_card(token: str, config: Config) -> str:
         return ""
     try:
         retire_discord_components(config, message_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 登记已先作废，收按钮失败只附在回执里
         return f"；旧卡按钮收起失败但已不能执行：{type(exc).__name__}: {exc}"
     return ""
 
@@ -1059,7 +1059,7 @@ def start_copilot_search(stage: str, *more: str) -> tuple[bool, str, str | None]
             start_new_session=True,
             close_fds=True,
         )
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         detail = f"搜索进程派发失败：{type(exc).__name__}: {exc}"
         _mark_search_dispatch_failed(token, detail)
         return False, detail, None
@@ -1220,7 +1220,7 @@ def copilot_card() -> tuple[bool, str]:
         retire_discord_components(
             config, previous.get("message_id") if isinstance(previous, dict) else None
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 收上一张卡的按钮尽力而为，失败只附在回执里
         warning = f"；上一张卡的按钮收起失败：{type(exc).__name__}: {exc}"
     with state_lock():
         registry = load_json(BUTTONS_PATH, {})
@@ -1290,7 +1290,7 @@ def _send_roguelike_card(config: Config, state: dict[str, Any]) -> str:
     warning = ""
     try:
         retire_discord_components(config, state.get("message_id"))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 收上一张卡的按钮尽力而为，失败只附在回执里
         warning = f"；上一张卡的按钮收起失败：{type(exc).__name__}: {exc}"
     with state_lock():
         registry = load_json(BUTTONS_PATH, {})
@@ -1409,7 +1409,7 @@ def roguelike_start() -> tuple[bool, str]:
     maa_roguelike.update_state(lambda fresh: fresh.update(started))
     try:
         dispatch_roguelike(token)
-    except Exception as exc:
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as exc:
         maa_roguelike.update_state(
             lambda fresh: fresh.update(
                 {"status": maa_roguelike.IDLE, "token": ""}
@@ -1512,7 +1512,7 @@ def copilot_auto(value: str) -> tuple[bool, str]:
             if changed:
                 try:
                     retire_discord_components(load_config(), message_id)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 — (c) 旧卡按钮已失效，收不掉只附在回执里
                     note = f"（旧卡按钮收起失败但已失效：{type(exc).__name__}）"
                 note = "已作废还没开打的一轮" + note + "。"
         elif status == "executing":
@@ -1543,7 +1543,7 @@ def copilot_cancel(token: str) -> tuple[bool, str]:
         atomic_write_json(BUTTONS_PATH, registry)
     try:
         retire_discord_components(config, message_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 已取消，收按钮失败只附在回执里
         return (
             True,
             "❌ 已取消；旧卡按钮收起失败但已经不能执行："
@@ -1642,7 +1642,7 @@ def dispatch(argv: list[str]) -> tuple[bool, str]:
 def main(argv: list[str]) -> int:
     try:
         ok, message = dispatch(argv[1:])
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：任何失败都要变成 ok=false 回执交给技能
         emit(False, f"操作失败：{type(exc).__name__}: {exc}")
         return 1
     emit(ok, message)

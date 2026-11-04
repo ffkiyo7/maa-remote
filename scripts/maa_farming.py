@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -231,7 +232,7 @@ def _fetch_cached(
     for label, call in fetchers:
         try:
             status, payload, new_etag = call(etag)
-        except Exception as exc:  # noqa: BLE001 - 抓取层永不抛，只降级
+        except Exception as exc:  # noqa: BLE001 — (c) 抓取层永不抛，只降级
             failures.append(f"{label}：{exc}")
             continue
         if status == 304:
@@ -709,11 +710,11 @@ def _unlock_evidence() -> tuple[dict[str, Any] | None, maa_copilot.Ledger | None
 
     try:
         roster = maa_copilot.load_roster()
-    except Exception:  # noqa: BLE001 - 旁路信息
+    except Exception:  # noqa: BLE001 — (c) 旁路信息，读不出来按没有处理
         roster = None
     try:
         ledger = maa_copilot.load_ledger()
-    except Exception:  # noqa: BLE001 - 旁路信息
+    except Exception:  # noqa: BLE001 — (c) 旁路信息，读不出来按没有处理
         ledger = None
     return roster, ledger
 
@@ -782,7 +783,7 @@ def candidate_stages(
     path = activity_cache or (Path(configured) if configured else None)
     try:
         deadlines = maa_plan_card.activity_deadlines(path)
-    except Exception:  # noqa: BLE001 - 旁路信息，读不出来就按「没有日历」处理
+    except Exception:  # noqa: BLE001 — (c) 旁路信息，读不出来就按「没有日历」处理
         deadlines = []
     stages = [
         str(stage).strip()
@@ -797,7 +798,7 @@ def candidate_stages(
         try:
             nav_of = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))
             navigable = [stage for stage in stages if nav_of(stage)[0]]
-        except Exception:  # noqa: BLE001 - 闸门读不出来时不该整条推荐消失
+        except Exception:  # noqa: BLE001 — (c) 闸门读不出来时不该整条推荐消失
             navigable = list(stages)
         try:
             roster, ledger = _unlock_evidence()
@@ -811,7 +812,7 @@ def candidate_stages(
                 )
                 for stage in navigable
             }
-        except Exception:  # noqa: BLE001 - 判不了解锁就按原口径，不让推荐消失
+        except Exception:  # noqa: BLE001 — (c) 判不了解锁就按原口径，不让推荐消失
             verdicts = {}
         locked = [why for why in verdicts.values() if why]
         navigable = [stage for stage in navigable if not verdicts.get(stage)]
@@ -854,7 +855,7 @@ def item_names(config: Config) -> dict[str, str]:
             names = {key: value for key, value in names.items() if value}
             if names:
                 return names
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — (c) 物品名只是显示用，读不出来退回 itemId
         return {}
     return {}
 
@@ -908,8 +909,8 @@ def _session_ap(config: Config, at: datetime) -> float:
         )
         if isinstance(value, (int, float)) and value > 0:
             return float(value)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001 — (c) 估不出理智就按默认场次理智
+        print(f"session AP estimate failed: {type(exc).__name__}: {exc}", file=sys.stderr)
     return FALLBACK_SESSION_AP
 
 

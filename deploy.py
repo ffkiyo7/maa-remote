@@ -299,7 +299,7 @@ def _compile_swift(name: str, consequence: str) -> None:
             raise RuntimeError(result.stderr[-500:])
         os.chmod(target, 0o700)
         changed.append(str(target))
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         print(
             f"{name} 编译失败（{type(exc).__name__}: {exc}）——{consequence}",
             file=sys.stderr,
@@ -942,7 +942,7 @@ def installed_versions() -> tuple[dict[str, str | None], dict[str, str]]:
     errors: dict[str, str] = {}
     try:
         cli, core = probe_maa_versions()
-    except Exception as exc:  # 探测失败只记原因；--check 不能因为某个组件探测出错就整个崩掉
+    except Exception as exc:  # noqa: BLE001 — (c) 探测失败只记原因，--check 不能因为某个组件探测出错就整个崩掉
         errors["maa-cli"] = errors["MaaCore"] = f"{type(exc).__name__}: {exc}"
     else:
         for name, value in (("maa-cli", cli), ("MaaCore", core)):

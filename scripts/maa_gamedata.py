@@ -129,7 +129,7 @@ def refresh_layout(
         stage_table = _fetch(f"{base}/stage_table.json", timeout)
         zone_table = _fetch(f"{base}/zone_table.json", timeout)
         fresh = extract_layout(stage_table, zone_table)
-    except Exception as exc:  # noqa: BLE001 - 网络 / 格式问题一律退回旧缓存
+    except Exception as exc:  # noqa: BLE001 — (c) 网络 / 格式问题一律退回旧缓存
         return layout, f"游戏数据抓取失败：{type(exc).__name__}: {exc}"[:300]
     if not fresh["stages"]:
         return layout, "游戏数据里一个活动关都没有，格式可能变了"

@@ -930,7 +930,7 @@ def report_game_busy(
     errors: list[str] = []
     try:
         merge_last_run(state_update)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 汇报路径：两步各自兜住，错误汇总后抛给调用方
         errors.append(f"跳过状态写入失败：{type(exc).__name__}: {exc}")
     try:
         channel = channel_id or str(config.get("channel_id", "")).strip()
@@ -950,7 +950,7 @@ def report_game_busy(
                 "allowed_mentions": {"parse": []},
             },
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 汇报路径：两步各自兜住，错误汇总后抛给调用方
         errors.append(f"跳过告警发送失败：{type(exc).__name__}: {exc}")
     if errors:
         raise RuntimeError("；".join(errors))
@@ -983,7 +983,7 @@ def cleanup_old_threads(token: str, at: datetime | None = None) -> dict[str, int
         try:
             delete_channel(token, str(item["thread_id"]))
             deleted += 1
-        except Exception:
+        except Exception:  # noqa: BLE001 — (c) 删旧线程尽力而为，失败记 delete_failed_at 下次再删
             item["delete_failed_at"] = at.isoformat()
             kept.append(item)
             failed += 1

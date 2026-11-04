@@ -253,7 +253,7 @@ def attach_sanity_yield(
                 "剿灭 / 基建 / 公招 / 商店 / 领奖照常。"
             ),
         }
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 估不出理智一律照常刷（不变量 #26）
         print(
             f"理智让路判定失败，本场照常刷理智：{type(exc).__name__}: {exc}",
             flush=True,
@@ -989,7 +989,7 @@ def verify_home_screenshot(path: Path) -> tuple[bool | None, str]:
             check=False,
             timeout=60,
         )
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return None, f"OCR 失败：{type(exc).__name__}: {exc}"
     if result.returncode != 0:
         return None, f"OCR 失败：{result.stderr.strip()[:120]}"
@@ -1076,6 +1076,7 @@ def run_maa(
         stderr_thread.start()
         stdout_thread.start()
         previous = ""
+        progress_error = ""
         next_update = time.monotonic()
         # Hermes' outer no-agent cron timeout is 3600s. Keep ten minutes of
         # headroom for boot, screenshot, cleanup and the final report.
@@ -1123,7 +1124,7 @@ def run_maa(
                         last_settle = now
                         try:
                             warning = maa_playcover.settle_game_window(config)
-                        except Exception as exc:  # 救场是尽力而为，不能拖垮主循环
+                        except Exception as exc:  # noqa: BLE001 — (c) 救场是尽力而为，不能拖垮主循环
                             warning = f"摆回游戏窗口失败：{exc}"
                         note = f"截图失败，已尝试把游戏窗口摆回台前。{warning}".strip()
                         stderr_lines.append(note)
@@ -1140,9 +1141,13 @@ def run_maa(
                                 {"content": content, "allowed_mentions": {"parse": []}},
                             )
                             previous = content
-                        except Exception:
+                        except Exception as exc:  # noqa: BLE001 — (c) 进度流是尽力而为，最终战报才是硬信号
                             # Streaming is best-effort; final report is the hard signal.
-                            pass
+                            # 每 5 秒一次，同一个错误只打一次，免得刷屏。
+                            error_text = f"{type(exc).__name__}: {exc}"
+                            if error_text != progress_error:
+                                print(f"progress update failed: {error_text}", file=sys.stderr, flush=True)
+                                progress_error = error_text
                     next_update = now + PROGRESS_INTERVAL_SECONDS
                 time.sleep(0.25)
         except KeyboardInterrupt:
@@ -1241,7 +1246,7 @@ def run_maa_resilient(
         try:
             warning = maa_playcover.settle_game_window(config)
             maa_playcover.wait_for_game(config)
-        except Exception as exc:  # 下一趟 maa run 自己会再报连接失败
+        except Exception as exc:  # noqa: BLE001 — (c) 重开前准备尽力而为，下一趟 maa run 自己会再报连接失败
             warning = f"重开前准备游戏失败：{exc}"
         if warning:
             stderr_all.append(warning)
@@ -1464,7 +1469,7 @@ def send_report(
         try:
             discord_upload(token, channel_id, payload, screenshot)
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (c) 内嵌截图上传失败退回纯 embed
             embed = dict(payload["embeds"][0])
             embed.pop("image", None)
             fields = list(embed.get("fields", []))
@@ -1547,7 +1552,7 @@ def report_lock_conflict(
                 "last_lock_conflict_reason": reason,
             }
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 汇报路径：两步各自兜住，错误汇总后抛给调用方
         errors.append(f"冲突状态写入失败：{type(exc).__name__}: {exc}")
     try:
         discord_request(
@@ -1566,7 +1571,7 @@ def report_lock_conflict(
                 "allowed_mentions": {"parse": []},
             },
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 汇报路径：两步各自兜住，错误汇总后抛给调用方
         errors.append(f"冲突告警发送失败：{type(exc).__name__}: {exc}")
     if errors:
         raise RuntimeError("；".join(errors))
@@ -1852,7 +1857,7 @@ def execute(phase: Phase, manual_token: str = "") -> int:
                 home_verified,
                 home_verify_detail,
             ) = capture_home_screenshot(config, screenshot_path)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (a) 整场兜底：异常进战报 / 直报，finally 照常关游戏
             exception_detail = f"{type(exc).__name__}: {exc}"
             stderr_lines.append(exception_detail)
             return_code = 1
@@ -1860,13 +1865,17 @@ def execute(phase: Phase, manual_token: str = "") -> int:
                 startup_error = exception_detail
                 try:
                     send_direct_failure(token, channel_id, phase, plan, exception_detail)
-                except Exception:
-                    pass
+                except Exception as report_exc:  # noqa: BLE001 — (b) 直报失败不能盖住主错误（主错误已在 stderr_lines）
+                    print(
+                        f"direct failure report failed: {type(report_exc).__name__}: {report_exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         finally:
             if game_opened:
                 try:
                     cleanup_errors = maa_playcover.close_game(config)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 — (b) 收尾清理不能盖住主错误，异常并入 cleanup_errors
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
         # 两个刷理智块的掉落一起回写库存估算（四期步骤 3b）。
@@ -1875,7 +1884,7 @@ def execute(phase: Phase, manual_token: str = "") -> int:
         if drops:
             try:
                 maa_depot.record_drops(drops, config, at=now_beijing())
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — (c) 掉落记账失败只进战报 inventory_error
                 inventory_error = f"{type(exc).__name__}: {exc}"
 
         duration = (now_beijing() - started).total_seconds()
@@ -1913,8 +1922,8 @@ def execute(phase: Phase, manual_token: str = "") -> int:
                         "allowed_mentions": {"parse": []},
                     },
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — (c) 进度消息收尾是尽力而为，最终战报才是硬信号
+                print(f"final progress update failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         # Startup failures were already reported directly. All runs that made
         # a thread get a deterministic battle report, with screenshot if valid.
         if thread_id:
@@ -1968,6 +1977,6 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：打一行再以 1 退出
         print(f"MAA 日常失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)

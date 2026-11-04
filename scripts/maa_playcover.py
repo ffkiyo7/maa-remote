@@ -153,6 +153,11 @@ class MaaToolsError(RuntimeError):
     pass
 
 
+# 一次 MaaTools 设备操作（连接 / 点击 / 截图）可能抛的全部异常：协议错、socket、
+# 包头解析。要收窄 `except` 时用它，别再各写一份。
+DEVICE_ERRORS: tuple[type[BaseException], ...] = (MaaToolsError, OSError, struct.error)
+
+
 class MaaTools:
     """一条 MaaTools 连接。`with MaaTools(config) as tools: tools.size()`。"""
 
@@ -282,7 +287,7 @@ def game_is_online(config: Config) -> tuple[bool, str]:
         return False, "探测已禁用（game_probe_timeout = 0）"
     try:
         pids = game_pids(config, timeout=min(budget, 3.0))
-    except Exception as exc:  # noqa: BLE001 — 探测永不抛
+    except Exception as exc:  # noqa: BLE001 — (c) 探测永不抛，失败按离线处理
         return False, f"进程探测失败（{type(exc).__name__}），按离线处理"
     if pids:
         return True, f"明日方舟（PlayCover）进程在跑（pid {', '.join(map(str, pids))}）"
@@ -520,7 +525,7 @@ def settle_game_window(config: Config) -> str:
             return " ".join(warnings)
         warnings.append("游戏窗口不在屏上（可能被最小化或隐藏了），后台截图可能失败。")
         return " ".join(warnings)
-    except Exception as exc:  # noqa: BLE001 — 只是体检，不阻断
+    except Exception as exc:  # noqa: BLE001 — (c) 只是体检，不阻断
         warnings.append(f"没能确认游戏窗口状态（{type(exc).__name__}），照常开跑。")
         return " ".join(warnings)
 
@@ -594,7 +599,7 @@ def capture_screenshot(config: Config, path: Path) -> tuple[bool, str]:
         capture_geometry(config, path)
         path.chmod(0o600)
         return True, ""
-    except Exception as exc:  # noqa: BLE001 — 截图失败只进战报，不带走整场
+    except Exception as exc:  # noqa: BLE001 — (c) 截图失败只进战报，不带走整场
         try:
             path.unlink()
         except FileNotFoundError:
@@ -633,18 +638,18 @@ def close_game(config: Config) -> list[str]:
     errors: list[str] = []
     try:
         pattern = process_pattern(config)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — (b) 清理路径：模式非法就拒绝清理并报告
         return [f"游戏进程模式非法，拒绝清理：{exc}"]
     try:
         if not game_pids(config):
             return []
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — (b) 清理路径：探测失败照样往下走 TERM / pkill
         errors.append(f"进程探测异常：{type(exc).__name__}")
     term_note = ""
     try:
         with MaaTools(config, timeout=5) as tools:
             tools.terminate()
-    except Exception as exc:  # noqa: BLE001 — 连不上就直接走 pkill
+    except Exception as exc:  # noqa: BLE001 — (b) 清理路径：连不上 MaaTools 就直接走 pkill
         term_note = f"MaaTools TERM 未送达（{type(exc).__name__}）"
 
     def wait_gone(seconds: float) -> bool:
@@ -653,7 +658,7 @@ def close_game(config: Config) -> list[str]:
             try:
                 if not game_pids(config):
                     return True
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 — (b) 清理路径：探测失败当作还没退
                 return False
             time.sleep(0.5)
         return False
@@ -662,7 +667,7 @@ def close_game(config: Config) -> list[str]:
         return errors
     try:
         subprocess.run(["pkill", "-f", pattern], capture_output=True, check=False, timeout=10)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — (b) 清理路径：兜底退出失败只记一句
         errors.append(f"游戏兜底退出异常：{type(exc).__name__}")
     if not wait_gone(float(config.get("cleanup_verify_timeout", 10))):
         if term_note:

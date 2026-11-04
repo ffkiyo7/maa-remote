@@ -332,18 +332,18 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
             if error_streak >= ERROR_STREAK_LIMIT:
                 stop_reason = f"上游连续 {ERROR_STREAK_LIMIT} 局报错，本轮收尾。"
                 break
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 整轮兜底：异常写进战报，finally 照常收尾
         stop_reason = f"{type(exc).__name__}: {exc}"
         print(f"roguelike EXCEPTION: {stop_reason}", flush=True)
     finally:
         if game_touched:
             try:
                 maa_playcover.capture_screenshot(config, png_path)
-            except Exception:
-                pass
+            except Exception as shot_exc:  # noqa: BLE001 — (b) 收尾截图不能盖住主错误
+                print(f"final screenshot failed: {type(shot_exc).__name__}: {shot_exc}", flush=True)
             try:
                 cleanup_errors = maa_playcover.close_game(config)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — (b) 收尾清理不能盖住主错误，异常并入 cleanup_errors
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
     ok = bool(runs) and not cleanup_errors and all(

@@ -299,7 +299,7 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
             progress = _normalize_activity_progress(
                 data.get("activity") if isinstance(data, dict) else None
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — (c) 活动进度是可选提示，坏数据不许带走练度
             progress = {}  # optional hint data must never break the roster
         return {
             "chars": _normalize_chars(chars, battle),
@@ -381,7 +381,7 @@ def daily_health_check(
     try:
         refresh_roster()
         error = ""
-    except Exception as exc:  # noqa: BLE001 - 任何失败都要让用户看见
+    except Exception as exc:  # noqa: BLE001 — (a) 任何失败都要让用户看见
         error = f"{type(exc).__name__}: {exc}"
     if error:
         expired = "过期" in error or "link" in error or "未配置" in error
@@ -434,7 +434,7 @@ def link_from_stdin() -> int:
         roster = refresh_roster()
         print(f"✅ 森空岛接入成功：{len(roster['chars'])} 名干员已缓存（uid={roster['uid']}）。")
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) CLI 顶层：token 已保存，拉取失败只提示重试
         print(f"⚠️ token 已保存，但拉取练度失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         print("可以稍后手动运行 python3 maa_skland.py refresh 重试。", file=sys.stderr)
         return 0

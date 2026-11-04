@@ -88,7 +88,7 @@ def _supersede_round(token: str, config: Config) -> bool:
         return False
     try:
         retire_discord_components(config, message_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 旧轮按钮已失效，收不掉只打日志
         print(
             f"旧活动卡按钮收起失败但已经失效：{type(exc).__name__}: {exc}",
             file=sys.stderr,
@@ -258,7 +258,7 @@ def cost_lookup(config: Config, index: dict[str, Any]):
             return cost
         try:
             cost = maa_farming.stage_ap_cost(resolved[0], config)
-        except Exception:  # noqa: BLE001 - 兜底查表不该让整轮排程崩掉
+        except Exception:  # noqa: BLE001 — (c) 兜底查表不该让整轮排程崩掉
             cost = None
         # 第三级：游戏数据缓存（`maa_gamedata`），EX 关的理智只有这里有。
         return cost if cost is not None else maa_gamedata.ap_cost(
@@ -603,7 +603,7 @@ def run_once() -> dict[str, Any]:
             import maa_skland
 
             maa_skland.refresh_roster()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (a) 森空岛读不到就停排并告警（网络 / 鉴权 / 解析，失败形态不定）
             # **读不到就不排**（fail-closed）。以前是「沿用缓存照排」：2026-10-11
             # 森空岛过期一个月，缓存里根本没有当期活动的 zone 进度，YW-4 没解锁也
             # 被排上，每 15 分钟开一次游戏。登录过期由计划卡每天提醒一次
@@ -730,7 +730,7 @@ def main() -> int:
         try:
             run_once()
             return 0
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：失败去重后发 Discord 告警
             config = load_config()
             state = load_json(WATCH_PATH, {})
             if not isinstance(state, dict):

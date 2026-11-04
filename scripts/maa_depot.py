@@ -587,13 +587,13 @@ def run_depot(config: Config, *, at: datetime | None = None) -> dict[str, Any]:
                 try:
                     count = run_operbox(config, env, at=observed_at)
                     operbox_note = f"{operbox_reason}；OperBox 后备已记录 {count} 名干员"
-                except Exception as operbox_exc:
+                except Exception as operbox_exc:  # noqa: BLE001 — (c) OperBox 后备失败只记一句，不影响库存真值
                     operbox_note = (
                         f"{operbox_reason}；OperBox 后备也失败："
                         f"{type(operbox_exc).__name__}: {operbox_exc}"
                     )
                 print(operbox_note, flush=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (b) 先关游戏，再把原异常（并上清理错误）抛出去
             error = exc
         cleanup_errors = maa_playcover.close_game(config) if game_opened else []
         if cleanup_errors:
@@ -635,7 +635,7 @@ def main() -> int:
     attempted_at = now_beijing()
     try:
         result = run_if_due(config, at=attempted_at)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：写失败状态 + 发告警后再抛
         detail = f"{type(exc).__name__}: {exc}"
         state_error = ""
         try:
@@ -646,7 +646,7 @@ def main() -> int:
                     "depot_error": detail,
                 }
             )
-        except Exception as state_exc:
+        except Exception as state_exc:  # noqa: BLE001 — (a) 汇报路径：状态写入失败并进告警文本
             state_error = f"；Depot 失败状态写入也失败：{type(state_exc).__name__}: {state_exc}"
         channel_id = str(config.get("channel_id", "")).strip()
         if not channel_id.isdigit():
@@ -670,7 +670,7 @@ def main() -> int:
                     "allowed_mentions": {"parse": []},
                 },
             )
-        except Exception as notify_exc:
+        except Exception as notify_exc:  # noqa: BLE001 — (a) 汇报路径：告警失败并进异常再抛
             raise RuntimeError(
                 f"{detail}{state_error}；Depot 失败告警也发送失败："
                 f"{type(notify_exc).__name__}: {notify_exc}"
@@ -705,6 +705,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：打一行再以 1 退出
         print(f"MAA Depot 对表失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)

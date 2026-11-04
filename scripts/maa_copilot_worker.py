@@ -197,7 +197,7 @@ def _notice(
             f"/channels/{config.get('channel_id', '')}/messages",
             payload,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 通知发不出去只打日志
         print(f"copilot notice failed: {type(exc).__name__}: {exc}", flush=True)
 
 
@@ -357,7 +357,7 @@ def cmd_search(token: str) -> int:
 
             try:
                 maa_skland.refresh_roster()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — (a) 转译：任何失败都包成 RuntimeError 再抛
                 raise RuntimeError(
                     f"森空岛练度与理智刷新失败，本次不降级执行：{type(exc).__name__}: {exc}"
                 ) from exc
@@ -406,7 +406,7 @@ def cmd_search(token: str) -> int:
                 print(f"copilot search: 本轮未派发（{blocker}）", flush=True)
                 return 0
             maa_action.dispatch_batch(token)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (a) 搜索进程兜底：标记失败并发通知
             _fail_search(token, f"{type(exc).__name__}: {exc}")
             _notice(
                 config,
@@ -551,7 +551,7 @@ def _run_copilot_with_watchdog(
                     check=False,
                     timeout=10,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 — (c) watchdog 读屏尽力而为，失败等下一拍
                 continue
             if POPUP_MARK not in result.stdout:
                 continue
@@ -569,8 +569,8 @@ def _run_copilot_with_watchdog(
             try:
                 maa_playcover.tap(config, tap_x, tap_y)
                 taps += 1
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 — (c) watchdog 点击尽力而为，失败等下一拍
+                print(f"watchdog tap failed: {type(exc).__name__}: {exc}", flush=True)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"# watchdog: 检测到接管弹窗，点击确认 (tap {tap_x},{tap_y})\n")
             time.sleep(4)
@@ -711,7 +711,7 @@ def settle_after_battle(
                 [maa_bin, "run", "copilot-settle", "--user-resource", "-v", "--batch"],
                 capture_output=True, text=True, check=False, timeout=timeout, env=settle_env,
             )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 战后收尾尽力而为，失败按「未收尾」处理、不记通关
         note = f"{stage} 战后收尾异常：{type(exc).__name__}: {exc}"
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"# settle {stage}\n{note}\n")
@@ -767,7 +767,7 @@ def _recheck_before_stage(
 
     try:
         roster = maa_skland.refresh_roster()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 转译：任何失败都包成 PrefightError 再抛
         raise PrefightError(
             f"森空岛实时理智读取失败：{type(exc).__name__}: {exc}"
         ) from exc
@@ -806,7 +806,7 @@ def _retire_round_controls(token: str, config: Config, message_id: Any) -> None:
         atomic_write_json(BUTTONS_PATH, registry)
     try:
         retire_discord_components(config, message_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 收按钮尽力而为，只打日志
         print(f"round card retire failed: {type(exc).__name__}: {exc}", flush=True)
 
 
@@ -936,7 +936,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         try:
             maa_copilot.register_auto_buttons()
             start_components = [maa_copilot.pause_button_row()]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (c) 暂停按钮注册失败不影响开打
             print(f"pause button register failed: {type(exc).__name__}: {exc}", flush=True)
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
@@ -1054,7 +1054,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
     except PrefightError as exc:
         stop_reason = str(exc)
         prefight_error = stop_reason
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 整轮兜底：异常写进战报 / prefight_error，finally 照常收尾
         stop_reason = f"{type(exc).__name__}: {exc}"
         print(f"copilot run-batch EXCEPTION: {stop_reason}", flush=True)
         if not any(r["outcome"] in ("won", "failed", "unknown") for r in results):
@@ -1065,11 +1065,11 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
         if game_touched:
             try:
                 maa_playcover.capture_screenshot(config, png_path)
-            except Exception:
-                pass
+            except Exception as shot_exc:  # noqa: BLE001 — (b) 收尾截图不能盖住主错误
+                print(f"final screenshot failed: {type(shot_exc).__name__}: {shot_exc}", flush=True)
             try:
                 cleanup_errors = maa_playcover.close_game(config)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — (b) 收尾清理不能盖住主错误，异常并入 cleanup_errors
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
     won = [r for r in results if r["outcome"] == "won"]
@@ -1318,7 +1318,7 @@ def _screen_text(config: Config) -> list[str]:
         result = subprocess.run([str(ocrbox), str(shot)], capture_output=True,
                                 text=True, check=False, timeout=15)
         return _base_box_lines(result.stdout.splitlines(), geometry)
-    except Exception:
+    except Exception:  # noqa: BLE001 — (c) 读屏是辅助判断，失败当作没认出来
         return []
     finally:
         try:
@@ -1377,7 +1377,7 @@ class ActivityNavigator:
             if point is not None:
                 try:
                     maa_playcover.tap(self.config, point[0], point[1])
-                except Exception as exc:
+                except maa_playcover.DEVICE_ERRORS as exc:
                     return False, f"点「{name}」入口失败：{exc}"
                 with self.log_path.open("a", encoding="utf-8") as handle:
                     handle.write(f"# zone-entry {zone_id} {name} tap {point}\n")
@@ -1425,7 +1425,7 @@ def _prepare_list_file(candidate: dict[str, Any], stage_id: str, target: Path) -
         payload = maa_copilot.http_get_json(
             f"{maa_copilot.PRTS_BASE}/copilot/get/{cand_id}", timeout=30
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — (c) 单份作业下载失败只退回这一份（HTTP / 网络 / JSON，形态不定）
         return f"作业 {cand_id} 下载失败：{type(exc).__name__}: {exc}"
     inner = payload.get("data") if isinstance(payload, dict) else None
     content = inner.get("content") if isinstance(inner, dict) else None
@@ -1694,7 +1694,7 @@ def _post_report(
         try:
             discord_upload(token_text, channel_id, payload, png_path)
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — (c) 内嵌截图上传失败退回纯 embed
             embed.pop("image", None)
             payload.pop("attachments", None)
             embed["fields"].append(
@@ -1704,7 +1704,7 @@ def _post_report(
         discord_request(
             token_text, "POST", f"/channels/{channel_id}/messages", payload
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 战报发不出去只打日志
         print(f"copilot report failed: {type(exc).__name__}: {exc}", flush=True)
 
 

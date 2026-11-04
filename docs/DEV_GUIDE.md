@@ -1536,14 +1536,15 @@ uvx pyright@1.1.414          # 同一范围；pythonVersion = 3.11、basic 模�
 
 **`except Exception` 约定（ruff `BLE001`）**：能说清 try 体会抛什么的，就只抓那几种
 （`OSError`、`subprocess.SubprocessError`、`ValueError`、`json.JSONDecodeError`、`RuntimeError`、
-`maa_playcover.MaaToolsError` 等）。确实要兜住一切的，只有三类，写成
-`except Exception as exc:  # noqa: BLE001 — <原因>`，原因写清是哪一类、为什么：
+`maa_playcover.MaaToolsError` 等；一次 MaaTools 设备操作用现成的 `maa_playcover.DEVICE_ERRORS`）。
+确实要兜住一切的，只有三类，写成 `except Exception as exc:  # noqa: BLE001 — (<类别>) <原因>`，
+例如 `# noqa: BLE001 — (c) watchdog 点击尽力而为，失败等下一拍`：
 
-1. **进程顶层兜底**：异常要变成 Discord 告警 / `last_run.json` 里的一行，不能让 cron 静默死掉；
-2. **清理 / finally 路径**：收尾失败不能盖住主错误（主错误才是要汇报的那个）；
-3. **尽力而为的辅助**：watchdog、救场、截图、旁路信息——失败只降级，绝不能把主流程带走。
+- **(a) 进程顶层兜底 / 汇报路径**：异常要变成 Discord 告警 / `last_run.json` 里的一行，不能让 cron 静默死掉；
+- **(b) 清理 / finally 路径**：收尾失败不能盖住主错误（主错误才是要汇报的那个）；
+- **(c) 尽力而为的辅助**：watchdog、救场、截图、旁路信息——失败只降级，绝不能把主流程带走。
 
-拿不准 try 体会抛什么就归第 3 类保留，别为了过检查去收窄：收窄会把以前被吞掉的异常变成
+拿不准 try 体会抛什么就归 (c) 保留，别为了过检查去收窄：收窄会把以前被吞掉的异常变成
 无人值守时的崩溃。`except Exception: pass` 不许出现——至少打一行日志（`print(..., file=sys.stderr)`
 或写进本场日志），或者收窄。`except BaseException` 一律不许（`_isolation` 的
 `RealHomeTouched` / `RealNetworkTouched` 就是靠它穿透 `except Exception` 的）。

@@ -51,7 +51,7 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(_isolation.RealHomeTouched):
             try:
                 live.read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001 - 正是要验它吞不掉
+            except Exception:  # noqa: BLE001 — 正是要验它吞不掉
                 self.fail("RealHomeTouched 被 except Exception 吞掉了")
         with self.assertRaises(_isolation.RealHomeTouched):
             os.listdir(_isolation.REAL_HOME / ".hermes")

@@ -333,7 +333,7 @@ def current_supply_choices(
 def refresh_activity_stages(config: Config) -> tuple[bool, str]:
     try:
         snapshot = query_activity_snapshot(config)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (c) 活动关刷新失败写在卡上，沿用旧活动关
         return False, f"活动关读取异常：{type(exc).__name__}: {exc}"
     stages = list(snapshot.get("stages", []))
     persist_activity_snapshot(config, snapshot)
@@ -403,7 +403,7 @@ def _run_captured(
             timeout=timeout,
             env=env,
         )
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
         return 1, "", f"{type(exc).__name__}: {exc}"
     return (
         result.returncode,
@@ -765,7 +765,7 @@ def stage_drops(config: Config) -> dict[str, dict[str, Any]]:
                 "ap": ap,
                 "stage_id": str(entry.get("stageId") or ""),
             }
-    except Exception:
+    except Exception:  # noqa: BLE001 — (c) 上游数据形状不定，解析失败按空表（卡片照发）
         table = {}
     _STAGE_DROPS_CACHE[cache_key] = table
     return table
@@ -846,7 +846,7 @@ def load_depot_state() -> dict[str, Any]:
         import maa_depot
 
         state = load_json(maa_depot.DEPOT_PATH, {})
-    except Exception:
+    except (ImportError, OSError, ValueError):
         return {}
     return state if isinstance(state, dict) else {}
 
@@ -1248,7 +1248,7 @@ def retire_old_plan_cards(token: str, channel_id: str) -> dict[str, int]:
                 {"components": []},
             )
             result["retired"] += 1
-        except Exception:
+        except Exception:  # noqa: BLE001 — (c) 收旧卡按钮尽力而为，只计失败数
             result["failed"] += 1
     return result
 
@@ -1368,13 +1368,13 @@ def _skland_health_notice(token: str, channel_id: str) -> None:
         import maa_skland
 
         maa_skland.daily_health_check(notify)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — (c) 体检不许拖垮计划卡
         print(f"森空岛体检失败：{type(exc).__name__}: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — (a) 进程顶层：打一行再以 1 退出
         print(f"MAA 计划卡失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)
