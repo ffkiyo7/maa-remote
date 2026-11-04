@@ -21,12 +21,15 @@ from typing import Any
 from maa_common import (
     STATE_DIR,
     atomic_write_json,
+    check_schema,
     load_json,
     now_beijing,
     state_lock,
 )
 
 STATE_PATH = STATE_DIR / "roguelike.json"
+# `roguelike.json` 的格式版本（DEV_GUIDE §6.1）：`save_state()` 写入，`load_state()` 校验。
+STATE_SCHEMA_VERSION = 1
 
 # 按钮前缀。它不在 `hermes:btn:maa:` 之下（连字符），所以 07:50 计划卡那趟
 # 整段清扫碰不到它；也不在 `hermes:btn:maa-copilot:` 之下，抄作业的
@@ -620,8 +623,12 @@ EMPTY_STATE: dict[str, Any] = {
 
 
 def load_state(path: Any = None) -> dict[str, Any]:
-    """读状态；文件不存在 / 坏掉一律回一份空状态，**绝不抛**（D-2 的教训）。"""
-    raw = load_json(path or STATE_PATH, None)
+    """读状态；文件不存在 / 结构不对一律回一份空状态（D-2 的教训）。
+
+    `schema_version` 比本脚本新时抛 `SchemaVersionError`：那是回滚到了旧脚本，
+    状态会驱动开跑 / 停止，宁可显式拒跑也不按猜的格式去读。
+    """
+    raw = check_schema("roguelike.json", load_json(path or STATE_PATH, None), STATE_SCHEMA_VERSION)
     state = dict(EMPTY_STATE)
     if isinstance(raw, dict):
         for key in EMPTY_STATE:
@@ -636,6 +643,7 @@ def load_state(path: Any = None) -> dict[str, Any]:
 
 def save_state(state: dict[str, Any], path: Any = None) -> dict[str, Any]:
     state["updated_at"] = now_beijing().isoformat()
+    state["schema_version"] = STATE_SCHEMA_VERSION
     atomic_write_json(path or STATE_PATH, state)
     return state
 

@@ -19,7 +19,9 @@ from maa_common import (
     BEIJING,
     BUTTONS_PATH,
     CONFIG_PATH,
+    CONFIG_SCHEMA_VERSION,
     atomic_write_json,
+    check_schema,
     cleanup_old_threads,
     cleanup_run_files,
     discord_request,
@@ -34,6 +36,7 @@ from maa_common import (
     plan_sessions,
     plan_stage_label,
     PLAN_PATH,
+    PLAN_SCHEMA_VERSION,
     state_lock,
     WATCH_PATH,
 )
@@ -431,7 +434,7 @@ def persist_installed_versions(
 ) -> None:
     if not cli_version and not core_version:
         return
-    current = load_json(CONFIG_PATH, {})
+    current = check_schema("config.json", load_json(CONFIG_PATH, {}), CONFIG_SCHEMA_VERSION)
     if not isinstance(current, dict):
         current = {}
     if cli_version:
@@ -918,7 +921,7 @@ def apply_auto_stage(
     # 判据是 `stage_source` 而不是 `source`：`source` 记的是「最后一次写这份覆盖的是谁」，
     # 点一次「跳过」也会把它写成 discord，拿它当闸门等于点跳过就冻住当天的自动定关。
     with state_lock():
-        current = load_json(PLAN_PATH, {})
+        current = check_schema("plan.json", load_json(PLAN_PATH, {}), PLAN_SCHEMA_VERSION)
         if (
             not isinstance(current, dict)
             or current.get("date") != moment.date().isoformat()
@@ -937,6 +940,7 @@ def apply_auto_stage(
         session["updated_at"] = moment.isoformat()
         sessions[phase] = session
         current["updated_at"] = moment.isoformat()
+        current["schema_version"] = PLAN_SCHEMA_VERSION
         atomic_write_json(PLAN_PATH, current)
     return stage
 

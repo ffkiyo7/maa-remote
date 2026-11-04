@@ -29,8 +29,10 @@ import maa_gamedata
 import maa_plan_card
 from maa_common import (
     LAST_RUN_PATH,
+    LAST_RUN_SCHEMA_VERSION,
     STATE_DIR,
     atomic_write_json,
+    check_schema,
     discord_request,
     discord_token,
     load_config,
@@ -196,7 +198,9 @@ def round_budget(
     from maa_daily import attach_annihilation
     from maa_common import effective_plan
 
-    last_run = load_json(LAST_RUN_PATH, {})
+    last_run = check_schema(
+        "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+    )
     plan = attach_annihilation(
         effective_plan(at), at, last_run if isinstance(last_run, dict) else {}
     )

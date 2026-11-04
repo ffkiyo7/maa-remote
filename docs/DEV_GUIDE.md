@@ -1136,6 +1136,46 @@ result = normalize_plan(result)             ← 再规范化一次
 同一天同场次的 `runs/` 文件名会复用（`<date>-<phase>`），所以一天里多次 `run now`
 会覆盖 `<date>-now.log/png`。要保留请自行改名或改 `run_stem`。
 
+### 6.1 状态文件格式版本（`schema_version`）
+
+`config.json` / `plan.json` / `last_run.json` / `manual_run.json` / `roguelike.json` 顶层带
+`schema_version`（整数，现在都是 1）。`depot.json`（`maa_depot.SCHEMA_VERSION`）、
+`copilot/ledger*.json`（`maa_copilot.LEDGER_SCHEMA_VERSION`）早就有自己的版本号，约定一致。
+
+| 文件 | 版本常量 | 谁写（写时带版本号） | 读到未知更高版本 |
+|---|---|---|---|
+| `config.json` | `maa_common.CONFIG_SCHEMA_VERSION` | 种子 `state/config.json` 经 `deploy_state()` merge；运行时改写保留原值 | **拒跑**（`load_config()` 抛）；`deploy_state()` 拒绝部署 |
+| `plan.json` | `PLAN_SCHEMA_VERSION` | `maa_action._save_override()`、`maa_plan_card.apply_auto_stage()`、种子 | **拒跑** |
+| `manual_run.json` | `MANUAL_RUN_SCHEMA_VERSION` | `maa_action._save_manual_run()` | **拒跑** |
+| `roguelike.json` | `maa_roguelike.STATE_SCHEMA_VERSION` | `maa_roguelike.save_state()` | **拒跑**（`load_state()` 抛；结构不对仍读成空状态） |
+| `last_run.json` | `LAST_RUN_SCHEMA_VERSION` | `merge_last_run()`、`cleanup_old_threads()`、种子 | stderr 告警一条，按现有 normalize **宽读**（它只用于汇报） |
+
+读的规则都在 `maa_common.check_schema(name, value, current, migrations=None, *, strict=True)`：
+
+- 缺字段 = 1（加版本号之前写的文件照常能读，不需要先部署一次）；等于当前版本原样返回；
+- 低于当前版本 → 按 `migrations[N]`（vN → vN+1）逐级升级，**只在内存里升**，下次正常写入时自然落盘新版本号；缺一级就抛；
+- 高于当前版本或不是正整数 → `SchemaVersionError`（`RuntimeError` 子类，现有 `except RuntimeError` 接得住）；`strict=False` 时只告警。
+- 不是 dict 原样返回，「必须是 object」「结构不对读成空」这些现有行为不变。
+
+**回滚到旧脚本会显式拒跑**：新脚本把某文件升到 v2 之后，再部署回只认 v1 的旧脚本，读到它的地方会报
+「schema_version=2 本脚本不认识……多半是回滚到了旧脚本」而不是按猜的格式去驱动开跑。处理办法：重新部署新版，
+或手动把那个文件删掉 / 改回旧格式（`plan.json` / `manual_run.json` 删掉就是「今天没覆盖 / 没有手动请求」）。
+`last_run.json` 只告警：旧脚本写回时会把版本号盖回自己认识的那个，所以下次新脚本读到的可能是「标着 v1、带着 v2 字段」——
+**迁移函数要能容忍字段已经是新格式**（幂等）。本步之前的旧脚本根本不看版本号，回滚到它们不会拒跑。
+
+**下次改格式怎么做**：
+
+1. 把对应常量 +1（例：`PLAN_SCHEMA_VERSION = 2`）；
+2. 写迁移函数 `def _plan_v1_to_v2(doc: dict) -> dict`，在**所有**读这个文件的 `check_schema()` 调用处传
+   `{1: _plan_v1_to_v2}`（`grep -n '"plan.json"' scripts/*.py` 找全；迁移表放在 `maa_common` 里一处定义）；
+3. 写入点不用动（都写常量）；种子文件（`state/*.json`）里的版本号一起改，`SeedVersionTests` 会盯着；
+4. `tests/test_state_schema.py` 补「v1 文件读进来长什么样」的用例。
+
+`config.json` 不在运行时迁移：它由 `deploy_state()` 逐键 merge 种子，迁移放 `deploy.CONFIG_MIGRATIONS`
+（`deploy.migrate_live_config()` 在 merge **之前**把线上那份升到种子的版本，线上比种子新就拒绝部署）。
+`RETIRED_CONFIG_KEYS` 本身也是一种迁移——只删没人读的键、新旧脚本都能读，所以不升版本号；
+改既有键的含义 / 结构才升。`schema_version` 归种子所有，**不得**进 `PRESERVED_RUNTIME_CACHE_KEYS`（不变量 #58）。
+
 ---
 
 ## 7. 部署链路（`deploy.py`）
@@ -1352,6 +1392,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 | 55 | **森空岛读不到就不自动排轮**（2026-10-11 改写：以前「刷新失败沿用缓存照排」，过期一个月的缓存里没有当期活动的 zone 进度，YW-4 没解锁也被排上）。**开打前的环境故障**（森空岛读不到、理智消耗查不到、开机 / ADB 炸了且一关都没进）worker 写进这一轮的 `prefight_error`，watcher 按北京日计数（`activity_watch.json` 的 `prefight_failures`），达到 `auto_copilot_max_prefight_failures_per_day`（默认 2）当天停排、只发一条——它们**不记账**，不另记就永远到不了 `daily_cap`。「理智不够」不是环境故障，不计数。「暂停自动作业」开关在 `copilot/auto_pause.json`：只管 `source == activity-watch` 的轮，暂停时作废 `scheduled` / `queued` 的一轮，**不中断正在打的那一关**、下一关开打前停；`copilot auto on` 同时清掉当天的开打前停排。按钮 custom_id 固定为 `hermes:btn:maa-copilot:auto:off|on`，不受按 token 清扫的影响 | `maa_activity_watch.run_once()` / `_count_prefight_failure()` / `_prefight_blocked()` + `maa_copilot_worker.PrefightError` + `maa_action.copilot_auto()` + `ActivityWatchTickTests` / `CopilotBatchExecutionTests.test_a_prefight_environment_failure_is_marked_on_the_round` / `CopilotAutoPauseCommandTests` |
 | 56 | **森空岛每日体检**挂在计划卡后面（早 07:50 / 晚 21:50，活动监控可能被暂停所以不挂那里）：每个北京日探一次，失败就发「🔑 森空岛登录已过期」（或「⚠️ 读取失败」），**一天最多一条**、恢复之前天天发；Discord 发送失败不记「今天已查」，晚场重试。体检自身的异常**不许拖垮计划卡**。`refresh_roster()` 成功一次就清掉 `skland.json` 的 `last_error` | `maa_skland.daily_health_check()` / `maa_plan_card._skland_health_notice()` + `SklandDailyHealthTests` |
 | 57 | **当期活动关的导航只有三小步自写，都只写进 `_isolated_config()` 的临时目录**：① 借锚点的上游链进活动、点进普通区域，把点关那一步换成只识别（方案 B，停在地图上）；② 剧情关挡路时在地图上点开它、跳过剧情；③ EX / S 区域按游戏数据里的区域名（`zone_table.zoneNameSecond`）在屏幕上找入口，相似度必须严格高于同活动其它区域名才点。**每一步之后都要在屏幕上认出目标区域的关卡代号**（`CopilotZoneReady`）才算到位，认不出就停下、按第一关失败记账。找关、编队、打仗全交给 MaaCore 的 `copilot_list`。教学关、没作业也没通关的关挡在前面时整轮从那里截断（`plan_segments()`），watcher 排轮前就截掉（`trim_unreachable()`），不为够不着的关开模拟器 | `maa_copilot_worker.ActivityNavigator` / `_run_activity_round()` / `maa_clearing.plan_segments()` / `zone_button()` + `CopilotListPlanTests` / `CopilotZoneEntryTests` / `CopilotListRoundTests` / `CopilotReachableTargetTests` |
+| 58 | **状态文件读时校验 `schema_version`、写时带上**（§6.1）：缺字段视作 1；会驱动动作的 `config` / `plan` / `manual_run` / `roguelike` 读到未知更高版本**拒跑**，只用于汇报的 `last_run` 告警后宽读。读 `config` / `plan` / `manual_run` / `last_run` 的每个地方都过 `check_schema()`，不许直接拿 `load_json()` 的结果用。`config.json` 的版本号随种子走，迁移只在 `deploy_state()`，`schema_version` 不得进 `PRESERVED_RUNTIME_CACHE_KEYS` | `maa_common.check_schema()` / `*_SCHEMA_VERSION` + `maa_roguelike.STATE_SCHEMA_VERSION` + `deploy.migrate_live_config()` / `CONFIG_MIGRATIONS` + `tests/test_state_schema.py` |
 
 ---
 

@@ -1,4 +1,5 @@
 {
+  "schema_version": 1,
   "channel_id": "REPLACE_WITH_DISCORD_CHANNEL_ID",
   "game_bundle_id": "com.hypergryph.arknights",
   "playcover_app_path": "~/Library/Containers/io.playcover.PlayCover/Applications/com.hypergryph.arknights.app",

@@ -20,15 +20,19 @@ from maa_common import (
     BUTTONS_PATH,
     DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES,
     LAST_RUN_PATH,
+    LAST_RUN_SCHEMA_VERSION,
     MANUAL_RUN_BUTTON_PREFIX,
     MANUAL_RUN_PATH,
+    MANUAL_RUN_SCHEMA_VERSION,
     MANUAL_RUN_TTL,
     PLAN_PATH,
     PLAN_PHASES,
+    PLAN_SCHEMA_VERSION,
     PLAN_SESSION_FIELDS,
     SCRIPTS_DIR,
     WATCH_PATH,
     atomic_write_json,
+    check_schema,
     discord_request,
     discord_token,
     effective_plan,
@@ -107,7 +111,7 @@ def _today_override() -> dict[str, Any]:
     掉了它，用户点一次「跳过」就会让当天的自动定关被当成手动选择冻住。
     """
     now = now_beijing()
-    current = load_json(PLAN_PATH, {})
+    current = check_schema("plan.json", load_json(PLAN_PATH, {}), PLAN_SCHEMA_VERSION)
     sessions: Any = {}
     if isinstance(current, dict) and current.get("date") == now.date().isoformat():
         sessions = current.get("sessions")
@@ -134,13 +138,16 @@ def _save_override(phase: str, key: str, value: Any, **extra: Any) -> dict[str, 
         session["source"] = "discord"
         session["updated_at"] = now.isoformat()
         plan["updated_at"] = now.isoformat()
+        plan["schema_version"] = PLAN_SCHEMA_VERSION
         # There is deliberately no stone field in this write path.
         atomic_write_json(PLAN_PATH, plan)
     return effective_plan(phase=phase)
 
 
 def _running_context() -> tuple[str, str]:
-    state = load_json(LAST_RUN_PATH, {})
+    state = check_schema(
+        "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+    )
     if not isinstance(state, dict) or state.get("status") != "running":
         return "本场", "上次的本"
     phase = str(state.get("phase", "now"))
@@ -296,8 +303,16 @@ def manual_run_blackout_reason(
 
 
 def _load_manual_run() -> dict[str, Any]:
-    state = load_json(MANUAL_RUN_PATH, {})
+    state = check_schema(
+        "manual_run.json", load_json(MANUAL_RUN_PATH, {}), MANUAL_RUN_SCHEMA_VERSION
+    )
     return state if isinstance(state, dict) else {}
+
+
+def _save_manual_run(state: dict[str, Any]) -> None:
+    """写 `manual_run.json`，带上格式版本号。调用方持 `state_lock()`。"""
+    state["schema_version"] = MANUAL_RUN_SCHEMA_VERSION
+    atomic_write_json(MANUAL_RUN_PATH, state)
 
 
 def _manual_run_custom_id(token: str) -> str:
@@ -406,7 +421,7 @@ def _retire_manual_run(
             return None
         state["status"] = status
         state["updated_at"] = now_beijing().isoformat()
-        atomic_write_json(MANUAL_RUN_PATH, state)
+        _save_manual_run(state)
         registry = load_json(BUTTONS_PATH, {})
         if isinstance(registry, dict):
             for custom_id in [k for k in registry if k.startswith(MANUAL_RUN_BUTTON_PREFIX)]:
@@ -508,7 +523,7 @@ def run_now() -> tuple[bool, str]:
     )
     state["message_id"] = str(message.get("id", "")) if isinstance(message, dict) else ""
     with state_lock():
-        atomic_write_json(MANUAL_RUN_PATH, state)
+        _save_manual_run(state)
     # 过期哨兵（M-d，尽力而为的 UI 清理）与缺口推荐补写（M-g，可能要查森空岛）
     # 都是脱离会话的子进程，不占这个 20s 进程。
     _spawn_action(["run", "expire", token, "--after", str(int(MANUAL_RUN_TTL.total_seconds()))])
@@ -569,7 +584,7 @@ def run_start(stage: str, token: str) -> tuple[bool, str]:
         state["stage"] = stage
         state["dispatched_at"] = now.isoformat()
         state["updated_at"] = now.isoformat()
-        atomic_write_json(MANUAL_RUN_PATH, state)
+        _save_manual_run(state)
         registry = load_json(BUTTONS_PATH, {})
         if isinstance(registry, dict):
             for custom_id in [k for k in registry if k.startswith(MANUAL_RUN_BUTTON_PREFIX)]:
@@ -652,7 +667,7 @@ def run_recommend(token: str) -> tuple[bool, str]:
         state["recommendation"] = text[:1000]
         state["recommended_stage"] = recommended
         state["updated_at"] = now_beijing().isoformat()
-        atomic_write_json(MANUAL_RUN_PATH, state)
+        _save_manual_run(state)
     choices = state.get("choices") if isinstance(state.get("choices"), list) else []
     rows, _entries = _manual_run_components(choices, token, recommended or None)
     _manual_run_message_patch(
@@ -662,7 +677,9 @@ def run_recommend(token: str) -> tuple[bool, str]:
 
 
 def log_tail() -> tuple[bool, str]:
-    state = load_json(LAST_RUN_PATH, {})
+    state = check_schema(
+        "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+    )
     if not isinstance(state, dict) or not state.get("status"):
         return True, "📋 还没有 MAA 执行结果。"
     summary = str(state.get("summary", "")).strip()

@@ -11,6 +11,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -18,7 +19,7 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -44,6 +45,15 @@ LAST_RUN_LOCK_PATH = STATE_DIR / "last_run.lock"
 # 10 分钟不选作废。手动关**不写 `plan.json`**（M4），只经这份文件传给手动场。
 MANUAL_RUN_PATH = STATE_DIR / "manual_run.json"
 MANUAL_RUN_TTL = timedelta(minutes=10)
+# 状态文件格式版本（DEV_GUIDE §6.1）。写入时带上，读取时过 `check_schema()`：
+# 缺字段视作 1，更高的未知版本——config / plan / manual_run 拒跑，last_run 告警宽读。
+# `roguelike.json` 的版本号在 `maa_roguelike.STATE_SCHEMA_VERSION`。
+# **改了某个文件的格式**：把它的版本号 +1，并在调用处给 `check_schema()` 传上
+# `{旧版本: 迁移函数}`；config.json 的迁移另放 `deploy.py` 的 `CONFIG_MIGRATIONS`。
+CONFIG_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 1
+LAST_RUN_SCHEMA_VERSION = 1
+MANUAL_RUN_SCHEMA_VERSION = 1
 # 选关卡自己的登记前缀：不在 `hermes:btn:maa:` 下（07:50 / 21:50 建卡整前缀清扫碰不到），
 # 也不在 `hermes:btn:maa-copilot:` 下（`prune_expired_searches()` 碰不到）。
 MANUAL_RUN_BUTTON_PREFIX = "hermes:btn:maa-now:"
@@ -179,6 +189,61 @@ def load_json(path: Path, default: Any = None) -> Any:
         return default
 
 
+class SchemaVersionError(RuntimeError):
+    """状态文件的 `schema_version` 本脚本不认识（多半是回滚到了旧脚本）。"""
+
+
+# 迁移函数：吃一份 vN 的文档，吐一份 vN+1 的文档（`schema_version` 由
+# `check_schema()` 改写，迁移函数不用管）。表的键是**起点**版本 N。
+SchemaMigration = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+def check_schema(
+    name: str,
+    value: Any,
+    current: int,
+    migrations: Mapping[int, SchemaMigration] | None = None,
+    *,
+    strict: bool = True,
+) -> Any:
+    """读状态文件时校验 `schema_version`，必要时逐级升级（DEV_GUIDE §6.1）。
+
+    - 不是 dict：原样返回，「必须是 object」由调用方自己的现有逻辑处理。
+    - 缺 `schema_version`：视作 1（加版本号之前写的文件）。
+    - 等于 `current`：原样返回同一个对象。
+    - 低于 `current`：按 `migrations[v]` 逐级升到 `current`，返回新 dict；
+      **不写回**——下次正常写入时自然带上新版本号。缺哪一级就抛。
+    - 高于 `current` / 不是正整数：`strict` 时抛 `SchemaVersionError` 拒跑；
+      非 strict（只用于汇报的 `last_run.json`）打一条告警到 stderr 后原样返回，
+      交给调用方现有的 normalize 宽读。
+    """
+    if not isinstance(value, dict):
+        return value
+    version = value.get("schema_version", 1)
+    if type(version) is not int or version < 1 or version > current:
+        message = (
+            f"{name} 的 schema_version={version!r} 本脚本不认识（认识 1~{current}）："
+            "多半是回滚到了旧脚本，请重新部署新版脚本，或手动处理这个文件"
+        )
+        if strict:
+            raise SchemaVersionError(message)
+        print(f"警告：{message}；按现有格式宽读", file=sys.stderr)
+        return value
+    if version == current:
+        return value
+    upgraded = dict(value)
+    while version < current:
+        step = (migrations or {}).get(version)
+        if step is None:
+            raise SchemaVersionError(
+                f"{name} 的 schema_version={version} 缺少到 {version + 1} 的迁移函数"
+            )
+        upgraded = dict(step(dict(upgraded)))
+        version += 1
+        upgraded["schema_version"] = version
+    return upgraded
+
+
 def http_get_json(url: str, *, timeout: int = 30, max_bytes: int = MAX_RESPONSE_BYTES) -> Any:
     """Small dependency-free GET for JSON APIs (prts, etc.)."""
     request = urllib.request.Request(url, headers={"User-Agent": "Hermes-MAA/1.0"})
@@ -262,7 +327,7 @@ def atomic_write_text(path: Path, value: str, *, mode: int = 0o600) -> None:
 
 
 def load_config() -> dict[str, Any]:
-    raw = load_json(CONFIG_PATH, {})
+    raw = check_schema("config.json", load_json(CONFIG_PATH, {}), CONFIG_SCHEMA_VERSION)
     if not isinstance(raw, dict):
         raise RuntimeError("config.json 必须是 JSON object")
     return raw
@@ -359,7 +424,7 @@ def plan_sessions(at: datetime | None = None) -> dict[str, dict[str, Any]]:
     （顶层 `stage` / `skip`）读到就当空——它一天后自然失效，不值得为它写迁移。
     """
     moment = at or now_beijing()
-    raw = load_json(PLAN_PATH, {})
+    raw = check_schema("plan.json", load_json(PLAN_PATH, {}), PLAN_SCHEMA_VERSION)
     if not isinstance(raw, dict) or raw.get("date") != moment.date().isoformat():
         return {}
     sessions = raw.get("sessions")
@@ -608,7 +673,9 @@ def cleanup_run_files(retention_days: int = 14, at: datetime | None = None) -> l
 
 def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
     with last_run_lock():
-        current = load_json(LAST_RUN_PATH, {})
+        current = check_schema(
+            "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+        )
         if not isinstance(current, dict):
             current = {}
         threads = current.get("threads", [])
@@ -623,6 +690,7 @@ def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(item, dict) and str(item.get("thread_id")) not in known:
                     threads.append(item)
         current["threads"] = threads
+        current["schema_version"] = LAST_RUN_SCHEMA_VERSION
         atomic_write_json(LAST_RUN_PATH, current)
         return current
 
@@ -679,7 +747,9 @@ def report_game_busy(
 
 def cleanup_old_threads(token: str, at: datetime | None = None) -> dict[str, int]:
     at = at or now_beijing()
-    current = load_json(LAST_RUN_PATH, {})
+    current = check_schema(
+        "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+    )
     if not isinstance(current, dict):
         current = {}
     threads = current.get("threads", [])
@@ -707,5 +777,6 @@ def cleanup_old_threads(token: str, at: datetime | None = None) -> dict[str, int
             kept.append(item)
             failed += 1
     current["threads"] = kept
+    current["schema_version"] = LAST_RUN_SCHEMA_VERSION
     atomic_write_json(LAST_RUN_PATH, current)
     return {"deleted": deleted, "failed": failed}

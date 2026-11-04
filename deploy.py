@@ -14,7 +14,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parent
@@ -99,6 +99,8 @@ PRESERVED_RUNTIME_CACHE_KEYS = (
 
 # 已经没有代码再读的配置键。`deploy_state()` 每次部署顺手删掉它们——
 # config.json 是逐键 merge 的，不删就会永远留在线上（四期步骤 2 拆掉通关队列）。
+# 这本身就是一种**不升版本号的迁移**：只删键、不改既有键的含义，新旧脚本都能读，
+# 所以不必动 `schema_version`。要改既有键的含义 / 结构时才走 `CONFIG_MIGRATIONS`。
 RETIRED_CONFIG_KEYS = (
     "clearing_enabled",
     "clearing_manual_after_days",
@@ -304,6 +306,34 @@ def _compile_swift(name: str, consequence: str) -> None:
         )
 
 
+# `config.json` 的格式迁移（DEV_GUIDE §6.1）。版本号随种子 `state/config.json`
+# 的 `schema_version` 走；`deploy_state()` 在 merge 种子**之前**把线上那份逐级升到
+# 种子的版本。键是起点版本 N，函数吃 vN 吐 vN+1（`schema_version` 由
+# `migrate_live_config()` 改写）。现在还是空表——第一次真改 config 格式时再填，
+# 并给它补一条「旧版本线上 config 部署后长什么样」的用例。
+CONFIG_MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+
+
+def migrate_live_config(current: dict[str, Any], target_version: Any) -> dict[str, Any]:
+    """把线上 config.json 升到种子的 `schema_version`；线上更新 / 不合法就拒绝部署。"""
+    if type(target_version) is not int or target_version < 1:
+        raise RuntimeError(f"仓库种子 config.json 的 schema_version 不合法：{target_version!r}")
+    version = current.get("schema_version", 1)
+    if type(version) is not int or version < 1 or version > target_version:
+        raise RuntimeError(
+            f"线上 config.json 的 schema_version={version!r} 比仓库种子（{target_version}）新或不合法："
+            "多半是拿旧提交部署，先切回新提交再部署"
+        )
+    while version < target_version:
+        step = CONFIG_MIGRATIONS.get(version)
+        if step is None:
+            raise RuntimeError(f"config.json 缺少 schema_version {version} → {version + 1} 的迁移")
+        current = dict(step(dict(current)))
+        version += 1
+        current["schema_version"] = version
+    return current
+
+
 def deploy_state(channel_id: str) -> None:
     target = HERMES_HOME / "state" / "maa"
     ensure_dir(target)
@@ -320,6 +350,10 @@ def deploy_state(channel_id: str) -> None:
     current_config = load_json(target / "config.json", {})
     if not isinstance(current_config, dict):
         raise RuntimeError("existing MAA config.json is not an object")
+    if isinstance(desired_config, dict):
+        current_config = migrate_live_config(
+            current_config, desired_config.get("schema_version", 1)
+        )
     preserved_runtime_caches = {
         key: current_config[key]
         for key in PRESERVED_RUNTIME_CACHE_KEYS

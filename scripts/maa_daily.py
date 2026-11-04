@@ -20,12 +20,15 @@ import maa_playcover
 from maa_common import (
     BEIJING,
     LAST_RUN_PATH,
+    LAST_RUN_SCHEMA_VERSION,
     MAA_CONFIG_DIR,
     MANUAL_RUN_PATH,
+    MANUAL_RUN_SCHEMA_VERSION,
     RUNS_DIR,
     SAFE_ITEM_ID_RE,
     SCRIPTS_DIR,
     atomic_write_json,
+    check_schema,
     atomic_write_text,
     cleanup_run_files,
     create_thread,
@@ -1570,7 +1573,9 @@ def manual_run_stage(manual_token: str) -> str | None:
     调用方不跑。token 为空（终端直接 `maa_daily.py now`）不走这里（M6）。
     """
     with state_lock():
-        state = load_json(MANUAL_RUN_PATH, {})
+        state = check_schema(
+            "manual_run.json", load_json(MANUAL_RUN_PATH, {}), MANUAL_RUN_SCHEMA_VERSION
+        )
     if (
         not isinstance(state, dict)
         or state.get("token") != manual_token
@@ -1613,7 +1618,9 @@ def execute(phase: str, manual_token: str = "") -> int:
     if not channel_id.isdigit():
         raise RuntimeError("config.json 中尚未配置 Discord channel_id")
     token = discord_token()
-    last_run_state = load_json(LAST_RUN_PATH, {})
+    last_run_state = check_schema(
+        "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
+    )
     if not isinstance(last_run_state, dict):
         last_run_state = {}
     # 计划按场次求值（四期 D1~D3）：早场改的关不会带到晚场。
