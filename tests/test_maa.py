@@ -1549,8 +1549,8 @@ class ConnectRetryTests(unittest.TestCase):
             with (
                 patch.object(maa_daily, "run_maa", side_effect=attempts) as runner,
                 patch.object(maa_daily.time, "sleep"),
-                patch.object(maa_daily, "settle_game_window", return_value="") as settle,
-                patch.object(maa_daily, "wait_for_game") as wait,
+                patch.object(maa_playcover, "settle_game_window", return_value="") as settle,
+                patch.object(maa_playcover, "wait_for_game") as wait,
             ):
                 result = maa_daily.run_maa_resilient(
                     {"maa_run_timeout": 3000, **config},
@@ -2201,7 +2201,7 @@ class HomeScreenshotTests(unittest.TestCase):
             return True, ""
 
         results = [(False, "识别到 0/8 个主页标识"), (True, "识别到 8/8 个主页标识")]
-        with patch.object(maa_daily, "capture_screenshot", fake_capture), patch.object(
+        with patch.object(maa_playcover, "capture_screenshot", fake_capture), patch.object(
             maa_daily, "verify_home_screenshot", lambda path: results.pop(0)
         ), patch.object(maa_daily.time, "sleep", lambda seconds: None):
             ok, error, verified, detail = maa_daily.capture_home_screenshot(
@@ -2215,7 +2215,7 @@ class HomeScreenshotTests(unittest.TestCase):
 
     def test_capture_failure_short_circuits_without_ocr(self) -> None:
         with patch.object(
-            maa_daily, "capture_screenshot", lambda config, path: (False, "adb 挂了")
+            maa_playcover, "capture_screenshot", lambda config, path: (False, "adb 挂了")
         ), patch.object(maa_daily, "verify_home_screenshot", lambda path: (True, "不该被调用")), patch.object(
             maa_daily.time, "sleep", lambda seconds: None
         ):
@@ -2269,7 +2269,7 @@ class HomeScreenshotTests(unittest.TestCase):
     def test_home_gate_does_not_touch_copilot(self) -> None:
         # 抄作业 must keep using the plain capture; it never ends on the home page.
         worker = (ROOT / "scripts" / "maa_copilot_worker.py").read_text(encoding="utf-8")
-        self.assertIn("capture_screenshot(config, png_path)", worker)
+        self.assertIn("maa_playcover.capture_screenshot(config, png_path)", worker)
         self.assertNotIn("capture_home_screenshot", worker)
         self.assertNotIn("verify_home_screenshot", worker)
 
@@ -2451,7 +2451,7 @@ class DepotTests(unittest.TestCase):
         failed = SimpleNamespace(returncode=1, stdout="", stderr="recognition failed")
         config = {"maa_bin": "/maa"}
         with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-            maa_depot, "game_is_online", return_value=(False, "离线")
+            maa_playcover, "game_is_online", return_value=(False, "离线")
         ), patch.object(maa_daily, "require_executable"), patch.object(
             maa_playcover, "launch_game"
         ), patch.object(
@@ -2565,7 +2565,7 @@ class GameProbeTests(unittest.TestCase):
         ), patch.object(maa_daily, "atomic_write_json"), patch.object(
             maa_daily, "should_skip", return_value=False
         ), patch.object(
-            maa_daily, "game_is_online", probe
+            maa_playcover, "game_is_online", probe
         ), patch.object(maa_daily, "merge_last_run") as merge, patch.object(
             maa_daily, "discord_request"
         ) as request, patch.object(
@@ -2578,9 +2578,9 @@ class GameProbeTests(unittest.TestCase):
             maa_common, "discord_token", return_value="token"
         ), patch.object(maa_daily, "require_executable"), patch.object(
             # 不桩它就会真去读 PlayCover 里明日方舟的安装和 MaaTools 设置。
-            maa_daily, "verify_game_installed"
+            maa_playcover, "verify_game_installed"
         ), patch.object(
-            maa_daily, "launch_game", side_effect=RuntimeError("STOP: probe passed")
+            maa_playcover, "launch_game", side_effect=RuntimeError("STOP: probe passed")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
         merge.call_args_list = merge.call_args_list + common_merge.call_args_list
@@ -4085,13 +4085,13 @@ class SessionDailyTests(unittest.TestCase):
         ), patch.object(maa_daily, "run_lock", return_value=lock), patch.object(
             maa_daily, "cleanup_run_files"
         ), patch.object(maa_daily, "atomic_write_json") as snapshot, patch.object(
-            maa_daily, "game_is_online", return_value=(False, "离线")
+            maa_playcover, "game_is_online", return_value=(False, "离线")
         ), patch.object(maa_daily, "merge_last_run"), patch.object(
             maa_daily, "discord_request"
         ) as request, patch.object(maa_daily, "require_executable"), patch.object(
-            maa_daily, "verify_game_installed"
+            maa_playcover, "verify_game_installed"
         ), patch.object(
-            maa_daily, "launch_game", side_effect=RuntimeError("STOP: 已越过跳过闸门")
+            maa_playcover, "launch_game", side_effect=RuntimeError("STOP: 已越过跳过闸门")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
         return SimpleNamespace(
@@ -4331,21 +4331,34 @@ class EmulatorProbeSharedTests(unittest.TestCase):
     """四期 1d：一份探测实现，四条自动链路共用（D18 / 不变量 #24）。"""
 
     def test_there_is_exactly_one_probe_implementation(self) -> None:
-        self.assertIs(maa_daily.game_is_online, maa_playcover.game_is_online)
-        self.assertIs(maa_depot.game_is_online, maa_playcover.game_is_online)
-        self.assertIs(maa_action.game_is_online, maa_playcover.game_is_online)
         import maa_copilot_worker
         import maa_roguelike_worker
 
-        self.assertIs(
-            maa_copilot_worker.game_is_online, maa_playcover.game_is_online
-        )
-        self.assertIs(
-            maa_roguelike_worker.game_is_online, maa_playcover.game_is_online
-        )
+        for module in (
+            maa_daily,
+            maa_depot,
+            maa_action,
+            maa_copilot_worker,
+            maa_roguelike_worker,
+        ):
+            with self.subTest(module=module.__name__):
+                # 调用方只经 `maa_playcover.game_is_online()` 走，不留自己的同名引用。
+                self.assertIs(module.maa_playcover, maa_playcover)
+                self.assertFalse(hasattr(module, "game_is_online"))
         for name in ("maa_daily.py", "maa_common.py"):
             source = (ROOT / "scripts" / name).read_text(encoding="utf-8")
             self.assertNotIn("def game_is_online", source)
+
+    def test_scripts_never_from_import_the_device_layer(self) -> None:
+        # 设备函数只在 `maa_playcover` 一处打桩；`from maa_playcover import x`
+        # 会在调用方留一份独立引用，桩打在 maa_playcover 上就漏过去了。
+        offenders = []
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "maa_playcover":
+                    offenders.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(offenders, [])
 
     def test_a_busy_emulator_stops_the_copilot_round_before_it_opens_anything(self) -> None:
         import maa_copilot_worker as worker
@@ -4372,13 +4385,13 @@ class EmulatorProbeSharedTests(unittest.TestCase):
             ), patch.object(
                 worker, "load_config", return_value={"channel_id": "1"}
             ), patch.object(
-                worker, "game_is_online", return_value=(True, "游戏进程在跑")
+                maa_playcover, "game_is_online", return_value=(True, "游戏进程在跑")
             ), patch.object(
                 worker, "_notice",
                 side_effect=lambda c, t, b, col: notices.append((t, b)),
             ), patch.object(worker, "merge_last_run") as merge, patch.object(
                 worker, "_fight_one"
-            ) as fight, patch.object(worker, "launch_game") as launch_game:
+            ) as fight, patch.object(maa_playcover, "launch_game") as launch_game:
                 code = worker._batch_run_locked(queued)
             restored = json.loads((searches / f"{token}.json").read_text("utf-8"))
         self.assertEqual(code, 0)
@@ -4407,7 +4420,7 @@ class EmulatorProbeSharedTests(unittest.TestCase):
                 "_state",
                 side_effect=lambda path=depot_path: maa_common.load_json(path, {}),
             ), patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-                maa_depot, "game_is_online", return_value=(True, "游戏进程在跑")
+                maa_playcover, "game_is_online", return_value=(True, "游戏进程在跑")
             ), patch.object(
                 maa_depot, "report_game_busy"
             ) as report, patch.object(
@@ -5166,7 +5179,7 @@ class CopilotDispatchGateTests(unittest.TestCase):
         with patch.object(maa_action, "_copilot_blackout_reason", return_value=blackout), \
              patch.object(maa_action, "depot_window_reason", return_value=depot), \
              patch.object(maa_action, "is_run_locked", return_value=locked), \
-             patch.object(maa_action, "game_is_online", return_value=online):
+             patch.object(maa_playcover, "game_is_online", return_value=online):
             return maa_action.dispatch_blocker({}, scheduled_at, self.at)
 
     def test_the_gate_has_exactly_one_implementation(self) -> None:
@@ -5357,17 +5370,17 @@ class CopilotBatchExecutionTests(unittest.TestCase):
                     worker, "load_config",
                     return_value={"channel_id": "1", **(config or {})},
                 ),
-                patch.object(worker, "game_is_online", return_value=(False, "")),
+                patch.object(maa_playcover, "game_is_online", return_value=(False, "")),
                 patch.object(worker, "_retire_round_controls"),
                 patch.object(worker, "_notice"),
                 patch.object(worker, "require_executable"),
-                patch.object(worker, "launch_game"),
-                patch.object(worker, "wait_for_game"),
-                patch.object(worker, "verify_game_installed"),
-                patch.object(worker, "settle_game_window"),
+                patch.object(maa_playcover, "launch_game"),
+                patch.object(maa_playcover, "wait_for_game"),
+                patch.object(maa_playcover, "verify_game_installed"),
+                patch.object(maa_playcover, "settle_game_window"),
                 patch.object(worker, "maa_subprocess_env", return_value={}),
-                patch.object(worker, "capture_screenshot", return_value=(True, "")),
-                patch.object(worker, "close_game", return_value=[]),
+                patch.object(maa_playcover, "capture_screenshot", return_value=(True, "")),
+                patch.object(maa_playcover, "close_game", return_value=[]),
                 patch.object(worker, "merge_last_run"),
                 patch.object(worker, "cleanup_run_files"),
                 patch.object(maa_action, "min_lead_reason", return_value=lead),
@@ -6306,8 +6319,8 @@ class ManualCopilotPathTests(unittest.TestCase):
                      patch.object(worker, "load_config", return_value={"channel_id": "1"}), \
                      patch.object(worker, "run_lock",
                                   return_value=contextlib.nullcontext(True)), \
-                     patch.object(worker, "launch_game") as launch_game, \
-                     patch.object(worker, "game_is_online",
+                     patch.object(maa_playcover, "launch_game") as launch_game, \
+                     patch.object(maa_playcover, "game_is_online",
                                   return_value=(False, "")) as probe, \
                      patch.object(worker, "_notice",
                                   side_effect=lambda c, t, b, k: notices.append(b)), \
@@ -7702,15 +7715,15 @@ class RoguelikeWorkerTests(unittest.TestCase):
             patch.object(worker, "load_config",
                          return_value={"channel_id": "1",
                                        "roguelike_run_timeout": 3600}),
-            patch.object(worker, "game_is_online", return_value=online),
+            patch.object(maa_playcover, "game_is_online", return_value=online),
             patch.object(worker, "require_executable"),
-            patch.object(worker, "launch_game", launch_game),
-            patch.object(worker, "wait_for_game"),
-            patch.object(worker, "verify_game_installed"),
-            patch.object(worker, "settle_game_window"),
+            patch.object(maa_playcover, "launch_game", launch_game),
+            patch.object(maa_playcover, "wait_for_game"),
+            patch.object(maa_playcover, "verify_game_installed"),
+            patch.object(maa_playcover, "settle_game_window"),
             patch.object(worker, "maa_subprocess_env", return_value={}),
-            patch.object(worker, "capture_screenshot", return_value=(True, "")),
-            patch.object(worker, "close_game", return_value=[]),
+            patch.object(maa_playcover, "capture_screenshot", return_value=(True, "")),
+            patch.object(maa_playcover, "close_game", return_value=[]),
             patch.object(worker, "merge_last_run"),
             patch.object(worker, "cleanup_run_files"),
             patch.object(worker, "_isolated_config",
@@ -8322,7 +8335,7 @@ class OperBoxFallbackTests(unittest.TestCase):
             config = {"maa_bin": "/maa", "maa_resource_dir": str(root)}
             operbox_roster = root / "roster-operbox.json"
             with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
-                maa_depot, "game_is_online", return_value=(False, "离线")
+                maa_playcover, "game_is_online", return_value=(False, "离线")
             ), patch.object(maa_daily, "require_executable"), patch.object(
                 maa_playcover, "launch_game"
             ), patch.object(maa_playcover, "wait_for_game"), patch.object(

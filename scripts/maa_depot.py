@@ -13,7 +13,6 @@ from typing import Any, Iterable
 
 import maa_copilot
 import maa_playcover
-from maa_playcover import game_is_online
 from maa_common import (
     STATE_DIR,
     atomic_write_json,
@@ -528,7 +527,7 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
     with run_lock(blocking=False) as acquired:
         if not acquired:
             raise RuntimeError("另一个 MAA 任务正在运行，Depot 对表未执行")
-        online, probe_detail = game_is_online(config)
+        online, probe_detail = maa_playcover.game_is_online(config)
         if online:
             reason = (
                 "检测到明日方舟正在运行，本次仓库对表未执行，也没有碰游戏；"

@@ -16,7 +16,6 @@ from typing import Any
 import maa_copilot
 import maa_roguelike
 import maa_playcover
-from maa_playcover import game_is_online
 from maa_common import (
     BUTTONS_PATH,
     DEFAULT_MANUAL_RUN_BLACKOUT_MINUTES,
@@ -824,7 +823,7 @@ def dispatch_blocker(
             return reason
     if is_run_locked():
         return "另一场 MAA 正在运行（run.lock 被占）"
-    online, detail = game_is_online(config)
+    online, detail = maa_playcover.game_is_online(config)
     if online:
         return f"明日方舟正在运行：{detail}"
     return ""

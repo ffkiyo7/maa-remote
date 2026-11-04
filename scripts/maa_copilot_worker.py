@@ -34,15 +34,6 @@ import maa_copilot
 import maa_gamedata
 import maa_playcover
 from maa_daily import HOME_TASK_NAMES
-from maa_playcover import (
-    capture_screenshot,
-    close_game,
-    game_is_online,
-    launch_game,
-    settle_game_window,
-    verify_game_installed,
-    wait_for_game,
-)
 from maa_common import (
     BUTTONS_PATH,
     RUNS_DIR,
@@ -901,7 +892,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
 
     # D18：抢到锁之后、碰设备之前先探一次。在线就把这一轮放回排程，什么都不做——
     # 任何失败路径都会 `close_game()` 退掉 BlueStacks，等于把人踢出游戏。
-    online, probe_detail = game_is_online(config)
+    online, probe_detail = maa_playcover.game_is_online(config)
     if online:
         _set_status(token, {"queued"}, "scheduled", last_prepare_error=GAME_BUSY_NOTICE)
         _notice(
@@ -949,7 +940,7 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             print(f"pause button register failed: {type(exc).__name__}: {exc}", flush=True)
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        verify_game_installed(config)
+        maa_playcover.verify_game_installed(config)
         atomic_write_json(
             RUNS_DIR / f"{stem}.json",
             {
@@ -980,12 +971,12 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
             start_components,
         )
 
-        launch_game(config)
+        maa_playcover.launch_game(config)
         game_touched = True
-        wait_for_game(config)
+        maa_playcover.wait_for_game(config)
         # 游戏窗口必须在 MAA-Game 虚拟屏台前，否则 MaaTools 截图为空。这里没有
         # 日常那层重试兜底，这一步更不能省。
-        settle_game_window(config)
+        maa_playcover.settle_game_window(config)
         env = maa_subprocess_env(config)
         env["MAA_LOG_PREFIX"] = "Never"
 
@@ -1073,11 +1064,11 @@ def _batch_run_locked(state: dict[str, Any]) -> int:
     finally:
         if game_touched:
             try:
-                capture_screenshot(config, png_path)
+                maa_playcover.capture_screenshot(config, png_path)
             except Exception:
                 pass
             try:
-                cleanup_errors = close_game(config)
+                cleanup_errors = maa_playcover.close_game(config)
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 

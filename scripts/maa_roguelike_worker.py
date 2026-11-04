@@ -22,15 +22,7 @@ from typing import Any
 
 import maa_action
 import maa_roguelike
-from maa_playcover import (
-    capture_screenshot,
-    close_game,
-    game_is_online,
-    launch_game,
-    settle_game_window,
-    verify_game_installed,
-    wait_for_game,
-)
+import maa_playcover
 # 这三个是抄作业 worker 里已经在线上跑过的通用件：隔离临时 `MAA_CONFIG_DIR`、
 # 灰卡通知、带截图的战报上传。复制一份只会多出第二处要维护的实现，
 # 所以直接复用（执行逻辑仍然只有一份）。
@@ -200,7 +192,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     # 不变量 #24：抢到 `run.lock` 之后、`launch_game()` 之前探一次。
     # 在线就什么都不碰——任何失败路径都会 `close_game()` 退掉 BlueStacks，
     # 等于把正在玩的用户踢出游戏。
-    online, probe_detail = game_is_online(config)
+    online, probe_detail = maa_playcover.game_is_online(config)
     if online:
         _finish(token, dirty=dirty, theme=last_theme)
         _notice(
@@ -231,7 +223,7 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     error_streak = 0
     try:
         require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-        verify_game_installed(config)
+        maa_playcover.verify_game_installed(config)
         merge_last_run(
             {
                 "status": "running",
@@ -273,11 +265,11 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
                     "每打完一局发一条进度；说「肉鸽停」会在本局结束后退出。",
                     0x9B59B6,
                 )
-                launch_game(config)
+                maa_playcover.launch_game(config)
                 game_touched = True
-                wait_for_game(config)
+                maa_playcover.wait_for_game(config)
                 # 游戏窗口必须在 MAA-Game 虚拟屏台前，否则 MaaTools 截图为空。
-                settle_game_window(config)
+                maa_playcover.settle_game_window(config)
                 env = maa_subprocess_env(config)
                 env["MAA_LOG_PREFIX"] = "Never"
             index = len(runs) + 1
@@ -345,11 +337,11 @@ def _run_locked(state: dict[str, Any], token: str) -> int:
     finally:
         if game_touched:
             try:
-                capture_screenshot(config, png_path)
+                maa_playcover.capture_screenshot(config, png_path)
             except Exception:
                 pass
             try:
-                cleanup_errors = close_game(config)
+                cleanup_errors = maa_playcover.close_game(config)
             except Exception as exc:
                 cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 

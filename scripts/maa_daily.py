@@ -16,15 +16,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import maa_depot
-from maa_playcover import (
-    capture_screenshot,
-    close_game,
-    game_is_online,
-    launch_game,
-    settle_game_window,
-    verify_game_installed,
-    wait_for_game,
-)
+import maa_playcover
 from maa_common import (
     BEIJING,
     LAST_RUN_PATH,
@@ -1016,7 +1008,7 @@ def capture_home_screenshot(
     ok, error, verified, detail = False, "未执行", None, ""
     for _ in range(attempts):
         time.sleep(delay)
-        ok, error = capture_screenshot(config, path)
+        ok, error = maa_playcover.capture_screenshot(config, path)
         if not ok:
             return ok, error, None, "没有截图可校验"
         verified, detail = verify_home_screenshot(path)
@@ -1121,7 +1113,7 @@ def run_maa(
                     if failures > screencap_failures and now - last_settle >= SCREENCAP_SETTLE_INTERVAL:
                         last_settle = now
                         try:
-                            warning = settle_game_window(config)
+                            warning = maa_playcover.settle_game_window(config)
                         except Exception as exc:  # 救场是尽力而为，不能拖垮主循环
                             warning = f"摆回游戏窗口失败：{exc}"
                         note = f"截图失败，已尝试把游戏窗口摆回台前。{warning}".strip()
@@ -1238,8 +1230,8 @@ def run_maa_resilient(
         _append_log(log_path, note)
         time.sleep(delay)
         try:
-            warning = settle_game_window(config)
-            wait_for_game(config)
+            warning = maa_playcover.settle_game_window(config)
+            maa_playcover.wait_for_game(config)
         except Exception as exc:  # 下一趟 maa run 自己会再报连接失败
             warning = f"重开前准备游戏失败：{exc}"
         if warning:
@@ -1708,7 +1700,7 @@ def execute(phase: str, manual_token: str = "") -> int:
         # from a user who is playing — every failure path here would quit their
         # game (结论 3). `now` is an explicit "run it anyway" and skips this.
         if phase in AUTO_PHASES:
-            online, probe_detail = game_is_online(config)
+            online, probe_detail = maa_playcover.game_is_online(config)
             if online:
                 report_game_busy(
                     config, token, channel_id, phase, probe_detail, now_beijing()
@@ -1732,10 +1724,10 @@ def execute(phase: str, manual_token: str = "") -> int:
         startup_error = ""
         try:
             require_executable(config, "maa_bin", "/opt/homebrew/bin/maa", "maa-cli")
-            verify_game_installed(config)
-            launch_game(config)
+            maa_playcover.verify_game_installed(config)
+            maa_playcover.launch_game(config)
             game_opened = True
-            wait_for_game(config)
+            maa_playcover.wait_for_game(config)
             opening = discord_request(
                 token,
                 "POST",
@@ -1781,7 +1773,7 @@ def execute(phase: str, manual_token: str = "") -> int:
             atomic_write_text(task_path, render_daily_toml(plan, config))
             # 最后一道门：游戏窗口必须在 MAA-Game 虚拟屏的台前，否则 MaaTools 截图为空、
             # 整场空跑。摆不回来只记一条警告，不阻断（maa run 自己会报连接失败并重开）。
-            settle_warning = settle_game_window(config)
+            settle_warning = maa_playcover.settle_game_window(config)
             if settle_warning:
                 stderr_lines.append(settle_warning)
             prior_errors = list(stderr_lines)
@@ -1860,7 +1852,7 @@ def execute(phase: str, manual_token: str = "") -> int:
         finally:
             if game_opened:
                 try:
-                    cleanup_errors = close_game(config)
+                    cleanup_errors = maa_playcover.close_game(config)
                 except Exception as exc:
                     cleanup_errors = [f"清理异常：{type(exc).__name__}: {exc}"]
 
