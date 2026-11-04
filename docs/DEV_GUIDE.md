@@ -86,8 +86,8 @@ winmove 要调用方有**辅助功能**权限，线上是 Hermes gateway 那个 
 `CGS_REQUIRE_INIT` 断言（进程没初始化 CoreGraphics 会话就调 SCK），要 DYLD 注入一个先调
 `CGMainDisplayID()` 的 shim 才能跑；而且要给 maa 进程开录屏权限。虚拟屏 + `SCRN` 更简单。
 
-**单测碰不到真游戏**：`tests/test_maa.py` / `tests/test_copilot.py` 的 `setUpModule()` 调
-`_isolation.guard_devices()`，把 `maa_playcover.subprocess` /
+**单测碰不到真游戏**：除 `test_playcover.py` / `test_state_schema.py` / `test_isolation.py`
+以外，每个 `tests/test_*.py` 的 `setUpModule()` 都调 `_isolation.guard_devices()`，把 `maa_playcover.subprocess` /
 `socket` 换成一碰就抛 `RealGameTouched`（BaseException，`except Exception` 吞不掉）的桩。
 2026-11-04 就是 Depot 用例桩了 `maa_daily.launch_game`、实际调的是 `maa_playcover.launch_game`，
 整套单测真的开关了一次游戏。设备层自己的行为在 `tests/test_playcover.py` 里对着一个本机
@@ -155,7 +155,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `deploy.py` | 幂等部署 + 给 Hermes 打本地补丁 + 备份 + 编译 ocrbox | 人工 | 秒级 |
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
 | `scripts/maa_playcover.py` | **设备层**（§0.5）：探测、开游戏、等 MaaTools、摆窗口、截图、点击、关游戏 | 被日常 / Depot / 抄作业 / 肉鸽 import | — |
-| `tests/test_maa.py` + `tests/test_copilot.py` + `tests/test_playcover.py` | stdlib 单测，不碰游戏（§0.5） | 人工 | 约 5s |
+| `tests/test_*.py` | stdlib 单测，不碰游戏（§0.5），按领域分文件：`test_plan` / `test_plan_card` / `test_daily` / `test_depot` / `test_farming` / `test_activity_watch` / `test_clearing` / `test_copilot` / `test_copilot_worker` / `test_roguelike` / `test_skland` / `test_deploy` / `test_playcover` / `test_state_schema` / `test_isolation`；共用桩在 `tests/_helpers.py`，隔离层在 `tests/_isolation.py`（§9） | 人工 | 约 6s |
 
 ---
 
@@ -1421,8 +1421,9 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开游戏、真�
 一次 SSL EOF 判红——「全绿」这个验收标准就此不可信。现在网络层由
 `tests/test_copilot.py: prts_http_stub()` 桩掉，整套 2.4s。
 
-**一图流 / 企鹅物流那条出口在 `tests/test_maa.py` 的 `setUpModule()` 里被整个封死**
-（模块级 patch 掉 `maa_farming._http_json`）。这一层不是洁癖：抓取层默认把缓存写进
+**一图流 / 企鹅物流那条出口在每个测试模块的 `setUpModule()` 里被整个封死**
+（`tests/_helpers.py: start_module_patches()` 模块级 patch 掉 `maa_farming._http_json`，
+游戏数据 `maa_gamedata._fetch` / `load_layout` 同理）。这一层不是洁癖：抓取层默认把缓存写进
 **线上** `~/.hermes/state/maa/farming/`，一条漏了打桩的用例既会打对方接口，又会往运行时
 状态里塞一份带假时间戳（用例的 `at=`）的缓存，把线上数据冻到那个未来时刻。
 需要自己造响应的用例在 `with patch.object(maa_farming, "_http_json", …)` 里覆盖它；
@@ -1478,6 +1479,26 @@ import 时就算死了，每用例换 HOME 得有一个 helper 统一重绑全�
 `state/agent-book/state.lock`，`fcntl` 锁随文件关闭释放，不携带状态）。断言看的是**整个**共享
 HOME 而不是「本模块新增的」：discover 按文件名顺序跑模块，前一个模块漏下的文件最晚在下一个
 模块收尾时被抓到，报错路径对应哪个常量，就去找写它的用例。
+
+**测试文件布局**（2026-11-04 起；之前是一个九千多行的 `test_maa.py`）：按领域一个文件，类名和
+方法名拆分时一个没改。新测试模块照抄任一 `test_*.py` 的开头：先 `sys.path` 加 `scripts/` 和
+`tests/`，**第一个** `import _isolation`，再 `import _helpers` 和 scripts 模块；`setUpModule()` 里
+`_isolation.guard_devices()` + `_helpers.start_module_patches()`，`tearDownModule()` 反过来
+`_helpers.stop_patches()`、停设备桩、最后 `_isolation.assert_shared_home_clean()`。
+被两个以上模块用到的桩 / fixture（`SR_INDEX` / `SR_LAYOUT` / `_nav_patch()` / `_offline_market()`、
+`needs_yaml` 等）放 `_helpers.py`；只有一个模块用的留在那个模块里（如 `test_daily.isolate_stage_index`、
+`test_farming.FarmingFixture`）。跑单个文件：`python3 -m unittest discover -s tests -p test_daily.py`
+（`deploy.py` 在仓库根，从 `tests/` 里直接 `-m unittest test_daily` 会 import 不到）。
+
+**脚本暂不拆**（2026-11-04 定）。`maa_action.py` / `maa_daily.py` / `maa_copilot_worker.py` 都上千行，
+但入口文件名是对外契约：cron（`~/.hermes/cron/jobs.json`）按文件名跑 `maa_plan_card.py` /
+`maa_daily.py` / `maa_activity_watch.py` / `maa_depot.py`，按钮白名单精确到 `maa_action.py`，
+两个 worker 按路径被 spawn，`deploy.py` 只拷不删（旧文件会留在 `~/.hermes/scripts/`）。拆分收益主要是可读性，
+暂不值得。以后真要拆，两条路：
+(B) 按接缝抽**平铺**模块（如 `maa_daily_report.py`、copilot watchdog），入口文件名不变、新文件进
+`deploy.SCRIPT_NAMES`；代价是测试里大量 `patch.object(<模块>, …)` 目标跟着搬（§0.5 的「桩只打一处」同理）。
+(C) 包目录 `~/.hermes/scripts/maa_remote/`、入口仍平铺；最干净但改动最大，`deploy.py` 要学会同步删除旧文件，
+`--check` 的逐字节比对也要跟着改。
 
 **线上契约冒烟**（默认跳过，故意要连真网的那一条）：
 

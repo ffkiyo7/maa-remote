@@ -28,7 +28,7 @@ import maa_copilot  # noqa: E402
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
-# 这里的用例会走到 maa_action 的派发链，设备层同 test_maa 一样封死。
+# 这里的用例会走到 maa_action 的派发链，设备层同其它测试模块一样封死。
 _DEVICE_GUARDS: list = []
 
 

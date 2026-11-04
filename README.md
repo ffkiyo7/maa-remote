@@ -552,7 +552,7 @@ task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]
 python3 -m unittest discover -s tests -v
 ```
 
-现有 stdlib 单测约 5 秒，不碰游戏（`test_maa.py` 在模块级把设备层的 `subprocess` / `socket`
+现有 stdlib 单测约 6 秒，不碰游戏（各 `tests/test_*.py` 在模块级把设备层的 `subprocess` / `socket`
 换成一碰就炸的桩）。**必须在仓库根目录跑。**
 
 改完代码要跑 `deploy.py` 才生效；改了 adapter / `config.yaml` / `.env` / `SKILL.md` 还要重启 gateway。
