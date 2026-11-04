@@ -23,8 +23,12 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 # 必须先于任何 scripts/ 模块：把 HOME 换成临时目录，碰真实 home / 外网当场炸。
-import _isolation  # noqa: E402,F401
+import _isolation  # noqa: E402
 import maa_playcover  # noqa: E402
+
+
+def tearDownModule() -> None:
+    _isolation.assert_shared_home_clean()
 
 
 class FakeMaaTools:

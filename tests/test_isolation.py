@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -63,3 +64,69 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(_isolation.RealNetworkTouched):
             socket.getaddrinfo("discord.com", 443)
         socket.getaddrinfo("127.0.0.1", 0)
+
+
+class SharedHomeCleanTests(unittest.TestCase):
+    """`assert_shared_home_clean()`：共享临时 HOME 里留了状态文件要报错。
+
+    在独立的临时目录上验（`root=`），不往真正的共享 HOME 里放东西。
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def touch(self, rel: str, content: str = "") -> None:
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def test_empty_whitelisted_locks_and_empty_dirs_pass(self) -> None:
+        for rel in _isolation.SHARED_HOME_ALLOWED:
+            self.touch(rel)
+        (self.root / ".hermes" / "state" / "maa" / "copilot").mkdir(parents=True)
+        _isolation.assert_shared_home_clean(root=self.root)
+
+    def test_a_leaked_state_file_is_reported_by_path(self) -> None:
+        self.touch(".hermes/state/maa/run.lock")
+        self.touch(".hermes/state/maa/copilot/stage_index.json", "{}")
+        with self.assertRaises(AssertionError) as caught:
+            _isolation.assert_shared_home_clean(root=self.root)
+        message = str(caught.exception)
+        self.assertIn(".hermes/state/maa/copilot/stage_index.json（2 B）", message)
+        self.assertNotIn("run.lock", message)
+
+    def test_a_whitelisted_lock_with_content_is_reported(self) -> None:
+        self.touch(".hermes/state/agent-book/state.lock", "123")
+        with self.assertRaises(AssertionError) as caught:
+            _isolation.assert_shared_home_clean(root=self.root)
+        self.assertIn("锁文件应为空", str(caught.exception))
+
+    def test_the_whitelist_is_by_exact_path_and_can_be_narrowed(self) -> None:
+        # 同名锁换个目录不算白名单。
+        self.touch("run.lock")
+        with self.assertRaises(AssertionError):
+            _isolation.assert_shared_home_clean(root=self.root)
+        (self.root / "run.lock").unlink()
+        self.touch(".hermes/state/maa/run.lock")
+        with self.assertRaises(AssertionError):
+            _isolation.assert_shared_home_clean(frozenset(), root=self.root)
+
+    def test_the_default_root_is_the_shared_temp_home(self) -> None:
+        self.assertEqual(
+            _isolation.shared_home_files(),
+            _isolation.shared_home_files(_isolation.TEMP_HOME),
+        )
+
+    def test_every_test_module_checks_the_shared_home_on_teardown(self) -> None:
+        for path in sorted((ROOT / "tests").glob("test_*.py")):
+            if path.name == "test_isolation.py":
+                continue
+            with self.subTest(module=path.name):
+                body = path.read_text(encoding="utf-8").split("def tearDownModule()")
+                self.assertEqual(len(body), 2, "缺 tearDownModule()")
+                self.assertIn(
+                    "_isolation.assert_shared_home_clean()",
+                    body[1].split("\ndef ")[0].split("\nclass ")[0],
+                )

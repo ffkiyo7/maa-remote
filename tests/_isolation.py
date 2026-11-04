@@ -14,14 +14,16 @@ MaaResource 路径这些常量，晚一步就已经指向线上了。
   计划卡用例走到 `_skland_health_notice()`，北京时间 07:50 之前跑会拿真 token 打森空岛、
   改写 `skland.json`，并把当天记成「已体检」，真计划卡那天就不再提醒过期。
 
-所以这里做三件事：
+所以这里做四件事：
 
 1. 把 `HOME` / `HERMES_HOME` / `MAA_CONFIG_DIR` 换成进程级临时目录，清掉会改变部署行为的
    环境变量；
 2. 装一个审计钩子（`sys.addaudithook`）：打开、列目录、建删改名、chmod 真实 home 下的
    `.hermes` / `.config/maa-cli` / `Library` 一律抛 `RealHomeTouched`；
 3. 同一个钩子封外网：解析或连接非回环地址抛 `RealNetworkTouched`（`MAA_LIVE_TESTS=1`
-   的线上契约冒烟例外）。
+   的线上契约冒烟例外）；
+4. `assert_shared_home_clean()`：各模块收尾时查共享临时 HOME 里没留下状态文件，
+   免得用例经它互相影响。
 
 两个异常都继承 `BaseException`：脚本里大量 `except Exception` 吞不掉它们，
 用例一定会红。
@@ -169,6 +171,52 @@ for _name in ("MAA_CHANNEL_ID", "SKLAND_HG_TOKEN"):
     os.environ.pop(_name, None)
 
 sys.addaudithook(_audit)
+
+
+# 整套单测共用上面这一个临时 HOME（不做每用例一个：`maa_common.STATE_DIR`、
+# `deploy.HERMES_HOME`、`maa_copilot.COPILOT_DIR` 等几十个路径常量 import 时就算死了，
+# 每用例重绑全部常量得维护一张清单，收益有限）。代价是用例之间能经它互相影响，
+# 所以约定：**用例自己的状态文件写进自己的临时目录**，共享 HOME 里只许留下面这两个
+# 空锁文件（`fcntl` 锁随文件关闭释放，空文件不携带状态；2026-11-04 实测整套跑完只剩它们）。
+SHARED_HOME_ALLOWED = frozenset({
+    ".hermes/state/maa/run.lock",  # maa_common.RUN_LOCK_PATH
+    ".hermes/state/agent-book/state.lock",  # maa_common.STATE_LOCK_PATH
+})
+
+
+def shared_home_files(root: Path | None = None) -> dict[str, int]:
+    """`root`（默认共享临时 HOME）下所有文件 → 字节数；键是 `/` 分隔的相对路径。"""
+    root = TEMP_HOME if root is None else root
+    found: dict[str, int] = {}
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            path = Path(dirpath) / name
+            found[path.relative_to(root).as_posix()] = path.lstat().st_size
+    return found
+
+
+def assert_shared_home_clean(
+    allowed: frozenset[str] | set[str] = SHARED_HOME_ALLOWED, *, root: Path | None = None
+) -> None:
+    """在各测试模块的 `tearDownModule()` 里调：共享临时 HOME 里不许有白名单以外的文件，
+    白名单里的锁文件也必须是空的。
+
+    看的是**整个**共享 HOME，不是「本模块跑完新增的」：discover 按文件名顺序跑模块，
+    前一个模块漏下的文件会在下一个模块收尾时（最晚在最后一个调了本函数的模块）被抓到，
+    不会因为「本来就有」而放过；报错里列出路径，按路径对应的常量去找写它的用例。
+    只看文件不看目录：空目录不携带状态。
+    """
+    found = shared_home_files(root)
+    stray = sorted(rel for rel in found if rel not in allowed)
+    dirty = sorted(rel for rel in found if rel in allowed and found[rel])
+    if stray or dirty:
+        lines = [f"  {rel}（{found[rel]} B）" for rel in stray]
+        lines += [f"  {rel}（{found[rel]} B，锁文件应为空）" for rel in dirty]
+        raise AssertionError(
+            "单测往共享临时 HOME 里留了状态文件，后面的用例会读到它们：\n"
+            + "\n".join(lines)
+            + "\n用例要把状态写进自己的临时目录（patch 对应路径常量，DEV_GUIDE §9）"
+        )
 
 
 class NoRealGame:

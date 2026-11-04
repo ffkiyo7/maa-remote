@@ -100,6 +100,22 @@ def tearDownModule() -> None:
         item.stop()
     for item in reversed(_DEVICE_GUARDS):
         item.stop()
+    _isolation.assert_shared_home_clean()
+
+
+def isolate_stage_index(case: unittest.TestCase) -> Path:
+    """让 `maa_copilot.load_stage_index()` 的缓存写进本用例自己的临时目录。
+
+    `maa_daily.execute()` 走到「理智不够让出刷理智」会建 `stage_index.json`；
+    写进共享临时 HOME 的话，后面的用例读到的就是前一个用例建的缓存（DEV_GUIDE §9）。
+    """
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    path = Path(tmp.name) / "stage_index.json"
+    patcher = patch.object(maa_copilot, "STAGE_INDEX_PATH", path)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    return path
 
 
 
@@ -2944,6 +2960,9 @@ class DepotTests(unittest.TestCase):
 
 
 class LockConflictTests(unittest.TestCase):
+    def setUp(self) -> None:
+        isolate_stage_index(self)
+
     def test_conflict_is_recorded_without_overwriting_the_active_status(self) -> None:
         at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
         with patch.object(maa_daily, "merge_last_run") as merge, patch.object(
@@ -2984,6 +3003,8 @@ class GameProbeTests(unittest.TestCase):
     这里只测日常 `execute()` 怎么用它。
     """
 
+    def setUp(self) -> None:
+        isolate_stage_index(self)
 
     def _execute(self, phase: str, *, online: bool, probe=None):
         """Drive execute() far enough to observe the probe branch."""
@@ -4495,6 +4516,7 @@ class SessionDailyTests(unittest.TestCase):
     """四期 1a：`execute(phase)` 只吃**这一场**的覆盖，`now` 一场都不吃。"""
 
     def setUp(self) -> None:
+        isolate_stage_index(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)

@@ -1458,6 +1458,25 @@ hermes cron run 50cd1fb095f2          # 完整早场（会真的开游戏、真�
 HOME="$(mktemp -d)" python3 -m unittest discover -s tests
 ```
 
+**共享临时 HOME 里不许留状态文件。** 整套单测共用**一个**进程级临时 HOME，不做每用例一个：
+`maa_common.STATE_DIR`、`deploy.HERMES_HOME`、`maa_copilot.COPILOT_DIR` 等几十个路径常量在
+import 时就算死了，每用例换 HOME 得有一个 helper 统一重绑全部常量、再维护一张常量清单，
+收益相对有限。代价是用例能经这个共享 HOME 互相影响——2026-11-04 实测整套跑完里面留着
+`state/maa/copilot/stage_index.json`：`maa_daily.execute()` 的用例（`GameProbeTests` /
+`LockConflictTests` / `SessionDailyTests`）走到「理智不够让出刷理智」时建了这份关卡索引缓存，
+后面的用例读到的就是前一个用例建的。现在这几个类在 `setUp` 里调 `isolate_stage_index(self)`
+把它 patch 进自己的临时目录。
+
+所以约定：**新用例自己的状态文件写进自己的 `tempfile.TemporaryDirectory()`**（patch 对应的
+路径常量，例如 `maa_copilot.STAGE_INDEX_PATH`、`maa_common.PLAN_PATH`），别依赖共享 HOME 里的
+任何东西。每个测试模块的 `tearDownModule()` 都调 `_isolation.assert_shared_home_clean()`
+（`test_isolation.py` 有一条用例查每个 `test_*.py` 都调了；新加测试文件照抄）：共享 HOME 里出现
+`_isolation.SHARED_HOME_ALLOWED` 以外的文件、或白名单里的锁文件不是空的，就报
+`tearDownModule` 错误并列出路径。白名单只有两个空锁文件（`state/maa/run.lock`、
+`state/agent-book/state.lock`，`fcntl` 锁随文件关闭释放，不携带状态）。断言看的是**整个**共享
+HOME 而不是「本模块新增的」：discover 按文件名顺序跑模块，前一个模块漏下的文件最晚在下一个
+模块收尾时被抓到，报错路径对应哪个常量，就去找写它的用例。
+
 **线上契约冒烟**（默认跳过，故意要连真网的那一条）：
 
 ```bash

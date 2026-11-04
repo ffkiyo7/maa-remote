@@ -38,6 +38,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     for item in reversed(_DEVICE_GUARDS):
         item.stop()
+    _isolation.assert_shared_home_clean()
 
 
 def op_item(item_id: int, stage_name: str, *, opers=None, groups=None,

@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 # 必须先于任何 scripts/ 模块：把 HOME 换成临时目录，碰真实 home / 外网当场炸。
-import _isolation  # noqa: E402,F401
+import _isolation  # noqa: E402
 import maa_action  # noqa: E402
 import maa_common  # noqa: E402
 import maa_daily  # noqa: E402
@@ -31,6 +31,10 @@ import maa_farming  # noqa: E402
 import maa_plan_card  # noqa: E402
 import maa_roguelike  # noqa: E402
 import deploy  # noqa: E402
+
+
+def tearDownModule() -> None:
+    _isolation.assert_shared_home_clean()
 
 FUTURE = 99
 AT = datetime(2026, 11, 4, 9, 30, tzinfo=maa_common.BEIJING)
