@@ -156,6 +156,7 @@ stdout 不投递到 Discord（消息由脚本自己用 Discord REST API 发）�
 | `skills/games/maa-operator/SKILL.md` | 约束 LLM 只能走 `maa_action.py` 的护栏 | gateway 按频道绑定加载 | — |
 | `scripts/maa_playcover.py` | **设备层**（§0.5）：探测、开游戏、等 MaaTools、摆窗口、截图、点击、关游戏 | 被日常 / Depot / 抄作业 / 肉鸽 import | — |
 | `tests/test_*.py` | stdlib 单测，不碰游戏（§0.5），按领域分文件：`test_plan` / `test_plan_card` / `test_daily` / `test_depot` / `test_farming` / `test_activity_watch` / `test_clearing` / `test_copilot` / `test_copilot_worker` / `test_roguelike` / `test_skland` / `test_deploy` / `test_playcover` / `test_state_schema` / `test_isolation`；共用桩在 `tests/_helpers.py`，隔离层在 `tests/_isolation.py`（§9） | 人工 | 约 6s |
+| `.github/workflows/tests.yml` | CI：macOS 上 3.11 / 3.12 × 两种 HOME 跑单测，外加 ruff + pyright（§9「CI」） | push 到 `playcover` / PR | 几分钟 |
 
 ---
 
@@ -1404,6 +1405,7 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 python3 -m unittest discover -s tests -v
 # 2.5 静态检查（见下文「静态检查」，两条都必须 0 报错）
 uvx ruff@0.17.3 check && uvx pyright@1.1.414
+# 2.6 推送后 GitHub Actions 会在 macOS 上再跑一遍 2 和 2.5（见下文「CI」）
 # 3. 部署（自动备份）
 python3 deploy.py
 # 4. 若改了 adapter/config.yaml/.env/SKILL.md
@@ -1569,6 +1571,23 @@ uvx pyright@1.1.414          # 同一范围；pythonVersion = 3.11、basic 模�
 无人值守时的崩溃。`except Exception: pass` 不许出现——至少打一行日志（`print(..., file=sys.stderr)`
 或写进本场日志），或者收窄。`except BaseException` 一律不许（`_isolation` 的
 `RealHomeTouched` / `RealNetworkTouched` 就是靠它穿透 `except Exception` 的）。
+
+### CI（GitHub Actions）
+
+`.github/workflows/tests.yml`：push 到 `playcover` 和任何 PR 时跑，`runs-on: macos-latest`（线上只跑 macOS，
+ubuntu 可能冒出与生产无关的红）。两个 job：
+
+- **unittest**：矩阵 Python 3.11 / 3.12（`actions/setup-python`），每个版本跑两遍——
+  runner 自己的 HOME 一遍、`HOME="$(mktemp -d)"` 一遍，和本地验收口径一致。
+- **lint**：`uvx ruff@0.17.3 check` + `uvx pyright@1.1.414`（uv 用 `pip install uv==<版本>` 装）。
+
+action 一律钉 commit SHA（行尾注释写 tag），升级时 SHA 和注释一起改；ruff / pyright 版本号和
+「静态检查」一节保持一致。CI 上**没有 PyYAML、Hermes venv、PlayCover、maa-cli**：`needs_yaml` 的
+9 条用例在 CI 上是 skip（本地有 Hermes venv 时会跑），其余全程打桩；新用例不许因为缺这些本机资源而红。
+本地模拟 CI 的办法：干净 HOME + `TZ=UTC`，并在 discover 之前把 `_isolation.yaml_python` 换成
+`lambda: None`，结果应是 `OK (skipped=10)`。线上契约冒烟（`MAA_LIVE_TESTS=1`）不进 CI。
+
+推 `.github/workflows/` 下的文件需要推送用的 token 带 `workflow` scope，否则 GitHub 拒收整次推送。
 
 ---
 

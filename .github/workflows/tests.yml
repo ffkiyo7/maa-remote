@@ -1,0 +1,55 @@
+# 单测 + 静态检查（DEV_GUIDE §9「CI」）。线上只跑 macOS，所以 runner 也用 macOS。
+# CI 里没有 PyYAML、没有 Hermes venv、没有 PlayCover / maa-cli：
+# 依赖它们的用例应是 skip（needs_yaml）或全程打桩，不能是红。
+name: tests
+
+on:
+  push:
+    branches: [playcover]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: unittest (Python ${{ matrix.python-version }})
+    runs-on: macos-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: unittest（runner 自己的 HOME）
+        run: python -m unittest discover -s tests -v
+      - name: unittest（干净的临时 HOME）
+        run: HOME="$(mktemp -d)" python -m unittest discover -s tests -v
+
+  lint:
+    name: ruff + pyright
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: 安装 uv
+        run: python -m pip install uv==0.11.26
+      - name: ruff
+        run: uvx ruff@0.17.3 check
+      - name: pyright
+        run: uvx pyright@1.1.414
