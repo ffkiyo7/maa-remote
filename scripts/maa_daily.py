@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -27,15 +26,21 @@ from maa_common import (
     RUNS_DIR,
     SAFE_ITEM_ID_RE,
     SCRIPTS_DIR,
+    Config,
+    LastRun,
+    Phase,
+    Plan,
     atomic_write_json,
-    check_schema,
     atomic_write_text,
+    check_schema,
     cleanup_run_files,
     create_thread,
     discord_request,
     discord_token,
     discord_upload,
     effective_plan,
+    is_phase,
+    is_plan_phase,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -161,15 +166,16 @@ def manual_token_from_argv(argv: list[str]) -> str:
     return ""
 
 
-def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> str:
-    if len(argv) == 2 and argv[1] in PHASE_LABELS:
+def select_phase(argv: list[str], at: datetime | None = None, cwd: Path | None = None) -> Phase:
+    # `is_phase()` 与 `PHASE_LABELS` 的键是同一组（am / pm / now）。
+    if len(argv) == 2 and is_phase(argv[1]):
         return argv[1]
     if manual_token_from_argv(argv):
         return "now"
     if len(argv) > 1:
         raise ValueError("场次只接受 am、pm 或 now（now 后可跟一个选关请求 token）")
     marker = (cwd or Path.cwd()).name.lower()
-    if marker in {"am", "pm"}:
+    if is_plan_phase(marker):
         return marker
     hour = (at or now_beijing()).hour
     if 7 <= hour < 14:
@@ -188,9 +194,9 @@ def cn_game_day(at: datetime | None = None) -> str:
 
 
 def should_run_annihilation(
-    plan: dict[str, Any],
+    plan: Plan,
     at: datetime | None = None,
-    last_run: dict[str, Any] | None = None,
+    last_run: LastRun | dict[str, Any] | None = None,
 ) -> bool:
     """Include annihilation in this run: fight is on, and not yet done this game day."""
     if not bool(plan.get("tasks", {}).get("fight", True)):
@@ -200,19 +206,19 @@ def should_run_annihilation(
 
 
 def attach_annihilation(
-    plan: dict[str, Any],
+    plan: Plan,
     at: datetime | None = None,
-    last_run: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    last_run: LastRun | dict[str, Any] | None = None,
+) -> Plan:
     """Return a per-run plan copy with the once-per-game-day annihilation flag."""
     return {**plan, "annihilation": should_run_annihilation(plan, at, last_run)}
 
 
 def attach_sanity_yield(
-    plan: dict[str, Any],
-    config: dict[str, Any],
+    plan: Plan,
+    config: Config,
     at: datetime | None = None,
-) -> dict[str, Any]:
+) -> Plan:
     """理智不够刷默认关时把「刷理智」让出来，保留剿灭（四期 D11）。
 
     自动抄作业跑完常常把理智打到个位数，这时候再开一个 Fight 只会空转一次
@@ -316,7 +322,7 @@ def _mall_item_list(value: Any) -> str:
     return "[" + ", ".join(_toml_string(name) for name in names) + "]"
 
 
-def _report_lines(config: dict[str, Any]) -> str:
+def _report_lines(config: Config) -> str:
     """掉落匿名上报（一图流 / 企鹅物流）。总开关 `report_drops`，默认开。
 
     ID 一律留空 = 匿名上报，不带任何账号标识；数据回馈的正是本项目自己
@@ -337,7 +343,7 @@ def _report_lines(config: dict[str, Any]) -> str:
 def _fight_block(
     name: str,
     stage: str,
-    config: dict[str, Any],
+    config: Config,
     medicine_days: int,
     *,
     drops: str,
@@ -364,7 +370,7 @@ def _fight_block(
     )
 
 
-def render_daily_toml(plan: dict[str, Any], config: dict[str, Any]) -> str:
+def render_daily_toml(plan: Plan, config: Config) -> str:
     """Render the exact immutable plan used for this run; no CloseDown task.
 
     `tasks.fight` is the master switch for both Fight blocks. Below it the two
@@ -733,7 +739,7 @@ def connect_failed(lines: list[str], return_code: int) -> str:
 def progress_content(
     lines: list[str],
     *,
-    plan: dict[str, Any] | None = None,
+    plan: Plan | None = None,
     final: str | None = None,
 ) -> str:
     clean = [_clean_line(line, 300) for line in lines if line.strip()]
@@ -775,7 +781,7 @@ def extract_summary(
     stdout_lines: list[str],
     stderr_lines: list[str],
     *,
-    plan: dict[str, Any] | None = None,
+    plan: Plan | None = None,
     ok: bool | None = None,
     home_verified: bool | None = None,
     home_verify_detail: str = "",
@@ -932,10 +938,10 @@ def _reader(
 
 
 def report_game_busy(
-    config: dict[str, Any],
+    config: Config,
     token: str,
     channel_id: str,
-    phase: str,
+    phase: Phase,
     detail: str,
     attempted_at: datetime,
 ) -> None:
@@ -999,7 +1005,7 @@ def verify_home_screenshot(path: Path) -> tuple[bool | None, str]:
 
 
 def capture_home_screenshot(
-    config: dict[str, Any], path: Path
+    config: Config, path: Path
 ) -> tuple[bool, str, bool | None, str]:
     """Capture the end-of-run screenshot and confirm it is the home page.
 
@@ -1021,12 +1027,12 @@ def capture_home_screenshot(
 
 
 def run_maa(
-    config: dict[str, Any],
+    config: Config,
     log_path: Path,
     token: str,
     thread_id: str,
     progress_message_id: str,
-    plan: dict[str, Any] | None = None,
+    plan: Plan | None = None,
     *,
     timeout: int | None = None,
     carry_lines: list[str] | None = None,
@@ -1176,12 +1182,12 @@ def run_maa(
 
 
 def run_maa_resilient(
-    config: dict[str, Any],
+    config: Config,
     log_path: Path,
     token: str,
     thread_id: str,
     progress_message_id: str,
-    plan: dict[str, Any] | None = None,
+    plan: Plan | None = None,
     *,
     timeout: int | None = None,
     carry_lines: list[str] | None = None,
@@ -1250,7 +1256,7 @@ def _append_log(log_path: Path, message: str) -> None:
         pass
 
 
-def salvage_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
+def salvage_plan(plan: Plan) -> Plan | None:
     """去掉 Fight 的补跑计划；除 Fight 外无事可做时返回 None。"""
     tasks = dict(plan.get("tasks", {}))
     if not any(bool(tasks.get(key, True)) for key in ("infrast", "recruit", "mall", "award")):
@@ -1259,7 +1265,7 @@ def salvage_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
     return {**plan, "tasks": tasks}
 
 
-def fallback_fight_plan(plan: dict[str, Any]) -> dict[str, Any] | None:
+def fallback_fight_plan(plan: Plan) -> Plan | None:
     """主关 Fight 空跑失败后，只刷后备关的补跑计划；没有可用后备关时返回 None。
 
     2026-09-09 早场：SR-8 的代理指挥没解锁，`Fight Error` 一颗理智没花，MaaCore 接着把
@@ -1304,8 +1310,8 @@ def _main_fight_was_dry(lines: list[str]) -> bool:
 
 def _fallback_fight_run(
     *,
-    config: dict[str, Any],
-    plan: dict[str, Any],
+    config: Config,
+    plan: Plan,
     task_path: Path,
     log_path: Path,
     token: str,
@@ -1337,15 +1343,15 @@ def _fallback_fight_run(
     )
     note = (
         f"刷理智 {plan_stage_label(plan)} 失败且未消耗理智，"
-        f"已改刷后备关 {retry_plan['stage']}（其余任务链不重跑）。"
+        f"已改刷后备关 {retry_plan.get('stage')}（其余任务链不重跑）。"
     )
     return code, out, [note, *err]
 
 
 def _salvage_run(
     *,
-    config: dict[str, Any],
-    plan: dict[str, Any],
+    config: Config,
+    plan: Plan,
     task_path: Path,
     log_path: Path,
     token: str,
@@ -1382,8 +1388,8 @@ def _salvage_run(
 def report_payload(
     *,
     ok: bool,
-    phase: str,
-    plan: dict[str, Any],
+    phase: Phase,
+    plan: Plan,
     duration: float,
     summary: str,
     screenshot_ok: bool,
@@ -1452,7 +1458,7 @@ def send_report(
     channel_id: str,
     payload: dict[str, Any],
     screenshot: Path,
-    config: dict[str, Any],
+    config: Config,
 ) -> None:
     if "attachments" in payload:
         try:
@@ -1484,8 +1490,8 @@ def send_report(
 def send_direct_failure(
     token: str,
     channel_id: str,
-    phase: str,
-    plan: dict[str, Any],
+    phase: Phase,
+    plan: Plan,
     message: str,
 ) -> None:
     discord_request(
@@ -1510,7 +1516,7 @@ def send_direct_failure(
     )
 
 
-def should_skip(plan: dict[str, Any], phase: str) -> bool:
+def should_skip(plan: Plan, phase: Phase) -> bool:
     """Whether this run bails out before touching the game.
 
     `skip` is now **per session** (四期 D2): it comes from `sessions.<phase>`,
@@ -1522,10 +1528,10 @@ def should_skip(plan: dict[str, Any], phase: str) -> bool:
 
 
 def report_lock_conflict(
-    config: dict[str, Any],
+    config: Config,
     token: str,
     channel_id: str,
-    phase: str,
+    phase: Phase,
     attempted_at: datetime,
 ) -> None:
     """Make a rejected daily run visible without clobbering the active run."""
@@ -1587,7 +1593,7 @@ def manual_run_stage(manual_token: str) -> str | None:
 
 
 def report_manual_run_mismatch(
-    config: dict[str, Any], token: str, channel_id: str, manual_token: str
+    config: Config, token: str, channel_id: str, manual_token: str
 ) -> None:
     discord_request(
         token,
@@ -1611,7 +1617,7 @@ def report_manual_run_mismatch(
     )
 
 
-def execute(phase: str, manual_token: str = "") -> int:
+def execute(phase: Phase, manual_token: str = "") -> int:
     started = now_beijing()
     config = load_config()
     channel_id = str(config.get("channel_id", "")).strip()
@@ -1752,7 +1758,7 @@ def execute(phase: str, manual_token: str = "") -> int:
                             )
                         )
                         + (" · ☄️ 今日剿灭" if plan.get("annihilation") else " · ☄️ 剿灭今日已刷")
-                        + f" · 🧪 {medicine_label(plan['medicine'])}"
+                        + f" · 🧪 {medicine_label(str(plan.get('medicine', '')))}"
                     ),
                     "allowed_mentions": {"parse": []},
                 },
@@ -1929,7 +1935,7 @@ def execute(phase: str, manual_token: str = "") -> int:
                 inventory_error=inventory_error,
             )
             send_report(token, channel_id, payload, screenshot_path, config)
-        finished: dict[str, Any] = {
+        finished: LastRun = {
             "status": "success" if ok else "failed",
             "finished_at": now_beijing().isoformat(),
             "duration_seconds": int(duration),

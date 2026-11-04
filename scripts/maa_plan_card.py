@@ -20,6 +20,12 @@ from maa_common import (
     BUTTONS_PATH,
     CONFIG_PATH,
     CONFIG_SCHEMA_VERSION,
+    PLAN_PATH,
+    PLAN_SCHEMA_VERSION,
+    WATCH_PATH,
+    Config,
+    Plan,
+    PlanPhase,
     atomic_write_json,
     check_schema,
     cleanup_old_threads,
@@ -27,6 +33,7 @@ from maa_common import (
     discord_request,
     discord_token,
     effective_plan,
+    is_plan_phase,
     load_config,
     load_json,
     maa_subprocess_env,
@@ -35,10 +42,7 @@ from maa_common import (
     now_beijing,
     plan_sessions,
     plan_stage_label,
-    PLAN_PATH,
-    PLAN_SCHEMA_VERSION,
     state_lock,
-    WATCH_PATH,
 )
 
 
@@ -70,18 +74,19 @@ def select_phase(
     argv: list[str],
     at: datetime | None = None,
     cwd: Path | None = None,
-) -> str:
+) -> PlanPhase:
     """哪一场的卡：argv > **工作目录名** > 按北京时间的小时兜底。
 
     与 `maa_daily.select_phase()` 同一套做法——Hermes 的 `--script` 不支持 argv，
     cron 靠 `--workdir ~/.hermes/state/maa/{am,pm}` 传场次。
     """
-    if len(argv) == 1 and argv[0] in PHASE_TITLES:
+    # `is_plan_phase()` 与 `PHASE_TITLES` 的键是同一组（am / pm）。
+    if len(argv) == 1 and is_plan_phase(argv[0]):
         return argv[0]
     if argv:
         raise ValueError("计划卡场次只接受 am 或 pm")
     marker = (cwd or Path.cwd()).name.lower()
-    if marker in PHASE_TITLES:
+    if is_plan_phase(marker):
         return marker
     return "am" if (at or now_beijing()).hour < 14 else "pm"
 
@@ -126,7 +131,7 @@ def activity_deadlines(
 
 
 def activity_deadline_text(
-    config: dict[str, Any], at: datetime | None = None
+    config: Config, at: datetime | None = None
 ) -> str:
     """计划卡 / 抄作业卡的「活动截止」一行；读不出来就是空串（调用方不显示这行）。"""
     configured = str(config.get("maa_activity_cache") or "").strip()
@@ -267,7 +272,7 @@ def activity_target_is_current(
 
 
 def query_activity_snapshot(
-    config: dict[str, Any],
+    config: Config,
     *,
     timeout: float = 30,
 ) -> dict[str, Any]:
@@ -288,7 +293,7 @@ def query_activity_snapshot(
 
 
 def persist_activity_snapshot(
-    config: dict[str, Any], snapshot: dict[str, Any]
+    config: Config, snapshot: dict[str, Any]
 ) -> None:
     updated = dict(config)
     updated["activity_stages"] = list(snapshot.get("stages", []))
@@ -312,7 +317,7 @@ def all_supply_stages_open(output: str) -> bool:
 
 
 def current_supply_choices(
-    config: dict[str, Any],
+    config: Config,
     at: datetime | None = None,
 ) -> list[tuple[str, str, str]]:
     # Arknights' CN game day changes at 04:00 Beijing time, not at midnight.
@@ -325,7 +330,7 @@ def current_supply_choices(
     ]
 
 
-def refresh_activity_stages(config: dict[str, Any]) -> tuple[bool, str]:
+def refresh_activity_stages(config: Config) -> tuple[bool, str]:
     try:
         snapshot = query_activity_snapshot(config)
     except Exception as exc:
@@ -415,7 +420,7 @@ def _brew_env(*, auto_update: bool = True) -> dict[str, str]:
     return env
 
 
-def read_maa_versions(config: dict[str, Any]) -> tuple[str, str]:
+def read_maa_versions(config: Config) -> tuple[str, str]:
     maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     code, stdout, stderr = _run_captured(
         [maa, "version"],
@@ -428,7 +433,7 @@ def read_maa_versions(config: dict[str, Any]) -> tuple[str, str]:
 
 
 def persist_installed_versions(
-    config: dict[str, Any],
+    config: Config,
     cli_version: str,
     core_version: str,
 ) -> None:
@@ -446,7 +451,7 @@ def persist_installed_versions(
     atomic_write_json(CONFIG_PATH, current)
 
 
-def upgrade_maa_cli(config: dict[str, Any]) -> dict[str, Any]:
+def upgrade_maa_cli(config: Config) -> dict[str, Any]:
     """Upgrade the Homebrew maa-cli formula when a newer bottle exists."""
     formula = str(config.get("maa_cli_formula", DEFAULT_MAA_CLI_FORMULA)).strip()
     timeout = max(30, int(config.get("maa_cli_update_timeout", 180)))
@@ -478,7 +483,7 @@ def upgrade_maa_cli(config: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "changed": True, "detail": detail or f"已升级 {formula}"}
 
 
-def update_maa_core(config: dict[str, Any]) -> dict[str, Any]:
+def update_maa_core(config: Config) -> dict[str, Any]:
     """Download a newer Beta MaaCore (and bundled resources) when one exists."""
     maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     timeout = max(30, int(config.get("resource_update_timeout", 300)))
@@ -496,7 +501,7 @@ def update_maa_core(config: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "detail": detail}
 
 
-def update_hot_resources(config: dict[str, Any]) -> dict[str, Any]:
+def update_hot_resources(config: Config) -> dict[str, Any]:
     """Keep the MaaResource overlay compatible with the installed MaaCore."""
     maa = str(config.get("maa_bin", "/opt/homebrew/bin/maa"))
     timeout = max(30, int(config.get("resource_update_timeout", 300)))
@@ -517,7 +522,7 @@ def update_hot_resources(config: dict[str, Any]) -> dict[str, Any]:
 def check_and_update_upstream(
     token: str,
     channel_id: str,
-    config: dict[str, Any],
+    config: Config,
 ) -> dict[str, Any]:
     """Check maa-cli and MaaCore on every plan card; follow upstream if newer."""
     at = now_beijing()
@@ -615,8 +620,8 @@ def _button(
 
 
 def _stage_choices(
-    plan: dict[str, Any],
-    config: dict[str, Any],
+    plan: Plan,
+    config: Config,
 ) -> list[tuple[str, str, str]]:
     choices: list[tuple[str, str, str]] = [
         ("上次作战关卡", "", "沿用游戏内最近一次作战关卡"),
@@ -646,10 +651,10 @@ def _stage_choices(
 
 
 def _stage_select(
-    plan: dict[str, Any],
-    config: dict[str, Any],
+    plan: Plan,
+    config: Config,
     registry: dict[str, dict[str, Any]],
-    phase: str,
+    phase: PlanPhase,
 ) -> dict[str, Any]:
     # custom_id 带场次：万一旧卡的组件没收干净（`retire_old_plan_cards()` 是尽力而为），
     # 点它只会得到「未登记」，而不会把早场的选择悄悄写进晚场。
@@ -695,7 +700,7 @@ def _stage_select(
 _STAGE_DROPS_CACHE: dict[str, dict[str, dict[str, Any]]] = {}
 
 
-def stage_drops(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def stage_drops(config: Config) -> dict[str, dict[str, Any]]:
     """`{关卡代号: {"materials": [主掉落材料名], "ap": 理智, "stage_id": 内部 id}}`。
 
     **这是「新活动自动跟随」的地基**：活动关的材料映射不再靠手工表——上游每次热更新
@@ -766,7 +771,7 @@ def stage_drops(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return table
 
 
-def material_stage_candidates(config: dict[str, Any]) -> dict[str, list[str]]:
+def material_stage_candidates(config: Config) -> dict[str, list[str]]:
     """`{材料名: [候选关卡]}`，**有序**，越靠前越优先。
 
     返回候选**列表**而不是单个关卡，因为同一材料常常有多个关会掉，而其中大多数
@@ -803,7 +808,7 @@ def material_stage_candidates(config: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def farming_recommendations(
-    config: dict[str, Any],
+    config: Config,
     depot_state: dict[str, Any],
     available_stages: set[str] | None = None,
     at: datetime | None = None,
@@ -847,7 +852,7 @@ def load_depot_state() -> dict[str, Any]:
 
 
 def current_farming_result(
-    plan: dict[str, Any], config: dict[str, Any]
+    plan: Plan, config: Config
 ) -> dict[str, Any]:
     """今天的材料推荐。
 
@@ -860,9 +865,9 @@ def current_farming_result(
 
 
 def build_components(
-    plan: dict[str, Any],
-    config: dict[str, Any],
-    phase: str,
+    plan: Plan,
+    config: Config,
+    phase: PlanPhase,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """恰好两行：一个关卡下拉 + 一个「跳过本场 / 恢复本场」按钮（D2）。
 
@@ -895,7 +900,7 @@ def build_components(
 
 
 def apply_auto_stage(
-    result: dict[str, Any], phase: str, at: datetime | None = None
+    result: dict[str, Any], phase: PlanPhase, at: datetime | None = None
 ) -> str:
     """把自动定的关写进当日 `plan.json` 的**这一场**。返回写入的关卡，没写返回空串。
 
@@ -945,15 +950,15 @@ def apply_auto_stage(
     return stage
 
 
-def today_stage_source(phase: str, at: datetime | None = None) -> str:
+def today_stage_source(phase: PlanPhase, at: datetime | None = None) -> str:
     """这一场今天的关是谁写的：`auto`（缺口算的）/ `discord`（你选的）/ 空。"""
     return str(plan_sessions(at).get(phase, {}).get("stage_source") or "")
 
 
 def build_embed(
-    plan: dict[str, Any],
-    config: dict[str, Any],
-    phase: str,
+    plan: Plan,
+    config: Config,
+    phase: PlanPhase,
     update: dict[str, Any] | None = None,
     farming: dict[str, Any] | None = None,
     stage_source: str = "",
@@ -1068,7 +1073,7 @@ def _scheduled_stages() -> dict[str, str]:
 
 
 def copilot_card_stages(
-    config: dict[str, Any], at: datetime | None = None
+    config: Config, at: datetime | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
     """`([{stage, code, materials, nav, reason, status, status_text}], 是不是活动期)`。
 
@@ -1167,7 +1172,7 @@ def copilot_card_stages(
 
 
 def copilot_card_view(
-    config: dict[str, Any], at: datetime | None = None
+    config: Config, at: datetime | None = None
 ) -> tuple[dict[str, Any], list[tuple[str, str, str]]]:
     """抄作业卡的 `(embed, [(标签, 关卡, 说明)])`。选项已按导航键过滤。"""
     rows, in_activity = copilot_card_stages(config, at)

@@ -10,7 +10,6 @@ import re
 import secrets
 import shlex
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -19,8 +18,13 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Mapping, TypedDict, cast
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    # 3.10+ 才有；只在注解里用（本文件 `from __future__ import annotations`），
+    # 运行时不 import，`/usr/bin/env python3` 落到系统 3.9 时也能加载。
+    from typing import TypeGuard
 
 
 BEIJING = ZoneInfo("Asia/Shanghai")
@@ -113,6 +117,211 @@ PLAN_SESSION_FIELDS = (
 # 上游 itemId 的字符集（`30013` / `mod_unlock_token`）。它会原样变成 `daily.toml`
 # 里 `drops` 表的键，所以在写进计划之前就校验，不留「渲染时再说」的口子。
 SAFE_ITEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+# ---------------------------------------------------------------------------
+# 状态文件的形状（只给 pyright 看，运行时就是普通 dict）。
+#
+# 全部 `total=False`：这些 dict 来自磁盘上的 JSON，任何键都可能缺；读的地方照旧
+# `.get()` + 自己的兜底 / `normalize_*()` 校验，类型只描述「写进去的应该长什么样」。
+# 加了新键要同步加到这里，否则 pyright 会在写入处报 undefined key。
+# ---------------------------------------------------------------------------
+
+# 场次：`am` / `pm` 是定时场（`PLAN_PHASES`），`now` 是手动场。
+PlanPhase = Literal["am", "pm"]
+Phase = Literal["am", "pm", "now"]
+# `last_run.json` 的 `status`。
+RunStatus = Literal["running", "success", "failed", "skipped"]
+# `manual_run.json` 的 `status`（`maa_action` 写 pending / superseded / expired / failed，
+# 派发时写 dispatched，`maa_daily` 只认 dispatched）。
+ManualRunStatus = Literal["pending", "dispatched", "superseded", "expired", "failed"]
+
+
+def is_phase(value: object) -> TypeGuard[Phase]:
+    return value in ("am", "pm", "now")
+
+
+def is_plan_phase(value: object) -> TypeGuard[PlanPhase]:
+    return value in PLAN_PHASES
+
+
+class Config(TypedDict, total=False):
+    """`config.json`：deploy 按键 merge 种子 `state/config.json`，运行时只有
+    `maa_plan_card` 回写版本号 / 活动快照。键全集 = 种子 + 代码里读的可选键。"""
+
+    schema_version: int
+    channel_id: str
+    game_bundle_id: str
+    playcover_app_path: str
+    playcover_settings_dir: str
+    maatools_address: str
+    game_display_name: str
+    game_launch_timeout: int
+    game_quit_timeout: int
+    game_probe_timeout: int
+    hermes_bin: str
+    maa_bin: str
+    maa_config_dir: str
+    maa_resource_dir: str
+    maa_activity_cache: str
+    maa_disable_proxy: bool
+    connect_retry_limit: int
+    connect_retry_delay: int
+    maa_run_timeout: int
+    cleanup_verify_timeout: int
+    home_screenshot_delay: int
+    home_screenshot_attempts: int
+    medicine_expire_days: int
+    fight_times: int
+    fight_fallback_on_error: bool
+    fight_fallback_min_seconds: int
+    report_drops: bool
+    proxy_failure_limit: int
+    proxy_failure_salvage: bool
+    proxy_failure_salvage_min_seconds: int
+    recruit_times: int
+    award_orundum: bool
+    award_mining: bool
+    award_specialaccess: bool
+    mall_buy_first: list[str]
+    mall_blacklist: list[str]
+    mall_reserve_max_credit: bool
+    mall_only_buy_discount: bool
+    retention_days: int
+    resource_update_timeout: int
+    maa_cli_update_timeout: int
+    maa_cli_formula: str
+    activity_stages: list[Any]
+    all_supply_stages_open: bool
+    maa_cli_version: str
+    maa_core_version: str
+    copilot_blackout_minutes: int
+    copilot_settle_timeout: int
+    copilot_list_item_timeout: int
+    copilot_raid_switch_task: str
+    manual_run_blackout_minutes: int
+    activity_search_retry_minutes: int
+    skland_roster_refresh_days: int
+    auto_copilot_min_lead_minutes: int
+    auto_copilot_max_attempts_per_day: int
+    roguelike_run_timeout: int
+    annihilation_sanity: int
+    depot_timeout: int
+    operbox_timeout: int
+    gamedata_base_url: str
+    farming_weights: dict[str, Any]
+    farming_min_samples: int
+    farming_target_days: int
+    farming_activity_edge: float
+    farming_rerun_days: int
+    farming_scarcity_horizon_days: int
+    farming_stage_table: dict[str, Any]
+    farming_manual_weights: dict[str, Any]
+
+
+class SessionOverride(TypedDict, total=False):
+    """`plan.json` 里 `sessions.<am|pm>` 的一格（字段见 `PLAN_SESSION_FIELDS`）。"""
+
+    stage: str
+    stage_source: str
+    skip: bool
+    fight: bool
+    source: str
+    updated_at: str
+    farming_drops: dict[str, int]
+    farming_fallback_stage: str
+
+
+class PlanFile(TypedDict, total=False):
+    """`plan.json` 整个文件：只对当天 `date` 有效。"""
+
+    schema_version: int
+    date: str
+    sessions: dict[str, SessionOverride]
+    updated_at: str
+
+
+class Plan(TypedDict, total=False):
+    """`normalize_plan()` / `effective_plan()` 吐出的一场计划。
+
+    最后几个键不落盘，只在一场日常里现算：`annihilation`（`attach_annihilation()`
+    按 `last_run` 算）、`farming` / `farming_skip_reason`（`attach_sanity_yield()`）、
+    `fallback_run`（`fallback_fight_plan()` 的补跑计划）。
+    """
+
+    stage: str
+    stage_source: str
+    medicine: str
+    skip: bool
+    stone: int
+    tasks: dict[str, bool]
+    farming_drops: dict[str, int]
+    farming_fallback_stage: str
+    date: str
+    annihilation: bool
+    farming: bool
+    farming_skip_reason: str
+    fallback_run: bool
+
+
+class LastRunThread(TypedDict, total=False):
+    thread_id: str
+    created_at: str
+    delete_failed_at: str
+
+
+class LastRun(TypedDict, total=False):
+    """`last_run.json`：日常 / 抄作业 / 肉鸽 / depot / 资源更新都往里 merge。
+
+    `phase` 不是 `Phase`：抄作业和肉鸽写的是 `copilot-<token>` / `roguelike-<token>`。
+    """
+
+    schema_version: int
+    status: RunStatus
+    phase: str
+    plan: Plan
+    stage: str
+    ok: bool
+    started_at: str
+    finished_at: str | None
+    duration_seconds: int | None
+    return_code: int | None
+    log: str | None
+    salvage_log: str | None
+    snapshot: str
+    screenshot: str | None
+    screenshot_error: str | None
+    startup_error: str | None
+    summary: str
+    skip_reason: str
+    game_probe: str
+    home_verified: bool | None
+    home_verify_detail: str | None
+    cleanup_errors: list[str]
+    proxy_failure_batches: int
+    proxy_failure_sanity_refunded: int
+    connect_retries: int
+    inventory_error: str | None
+    thread_id: str | None
+    threads: list[LastRunThread]
+    annihilation_game_day: str
+    annihilation_finished_at: str
+    last_lock_conflict_at: str
+    last_lock_conflict_phase: str
+    last_lock_conflict_reason: str
+    depot_status: str
+    depot_snapshot_at: str | None
+    depot_error: str | None
+    depot_attempted_at: str
+    depot_item_count: int
+    depot_operbox_note: str
+    resource_update_attempted_at: str
+    resource_update_status: Literal["ok", "failed"]
+    resource_update_changed: bool
+    resource_update_detail: str
+    resource_update_summary: str
+    maa_cli_version: str
+    maa_core_version: str
 
 
 def now_beijing() -> datetime:
@@ -326,15 +535,15 @@ def atomic_write_text(path: Path, value: str, *, mode: int = 0o600) -> None:
             pass
 
 
-def load_config() -> dict[str, Any]:
+def load_config() -> Config:
     raw = check_schema("config.json", load_json(CONFIG_PATH, {}), CONFIG_SCHEMA_VERSION)
     if not isinstance(raw, dict):
         raise RuntimeError("config.json 必须是 JSON object")
-    return raw
+    return cast(Config, raw)
 
 
 def require_executable(
-    config: dict[str, Any],
+    config: Config,
     key: str,
     default: str,
     label: str,
@@ -348,7 +557,7 @@ def require_executable(
 
 
 def maa_subprocess_env(
-    config: dict[str, Any],
+    config: Config,
     *,
     keep_proxy: bool = False,
 ) -> dict[str, str]:
@@ -378,9 +587,9 @@ def _normalized_tasks(value: Any) -> dict[str, bool]:
     return tasks
 
 
-def normalize_plan(value: Any) -> dict[str, Any]:
+def normalize_plan(value: Any) -> Plan:
     raw = value if isinstance(value, dict) else {}
-    result = {
+    result: Plan = {
         "stage": str(raw.get("stage", DEFAULT_PLAN["stage"])),
         # Medication is intentionally not user-configurable. MaaCore receives
         # medicine=0 plus medicine_expire_days from the trusted local config.
@@ -417,7 +626,7 @@ def normalize_plan(value: Any) -> dict[str, Any]:
     return result
 
 
-def plan_sessions(at: datetime | None = None) -> dict[str, dict[str, Any]]:
+def plan_sessions(at: datetime | None = None) -> dict[str, SessionOverride]:
     """当天 `plan.json` 的场次表 `{场次: 覆盖}`。
 
     只认新结构 `{date, sessions: {am, pm}, updated_at}`。**旧的按天格式**
@@ -431,28 +640,29 @@ def plan_sessions(at: datetime | None = None) -> dict[str, dict[str, Any]]:
     if not isinstance(sessions, dict):
         return {}
     return {
-        str(name): dict(override)
+        str(name): cast(SessionOverride, dict(override))
         for name, override in sessions.items()
         if isinstance(override, dict)
     }
 
 
-def session_override(phase: str, at: datetime | None = None) -> dict[str, Any]:
+def session_override(phase: str, at: datetime | None = None) -> SessionOverride:
     """一个场次今天的覆盖；没有就是空 dict。"""
     return plan_sessions(at).get(str(phase), {})
 
 
 def effective_plan(
-    at: datetime | None = None, phase: str = "now"
-) -> dict[str, Any]:
+    at: datetime | None = None, phase: Phase = "now"
+) -> Plan:
     """defaults ⊕ 当天 `sessions.<phase>` 的覆盖。
 
     `phase` 取 `am` / `pm` / `now`。手动场 `now` 从来没有人写过它的场次覆盖，
     所以它天然等于默认计划——这就是 D4「现在跑取缺口默认关，不看卡片上的手动选择」。
     """
     at = at or now_beijing()
-    result = normalize_plan(load_json(DEFAULTS_PATH, DEFAULT_PLAN))
-    override = session_override(phase, at)
+    # 合并时按普通 dict 处理：覆盖来自磁盘，值的类型由下面第二次 normalize_plan() 兜底。
+    merged: dict[str, Any] = dict(normalize_plan(load_json(DEFAULTS_PATH, DEFAULT_PLAN)))
+    override: dict[str, Any] = dict(session_override(phase, at))
     for key in (
         "stage",
         "stage_source",
@@ -461,16 +671,16 @@ def effective_plan(
         "farming_fallback_stage",
     ):
         if key in override:
-            result[key] = override[key]
+            merged[key] = override[key]
     if isinstance(override.get("fight"), bool):
         # 「这场不清理智」：剿灭和刷理智一起摘掉，基建 / 公招 / 商店 / 领奖照常。
-        result["tasks"] = {**result.get("tasks", {}), "fight": override["fight"]}
-    result = normalize_plan(result)
+        merged["tasks"] = {**merged.get("tasks", {}), "fight": override["fight"]}
+    result = normalize_plan(merged)
     result["date"] = at.date().isoformat()
     return result
 
 
-def plan_stage_label(plan: dict[str, Any]) -> str:
+def plan_stage_label(plan: Mapping[str, Any]) -> str:
     return str(plan.get("stage") or "上次的本")
 
 
@@ -564,7 +774,7 @@ def discord_request(
     raise RuntimeError("Discord API retry limit reached")
 
 
-def retire_discord_components(config: dict[str, Any], message_id: Any) -> bool:
+def retire_discord_components(config: Config, message_id: Any) -> bool:
     """Remove controls from one tracked Discord message.
 
     Old search records may not have a message id; that is reported as False.
@@ -671,7 +881,7 @@ def cleanup_run_files(retention_days: int = 14, at: datetime | None = None) -> l
     return removed
 
 
-def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
+def merge_last_run(update: LastRun) -> LastRun:
     with last_run_lock():
         current = check_schema(
             "last_run.json", load_json(LAST_RUN_PATH, {}), LAST_RUN_SCHEMA_VERSION, strict=False
@@ -692,7 +902,8 @@ def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
         current["threads"] = threads
         current["schema_version"] = LAST_RUN_SCHEMA_VERSION
         atomic_write_json(LAST_RUN_PATH, current)
-        return current
+        # 宽读来的文件可能带旧版 / 未知键，这里只承诺「是个 dict」。
+        return cast(LastRun, current)
 
 
 # ---------------------------------------------------------------------------
@@ -700,13 +911,13 @@ def merge_last_run(update: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def report_game_busy(
-    config: dict[str, Any],
+    config: Config,
     *,
     title: str,
     reason: str,
     detail: str,
     at: datetime,
-    state_update: dict[str, Any],
+    state_update: LastRun,
     token: str = "",
     channel_id: str = "",
 ) -> None:

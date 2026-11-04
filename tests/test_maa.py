@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -272,7 +274,7 @@ class PlanTests(unittest.TestCase):
         self.assertTrue(any(entry["kind"] == "exec" for entry in registry.values()))
 
     def test_stage_allowlist(self) -> None:
-        config = {"activity_stages": ["SSReopen-IC"], "maa_bin": "/missing/maa"}
+        config: maa_common.Config = {"activity_stages": ["SSReopen-IC"], "maa_bin": "/missing/maa"}
         self.assertTrue(maa_action.valid_stage("", config))
         self.assertTrue(maa_action.valid_stage("CE-6", config))
         self.assertTrue(maa_action.valid_stage("1-7", config))
@@ -281,7 +283,7 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(maa_action.valid_stage("CE-6;shutdown", config))
 
     def test_activity_probe_requires_an_exact_stage_token(self) -> None:
-        config = {"activity_stages": [], "maa_bin": "/maa"}
+        config: maa_common.Config = {"activity_stages": [], "maa_bin": "/maa"}
         result = SimpleNamespace(
             returncode=0,
             stdout="Official server: current activity SSReopen-IC-9",
@@ -298,7 +300,7 @@ class RenderingTests(unittest.TestCase):
         self.plan = maa_common.normalize_plan(
             {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
         )
-        self.config = {
+        self.config: maa_common.Config = {
             "medicine_expire_days": 2,
             "fight_times": 2147483647,
             "recruit_times": 4,
@@ -690,7 +692,7 @@ Opening mini games:
     def test_empty_activity_snapshot_clears_persisted_stages(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config_path = Path(raw) / "config.json"
-            config = {"activity_stages": ["OLD-8"]}
+            config: maa_common.Config = {"activity_stages": ["OLD-8"]}
             with patch.object(maa_plan_card, "CONFIG_PATH", config_path):
                 maa_plan_card.persist_activity_snapshot(
                     config,
@@ -703,7 +705,7 @@ Opening mini games:
         self.assertEqual(persisted["activity_stages"], [])
 
     def test_activity_snapshot_does_not_clear_on_unrecognized_output(self) -> None:
-        config = {"activity_stages": ["OLD-8"]}
+        config: maa_common.Config = {"activity_stages": ["OLD-8"]}
         with self.assertRaisesRegex(RuntimeError, "输出格式已变化"):
             maa_plan_card.activity_snapshot("garbled output")
         self.assertEqual(config["activity_stages"], ["OLD-8"])
@@ -711,7 +713,7 @@ Opening mini games:
     def test_persist_activity_snapshot_drops_the_obsolete_event_cache(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             config_path = Path(raw) / "config.json"
-            config = {"activity_events": [{"title": "旧活动"}]}
+            config = cast(maa_common.Config, {"activity_events": [{"title": "旧活动"}]})  # 故意塞退役键
             with patch.object(maa_plan_card, "CONFIG_PATH", config_path):
                 maa_plan_card.persist_activity_snapshot(
                     config,
@@ -744,10 +746,11 @@ Opening mini games:
 
     def test_the_card_has_exactly_one_select_and_one_button(self) -> None:
         """D2：计划卡只剩一个下拉 + 一个「跳过本场」按钮，恰好两行。"""
-        for phase, expect_label in (
+        cases: tuple[tuple[maa_common.PlanPhase, str], ...] = (
             ("am", "⏭️ 跳过本场（早场 08:00）"),
             ("pm", "⏭️ 跳过本场（晚场 22:00）"),
-        ):
+        )
+        for phase, expect_label in cases:
             with self.subTest(phase=phase):
                 rows, registry = maa_plan_card.build_components(
                     maa_common.normalize_plan({}),
@@ -1997,7 +2000,7 @@ class ConnectFailureTests(unittest.TestCase):
 
 
 class ConnectRetryTests(unittest.TestCase):
-    def _resilient(self, attempts: list[tuple[int, list[str], list[str]]], config: dict):
+    def _resilient(self, attempts: list[tuple[int, list[str], list[str]]], config: maa_common.Config):
         with tempfile.TemporaryDirectory() as raw:
             log_path = Path(raw) / "run.log"
             with (
@@ -2195,7 +2198,7 @@ class FakeMaaProcess:
 
 
 class CircuitBreakerTests(unittest.TestCase):
-    def _run(self, stdout_text: str, config: dict) -> tuple[int, list[str], list[str]]:
+    def _run(self, stdout_text: str, config: maa_common.Config) -> tuple[int, list[str], list[str]]:
         process = FakeMaaProcess(stdout_text)
         with tempfile.TemporaryDirectory() as raw:
             with (
@@ -2412,7 +2415,7 @@ class FightFallbackTests(unittest.TestCase):
         self.assertFalse(maa_daily.fight_failed_dry(lines))
 
     def test_a_completed_fight_or_a_second_block_is_not_dry(self) -> None:
-        completed = [l.replace("(56s) Error", "(5m) Completed") for l in DRY_FIGHT_ERROR_LOG]
+        completed = [line.replace("(56s) Error", "(5m) Completed") for line in DRY_FIGHT_ERROR_LOG]
         self.assertFalse(maa_daily.fight_failed_dry(completed))
         with_second = DRY_FIGHT_ERROR_LOG + ["[刷理智·续] 08:20 - 08:30 Completed"]
         self.assertFalse(maa_daily.fight_failed_dry(with_second))
@@ -2449,10 +2452,11 @@ class FightFallbackTests(unittest.TestCase):
         self.assertIsNone(maa_daily.fallback_fight_plan(off))
 
     def test_the_fallback_run_respects_the_switch_and_the_budget(self) -> None:
-        for config, elapsed, note in (
+        cases: tuple[tuple[maa_common.Config, int, str], ...] = (
             ({"fight_fallback_on_error": False}, 0, ""),
             ({"maa_run_timeout": 3000}, 2900, "跳过后备关补跑"),
-        ):
+        )
+        for config, elapsed, note in cases:
             with self.subTest(config=config), patch.object(maa_daily, "run_maa") as runner:
                 code, _out, err = maa_daily._fallback_fight_run(
                     config=config, plan=self._plan(), task_path=Path("/nonexistent/daily.toml"),
@@ -2808,7 +2812,7 @@ class HomeScreenshotTests(unittest.TestCase):
 
 
 class DepotTests(unittest.TestCase):
-    def _resource(self, root: Path) -> dict[str, object]:
+    def _resource(self, root: Path) -> maa_common.Config:
         maa_common.atomic_write_json(
             root / "item_index.json",
             {
@@ -2903,7 +2907,7 @@ class DepotTests(unittest.TestCase):
         context.__enter__.return_value = True
         context.__exit__.return_value = False
         failed = SimpleNamespace(returncode=1, stdout="", stderr="recognition failed")
-        config = {"maa_bin": "/maa"}
+        config: maa_common.Config = {"maa_bin": "/maa"}
         with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
             maa_playcover, "game_is_online", return_value=(False, "离线")
         ), patch.object(maa_daily, "require_executable"), patch.object(
@@ -3006,7 +3010,7 @@ class GameProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         isolate_stage_index(self)
 
-    def _execute(self, phase: str, *, online: bool, probe=None):
+    def _execute(self, phase: maa_common.Phase, *, online: bool, probe=None):
         """Drive execute() far enough to observe the probe branch."""
         at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
         lock = unittest.mock.MagicMock()
@@ -3042,8 +3046,8 @@ class GameProbeTests(unittest.TestCase):
             maa_playcover, "launch_game", side_effect=RuntimeError("STOP: probe passed")
         ) as opened, patch.object(maa_daily, "send_direct_failure"):
             code = maa_daily.execute(phase)
-        merge.call_args_list = merge.call_args_list + common_merge.call_args_list
-        request.call_args_list = request.call_args_list + common_request.call_args_list
+        merge.call_args_list = merge.call_args_list + common_merge.call_args_list  # pyright: ignore[reportAttributeAccessIssue]  # 合并两处桩的调用记录
+        request.call_args_list = request.call_args_list + common_request.call_args_list  # pyright: ignore[reportAttributeAccessIssue]  # 合并两处桩的调用记录
         return SimpleNamespace(
             code=code, merge=merge, request=request, opened=opened, probe=probe
         )
@@ -3186,7 +3190,7 @@ class FarmingFixture(unittest.TestCase):
         self.cache_dir = Path(self._cache.name)
         maa_plan_card._STAGE_DROPS_CACHE.clear()
         self.addCleanup(maa_plan_card._STAGE_DROPS_CACHE.clear)
-        self.config = {
+        self.config: maa_common.Config = {
             "maa_resource_dir": self._resources.name,
             # 指到一个不存在的路径：否则 `candidate_stages()` 会去读**本机真实**的
             # `StageActivityV2.json`，结果随机器而变。单测必须密闭。
@@ -3452,7 +3456,7 @@ class FarmingScoreTests(FarmingFixture):
 
     def test_a_null_item_value_never_reaches_the_gap_formula(self) -> None:
         """129 条里 16 条 `itemValue == null`；`float * None` 会直接崩（spike B §2）。"""
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {"活动代币": "SR-8"}
         config["farming_manual_weights"] = {}
         result = maa_farming.farming_result(
@@ -3524,14 +3528,14 @@ class FarmingScoreTests(FarmingFixture):
         depot = self.depot(
             {"异铁组": 1.0, "固源岩组": 40.0}, {"异铁组": 200, "固源岩组": 0}, at=self.at
         )
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {"固源岩组": "1-7", "异铁组": "SR-8"}
         config["farming_weights"] = {"scarcity": 1, "gap": 0, "efficiency": 0}
         scarce_first = maa_farming.farming_result(
             config, depot, available_stages={"SR-8", "1-7"}, at=self.at,
             data=self.market(),
         )
-        config = dict(config)
+        config = config.copy()
         config["farming_weights"] = {"scarcity": 0, "gap": 1, "efficiency": 0}
         gap_first = maa_farming.farming_result(
             config, depot, available_stages={"SR-8", "1-7"}, at=self.at,
@@ -3542,7 +3546,7 @@ class FarmingScoreTests(FarmingFixture):
 
     # --- 关卡查不到 / 今天没开 --------------------------------------------
     def test_a_material_without_a_stage_is_reported_not_guessed(self) -> None:
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {}
         result = maa_farming.farming_result(
             config,
@@ -3555,7 +3559,7 @@ class FarmingScoreTests(FarmingFixture):
         self.assertIn("聚合剂", result["skipped_no_stage"])
 
     def test_a_stage_that_is_not_open_today_is_reported_closed(self) -> None:
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {"扭转醇": "9-9"}
         result = maa_farming.farming_result(
             config, {}, available_stages={"SR-8", "1-7"}, at=self.at, data=self.market()
@@ -3572,7 +3576,7 @@ class FarmingScoreTests(FarmingFixture):
         self.assertIn("外部掉率数据不可用", maa_farming.farming_note(result))
 
     def test_a_priced_material_picks_the_cheapest_open_stage(self) -> None:
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {}
         result = maa_farming.farming_result(
             config,
@@ -3632,7 +3636,7 @@ class FarmingCandidateSetTests(FarmingFixture):
         self.assertNotIn("SR-8", stages)
 
     def test_an_activity_stage_without_an_upstream_nav_key_is_dropped(self) -> None:
-        config = dict(self.config)
+        config = self.config.copy()
         config["activity_stages"] = ["SR-8", "SR-9"]
         stages, _in_activity, _reason = maa_farming.candidate_stages(
             config, self.at,
@@ -3640,7 +3644,7 @@ class FarmingCandidateSetTests(FarmingFixture):
         )
         self.assertEqual(stages, {"SR-8"})
 
-    def _candidates(self, config: dict | None = None):
+    def _candidates(self, config: maa_common.Config | None = None):
         return maa_farming.candidate_stages(
             config or {**self.config, "activity_stages": ["SR-7", "SR-8"]},
             self.at,
@@ -3691,7 +3695,7 @@ class FarmingCandidateSetTests(FarmingFixture):
 
     def test_auto_stage_never_picks_a_locked_stage(self) -> None:
         self.unlock = (self.roster_with(cleared=2), self.ledger_with())
-        config = {**self.config, "farming_stage_table": {}}
+        config: maa_common.Config = {**self.config, "farming_stage_table": {}}
         result = maa_farming.farming_result(
             config,
             self.depot({"异铁组": 2.0}, {"异铁组": 0}, at=self.at),
@@ -3854,7 +3858,7 @@ class FarmingDropsTests(unittest.TestCase):
     """四期步骤 3b：Fight `drops` 上限 + 刷够之后的第二个 Fight 块。"""
 
     def setUp(self) -> None:
-        self.config = {
+        self.config: maa_common.Config = {
             "medicine_expire_days": 2,
             "fight_times": 2147483647,
             "recruit_times": 4,
@@ -4088,11 +4092,11 @@ class FarmingConfigTests(unittest.TestCase):
             self.assertNotIn(key, deploy.PRESERVED_RUNTIME_CACHE_KEYS)
 
     def test_bad_config_values_fall_back_to_the_defaults(self) -> None:
-        broken = {
+        broken = cast(maa_common.Config, {  # 故意传坏值
             "farming_weights": {"scarcity": "x", "gap": -1},
             "farming_min_samples": "nope",
             "farming_target_days": 0,
-        }
+        })
         self.assertEqual(maa_farming.weights(broken)["scarcity"], 0.5)
         self.assertEqual(maa_farming.weights(broken)["gap"], 0.0)
         self.assertEqual(maa_farming.setting(broken, "farming_min_samples"), 300)
@@ -4113,7 +4117,7 @@ class FarmingAutoStageTests(unittest.TestCase):
         maa_plan_card._STAGE_DROPS_CACHE.clear()
         self.addCleanup(maa_plan_card._STAGE_DROPS_CACHE.clear)
         self.plan = maa_common.normalize_plan({"stage": "1-7"})
-        self.config = {
+        self.config: maa_common.Config = {
             "channel_id": "1",
             "activity_stages": [],
             "maa_resource_dir": self._resources.name,
@@ -4133,7 +4137,7 @@ class FarmingAutoStageTests(unittest.TestCase):
         )
         maa_plan_card._STAGE_DROPS_CACHE.clear()
 
-    def _components(self, phase: str = "am"):
+    def _components(self, phase: maa_common.PlanPhase = "am"):
         with patch.object(maa_plan_card, "load_depot_state", return_value={}):
             return maa_plan_card.build_components(self.plan, self.config, phase)
 
@@ -4274,7 +4278,7 @@ class FarmingAutoStageTests(unittest.TestCase):
 
     def test_no_candidate_material_keeps_the_default_stage(self) -> None:
         """一个材料都算不出来时才沿用默认关，而且说清楚。"""
-        config = dict(self.config)
+        config = self.config.copy()
         config["farming_stage_table"] = {}
         result = maa_plan_card.farming_recommendations(
             config, {}, {"1-7"}, None, data=_offline_market()
@@ -4531,7 +4535,7 @@ class SessionDailyTests(unittest.TestCase):
             },
         )
 
-    def _execute(self, phase: str):
+    def _execute(self, phase: maa_common.Phase):
         at = datetime(2026, 8, 8, 8, 0, tzinfo=BEIJING)
         lock = unittest.mock.MagicMock()
         lock.__enter__.return_value = True
@@ -5037,8 +5041,8 @@ def _zone(cleared: int, total: int, act: str = "act54side") -> dict:
     ]}}
 
 
-RAID_ON = {"copilot_raid_switch_task": "ChangeToRaidDifficulty"}
-RAID_OFF = {"copilot_raid_switch_task": ""}
+RAID_ON: maa_common.Config = {"copilot_raid_switch_task": "ChangeToRaidDifficulty"}
+RAID_OFF: maa_common.Config = {"copilot_raid_switch_task": ""}
 
 
 class CopilotModeTests(unittest.TestCase):
@@ -5082,8 +5086,8 @@ class CopilotModeTests(unittest.TestCase):
                          ("normal", "raid"))
         for bad in (None, "", []):
             with self.subTest(config=bad):
-                self.assertEqual(maa_clearing.raid_switch_task(bad), "")
-                self.assertEqual(maa_clearing.required_modes("SR-8", "SR", bad),
+                self.assertEqual(maa_clearing.raid_switch_task(bad), "")  # pyright: ignore[reportArgumentType]  # 故意传坏值
+                self.assertEqual(maa_clearing.required_modes("SR-8", "SR", bad),  # pyright: ignore[reportArgumentType]  # 故意传坏值
                                  ("normal",))
         # 不传 config 一律 fail-closed。
         self.assertEqual(maa_clearing.required_modes("SR-8", "SR"), ("normal",))
@@ -5321,7 +5325,7 @@ class CopilotTargetSetTests(unittest.TestCase):
     """2b：目标集合与顺序。不变量 #37 的导航键闸门落在这里。"""
 
     def setUp(self) -> None:
-        self.config = {"activity_search_retry_minutes": 30}
+        self.config: maa_common.Config = {"activity_search_retry_minutes": 30}
         self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
 
     def _collect(self, *, ledger=None, roster=None, state=None, config=None,
@@ -5331,7 +5335,7 @@ class CopilotTargetSetTests(unittest.TestCase):
 
         with _nav_patch(set(keys)):
             return watch.collect_targets(
-                {**self.config, **(config or {})},
+                cast(maa_common.Config, {**self.config, **(config or {})}),
                 state if state is not None else {}, "SR",
                 SR_INDEX, ledger or {}, roster, self.at,
             )
@@ -5439,7 +5443,7 @@ class CopilotDailyAttemptCapTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.config = {"activity_search_retry_minutes": 30}
+        self.config: maa_common.Config = {"activity_search_retry_minutes": 30}
         self.at = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
 
     def _ledger(self, *attempts):
@@ -5501,7 +5505,7 @@ class CopilotDailyAttemptCapTests(unittest.TestCase):
         self.assertIn("SR-5", [t["stage"] for t in self._collect(ledger)[0]])
 
     def test_a_zero_cap_turns_the_rule_off(self) -> None:
-        self.config = {**self.config, "auto_copilot_max_attempts_per_day": 0}
+        self.config: maa_common.Config = {**self.config, "auto_copilot_max_attempts_per_day": 0}
         ledger = self._ledger(*[
             ("normal", "unknown", self.at - timedelta(hours=n)) for n in range(1, 6)
         ])
@@ -5511,7 +5515,7 @@ class CopilotDailyAttemptCapTests(unittest.TestCase):
         self.assertEqual(maa_copilot.daily_attempt_cap({}), 2)
         self.assertEqual(maa_copilot.daily_attempt_cap(None), 2)
         self.assertEqual(
-            maa_copilot.daily_attempt_cap({"auto_copilot_max_attempts_per_day": "x"}), 2
+            maa_copilot.daily_attempt_cap({"auto_copilot_max_attempts_per_day": "x"}), 2  # pyright: ignore[reportArgumentType]  # 故意传坏值
         )
 
     def test_the_cap_is_not_a_runtime_cache_key(self) -> None:
@@ -5527,7 +5531,7 @@ class CopilotRoundPlanningTests(unittest.TestCase):
     """2c：理智预算、排轮、`scheduled_at`。"""
 
     def setUp(self) -> None:
-        self.plan = {"annihilation": True, "tasks": {"fight": True}}
+        self.plan: maa_common.Plan = {"annihilation": True, "tasks": {"fight": True}}
 
     def test_the_budget_deducts_todays_annihilation_first(self) -> None:
         self.assertEqual(maa_clearing.sanity_budget(100, self.plan, {}), 75)
@@ -5540,7 +5544,7 @@ class CopilotRoundPlanningTests(unittest.TestCase):
 
     def test_unknown_sanity_is_a_zero_budget_not_a_guess(self) -> None:
         self.assertEqual(maa_clearing.sanity_budget(None, self.plan, {}), 0)
-        self.assertEqual(maa_clearing.sanity_budget("x", self.plan, {}), 0)
+        self.assertEqual(maa_clearing.sanity_budget("x", self.plan, {}), 0)  # pyright: ignore[reportArgumentType]  # 故意传坏值
         self.assertEqual(maa_clearing.sanity_budget(10, self.plan, {}), 0)
 
     def test_plan_round_stops_at_the_budget(self) -> None:
@@ -5804,7 +5808,7 @@ class CopilotBatchExecutionTests(unittest.TestCase):
             if ledger_dir is not None
             else [
                 patch.object(maa_copilot, "ensure_ledger", return_value=(ledger, "")),
-                patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l),
+                patch.object(maa_copilot, "save_ledger", side_effect=lambda ledger, *a: ledger),
             ]
         )
         with tempfile.TemporaryDirectory() as raw:
@@ -6286,7 +6290,7 @@ class CopilotSettleTests(unittest.TestCase):
             log_path.write_text("", encoding="utf-8")
             written: dict[str, str] = {}
             overlays: dict[str, dict] = {}
-            run_kwargs = (
+            run_kwargs: dict[str, Any] = (
                 {"side_effect": raise_exc} if raise_exc
                 else {"return_value": SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")}
             )
@@ -6403,14 +6407,14 @@ class SanityYieldTests(unittest.TestCase):
             {"stage": "CE-6", "medicine": "expiring", "tasks": {}}
         )
         self.plan["annihilation"] = True
-        self.config = {
+        self.config: maa_common.Config = {
             "medicine_expire_days": 2,
             "fight_times": 2147483647,
             "recruit_times": 4,
         }
         self.at = datetime(2026, 9, 9, 22, 0, tzinfo=BEIJING)
 
-    def _yield(self, *, sanity, cost=18):
+    def _yield(self, *, sanity, cost: int | None = 18):
         roster = None if sanity is None else {"sanity": {
             "current": sanity, "max": 135,
             "server_current_at": int(self.at.timestamp()),
@@ -8156,7 +8160,7 @@ class RoguelikeWorkerTests(unittest.TestCase):
             item = runs[min(index - 1, len(runs) - 1)]
             return item(self.state_path) if callable(item) else item
 
-        def gate(value):
+        def gate(value) -> dict[str, Any]:
             """闸门桩：给个 callable 就当 `side_effect`（同一轮里前后不同答案）。"""
             return ({"side_effect": value} if callable(value)
                     else {"return_value": value})
@@ -8396,7 +8400,7 @@ class RoguelikeSubprocessTests(unittest.TestCase):
 
         def wait(self, timeout=None):
             if self.stubborn and not self.killed:
-                raise subprocess.TimeoutExpired("maa", timeout)
+                raise subprocess.TimeoutExpired("maa", timeout)  # pyright: ignore[reportArgumentType]  # 假进程原样转发 None
             return self.returncode
 
     def _run_one(self, *, abort=False, timeout_now=False, stubborn=False):
@@ -8494,7 +8498,7 @@ class RoguelikeDeployTests(unittest.TestCase):
 class RoguelikeStaleRoundTests(unittest.TestCase):
     """worker 崩了不能把功能永久锁死：状态说在跑但锁是空的 → 允许重开。"""
 
-    def _state(self, minutes_ago: int, status: str = "running") -> dict:
+    def _state(self, minutes_ago: int, status: str = "running") -> tuple[dict, datetime]:
         moment = datetime(2026, 9, 9, 12, 0, tzinfo=BEIJING)
         return {
             **maa_roguelike.EMPTY_STATE,
@@ -8547,7 +8551,7 @@ class DropReportTests(unittest.TestCase):
         self.plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
         self.plan["farming_drops"] = {"30013": 40}
         self.plan["farming_fallback_stage"] = "CE-6"
-        self.config = {
+        self.config: maa_common.Config = {
             "medicine_expire_days": 2,
             "fight_times": 2147483647,
             "recruit_times": 4,
@@ -8601,17 +8605,17 @@ class AwardAndMallOptionTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.plan = maa_common.normalize_plan({"stage": "1-7", "tasks": {}})
-        self.config = {
+        self.config: maa_common.Config = {
             "medicine_expire_days": 2,
             "fight_times": 2147483647,
             "recruit_times": 4,
         }
 
-    def _award(self, config: dict) -> str:
+    def _award(self, config: maa_common.Config) -> str:
         rendered = maa_daily.render_daily_toml(self.plan, config)
         return next(b for b in rendered.split("[[tasks]]") if 'type = "Award"' in b)
 
-    def _mall(self, config: dict) -> str:
+    def _mall(self, config: maa_common.Config) -> str:
         rendered = maa_daily.render_daily_toml(self.plan, config)
         return next(b for b in rendered.split("[[tasks]]") if 'type = "Mall"' in b)
 
@@ -8636,7 +8640,7 @@ class AwardAndMallOptionTests(unittest.TestCase):
             self.assertIn(line, block)
 
     def test_a_non_boolean_switch_is_read_as_off(self) -> None:
-        block = self._award({**self.config, "award_orundum": "yes"})
+        block = self._award({**self.config, "award_orundum": "yes"})  # pyright: ignore[reportArgumentType]  # 故意传坏值
         self.assertIn("orundum = false", block)
 
     def test_mall_defaults_stay_empty_and_off(self) -> None:
@@ -8658,7 +8662,7 @@ class AwardAndMallOptionTests(unittest.TestCase):
                     '坏"名字',          # 引号会撬开 TOML 字符串
                     "x" * 40,           # 超长
                     "赤金\n注入",        # 换行
-                    42,                  # 根本不是字符串
+                    42,                  # 根本不是字符串  # pyright: ignore[reportArgumentType]  # 故意传坏值
                 ],
                 "mall_blacklist": ["碳"],
                 "mall_reserve_max_credit": True,
@@ -8673,7 +8677,7 @@ class AwardAndMallOptionTests(unittest.TestCase):
             self.assertNotIn(rejected, block)
 
     def test_a_broken_list_never_takes_the_whole_render_down(self) -> None:
-        block = self._mall({**self.config, "mall_buy_first": "招聘许可"})
+        block = self._mall({**self.config, "mall_buy_first": "招聘许可"})  # pyright: ignore[reportArgumentType]  # 故意传坏值
         self.assertIn("buy_first = []", block)
 
 
@@ -8733,7 +8737,7 @@ class OperBoxFallbackTests(unittest.TestCase):
 
     def test_skland_health_is_decided_from_local_state_only(self) -> None:
         at = datetime(2026, 9, 9, 4, 30, tzinfo=BEIJING)
-        config = {"skland_roster_refresh_days": 7}
+        config: maa_common.Config = {"skland_roster_refresh_days": 7}
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             skland = root / "skland.json"
@@ -8794,7 +8798,7 @@ class OperBoxFallbackTests(unittest.TestCase):
             maa_common.atomic_write_json(
                 root / "item_index.json", {"30012": {"name": "固源岩组"}}
             )
-            config = {"maa_bin": "/maa", "maa_resource_dir": str(root)}
+            config: maa_common.Config = {"maa_bin": "/maa", "maa_resource_dir": str(root)}
             operbox_roster = root / "roster-operbox.json"
             with patch.object(maa_depot, "run_lock", return_value=context), patch.object(
                 maa_playcover, "game_is_online", return_value=(False, "离线")
@@ -9558,7 +9562,7 @@ class CopilotListRoundTests(unittest.TestCase):
              patch.object(maa_copilot, "load_stage_index", return_value=SR_INDEX), \
              patch.object(maa_copilot, "load_roster", return_value=None), \
              patch.object(maa_copilot, "PREPARED_DIR", Path(raw)), \
-             patch.object(maa_copilot, "save_ledger", side_effect=lambda l, *a: l), \
+             patch.object(maa_copilot, "save_ledger", side_effect=lambda ledger, *a: ledger), \
              patch.object(maa_action, "min_lead_reason", return_value=""), \
              patch.object(worker, "_run_tasks", side_effect=run_tasks), \
              patch.object(worker, "_prepare_list_file", return_value=prep_problem), \

@@ -1402,6 +1402,8 @@ cron 表达式是 **UTC**（`config.yaml: timezone: Etc/UTC`），所以 Depot �
 # 1. 改代码
 # 2. 跑测试（必须在仓库根目录）
 python3 -m unittest discover -s tests -v
+# 2.5 静态检查（见下文「静态检查」，两条都必须 0 报错）
+uvx ruff@0.17.3 check && uvx pyright@1.1.414
 # 3. 部署（自动备份）
 python3 deploy.py
 # 4. 若改了 adapter/config.yaml/.env/SKILL.md
@@ -1494,6 +1496,57 @@ MAA_LIVE_TESTS=1 python3 -m unittest tests.test_copilot -k LiveContract -v
 `config/maa-cli/tasks/infrast-smoke.toml` 是单独验证七类设施实时自动排班的诊断任务。
 
 调试期间想避免定时任务插进来：`hermes cron pause <id>`，完事 `hermes cron resume <id>`。
+
+### 静态检查（ruff + pyright）
+
+只是开发工具：**运行脚本仍然是纯标准库**，部署时不带任何依赖。配置在仓库根的
+`pyproject.toml`（只有 `[tool.ruff]` / `[tool.pyright]`，没有 `[project]`），版本钉死，用 `uvx`
+现下现跑（第一次会从 PyPI 下载，pyright 还会顺带拉一份 Node 版本）：
+
+```bash
+uvx ruff@0.17.3 check        # 范围：scripts/*.py、deploy.py、tests/*.py
+uvx pyright@1.1.414          # 同一范围；pythonVersion = 3.11、basic 模式
+```
+
+两条都必须 **0 报错**，和单测全绿同一个验收级别。升级版本号时连同本节一起改。
+
+**ruff 规则**：`E4` / `E7` / `E9`（import、语句、语法类）+ `F`（pyflakes：未用 import、未定义名字……）
++ `BLE`（`except Exception` / 裸 `except`）。**不开 `E501`**（行宽）。
+
+**pyright 约定**：
+
+- 状态文件的形状写成 `TypedDict`（`total=False`）：`maa_common.Config` / `Plan` / `PlanFile` /
+  `SessionOverride` / `LastRun`，`maa_copilot.Ledger` / `LedgerStage` / `LedgerAttempt`；状态值是
+  `Literal`：`Phase`（am/pm/now）、`PlanPhase`（am/pm）、`RunStatus`、`ManualRunStatus`、
+  `maa_copilot.Outcome`（won/nav/failed/unknown）、`SearchStatus`。**它们只描述「写进去应该长什么样」**：
+  `load_json()` 仍然返回 `Any`，读的地方照旧 `.get()` + `normalize_*()` / `check_schema()` 兜底，
+  运行时校验一条都不能因为有了类型就删。往这几个文件加新键时**同步加到对应的 TypedDict**，
+  否则 pyright 会在写入处报 undefined key（这正是它的用处）。
+- `str` 收窄成场次用 `maa_common.is_phase()` / `is_plan_phase()`（`TypeGuard`），不要 `cast`。
+- `TypeGuard` 是 3.10+ 才有的，只在 `if TYPE_CHECKING:` 下 import（脚本都有
+  `from __future__ import annotations`，注解不求值）。**脚本必须仍能被系统 3.9 加载**：
+  `~/.hermes/scripts/maa_copilot_morning.sh` 用 `/usr/bin/env python3` 调 `maa_action.py`，
+  cron 的 PATH 下很可能就是 `/usr/bin/python3`（3.9）。运行时用到的类型构造只限 3.9 已有的
+  （`TypedDict`、`Literal`、`cast`）。
+- `tests/` 单独关掉三条：`reportTypedDictNotRequiredAccess` / `reportOptionalSubscript` /
+  `reportOptionalMemberAccess`——用例里 `ledger["stages"]`、`found.endswith(...)` 本身就是断言，
+  键不在或值是 None 当场红，正是想要的效果。`scripts/` 全开。
+- 故意给函数喂坏值的用例（测降级路径）写 `# pyright: ignore[reportArgumentType]  # 故意传坏值`，
+  或 `cast(maa_common.Config, {...})  # 故意塞退役键`。别的地方的 `# pyright: ignore[规则]` 必须带规则名和原因。
+
+**`except Exception` 约定（ruff `BLE001`）**：能说清 try 体会抛什么的，就只抓那几种
+（`OSError`、`subprocess.SubprocessError`、`ValueError`、`json.JSONDecodeError`、`RuntimeError`、
+`maa_playcover.MaaToolsError` 等）。确实要兜住一切的，只有三类，写成
+`except Exception as exc:  # noqa: BLE001 — <原因>`，原因写清是哪一类、为什么：
+
+1. **进程顶层兜底**：异常要变成 Discord 告警 / `last_run.json` 里的一行，不能让 cron 静默死掉；
+2. **清理 / finally 路径**：收尾失败不能盖住主错误（主错误才是要汇报的那个）；
+3. **尽力而为的辅助**：watchdog、救场、截图、旁路信息——失败只降级，绝不能把主流程带走。
+
+拿不准 try 体会抛什么就归第 3 类保留，别为了过检查去收窄：收窄会把以前被吞掉的异常变成
+无人值守时的崩溃。`except Exception: pass` 不许出现——至少打一行日志（`print(..., file=sys.stderr)`
+或写进本场日志），或者收窄。`except BaseException` 一律不许（`_isolation` 的
+`RealHomeTouched` / `RealNetworkTouched` 就是靠它穿透 `except Exception` 的）。
 
 ---
 

@@ -21,16 +21,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Callable
 
-from maa_common import atomic_write_json, atomic_write_text, load_json, now_beijing
+from maa_common import Config, atomic_write_json, atomic_write_text, load_json, now_beijing
 import maa_copilot
 
 APP_CODE = "4ca99fa6b56cc2ba"
@@ -410,7 +408,7 @@ def daily_health_check(
     return "notified" if error else "ok"
 
 
-def roster_needs_refresh(config: dict[str, Any]) -> bool:
+def roster_needs_refresh(config: Config) -> bool:
     """Lazy refresh: roster older than skland_roster_refresh_days -> True."""
     roster = load_json(ROSTER_PATH, None)
     if not isinstance(roster, dict) or not isinstance(roster.get("chars"), dict):

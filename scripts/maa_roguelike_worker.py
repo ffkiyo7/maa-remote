@@ -29,6 +29,7 @@ import maa_playcover
 from maa_copilot_worker import _isolated_config, _notice, _post_report
 from maa_common import (
     RUNS_DIR,
+    Config,
     cleanup_run_files,
     load_config,
     maa_subprocess_env,
@@ -58,7 +59,7 @@ def _stop_flag(key: str) -> str:
     return str(maa_roguelike.load_state().get(key) or "")
 
 
-def _next_round_blocker(config: dict[str, Any]) -> str:
+def _next_round_blocker(config: Config) -> str:
     """还能不能再开一局：日常临近 / Depot 对表窗口。
 
     闸门实现只有一份，在 `maa_action`（不变量 #13）。肉鸽不耗理智，
@@ -75,7 +76,7 @@ def _next_round_blocker(config: dict[str, Any]) -> str:
 
 
 def _run_one_exploration(
-    config: dict[str, Any], env: dict[str, str], log_path: Path, index: int
+    config: Config, env: dict[str, str], log_path: Path, index: int
 ) -> tuple[int, str, str]:
     """跑一局，返回 `(退出码, 这一局的输出, 提前收手的原因)`。
 

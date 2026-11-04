@@ -16,6 +16,7 @@ import unittest
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 # 必须先于任何 scripts/ 模块：把 HOME 换成临时目录，碰真实 home / 外网当场炸。
 import _isolation  # noqa: E402
 import maa_playcover  # noqa: E402
+
+if TYPE_CHECKING:
+    import maa_common
 
 
 def tearDownModule() -> None:
@@ -52,7 +56,7 @@ class FakeMaaTools:
         self.thread.start()
 
     @property
-    def config(self) -> dict:
+    def config(self) -> maa_common.Config:
         return {"maatools_address": f"127.0.0.1:{self.port}"}
 
     def _recv(self, conn: socket.socket, size: int) -> bytes:
@@ -187,7 +191,7 @@ class MaaToolsProtocolTests(unittest.TestCase):
 
         thread = threading.Thread(target=serve, daemon=True)
         thread.start()
-        config = {"maatools_address": f"127.0.0.1:{server.getsockname()[1]}"}
+        config: maa_common.Config = {"maatools_address": f"127.0.0.1:{server.getsockname()[1]}"}
         tools = maa_playcover.MaaTools(config, timeout=0.3)
         with self.assertRaisesRegex(maa_playcover.MaaToolsError, "读不到 VERN"):
             tools.__enter__()
@@ -295,7 +299,7 @@ class ConfigTests(unittest.TestCase):
             app.mkdir()
             with (app / "Info.plist").open("wb") as handle:
                 plistlib.dump({"CFBundleExecutable": "arknights"}, handle)
-            config = {"playcover_app_path": str(app)}
+            config: maa_common.Config = {"playcover_app_path": str(app)}
             pattern = maa_playcover.process_pattern(config)
             executable = str(app / "arknights")
         self.assertRegex(executable, pattern)
@@ -303,7 +307,7 @@ class ConfigTests(unittest.TestCase):
 
 
 class InstallCheckTests(unittest.TestCase):
-    def _layout(self, root: Path, settings: dict | None) -> dict:
+    def _layout(self, root: Path, settings: dict | None) -> maa_common.Config:
         app = root / "com.hypergryph.arknights.app"
         app.mkdir()
         with (app / "Info.plist").open("wb") as handle:
@@ -549,7 +553,7 @@ class CloseTests(unittest.TestCase):
         ), patch.object(
             maa_playcover.time, "sleep", side_effect=lambda s: clock.__setitem__("now", clock["now"] + s)
         ):
-            errors = maa_playcover.close_game({**self.fake.config, **config})
+            errors = maa_playcover.close_game(cast("maa_common.Config", {**self.fake.config, **config}))
         return errors, calls
 
     def test_a_closed_game_needs_nothing(self) -> None:

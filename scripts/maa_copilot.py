@@ -17,12 +17,13 @@ import re
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal, TypedDict, cast
 
 from maa_common import (
     BEIJING,
     BUTTONS_PATH,
     STATE_DIR,
+    Config,
     atomic_write_json,
     http_get_json as _common_http_get_json,
     is_run_locked,
@@ -69,7 +70,7 @@ class StaleActivityError(RuntimeError):
 # Stage index (local Tile-Pos is the authoritative code -> stageId mapping)
 # ---------------------------------------------------------------------------
 
-def resource_signature(config: dict[str, Any]) -> str:
+def resource_signature(config: Config) -> str:
     """Signature of the local Maa resource tree (version.json + dir mtime)."""
     parts: list[str] = []
     for res_dir in _resource_dirs(config):
@@ -86,7 +87,7 @@ def resource_signature(config: dict[str, Any]) -> str:
     return "||".join(parts)
 
 
-def build_stage_index(config: dict[str, Any]) -> dict[str, Any]:
+def build_stage_index(config: Config) -> dict[str, Any]:
     """Scan Arknights-Tile-Pos and persist code->stageId / stageId->code maps.
 
     #f# variant files (686 of them) are raid-unrelated duplicates; skip them.
@@ -123,7 +124,7 @@ def build_stage_index(config: dict[str, Any]) -> dict[str, Any]:
     return index
 
 
-def load_stage_index(config: dict[str, Any]) -> dict[str, Any]:
+def load_stage_index(config: Config) -> dict[str, Any]:
     """Cached stage index; rebuild only when the resource tree changed."""
     index = load_json(STAGE_INDEX_PATH, {})
     if (
@@ -135,7 +136,7 @@ def load_stage_index(config: dict[str, Any]) -> dict[str, Any]:
     return build_stage_index(config)
 
 
-def _resource_dirs(config: dict[str, Any]) -> list[Path]:
+def _resource_dirs(config: Config) -> list[Path]:
     """MaaResource hot-update overlay first, bundled resource second."""
     configured = config.get("maa_resource_dir")
     base = Path(str(configured or DEFAULT_RESOURCE_DIR))
@@ -164,7 +165,7 @@ def _one_cost(values: list[Any]) -> int | None:
 def stage_sanity_cost(
     stage_id: str,
     code: str,
-    config: dict[str, Any],
+    config: Config,
 ) -> int | None:
     """Resolve one battle's AP cost from MaaResource ``stages.json``.
 
@@ -213,7 +214,7 @@ def resolve_copilot_stage(
 # battle_data.json (op name -> charId, prefer char_*)
 # ---------------------------------------------------------------------------
 
-def battle_data(config: dict[str, Any]) -> dict[str, Any]:
+def battle_data(config: Config) -> dict[str, Any]:
     """charId -> {name, ...} map from the local battle_data.json (cached)."""
     global _battle_data_cache
     if _battle_data_cache is not None:
@@ -228,7 +229,7 @@ def battle_data(config: dict[str, Any]) -> dict[str, Any]:
     return _battle_data_cache
 
 
-def name_to_char_ids(name: str, config: dict[str, Any]) -> list[str]:
+def name_to_char_ids(name: str, config: Config) -> list[str]:
     """Resolve an op name to candidate charIds; summons resolve to token_*."""
     data = battle_data(config)
     found: list[str] = []
@@ -293,7 +294,7 @@ def _parse_version(raw: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
 
 
-def core_too_old(minimum_required: str, config: dict[str, Any]) -> bool:
+def core_too_old(minimum_required: str, config: Config) -> bool:
     """True when the op needs a newer MaaCore than the local one."""
     if not minimum_required:
         return False
@@ -332,7 +333,7 @@ def skill_label(level: int) -> str:
 
 
 def lookup_roster_char(
-    roster: dict[str, Any], name: str, config: dict[str, Any]
+    roster: dict[str, Any], name: str, config: Config
 ) -> tuple[dict[str, Any] | None, bool, bool]:
     """Resolve an op name against the roster.
 
@@ -361,7 +362,7 @@ def lookup_roster_char(
 def check_op_requirements(
     op: dict[str, Any],
     roster: dict[str, Any] | None,
-    config: dict[str, Any],
+    config: Config,
 ) -> tuple[bool, float, list[str], list[str]]:
     """One operator slot: (satisfied, score, hard_gaps, soft_gaps).
 
@@ -442,7 +443,7 @@ def check_op_requirements(
 def evaluate_candidate(
     item: dict[str, Any],
     roster: dict[str, Any] | None,
-    config: dict[str, Any],
+    config: Config,
 ) -> dict[str, Any] | None:
     """Score one raw query item into a candidate dict (or None to exclude)."""
     content = parse_content(item)
@@ -562,7 +563,7 @@ def _absorb(seen: dict[int, dict[str, Any]], inner: dict[str, Any],
 
 
 def fetch_stage_copilots(
-    stage_id: str, code: str, config: dict[str, Any], timeout: int = 60
+    stage_id: str, code: str, config: Config, timeout: int = 60
 ) -> list[dict[str, Any]]:
     """All raw query items for one stage (deduped, client-filtered)."""
     probe = prts_query({"limit": 1}, timeout=timeout)
@@ -633,7 +634,7 @@ def _slim_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def search_copilots(
     stage_id: str,
     code: str,
-    config: dict[str, Any],
+    config: Config,
     roster: dict[str, Any] | None = None,
     limit: int = 3,
     *,
@@ -705,7 +706,7 @@ def execution_uri(
 def pick_perfect_candidate(
     stage: str,
     stage_id: str,
-    config: dict[str, Any],
+    config: Config,
     roster: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, str, list[str]]:
     """这一关唯一的作业筛选口径：`ratio == 1.0` 且**无软硬缺口**（D12 / 不变量 #18）。
@@ -775,7 +776,7 @@ def activity_stage_codes(index: dict[str, Any], prefix: str) -> list[str]:
 
 
 def copilot_nav_checker(
-    config: dict[str, Any], activity_prefix: str, index: dict[str, Any] | None = None
+    config: Config, activity_prefix: str, index: dict[str, Any] | None = None
 ):
     """抄作业用的导航闸门：`(关名) -> (能不能导航过去, 不能的话为什么)`。
 
@@ -822,6 +823,54 @@ LEDGER_STANDALONE_PATH = COPILOT_DIR / "ledger-standalone.json"
 LEDGER_SCHEMA_VERSION = 1
 LEDGER_ATTEMPT_LIMIT = 40
 
+# 账本的形状（只给 pyright 看；`total=False` 同 `maa_common.Config` 的理由）。
+# 一关一种模式的结论：`nav` = 导航 / 切难度失败（环境坏了，整轮停）。
+Outcome = Literal["won", "nav", "failed", "unknown"]
+LedgerMode = Literal["normal", "raid"]
+# 一份抄作业搜索 / 一轮自动作业（`searches/<token>.json`）的 `status`。
+# 手动搜索：pending → running → failed；自动轮：scheduled ⇄ queued → executing →
+# executed / execution_failed；任一可取消状态 → canceled / superseded。
+SearchStatus = Literal[
+    "pending",
+    "running",
+    "failed",
+    "scheduled",
+    "queued",
+    "executing",
+    "executed",
+    "execution_failed",
+    "canceled",
+    "superseded",
+]
+
+
+class LedgerAttempt(TypedDict, total=False):
+    at: str
+    mode: str
+    op: int
+    # 写入的是 `Outcome`（手动标记写 `won`）；旧文件里可能有别的串，读的地方按 str 比。
+    outcome: str
+    detail: str
+
+
+class LedgerStage(TypedDict, total=False):
+    """一关的记账：`normal` / `raid` 是该模式**通关**时间戳，没通是 None。"""
+
+    normal: str | None
+    raid: str | None
+    attempts: list[LedgerAttempt]
+    skipped_reason: str
+
+
+class Ledger(TypedDict, total=False):
+    schema_version: int
+    activity_key: str
+    stages: dict[str, LedgerStage]
+    updated_at: str
+    # 已种过种子的活动前缀（`seed_ledger()`）。
+    seeded: str
+
+
 # 记账种子（来源：spike A 报告 `docs/spikes/copilot-list-2026-09-08.md` 与用户自述）。
 # SR-5 / SR-6 用户此前自己打过，09-08 23:40 的 spike 又重打了一遍；SR-8 是 09-08
 # 15:17 由抄作业通关的。三关的**突袭都没打过**，留空。只在**首次建账**且当期活动
@@ -831,13 +880,13 @@ SEED_CLEARED_NORMAL = ("SR-5", "SR-6", "SR-8")
 SEED_AT = "2026-09-08T23:58:00+08:00"
 
 
-def _safe_key(value: str) -> str:
+def _safe_key(value: object) -> str:
     """活动 key → 能当文件名的一段（归档账本用）。"""
     cleaned = re.sub(r"[^0-9A-Za-z._-]+", "-", str(value or "")).strip("-")
     return (cleaned or "unknown")[:80]
 
 
-def new_ledger(activity_key: str) -> dict[str, Any]:
+def new_ledger(activity_key: str) -> Ledger:
     return {
         "schema_version": LEDGER_SCHEMA_VERSION,
         "activity_key": str(activity_key or "")[:200],
@@ -846,7 +895,7 @@ def new_ledger(activity_key: str) -> dict[str, Any]:
     }
 
 
-def load_ledger(path: Path | None = None) -> dict[str, Any] | None:
+def load_ledger(path: Path | None = None) -> Ledger | None:
     """读记账；文件不存在、坏掉或结构不对都返回 None（= 还没建账）。
 
     坏文件不抛异常是刻意的：记账挂在 watcher 与卡片两条只读路径上，
@@ -859,10 +908,10 @@ def load_ledger(path: Path | None = None) -> dict[str, Any] | None:
         return None
     if not isinstance(state, dict) or not isinstance(state.get("stages"), dict):
         return None
-    return state
+    return cast(Ledger, state)
 
 
-def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+def save_ledger(ledger: Ledger, path: Path | None = None) -> Ledger:
     target = path or LEDGER_PATH
     ledger["schema_version"] = LEDGER_SCHEMA_VERSION
     ledger["updated_at"] = now_beijing().isoformat()
@@ -872,7 +921,7 @@ def save_ledger(ledger: dict[str, Any], path: Path | None = None) -> dict[str, A
     return ledger
 
 
-def seed_ledger(ledger: dict[str, Any], activity_key: str) -> dict[str, Any]:
+def seed_ledger(ledger: Ledger, activity_key: str) -> Ledger:
     """把已知已通的关写进账本，避免上线第一轮重抄一遍。
 
     只认 `SEED_ACTIVITY_PREFIX`；且**只补空位**——已有记账一律不覆盖，
@@ -910,7 +959,7 @@ def ledger_path(activity_key: str, *, path: Path | None = None) -> Path:
 
 def ensure_ledger(
     activity_key: str, *, path: Path | None = None
-) -> tuple[dict[str, Any], str]:
+) -> tuple[Ledger, str]:
     """拿到当期活动的账本，返回 `(ledger, 变更说明)`。
 
     活动 key 变了（新活动 / 复刻）→ 旧账归档到 `ledger-<key>.json` 再新开一份。
@@ -961,11 +1010,12 @@ def ensure_ledger(
     return fresh, note
 
 
-def ledger_stage(ledger: dict[str, Any], stage: str) -> dict[str, Any]:
+def ledger_stage(ledger: Ledger, stage: str) -> LedgerStage:
+    """这一关的记账格（没有就新建）；返回的格子**保证**带 `attempts` 列表。"""
     stages = ledger.setdefault("stages", {})
     entry = stages.get(stage)
     if not isinstance(entry, dict):
-        entry = {"normal": None, "raid": None, "attempts": [], "skipped_reason": ""}
+        entry = LedgerStage(normal=None, raid=None, attempts=[], skipped_reason="")
         stages[stage] = entry
     if not isinstance(entry.get("attempts"), list):
         entry["attempts"] = []
@@ -973,7 +1023,7 @@ def ledger_stage(ledger: dict[str, Any], stage: str) -> dict[str, Any]:
 
 
 def ledger_cleared_stage_ids(
-    ledger: dict[str, Any] | None, index: dict[str, Any]
+    ledger: Ledger | None, index: dict[str, Any]
 ) -> set[str]:
     """账本里普通难度已通关的关 → 它们的 stageId（多作业排段用）。"""
     stages = (ledger or {}).get("stages") if isinstance(ledger, dict) else None
@@ -987,7 +1037,7 @@ def ledger_cleared_stage_ids(
 
 
 def record_copilot_attempt(
-    ledger: dict[str, Any],
+    ledger: Ledger,
     stage: str,
     mode: str,
     *,
@@ -996,7 +1046,7 @@ def record_copilot_attempt(
     detail: str = "",
     at: datetime | None = None,
     log_name: str = "",
-) -> dict[str, Any]:
+) -> Ledger:
     """记一次执行。**只有 `won` 才写模式的通关时间戳**。
 
     突袭失败时普通那格照旧保留（它确实打过了），但这一关**不算通关**——
@@ -1011,7 +1061,8 @@ def record_copilot_attempt(
     text = str(detail or "")
     if str(outcome) == "unknown" and log_name:
         text = f"{text[:220]} · 日志 runs/{log_name}".strip(" ·")
-    entry["attempts"].append(
+    attempts = entry.setdefault("attempts", [])  # ledger_stage() 已保证是 list
+    attempts.append(
         {
             "at": moment,
             "mode": mode,
@@ -1020,7 +1071,7 @@ def record_copilot_attempt(
             "detail": text[:300],
         }
     )
-    del entry["attempts"][:-LEDGER_ATTEMPT_LIMIT]
+    del attempts[:-LEDGER_ATTEMPT_LIMIT]
     if outcome == "won" and mode in ("normal", "raid"):
         entry[mode] = moment
     return ledger
@@ -1030,7 +1081,7 @@ MANUAL_MARK_DETAIL = "手动标记：用户自己打过"
 
 
 def mark_stage_cleared(
-    ledger: dict[str, Any],
+    ledger: Ledger,
     stage: str,
     modes: Iterable[str],
     *,
@@ -1049,21 +1100,22 @@ def mark_stage_cleared(
     会让这一关平白吃掉当日上限。
     """
     entry = ledger_stage(ledger, stage)
+    attempts = entry.setdefault("attempts", [])  # ledger_stage() 已保证是 list
     moment = (at or now_beijing()).isoformat()
     marked: list[str] = []
     for mode in modes:
         if mode not in ("normal", "raid") or entry.get(mode):
             continue
         entry[mode] = moment
-        entry["attempts"].append(
+        attempts.append(
             {"at": moment, "mode": mode, "op": 0, "outcome": "won", "detail": MANUAL_MARK_DETAIL}
         )
         marked.append(mode)
-    del entry["attempts"][:-LEDGER_ATTEMPT_LIMIT]
+    del attempts[:-LEDGER_ATTEMPT_LIMIT]
     return marked
 
 
-def unmark_stage_cleared(ledger: dict[str, Any], stage: str) -> list[str]:
+def unmark_stage_cleared(ledger: Ledger, stage: str) -> list[str]:
     """撤销一关的通关时间戳（普通 + 突袭都清），返回被清掉的模式。
 
     标错了要能改回来：账本一旦写成「通关」这一关就永远不再排（`maa_clearing` 里
@@ -1095,7 +1147,7 @@ def _attempt_day(raw: Any) -> str:
 
 
 def attempts_today(
-    ledger: dict[str, Any] | None,
+    ledger: Ledger | None,
     stage: str,
     mode: str,
     at: datetime | None = None,
@@ -1122,7 +1174,7 @@ def attempts_today(
     )
 
 
-def daily_attempt_cap(config: dict[str, Any] | None) -> int:
+def daily_attempt_cap(config: Config | None) -> int:
     """`auto_copilot_max_attempts_per_day`：同一 `(关, 模式)` 当天最多试几次。
 
     ≤ 0 视为不限制。读不出来退回默认值，绝不抛——它挂在排轮与卡片两条路径上。
@@ -1138,10 +1190,10 @@ def daily_attempt_cap(config: dict[str, Any] | None) -> int:
 
 
 def daily_capped_modes(
-    ledger: dict[str, Any] | None,
+    ledger: Ledger | None,
     stage: str,
     modes: Iterable[str],
-    config: dict[str, Any] | None,
+    config: Config | None,
     at: datetime | None = None,
 ) -> list[tuple[str, int]]:
     """今天已经用满次数的 `(模式, 次数)`——排轮据此把整关跳到明天。
@@ -1162,7 +1214,7 @@ def daily_capped_modes(
 
 
 def ledger_pending_modes(
-    ledger: dict[str, Any] | None,
+    ledger: Ledger | None,
     roster: dict[str, Any] | None,
     stage: str,
     stage_id: str,
@@ -1497,7 +1549,7 @@ def zone_progress_warning(
     # warning reads as stale instead of as a current fact.  (Keep this even
     # though roster_hint also prints the age: the hint only shows when
     # roster_ok, the warning can appear without it.)
-    days = roster_age_days(roster)
+    days = roster_age_days(roster or {})  # stage_zone() 找到了 → roster 一定不是 None
     suffix = (
         f"（森空岛数据 {days} 天前，如已推进请忽略）"
         if days and days > 0

@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from typing import Any
 
-from maa_common import STATE_DIR, atomic_write_json, load_json, now_beijing
+from maa_common import STATE_DIR, Config, atomic_write_json, load_json, now_beijing
 
 GAMEDATA_PATH = STATE_DIR / "copilot" / "gamedata.json"
 DEFAULT_GAMEDATA_BASE = (
@@ -114,7 +114,7 @@ def layout_age(layout: dict[str, Any], at: datetime | None = None) -> timedelta 
 
 
 def refresh_layout(
-    config: dict[str, Any], *, force: bool = False, timeout: int = 60
+    config: Config, *, force: bool = False, timeout: int = 60
 ) -> tuple[dict[str, Any], str]:
     """缓存过期（或 `force`）就重抓一次，返回 `(layout, 抓取失败的说明)`。
 

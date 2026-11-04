@@ -22,15 +22,19 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from maa_common import (
     BEIJING,
     STATE_DIR,
+    Config,
     atomic_write_json,
     load_json,
     now_beijing,
 )
+
+if TYPE_CHECKING:
+    import maa_copilot
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +90,7 @@ FARMING_DEFAULTS: dict[str, Any] = {
 WEIGHT_KEYS = ("scarcity", "gap", "efficiency")
 
 
-def weights(config: dict[str, Any]) -> dict[str, float]:
+def weights(config: Config) -> dict[str, float]:
     """三项权重。缺项按默认补齐，负数按 0；**和为任意值都归一**（见 `_blend()`）。"""
     raw = config.get("farming_weights")
     raw = raw if isinstance(raw, dict) else {}
@@ -100,7 +104,7 @@ def weights(config: dict[str, Any]) -> dict[str, float]:
     return result
 
 
-def setting(config: dict[str, Any], key: str) -> float:
+def setting(config: Config, key: str) -> float:
     """一个数值型配置键，坏值一律退回默认。"""
     default = float(FARMING_DEFAULTS[key])
     try:
@@ -377,7 +381,7 @@ def _normalize_item_values(payload: Any) -> dict[str, float | None]:
 
 
 def load_market_data(
-    config: dict[str, Any],
+    config: Config,
     *,
     at: datetime | None = None,
     cache_dir: Path | None = None,
@@ -699,7 +703,7 @@ def _blend(parts: dict[str, float], weight_map: dict[str, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _unlock_evidence() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def _unlock_evidence() -> tuple[dict[str, Any] | None, maa_copilot.Ledger | None]:
     """`(练度快照, 当期活动账本)`，给 `locked_activity_stage()` 用。读不出来就是 `None`，绝不抛。"""
     import maa_copilot
 
@@ -718,7 +722,7 @@ def locked_activity_stage(
     stage: str,
     stage_id: str,
     roster: dict[str, Any] | None,
-    ledger: dict[str, Any] | None,
+    ledger: maa_copilot.Ledger | None,
 ) -> str:
     """活动关**现在刷不了**的原因；能刷或判不了返回空串。
 
@@ -754,7 +758,7 @@ def locked_activity_stage(
 
 
 def candidate_stages(
-    config: dict[str, Any],
+    config: Config,
     at: datetime | None = None,
     *,
     activity_cache: Path | None = None,
@@ -832,7 +836,7 @@ def candidate_stages(
 # ---------------------------------------------------------------------------
 
 
-def item_names(config: dict[str, Any]) -> dict[str, str]:
+def item_names(config: Config) -> dict[str, str]:
     """`{itemId: 中文名}`，读不出来返回空表（绝不抛）。"""
     import maa_copilot
 
@@ -857,7 +861,7 @@ def item_names(config: dict[str, Any]) -> dict[str, str]:
 
 def stage_ap_cost(
     stage_id: str,
-    config: dict[str, Any] | None = None,
+    config: Config | None = None,
     *,
     cache_dir: Path | None = None,
 ) -> int | None:
@@ -891,7 +895,7 @@ def stage_ap_cost(
 # ---------------------------------------------------------------------------
 
 
-def _session_ap(config: dict[str, Any], at: datetime) -> float:
+def _session_ap(config: Config, at: datetime) -> float:
     """本场大致可用理智，只用来把缺口价值归一。读不出来用常量兜底。"""
     del config
     try:
@@ -909,7 +913,7 @@ def _session_ap(config: dict[str, Any], at: datetime) -> float:
     return FALLBACK_SESSION_AP
 
 
-def _manual_weights(config: dict[str, Any]) -> dict[str, float]:
+def _manual_weights(config: Config) -> dict[str, float]:
     raw = config.get("farming_manual_weights")
     raw = raw if isinstance(raw, dict) else {}
     result: dict[str, float] = {}
@@ -922,7 +926,7 @@ def _manual_weights(config: dict[str, Any]) -> dict[str, float]:
 
 
 def _stage_index(
-    config: dict[str, Any],
+    config: Config,
     market: dict[str, Any],
     *,
     at: datetime,
@@ -992,7 +996,7 @@ def _consumption(depot_state: dict[str, Any], at: datetime) -> dict[str, Any]:
 
 
 def farming_result(
-    config: dict[str, Any],
+    config: Config,
     depot_state: dict[str, Any],
     *,
     available_stages: set[str] | None = None,

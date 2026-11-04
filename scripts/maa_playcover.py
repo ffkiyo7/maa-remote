@@ -42,7 +42,10 @@ import subprocess
 import time
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from maa_common import Config
 
 DEFAULT_BUNDLE_ID = "com.hypergryph.arknights"
 DEFAULT_APP_PATH = (
@@ -75,28 +78,28 @@ MIN_MAATOOLS_VERSION = 4
 # 配置
 # ---------------------------------------------------------------------------
 
-def bundle_id(config: dict[str, Any]) -> str:
+def bundle_id(config: Config) -> str:
     value = str(config.get("game_bundle_id", DEFAULT_BUNDLE_ID)).strip()
     if not SAFE_BUNDLE_ID_RE.fullmatch(value):
         raise RuntimeError("game_bundle_id 格式非法")
     return value
 
 
-def app_path(config: dict[str, Any]) -> Path:
+def app_path(config: Config) -> Path:
     raw = str(config.get("playcover_app_path", DEFAULT_APP_PATH)).strip()
     if not SAFE_PATH_RE.fullmatch(raw):
         raise RuntimeError("playcover_app_path 含非法字符")
     return Path(raw).expanduser()
 
 
-def settings_path(config: dict[str, Any]) -> Path:
+def settings_path(config: Config) -> Path:
     raw = str(config.get("playcover_settings_dir", DEFAULT_SETTINGS_DIR)).strip()
     if not SAFE_PATH_RE.fullmatch(raw):
         raise RuntimeError("playcover_settings_dir 含非法字符")
     return Path(raw).expanduser() / f"{bundle_id(config)}.plist"
 
 
-def maatools_address(config: dict[str, Any]) -> tuple[str, int]:
+def maatools_address(config: Config) -> tuple[str, int]:
     raw = str(config.get("maatools_address", DEFAULT_ADDRESS)).strip()
     match = ADDRESS_RE.fullmatch(raw)
     if not match:
@@ -107,7 +110,7 @@ def maatools_address(config: dict[str, Any]) -> tuple[str, int]:
     return ("127.0.0.1" if match.group(1) == "localhost" else match.group(1)), port
 
 
-def executable_path(config: dict[str, Any]) -> Path:
+def executable_path(config: Config) -> Path:
     app = app_path(config)
     name = "Arknights"
     try:
@@ -118,7 +121,7 @@ def executable_path(config: dict[str, Any]) -> Path:
     return app / name
 
 
-def process_pattern(config: dict[str, Any]) -> str:
+def process_pattern(config: Config) -> str:
     """`pgrep -f` / `pkill -f` 用的正则：游戏可执行文件的**完整路径**。
 
     首字符套一层方括号，正则照样命中目标，却命中不了 pgrep 自己的命令行。
@@ -129,7 +132,7 @@ def process_pattern(config: dict[str, Any]) -> str:
     return f"[{re.escape(text[0])}]{re.escape(text[1:])}"
 
 
-def game_pids(config: dict[str, Any], timeout: float = 2.0) -> list[int]:
+def game_pids(config: Config, timeout: float = 2.0) -> list[int]:
     found = subprocess.run(
         ["pgrep", "-f", process_pattern(config)],
         capture_output=True,
@@ -153,7 +156,7 @@ class MaaToolsError(RuntimeError):
 class MaaTools:
     """一条 MaaTools 连接。`with MaaTools(config) as tools: tools.size()`。"""
 
-    def __init__(self, config: dict[str, Any], timeout: float = 5.0) -> None:
+    def __init__(self, config: Config, timeout: float = 5.0) -> None:
         self.address = maatools_address(config)
         self.timeout = timeout
         self.sock: socket.socket | None = None
@@ -244,7 +247,7 @@ class MaaTools:
         self._send(b"TERM")
 
 
-def maatools_ready(config: dict[str, Any], timeout: float = 2.0) -> tuple[bool, str]:
+def maatools_ready(config: Config, timeout: float = 2.0) -> tuple[bool, str]:
     try:
         with MaaTools(config, timeout=timeout) as tools:
             width, height = tools.size()
@@ -260,7 +263,7 @@ def maatools_ready(config: dict[str, Any], timeout: float = 2.0) -> tuple[bool, 
 # 「你在玩吗」探测（四期 D18 的 PlayCover 版）
 # ---------------------------------------------------------------------------
 
-def game_is_online(config: dict[str, Any]) -> tuple[bool, str]:
+def game_is_online(config: Config) -> tuple[bool, str]:
     """游戏是不是已经开着——也就是「用户此刻在玩」？
 
     在**每一条自动链路**抢到 `run.lock` 之后、`launch_game()` 之前调用（日常 am/pm、
@@ -290,7 +293,7 @@ def game_is_online(config: dict[str, Any]) -> tuple[bool, str]:
 # 生命周期
 # ---------------------------------------------------------------------------
 
-def verify_game_installed(config: dict[str, Any]) -> None:
+def verify_game_installed(config: Config) -> None:
     """PlayCover 里装着游戏、并且 MaaTools 开着且端口和配置一致。启动前调用。"""
     executable = executable_path(config)
     if not executable.is_file():
@@ -311,7 +314,7 @@ def verify_game_installed(config: dict[str, Any]) -> None:
         )
 
 
-def launch_game(config: dict[str, Any]) -> None:
+def launch_game(config: Config) -> None:
     """`open -a <容器里的 .app>`：没在跑就拉起，在跑就激活（把窗口请回台前）。
 
     不用 `open -b`：bundle id 会被 LaunchServices 解析到 `~/Applications/PlayCover/`
@@ -333,7 +336,7 @@ def launch_game(config: dict[str, Any]) -> None:
     raise RuntimeError(f"无法启动明日方舟：{last[-200:]}")
 
 
-def wait_for_game(config: dict[str, Any]) -> None:
+def wait_for_game(config: Config) -> None:
     timeout = max(5, int(config.get("game_launch_timeout", 120)))
     deadline = time.monotonic() + timeout
     detail = "未就绪"
@@ -377,7 +380,7 @@ def _jxa_windows(pids: list[int]) -> list[dict[str, Any]]:
     return windows if isinstance(windows, list) else []
 
 
-def game_window(config: dict[str, Any]) -> dict[str, Any] | None:
+def game_window(config: Config) -> dict[str, Any] | None:
     """游戏的主窗口（面积最大的那个普通窗口）；没有就 None。"""
     pids = game_pids(config)
     if not pids:
@@ -388,7 +391,7 @@ def game_window(config: dict[str, Any]) -> dict[str, Any] | None:
     return max(windows, key=lambda w: (bool(w.get("onscreen")), w["width"] * w["height"]))
 
 
-def game_display_name(config: dict[str, Any]) -> str:
+def game_display_name(config: Config) -> str:
     value = str(config.get("game_display_name", DEFAULT_GAME_DISPLAY)).strip()
     if not SAFE_DISPLAY_RE.fullmatch(value):
         raise RuntimeError("game_display_name 含非法字符")
@@ -417,7 +420,7 @@ def _screens() -> list[dict[str, Any]]:
     return screens if isinstance(screens, list) else []
 
 
-def game_display(config: dict[str, Any]) -> dict[str, Any] | None:
+def game_display(config: Config) -> dict[str, Any] | None:
     name = game_display_name(config)
     if not name:
         return None
@@ -451,7 +454,7 @@ def _fits_display(window: dict[str, Any], display: dict[str, Any]) -> bool:
     return inside or (int(window["x"]), int(window["y"])) == _centred_on(window, display)
 
 
-def move_to_game_display(config: dict[str, Any], window: dict[str, Any]) -> tuple[bool, str]:
+def move_to_game_display(config: Config, window: dict[str, Any]) -> tuple[bool, str]:
     """游戏窗口没整个落在虚拟屏上就挪过去（居中）。返回 (挪了没有, 告警)。
 
     只看中心不够：PlayCover 有时直接开在虚拟屏上，却偏到右下、一截伸出屏外
@@ -485,7 +488,7 @@ def move_to_game_display(config: dict[str, Any], window: dict[str, Any]) -> tupl
     return True, ""
 
 
-def settle_game_window(config: dict[str, Any]) -> str:
+def settle_game_window(config: Config) -> str:
     """确认游戏窗口在虚拟屏上、在屏上（没被最小化 / 隐藏 / 被台前调度收进侧边栏）。
 
     返回告警文本，空串 = 一切正常。窗口不在屏上时 MaaTools 的 `SCRN` 回 0 字节，
@@ -546,7 +549,7 @@ def _png_size(path: Path) -> tuple[int, int]:
     return struct.unpack(">II", head[16:24])
 
 
-def capture_geometry(config: dict[str, Any], path: Path) -> dict[str, Any]:
+def capture_geometry(config: Config, path: Path) -> dict[str, Any]:
     """截一张游戏画面到 `path`，返回把图上坐标换回 1920×1080 游戏坐标所需的几何信息。
 
     `{"source", "width", "height", "top"}`：`top` 是图里游戏画面上方的标题栏高度，
@@ -586,7 +589,7 @@ def capture_geometry(config: dict[str, Any], path: Path) -> dict[str, Any]:
     return {"source": "window", "width": out_width, "height": out_height, "top": top}
 
 
-def capture_screenshot(config: dict[str, Any], path: Path) -> tuple[bool, str]:
+def capture_screenshot(config: Config, path: Path) -> tuple[bool, str]:
     try:
         capture_geometry(config, path)
         path.chmod(0o600)
@@ -605,7 +608,7 @@ def image_to_base(geometry: dict[str, Any], x: float, y: float) -> tuple[float, 
     return x * scale, (y - int(geometry.get("top", 0))) * scale
 
 
-def tap(config: dict[str, Any], x: float, y: float) -> None:
+def tap(config: Config, x: float, y: float) -> None:
     """在 1920×1080 游戏坐标 `(x, y)` 点一下。坐标按 MaaTools 的 `SIZE` 换算。"""
     if not (0 <= x <= BASE_WIDTH and 0 <= y <= BASE_HEIGHT):
         raise RuntimeError(f"点击坐标越界：({x:.0f}, {y:.0f})")
@@ -621,7 +624,7 @@ def tap(config: dict[str, Any], x: float, y: float) -> None:
         time.sleep(0.05)
 
 
-def close_game(config: dict[str, Any]) -> list[str]:
+def close_game(config: Config) -> list[str]:
     """结束游戏进程并复核。返回清理错误列表（空 = 干净）。
 
     先 MaaTools `TERM`（MaaCore 的 `stop_game` 就是这条，相当于游戏自己退出），

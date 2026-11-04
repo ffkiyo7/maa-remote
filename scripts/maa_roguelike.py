@@ -295,7 +295,7 @@ def normalize_pending(pending: Any) -> dict[str, Any]:
         result["mode"] = mode_token
         result["squad"] = default_squad(theme, mode_token)
     try:
-        difficulty = int(raw.get("difficulty"))
+        difficulty = int(raw.get("difficulty", ""))  # 缺键 → ValueError，null → TypeError
     except (TypeError, ValueError):
         difficulty = result["difficulty"]
     if valid_difficulty(theme, difficulty):

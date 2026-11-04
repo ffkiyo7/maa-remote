@@ -15,6 +15,8 @@ import maa_copilot
 import maa_playcover
 from maa_common import (
     STATE_DIR,
+    Config,
+    LastRun,
     atomic_write_json,
     discord_request,
     discord_token,
@@ -47,7 +49,7 @@ def _state(path: Path = DEPOT_PATH) -> dict[str, Any]:
     return value
 
 
-def _item_names(config: dict[str, Any]) -> dict[str, str]:
+def _item_names(config: Config) -> dict[str, str]:
     """Use the same MaaCore/MaaResource precedence as the existing stage index."""
     for resource_dir in maa_copilot._resource_dirs(config):
         raw = load_json(resource_dir / "item_index.json", {})
@@ -91,7 +93,7 @@ def _json_objects_after_depot(output: str) -> Iterable[dict[str, Any]]:
     return _json_objects_after(output, "Depot:")
 
 
-def parse_depot_output(output: str, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def parse_depot_output(output: str, config: Config) -> dict[str, dict[str, Any]]:
     """Return only MaaCore's final, complete Depot observation.
 
     Current MaaCore emits intermediate callbacks with ``done=false``. Treating
@@ -199,7 +201,7 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
-def skland_unavailable(config: dict[str, Any], *, at: datetime | None = None) -> str:
+def skland_unavailable(config: Config, *, at: datetime | None = None) -> str:
     """森空岛能不能用；不能用时返回原因（空串 = 能用）。
 
     **只读本机状态、绝不发请求**：这条判断跑在 Depot 那趟的锁内，不能在这里等网络。
@@ -226,7 +228,7 @@ def skland_unavailable(config: dict[str, Any], *, at: datetime | None = None) ->
 
 
 def run_operbox(
-    config: dict[str, Any],
+    config: Config,
     env: dict[str, str],
     *,
     at: datetime | None = None,
@@ -346,10 +348,10 @@ def reconcile(
     for entry in history:
         if not isinstance(entry, dict):
             continue
-        interval_items = entry.get("items")
-        if not isinstance(interval_items, dict):
+        entry_items = entry.get("items")
+        if not isinstance(entry_items, dict):
             continue
-        for item_id, detail in interval_items.items():
+        for item_id, detail in entry_items.items():
             if not isinstance(detail, dict):
                 continue
             target = totals.setdefault(
@@ -464,7 +466,7 @@ def stock_by_name(state: dict[str, Any]) -> dict[str, int]:
 
 def record_drops(
     pairs: Iterable[tuple[str, int]],
-    config: dict[str, Any],
+    config: Config,
     *,
     at: datetime | None = None,
     path: Path = DEPOT_PATH,
@@ -513,7 +515,7 @@ def record_drops(
     return state
 
 
-def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str, Any]:
+def run_depot(config: Config, *, at: datetime | None = None) -> dict[str, Any]:
     """Run one real Depot scan; install it only after the whole flow succeeds.
 
     游戏已经在跑时**什么都不做**（D18）：写一条灰卡与 `depot_status`，
@@ -610,7 +612,7 @@ def run_depot(config: dict[str, Any], *, at: datetime | None = None) -> dict[str
         return {**updated, "operbox_note": operbox_note} if operbox_note else updated
 
 
-def run_if_due(config: dict[str, Any], *, at: datetime | None = None) -> dict[str, Any]:
+def run_if_due(config: Config, *, at: datetime | None = None) -> dict[str, Any]:
     moment = at or now_beijing()
     state = _state()
     if not is_due(state, moment):
@@ -675,7 +677,7 @@ def main() -> int:
             ) from exc
         raise RuntimeError(detail + state_error) from exc
 
-    record = {
+    record: LastRun = {
         "depot_status": result["status"],
         "depot_snapshot_at": result.get("snapshot_at"),
         "depot_error": None,

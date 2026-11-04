@@ -14,7 +14,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 
 ROOT = Path(__file__).resolve().parent
@@ -914,7 +914,8 @@ def probe_maa_versions() -> tuple[str, str]:
     import maa_plan_card
 
     config = load_json(HERMES_HOME / "state" / "maa" / "config.json", {})
-    return maa_plan_card.read_maa_versions(config if isinstance(config, dict) else {})
+    # deploy 不 import maa_common；config.json 的形状由 read_maa_versions() 自己 .get() 兜底。
+    return maa_plan_card.read_maa_versions(cast(Any, config) if isinstance(config, dict) else {})
 
 
 def probe_hermes_commit() -> str:

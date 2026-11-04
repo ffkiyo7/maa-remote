@@ -31,6 +31,7 @@ from maa_common import (
     LAST_RUN_PATH,
     LAST_RUN_SCHEMA_VERSION,
     STATE_DIR,
+    Config,
     atomic_write_json,
     check_schema,
     discord_request,
@@ -56,7 +57,7 @@ def _search_path(token: str) -> Path:
     return maa_copilot.SEARCHES_DIR / f"{token}.json"
 
 
-def _notify(config: dict[str, Any], title: str, description: str, color: int) -> None:
+def _notify(config: Config, title: str, description: str, color: int) -> None:
     channel_id = str(config.get("channel_id") or "")
     if not channel_id.isdigit():
         raise RuntimeError("config.json 中尚未配置 Discord channel_id")
@@ -78,7 +79,7 @@ def _notify(config: dict[str, Any], title: str, description: str, color: int) ->
     )
 
 
-def _supersede_round(token: str, config: dict[str, Any]) -> bool:
+def _supersede_round(token: str, config: Config) -> bool:
     """作废一轮还没开打的条目并收掉它的按钮。"""
     if not token:
         return False
@@ -106,11 +107,11 @@ def _save(state: dict[str, Any], at: datetime) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def collect_targets(
-    config: dict[str, Any],
+    config: Config,
     state: dict[str, Any],
     prefix: str,
     index: dict[str, Any],
-    ledger: dict[str, Any],
+    ledger: maa_copilot.Ledger,
     roster: dict[str, Any] | None,
     at: datetime,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -192,7 +193,7 @@ def collect_targets(
 # ---------------------------------------------------------------------------
 
 def round_budget(
-    config: dict[str, Any], roster: dict[str, Any] | None, at: datetime
+    config: Config, roster: dict[str, Any] | None, at: datetime
 ) -> tuple[int, int | None]:
     """`(可花理智, 估算出的当前理智)`。理智未知一律 0（fail-closed）。"""
     from maa_daily import attach_annihilation
@@ -213,7 +214,7 @@ def round_budget(
 
 def trim_unreachable(
     items: list[dict[str, Any]],
-    ledger: dict[str, Any],
+    ledger: maa_copilot.Ledger,
     roster: dict[str, Any] | None,
     index: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str]:
@@ -236,7 +237,7 @@ def trim_unreachable(
     return [item for item in items if id(item) in kept], (dropped[0][1] if dropped else "")
 
 
-def cost_lookup(config: dict[str, Any], index: dict[str, Any]):
+def cost_lookup(config: Config, index: dict[str, Any]):
     """条目 → 理智消耗。突袭条目按**普通关名**查（不变量 #34）。
 
     两级查表，仍然 fail-closed：先问上游 `stages.json`
@@ -277,7 +278,7 @@ def _entry_list(targets: list[dict[str, Any]]) -> list[str]:
 
 
 def build_round(
-    config: dict[str, Any],
+    config: Config,
     state: dict[str, Any],
     targets: list[dict[str, Any]],
     index: dict[str, Any],
@@ -376,7 +377,7 @@ def build_round(
 # 自动与手动两条路共用。这里只负责「被挡了怎么记状态」。
 
 
-def _dispatch(state: dict[str, Any], token: str, config: dict[str, Any], at: datetime) -> str:
+def _dispatch(state: dict[str, Any], token: str, config: Config, at: datetime) -> str:
     """派发一轮；返回状态说明。"""
     blocker = maa_action.dispatch_blocker(config, str(state.get("scheduled_at") or ""), at)
     if blocker:
@@ -404,7 +405,7 @@ def _dispatch(state: dict[str, Any], token: str, config: dict[str, Any], at: dat
 DEFAULT_PREFIGHT_FAILURE_CAP = 2
 
 
-def _prefight_cap(config: dict[str, Any]) -> int:
+def _prefight_cap(config: Config) -> int:
     try:
         return max(1, int(config.get(
             "auto_copilot_max_prefight_failures_per_day", DEFAULT_PREFIGHT_FAILURE_CAP
@@ -414,7 +415,7 @@ def _prefight_cap(config: dict[str, Any]) -> int:
 
 
 def _count_prefight_failure(
-    config: dict[str, Any], state: dict[str, Any], detail: str, at: datetime
+    config: Config, state: dict[str, Any], detail: str, at: datetime
 ) -> None:
     today = at.date().isoformat()
     record = state.get("prefight_failures")
@@ -436,7 +437,7 @@ def _count_prefight_failure(
         )
 
 
-def _prefight_blocked(config: dict[str, Any], state: dict[str, Any], at: datetime) -> str:
+def _prefight_blocked(config: Config, state: dict[str, Any], at: datetime) -> str:
     record = state.get("prefight_failures")
     if not isinstance(record, dict) or record.get("date") != at.date().isoformat():
         return ""
@@ -454,7 +455,7 @@ GAMEDATA_MISSING_RETRY = timedelta(hours=1)
 
 
 def _refresh_gamedata(
-    config: dict[str, Any],
+    config: Config,
     state: dict[str, Any],
     index: dict[str, Any],
     prefix: str,
@@ -484,7 +485,7 @@ def _refresh_gamedata(
 
 def _reachable_targets(
     targets: list[dict[str, Any]],
-    ledger: dict[str, Any],
+    ledger: maa_copilot.Ledger,
     roster: dict[str, Any] | None,
     index: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], str]:
@@ -690,7 +691,7 @@ def run_once() -> dict[str, Any]:
 
 
 def _go_idle(
-    config: dict[str, Any],
+    config: Config,
     state: dict[str, Any],
     snapshot: dict[str, Any],
     now: datetime,

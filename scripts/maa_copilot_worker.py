@@ -24,7 +24,6 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +37,7 @@ from maa_common import (
     BUTTONS_PATH,
     RUNS_DIR,
     SCRIPTS_DIR,
+    Config,
     atomic_write_json,
     atomic_write_text,
     cleanup_run_files,
@@ -170,7 +170,7 @@ def _search_path(token: str) -> Path:
 
 
 def _notice(
-    config: dict[str, Any],
+    config: Config,
     title: str,
     body: str,
     color: int,
@@ -248,7 +248,7 @@ def _search_targets(state: dict[str, Any]) -> list[dict[str, Any]]:
     return targets
 
 
-def _stage_cost(stage_id: str, code: str, config: dict[str, Any]) -> int | None:
+def _stage_cost(stage_id: str, code: str, config: Config) -> int | None:
     cost = maa_copilot.stage_sanity_cost(stage_id, code, config)
     if cost is None:
         # EX 关不在上游 `stages.json` 里，游戏数据里有。
@@ -259,7 +259,7 @@ def _stage_cost(stage_id: str, code: str, config: dict[str, Any]) -> int | None:
 def _plan_search_entries(
     targets: list[dict[str, Any]],
     costs: list[int | None],
-    config: dict[str, Any],
+    config: Config,
     roster: dict[str, Any] | None,
     code: str,
 ) -> tuple[list[dict[str, Any]], str]:
@@ -333,7 +333,7 @@ def cmd_search(token: str) -> int:
         if state is None:
             return 0
 
-        config: dict[str, Any] = {}
+        config: Config = {}
         code = str(state.get("stage") or "")
         try:
             config = load_config()
@@ -424,7 +424,7 @@ def cmd_search(token: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _prepare_op_file(
-    candidate: dict[str, Any], stage_id: str, config: dict[str, Any]
+    candidate: dict[str, Any], stage_id: str, config: Config
 ) -> tuple[str, bool]:
     """Resolve the op URI; rewrite display-code ops into prepared/<id>.json."""
     uri, needs_rewrite = maa_copilot.execution_uri(candidate, stage_id)
@@ -480,7 +480,7 @@ def _copilot_summary(lines: list[str], *, ok: bool) -> str:
 
 
 def _run_copilot_with_watchdog(
-    config: dict[str, Any],
+    config: Config,
     command: list[str],
     log_handle: Any,
     log_path: Path,
@@ -536,7 +536,7 @@ def _run_copilot_with_watchdog(
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write(
                         "maa copilot 超时\n" if now >= deadline
-                        else f"maa copilot 无进展超时（{stall[1]}s 没有开始下一份作业）\n"
+                        else f"maa copilot 无进展超时（{stall[1] if stall else timeout}s 没有开始下一份作业）\n"
                     )
                 return 124, taps
             time.sleep(2)
@@ -635,7 +635,7 @@ def _navigation_config(stage: str, env: dict[str, str]):
 
 
 def _navigate_to_stage(
-    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+    config: Config, stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
     """Run upstream navigation, then recognize the stage screen without clicking."""
     supported, detail = maa_clearing.nav_checker(maa_copilot._resource_dirs(config))(stage)
@@ -658,7 +658,7 @@ def _navigate_to_stage(
 
 
 def switch_to_raid(
-    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+    config: Config, stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
     """把关卡详情页从普通难度切到突袭（⚠️ **2026-09-09 真机验失败**，见文件头注释）。
 
@@ -688,7 +688,7 @@ def switch_to_raid(
 
 
 def settle_after_battle(
-    config: dict[str, Any], stage: str, env: dict[str, str], log_path: Path
+    config: Config, stage: str, env: dict[str, str], log_path: Path
 ) -> tuple[bool, str]:
     """一关打完后收尾：跳过战后剧情 → 返回主界面（见 `SETTLE_TOML_TEMPLATE`）。
 
@@ -737,7 +737,7 @@ class PrefightError(RuntimeError):
 
 
 def _recheck_before_stage(
-    config: dict[str, Any], state: dict[str, Any], entry: dict[str, Any]
+    config: Config, state: dict[str, Any], entry: dict[str, Any]
 ) -> tuple[bool, str]:
     """每关开打前的复核：活动还在不在、理智够不够。
 
@@ -796,7 +796,7 @@ def _set_status(
         return fresh
 
 
-def _retire_round_controls(token: str, config: dict[str, Any], message_id: Any) -> None:
+def _retire_round_controls(token: str, config: Config, message_id: Any) -> None:
     """收掉「取消本轮」按钮：开始碰设备之后取消已经没有意义。"""
     with state_lock():
         registry = load_json(BUTTONS_PATH, {})
@@ -1251,7 +1251,7 @@ def _story_overlay(code: str) -> dict[str, Any]:
 
 
 def _run_tasks(
-    config: dict[str, Any],
+    config: Config,
     env: dict[str, str],
     log_path: Path,
     name: str,
@@ -1304,7 +1304,7 @@ def _base_box_lines(lines: list[str], geometry: dict[str, Any]) -> list[str]:
     return converted
 
 
-def _screen_text(config: dict[str, Any]) -> list[str]:
+def _screen_text(config: Config) -> list[str]:
     """当前屏幕的 OCR 行（`ocrbox`：`文字\\t[x,y,w,h]`，已换成 1920×1080 游戏坐标）。
 
     读不到返回空表。
@@ -1444,7 +1444,7 @@ def _prepare_list_file(candidate: dict[str, Any], stage_id: str, target: Path) -
 
 
 def _run_copilot_list(
-    config: dict[str, Any],
+    config: Config,
     env: dict[str, str],
     log_path: Path,
     items: list[tuple[dict[str, Any], Path]],
@@ -1481,12 +1481,12 @@ def _run_copilot_list(
 
 
 def _run_activity_round(
-    config: dict[str, Any],
+    config: Config,
     state: dict[str, Any],
     entries: list[dict[str, Any]],
     env: dict[str, str],
     log_path: Path,
-    ledger: dict[str, Any],
+    ledger: maa_copilot.Ledger,
     ledger_file: Path,
     results: list[dict[str, Any]],
     auto_round: bool,
@@ -1521,7 +1521,7 @@ def _run_activity_round(
             runnable.append(entry)
     anchor_stage = maa_copilot.resolve_copilot_stage(anchor, maa_copilot.load_stage_index(config))
     anchor_info = maa_gamedata.stage_info(layout, anchor_stage[0]) if anchor_stage else None
-    if not anchor or anchor_info is None:
+    if not anchor or anchor_stage is None or anchor_info is None:
         reason = anchor_error or f"游戏数据里没有锚点 {anchor}"
         for entry in runnable:
             skip(entry, reason)
@@ -1541,7 +1541,7 @@ def _run_activity_round(
         if auto_round and maa_copilot.auto_pause_state():
             stop_reason = "自动作业已暂停"
         else:
-            stop_reason = maa_action.min_lead_reason(config)
+            stop_reason = maa_action.min_lead_reason(config) or ""
         if not stop_reason:
             ok, detail = navigator.ensure(str(segment["zone_id"]))
             if ok and segment["kind"] == "story":
@@ -1599,7 +1599,7 @@ def _run_activity_round(
                     record(entry, verdict, detail)
                 failed = next((d for v, d in outcomes if v != "won"), None)
                 if failed is not None:
-                    stop_reason = failed or "有一份作业没过"
+                    stop_reason = str(failed or "有一份作业没过")
         if stop_reason:
             for later in segments[index + 1:]:
                 for entry in later.get("items") or []:
@@ -1628,7 +1628,7 @@ def _log_since(log_path: Path, offset: int) -> str:
 
 
 def _fight_one(
-    config: dict[str, Any],
+    config: Config,
     entry: dict[str, Any],
     env: dict[str, str],
     log_path: Path,
@@ -1679,14 +1679,14 @@ def _fight_one(
 
 
 def _post_report(
-    config: dict[str, Any], embed: dict[str, Any], png_path: Path | None
+    config: Config, embed: dict[str, Any], png_path: Path | None
 ) -> None:
     """战报：有截图就内嵌上传，上传失败退回纯 embed（截图不该带走战报）。"""
     token_text = discord_token()
     channel_id = str(config.get("channel_id", ""))
     has_shot = bool(png_path and png_path.is_file() and png_path.stat().st_size > 0)
     payload: dict[str, Any] = {"embeds": [embed], "allowed_mentions": {"parse": []}}
-    if has_shot:
+    if has_shot and png_path is not None:
         embed["image"] = {"url": "attachment://shot.png"}
         payload["attachments"] = [{"id": 0, "filename": "shot.png"}]
         from maa_common import discord_upload

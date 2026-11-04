@@ -11,7 +11,10 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from typing import TypeGuard  # 3.10+，只在注解里用（见 maa_common）
 
 import maa_copilot
 import maa_roguelike
@@ -31,11 +34,17 @@ from maa_common import (
     PLAN_SESSION_FIELDS,
     SCRIPTS_DIR,
     WATCH_PATH,
+    Config,
+    Plan,
+    PlanFile,
+    PlanPhase,
+    SessionOverride,
     atomic_write_json,
     check_schema,
     discord_request,
     discord_token,
     effective_plan,
+    is_plan_phase,
     is_run_locked,
     load_config,
     load_json,
@@ -67,7 +76,7 @@ def emit(ok: bool, message: str) -> None:
     print(raw)
 
 
-def _activity_output_allows(stage: str, config: dict[str, Any]) -> bool:
+def _activity_output_allows(stage: str, config: Config) -> bool:
     configured = config.get("activity_stages", [])
     if isinstance(configured, list) and stage in {str(item) for item in configured}:
         return True
@@ -92,16 +101,16 @@ def _activity_output_allows(stage: str, config: dict[str, Any]) -> bool:
     return result.returncode == 0 and bool(token.search(output))
 
 
-def valid_stage(stage: str, config: dict[str, Any]) -> bool:
+def valid_stage(stage: str, config: Config) -> bool:
     return stage == "" or bool(STAGE_PATTERN.fullmatch(stage)) or _activity_output_allows(stage, config)
 
 
-def valid_phase(phase: str) -> bool:
+def valid_phase(phase: str) -> TypeGuard[PlanPhase]:
     """场次只接受 `am` / `pm`。值由登记表的 `select_args` / `args` 写死，不从 Discord 直通。"""
-    return phase in PLAN_PHASES
+    return is_plan_phase(phase)
 
 
-def _today_override() -> dict[str, Any]:
+def _today_override() -> PlanFile:
     """当天的场次表，已按白名单过滤。
 
     结构是 `{date, sessions: {am: {...}, pm: {...}}, updated_at}`。日期不是今天、
@@ -115,24 +124,25 @@ def _today_override() -> dict[str, Any]:
     sessions: Any = {}
     if isinstance(current, dict) and current.get("date") == now.date().isoformat():
         sessions = current.get("sessions")
-    kept: dict[str, dict[str, Any]] = {}
+    kept: dict[str, SessionOverride] = {}
     if isinstance(sessions, dict):
         for phase in PLAN_PHASES:
             override = sessions.get(phase)
             if isinstance(override, dict):
-                kept[phase] = {
+                kept[phase] = cast(SessionOverride, {
                     key: override[key]
                     for key in PLAN_SESSION_FIELDS
                     if key in override
-                }
+                })
     return {"date": now.date().isoformat(), "sessions": kept}
 
 
-def _save_override(phase: str, key: str, value: Any, **extra: Any) -> dict[str, Any]:
+def _save_override(phase: PlanPhase, key: str, value: Any, **extra: Any) -> Plan:
     now = now_beijing()
     with state_lock():
         plan = _today_override()
-        session = plan["sessions"].setdefault(phase, {})
+        # 字段名由调用方写死（stage / skip / fight），这里按普通 dict 写。
+        session = cast("dict[str, Any]", plan["sessions"].setdefault(phase, {}))  # pyright: ignore[reportTypedDictNotRequiredAccess]  # _today_override() 一定带 sessions
         session[key] = value
         session.update(extra)
         session["source"] = "discord"
@@ -157,7 +167,7 @@ def _running_context() -> tuple[str, str]:
     return phase_label, stage
 
 
-def _confirmation(plan: dict[str, Any], was_running: bool, phase: str) -> str:
+def _confirmation(plan: Plan, was_running: bool, phase: PlanPhase) -> str:
     """一句回执：改的是**哪一场**、另一场不受影响、正在跑的那场不被打断。"""
     now = now_beijing()
     stage = plan_stage_label(plan)
@@ -276,7 +286,7 @@ MANUAL_RUN_PENDING_TEXT = "计算中…"
 
 
 def manual_run_blackout_reason(
-    config: dict[str, Any], at: datetime | None = None
+    config: Config, at: datetime | None = None
 ) -> str | None:
     """定时场优先（M10）：距 08:00 / 22:00 不足 N 分钟，手动场不发卡也不派发。
 
@@ -392,7 +402,7 @@ def _manual_run_embed(
 
 
 def _manual_run_message_patch(
-    config: dict[str, Any], state: dict[str, Any], payload: dict[str, Any]
+    config: Config, state: dict[str, Any], payload: dict[str, Any]
 ) -> bool:
     channel_id = str(config.get("channel_id") or "")
     message_id = str(state.get("message_id") or "")
@@ -408,7 +418,7 @@ def _manual_run_message_patch(
 
 
 def _retire_manual_run(
-    config: dict[str, Any], status: str, footer: str
+    config: Config, status: str, footer: str
 ) -> dict[str, Any] | None:
     """把当前 `pending` 请求收成 `status`：状态 → 删登记 → 收卡片组件。
 
@@ -668,7 +678,8 @@ def run_recommend(token: str) -> tuple[bool, str]:
         state["recommended_stage"] = recommended
         state["updated_at"] = now_beijing().isoformat()
         _save_manual_run(state)
-    choices = state.get("choices") if isinstance(state.get("choices"), list) else []
+    raw_choices = state.get("choices")
+    choices = raw_choices if isinstance(raw_choices, list) else []
     rows, _entries = _manual_run_components(choices, token, recommended or None)
     _manual_run_message_patch(
         config, state, {"embeds": [_manual_run_embed(state)], "components": rows}
@@ -695,7 +706,7 @@ def log_tail() -> tuple[bool, str]:
             summary = extract_summary(
                 raw,
                 [],
-                plan=plan if isinstance(plan, dict) else {},
+                plan=cast(Plan, plan) if isinstance(plan, dict) else {},
                 ok=state.get("status") == "success",
             )
     if not summary:
@@ -710,7 +721,7 @@ def log_tail() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def valid_copilot_stage(
-    name: str, config: dict[str, Any]
+    name: str, config: Config
 ) -> tuple[str, str] | None:
     """Exact lookup in the local stage index; never guess aliases."""
     index = maa_copilot.load_stage_index(config)
@@ -743,7 +754,7 @@ def _mark_search_dispatch_failed(token: str, message: str) -> None:
         atomic_write_json(_search_path(token), state)
 
 
-def _invalidate_search_card(token: str, config: dict[str, Any]) -> str:
+def _invalidate_search_card(token: str, config: Config) -> str:
     changed, message_id = maa_copilot.supersede_search(token)
     if not changed:
         return ""
@@ -754,7 +765,7 @@ def _invalidate_search_card(token: str, config: dict[str, Any]) -> str:
     return ""
 
 
-def _copilot_blackout_reason(config: dict[str, Any]) -> str | None:
+def _copilot_blackout_reason(config: Config) -> str | None:
     """Refuse to start a copilot run close to the 08:00/22:00 daily runs."""
     minutes = max(0, int(config.get("copilot_blackout_minutes", 25)))
     if minutes == 0:
@@ -782,7 +793,7 @@ DEPOT_WINDOW_END_MINUTES = 5 * 60
 DEFAULT_MIN_LEAD_MINUTES = 40
 
 
-def min_lead_reason(config: dict[str, Any], at: datetime | None = None) -> str | None:
+def min_lead_reason(config: Config, at: datetime | None = None) -> str | None:
     """距下一场日常还够不够**开新的一关**（四期 2c 的时间预算）。
 
     与 `copilot_blackout_minutes` 是两条不同的闸门：blackout 管「能不能开这一轮」，
@@ -815,7 +826,7 @@ def depot_window_reason(at: datetime | None = None) -> str | None:
 
 
 def dispatch_blocker(
-    config: dict[str, Any], scheduled_at: str, at: datetime | None = None
+    config: Config, scheduled_at: str, at: datetime | None = None
 ) -> str:
     """还不能派发的原因；可以派发返回空串。**每一条都要能说出口**（护栏 4）。
 
@@ -849,7 +860,7 @@ def dispatch_blocker(
 def publish_round(
     token: str,
     entries: list[dict[str, Any]],
-    config: dict[str, Any],
+    config: Config,
     *,
     title: str,
     scheduled_at: str = "",
@@ -923,7 +934,7 @@ def _area_codes(area: str, index: dict[str, Any]) -> list[str]:
 
 
 def _expand_copilot_targets(
-    names: list[str], config: dict[str, Any], prefix: str, activity_key: str
+    names: list[str], config: Config, prefix: str, activity_key: str
 ) -> tuple[list[dict[str, Any]], str, str]:
     """手动参数 → `(targets, 拒绝理由, 提示)`；targets 是 `{stage, stage_id, modes}`。
 
@@ -1072,7 +1083,7 @@ def copilot_find(stage: str, *more: str) -> tuple[bool, str]:
 MARK_MODE_ARGS = {"normal": ("normal",), "raid": ("raid",), "all": ("normal", "raid")}
 
 
-def _ledger_target(stage: str) -> tuple[str, str, str, dict[str, Any]] | str:
+def _ledger_target(stage: str) -> tuple[str, str, str, Config] | str:
     """`(关卡代号, 活动 key, 活动前缀, config)`，或一句拒绝理由。
 
     活动 key 的取法与 `start_copilot_search()` 完全一致：当期活动关落活动账本，
@@ -1132,7 +1143,7 @@ def copilot_unmark(stage: str) -> tuple[bool, str]:
     with state_lock():
         ledger = maa_copilot.load_ledger(maa_copilot.ledger_path(activity_key))
         cleared = maa_copilot.unmark_stage_cleared(ledger, code) if ledger else []
-        if cleared:
+        if cleared and ledger:
             maa_copilot.save_ledger(ledger, maa_copilot.ledger_path(activity_key))
     if not cleared:
         return True, f"ℹ️ {code} 账本里本来就没有通关记录，没有改动。"
@@ -1265,7 +1276,7 @@ def dispatch_roguelike(token: str) -> None:
     )
 
 
-def _send_roguelike_card(config: dict[str, Any], state: dict[str, Any]) -> str:
+def _send_roguelike_card(config: Config, state: dict[str, Any]) -> str:
     """发一张新的肉鸽卡并收掉上一张，返回给用户看的补充说明。
 
     顺序与抄作业卡一致（不变量 #14b）：**PATCH 旧卡组件 → 删旧登记 →
@@ -1457,8 +1468,9 @@ def roguelike_status() -> tuple[bool, str]:
                 "没有干净结束，下次要用同主题收尾"
             )
         return True, f"🎲 肉鸽空闲中（说「刷肉鸽」发配置卡）{tail}。"
-    params = state.get("params") if isinstance(state.get("params"), dict) else {}
-    head = "▶️ 正在跑" if status == maa_roguelike.RUNNING else "⏹️ 已收到停止指令，本局结束后退出"
+    raw_params = state.get("params")
+    params = raw_params if isinstance(raw_params, dict) else {}
+    head ="▶️ 正在跑" if status == maa_roguelike.RUNNING else "⏹️ 已收到停止指令，本局结束后退出"
     return True, (
         f"{head}：{maa_roguelike.params_text(params)}\n"
         f"已完成 {len(runs)} 局：\n{maa_roguelike.run_lines(runs)}"

@@ -11,6 +11,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -150,7 +151,7 @@ def char(*, elite=2, level=90, main_skill_lvl=7, skills=None, module_levels=None
     }
 
 
-CONFIG = {"maa_resource_dir": "/nonexistent"}
+CONFIG: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
 
 
 class StageIndexTests(unittest.TestCase):
@@ -214,7 +215,7 @@ class StageIndexTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            config = {"maa_resource_dir": str(resource)}
+            config: maa_common.Config = {"maa_resource_dir": str(resource)}
             self.assertEqual(
                 maa_copilot.stage_sanity_cost("act53side_09", "TO-9", config), 18
             )
@@ -429,7 +430,7 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(cand["gaps"], [])
 
     def test_hard_excludes_available_and_core_version(self) -> None:
-        config = {"maa_resource_dir": "/nonexistent", "maa_core_version": "v6.16.0"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent", "maa_core_version": "v6.16.0"}
         unavailable = op_item(1, "act53side_09", opers=[{"name": "x", "skill": 1}], available=False)
         self.assertIsNone(maa_copilot.evaluate_candidate(unavailable, None, config))
         too_new = op_item(
@@ -447,7 +448,7 @@ class MatchingTests(unittest.TestCase):
 class SearchTests(unittest.TestCase):
     def test_level_keyword_degradation_triggers_latest_scan(self) -> None:
         """act53side_09 not in the server index -> total == full -> scan pages."""
-        config = {"maa_resource_dir": "/nonexistent"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
 
         def fake_query(params, timeout=60):
             if "level_keyword" in params:
@@ -472,7 +473,7 @@ class SearchTests(unittest.TestCase):
         self.assertNotIn(99, ids)  # wrong stage filtered client-side
 
     def test_level_keyword_trusted_when_it_filters(self) -> None:
-        config = {"maa_resource_dir": "/nonexistent"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
 
         def fake_query(params, timeout=60):
             if "level_keyword" in params:
@@ -487,7 +488,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], [1])
 
     def test_document_search_is_supplementary_and_filtered(self) -> None:
-        config = {"maa_resource_dir": "/nonexistent"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
         calls: list[dict] = []
 
         def fake_query(params, timeout=60):
@@ -510,7 +511,7 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(any(p.get("document") == "TO-9" for p in calls))
 
     def test_search_copilots_sorts_by_ratio_bucket_then_quality(self) -> None:
-        config = {"maa_resource_dir": "/nonexistent"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
         perfect = op_item(1, "act53side_09", opers=[{"name": "阿米娅", "skill": 1, "requirements": {"elite": 2}}],
                           rating_ratio=0.5, views=50)
         hot_but_gappy = op_item(2, "act53side_09", opers=[
@@ -536,7 +537,7 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(candidates[1]["ratio"], 0.5)
 
     def test_search_copilots_respects_cache_ttl(self) -> None:
-        config = {"maa_resource_dir": "/nonexistent"}
+        config: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
         with tempfile.TemporaryDirectory() as raw:
             cache_dir = Path(raw) / "cache"
             cache_dir.mkdir()
@@ -602,7 +603,7 @@ class DegradedScanTests(unittest.TestCase):
     exercised the filtered path.
     """
 
-    CONFIG = {"maa_resource_dir": "/nonexistent"}
+    CONFIG: maa_common.Config = {"maa_resource_dir": "/nonexistent"}
 
     @staticmethod
     def _scan_params(wire) -> list[dict]:
@@ -974,7 +975,7 @@ class ButtonRegistryTests(unittest.TestCase):
 
 class PickValidationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.config = {"copilot_blackout_minutes": 25}
+        self.config: maa_common.Config = {"copilot_blackout_minutes": 25}
 
     def test_blackout_refuses_near_daily_runs(self) -> None:
         at = datetime(2026, 8, 2, 7, 50, tzinfo=BEIJING)
@@ -1099,6 +1100,7 @@ class SklandTests(unittest.TestCase):
             }
         )
         self.assertIsNotNone(sanity)
+        assert sanity is not None  # 给类型检查收窄
         self.assertEqual(maa_copilot.estimated_sanity(sanity, at), 19)
         later = at + timedelta(minutes=12)
         self.assertEqual(maa_copilot.estimated_sanity(sanity, later), 21)
@@ -1347,7 +1349,7 @@ class ReviewFixTests(unittest.TestCase):
             upstream = root / "upstream" / "tasks" / "Stages"
             upstream.mkdir(parents=True)
             (upstream / "SR.json").write_text('{"SR-8": {}}')
-            config = {"maa_resource_dir": str(root / "upstream")}
+            config: maa_common.Config = {"maa_resource_dir": str(root / "upstream")}
             env = {"MAA_CONFIG_DIR": str(root / "config")}
             for output, code, expected in (
                 ("Fight Completed", 0, False),
@@ -1658,6 +1660,7 @@ class ZoneProgressTests(unittest.TestCase):
         ])
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
         self.assertIsNotNone(warning)
+        assert warning is not None  # 给类型检查收窄
         self.assertIn("act53side_zone1", warning)
         self.assertIn("1/13", warning)
         self.assertIn("大概率未解锁", warning)
@@ -1670,6 +1673,7 @@ class ZoneProgressTests(unittest.TestCase):
         ])
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
         self.assertIsNotNone(warning)
+        assert warning is not None  # 给类型检查收窄
         self.assertIn("的突袭大概率未解锁", warning)
         # the other tier's distinctive wording must be absent — this is the
         # "raid only" case, not the "stage itself locked" case
@@ -1722,6 +1726,7 @@ class ZoneProgressTests(unittest.TestCase):
         # 四期步骤 2：候选卡没了，这条单向启发改挂在抄作业卡的每关状态上。
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
         self.assertIsNotNone(warning)
+        assert warning is not None  # 给类型检查收窄
         self.assertIn("1/13", warning)
         self.assertIn("大概率未解锁", warning)
 
@@ -1736,6 +1741,7 @@ class ZoneProgressTests(unittest.TestCase):
             fetched_at=stale,
         )
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        assert warning is not None  # 给类型检查收窄
         self.assertTrue(
             warning.endswith("（森空岛数据 4 天前，如已推进请忽略）"),
             f"unexpected warning: {warning!r}",
@@ -1747,6 +1753,7 @@ class ZoneProgressTests(unittest.TestCase):
             {"zoneId": "act53side_zone1", "clearedStage": 1, "totalStage": 13},
         ])
         warning = maa_copilot.zone_progress_warning("TO-9", "act53side_09", r)
+        assert warning is not None  # 给类型检查收窄
         self.assertTrue(warning.endswith("点了可能空跑。"))
         self.assertNotIn("森空岛数据", warning)
 

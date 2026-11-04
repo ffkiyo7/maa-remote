@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from maa_common import BEIJING, now_beijing
+from maa_common import BEIJING, Config, Plan, now_beijing
 
 # 剿灭同样吃理智（地基事实 H）。国服剿灭作战单次 25 理智；写成可配是因为
 # 这个数字属于游戏侧常量，改版时不该改代码。
@@ -78,7 +78,7 @@ def stage_nav_prefix(stage: str) -> str:
 DEFAULT_RAID_SWITCH_TASK = "ChangeToRaidDifficulty"
 
 
-def raid_switch_task(config: dict[str, Any] | None) -> str:
+def raid_switch_task(config: Config | None) -> str:
     """配置里的突袭切换任务名；空串 = 功能关闭。
 
     键**缺失**时取默认值（与 `maa_copilot_worker.switch_to_raid()` 同一套取值口径），
@@ -89,13 +89,13 @@ def raid_switch_task(config: dict[str, Any] | None) -> str:
     return str(config.get("copilot_raid_switch_task", DEFAULT_RAID_SWITCH_TASK) or "").strip()
 
 
-def raid_enabled(config: dict[str, Any] | None) -> bool:
+def raid_enabled(config: Config | None) -> bool:
     """突袭功能的总开关。**不传 config = 关闭**：宁可少排一个模式，也不许错记通关。"""
     return bool(raid_switch_task(config))
 
 
 def required_modes(
-    stage: str, activity_prefix: str, config: dict[str, Any] | None = None
+    stage: str, activity_prefix: str, config: Config | None = None
 ) -> tuple[str, ...]:
     """这一关要打**哪些模式**才算通关（D7）。
 
@@ -327,7 +327,7 @@ def plan_segments(
                     else f"前置关 {code} 还没通关，本轮也没排它"
                 )
                 break
-        if blocker:
+        if blocker or info is None:  # info 为 None 时 blocker 必然非空；写出来给类型检查看
             dropped.extend((rest, blocker) for rest in entries[position:])
             break
         enter(str(info.get("zone_id") or ""))
@@ -470,7 +470,7 @@ def list_outcomes(
 # 理智预算
 # ---------------------------------------------------------------------------
 
-def annihilation_reserve(plan: dict[str, Any], config: dict[str, Any]) -> int:
+def annihilation_reserve(plan: Plan, config: Config) -> int:
     """今天还要打的剿灭要预留多少理智（地基事实 H）。
 
     剿灭是 `daily.toml` 里的第二个 `Fight(stage=Annihilation)`，**它同样消耗理智**。
@@ -491,8 +491,8 @@ def annihilation_reserve(plan: dict[str, Any], config: dict[str, Any]) -> int:
 
 def sanity_budget(
     available: int | None,
-    plan: dict[str, Any],
-    config: dict[str, Any],
+    plan: Plan,
+    config: Config,
 ) -> int:
     """这一轮能花的理智 = 当前理智 − 剿灭那份。理智未知一律 0（fail-closed）。"""
     if available is None:
