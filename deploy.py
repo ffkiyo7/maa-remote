@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -213,27 +214,43 @@ def resolve_channel_id() -> str:
     return configured
 
 
-def deploy_scripts() -> None:
+# 部署到 `~/.hermes/scripts/` 的 Python 脚本，`deploy_scripts()` 和 `--check` 共用。
+# 必须与仓库 `scripts/*.py` 一一对应（`test_script_names_match_the_repository_scripts`）。
+SCRIPT_NAMES = (
+    "maa_common.py",
+    "maa_playcover.py",
+    "maa_plan_card.py",
+    "maa_activity_watch.py",
+    "maa_depot.py",
+    "maa_daily.py",
+    "maa_action.py",
+    "maa_clearing.py",
+    "maa_copilot.py",
+    "maa_farming.py",
+    "maa_gamedata.py",
+    "maa_roguelike.py",
+    "maa_copilot_worker.py",
+    "maa_roguelike_worker.py",
+    "maa_skland.py",
+)
+# swiftc 编译产物：线上是二进制，`--check` 只查存在。
+COMPILED_HELPERS = ("ocrbox", "winmove")
+SKILL_RELATIVE_PATH = Path("skills") / "games" / "maa-operator" / "SKILL.md"
+
+
+def script_file_pairs() -> list[tuple[Path, Path]]:
     target = HERMES_HOME / "scripts"
-    ensure_dir(target, 0o700)
-    for name in (
-        "maa_common.py",
-        "maa_playcover.py",
-        "maa_plan_card.py",
-        "maa_activity_watch.py",
-        "maa_depot.py",
-        "maa_daily.py",
-        "maa_action.py",
-        "maa_clearing.py",
-        "maa_copilot.py",
-        "maa_farming.py",
-        "maa_gamedata.py",
-        "maa_roguelike.py",
-        "maa_copilot_worker.py",
-        "maa_roguelike_worker.py",
-        "maa_skland.py",
-    ):
-        copy_file(ROOT / "scripts" / name, target / name, 0o700)
+    return [(ROOT / "scripts" / name, target / name) for name in SCRIPT_NAMES]
+
+
+def skill_file_pair() -> tuple[Path, Path]:
+    return ROOT / SKILL_RELATIVE_PATH, HERMES_HOME / SKILL_RELATIVE_PATH
+
+
+def deploy_scripts() -> None:
+    ensure_dir(HERMES_HOME / "scripts", 0o700)
+    for source, target in script_file_pairs():
+        copy_file(source, target, 0o700)
 
 
 def deploy_skland_token() -> None:
@@ -347,11 +364,8 @@ def deploy_maa_config() -> None:
 
 
 def deploy_skill() -> None:
-    copy_file(
-        ROOT / "skills" / "games" / "maa-operator" / "SKILL.md",
-        HERMES_HOME / "skills" / "games" / "maa-operator" / "SKILL.md",
-        0o600,
-    )
+    source, target = skill_file_pair()
+    copy_file(source, target, 0o600)
 
 
 def patch_adapter_source(text: str) -> str:
@@ -437,8 +451,12 @@ def patch_adapter_source(text: str) -> str:
     return text
 
 
+def adapter_path() -> Path:
+    return HERMES_HOME / "hermes-agent" / "plugins" / "platforms" / "discord" / "adapter.py"
+
+
 def patch_adapter() -> None:
-    adapter = HERMES_HOME / "hermes-agent" / "plugins" / "platforms" / "discord" / "adapter.py"
+    adapter = adapter_path()
     text = adapter.read_text(encoding="utf-8")
     patched = patch_adapter_source(text)
     if patched != text:
@@ -682,44 +700,167 @@ def patch_config_yaml(channel_id: str) -> None:
     write_text(path, patch_config_yaml_text(text, channel_id), 0o600)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--check", action="store_true", help="only report whether deployment is current")
-    args = parser.parse_args()
-    if args.check:
-        checks = [
-            HERMES_HOME / "scripts" / name
-            for name in (
-                "maa_common.py",
-                "maa_playcover.py",
-                "maa_plan_card.py",
-                "maa_activity_watch.py",
-                "maa_depot.py",
-                "maa_daily.py",
-                "maa_action.py",
-                "maa_clearing.py",
-                "maa_copilot.py",
-                "maa_farming.py",
-                "maa_gamedata.py",
-                "maa_roguelike.py",
-                "maa_copilot_worker.py",
-                "maa_roguelike_worker.py",
-                "maa_skland.py",
-                "ocrbox",
-                "winmove",
-            )
-        ]
-        checks.extend(target for _source, target in maa_config_file_pairs())
-        missing = [str(path) for path in checks if not path.is_file()]
-        mismatched = content_mismatches(maa_config_content_checked_pairs())
-        ok = not missing and not mismatched
-        print(
-            json.dumps(
-                {"ok": ok, "missing": missing, "mismatched": mismatched},
-                ensure_ascii=False,
-            )
+# ---------------------------------------------------------------------------
+# `--check`：只读。不写文件、不打补丁，只报告线上与仓库是否一致。
+# ---------------------------------------------------------------------------
+
+GATEWAY_PLIST_RELATIVE_PATH = Path("Library") / "LaunchAgents" / "ai.hermes.gateway.plist"
+# Hermes 仓库里可能并存的两个虚拟环境：`venv` 是 gateway 实际用的（HERMES_VENV_PYTHON），
+# `.venv` 是 uv 等工具顺手建的；两个都在时容易装错包、跑错解释器。
+HERMES_VENV_NAMES = ("venv", ".venv")
+PYTHON_VERSION_PROBE = "import sys; print('.'.join(map(str, sys.version_info[:3])))"
+PYTHON_VERSION_TIMEOUT = 10.0
+
+
+def gateway_plist_path() -> Path:
+    """调用时才按 `USER_HOME` 算，单测可以 patch。"""
+    return USER_HOME / GATEWAY_PLIST_RELATIVE_PATH
+
+
+def python_version(interpreter: Path, timeout: float = PYTHON_VERSION_TIMEOUT) -> str:
+    """让 `interpreter` 自己打印版本号；起不来、超时、非零退出都抛 RuntimeError。"""
+    try:
+        result = subprocess.run(
+            [str(interpreter), "-I", "-c", PYTHON_VERSION_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
-        return 0 if ok else 1
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"exit {result.returncode}: {result.stderr.strip()[-200:]}")
+    version = result.stdout.strip()
+    if not version:
+        raise RuntimeError("没有输出版本号")
+    return version
+
+
+def same_interpreter(program: str, expected: str) -> bool:
+    """路径字符串相同，或 realpath 相同且所在目录 realpath 也相同。
+
+    只比文件 realpath 不够：venv 里的 `bin/python` 是指向 uv 解释器的符号链接，
+    两个不同 venv 指向同一个 3.11 时 realpath 一样，但 site-packages 不同。
+    """
+    if program == expected:
+        return True
+    return os.path.realpath(os.path.dirname(program)) == os.path.realpath(
+        os.path.dirname(expected)
+    ) and os.path.realpath(program) == os.path.realpath(expected)
+
+
+def check_adapter() -> str:
+    """`patched` / `needs_patch` / `anchor_mismatch: …` / `missing`（/ `unreadable: …`）。"""
+    path = adapter_path()
+    if not path.is_file():
+        return "missing"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"unreadable: {type(exc).__name__}: {exc}"
+    try:
+        patched = patch_adapter_source(text)
+    except RuntimeError as exc:
+        return f"anchor_mismatch: {exc}"
+    return "patched" if patched == text else "needs_patch"
+
+
+def check_gateway_python() -> dict[str, Any]:
+    plist = gateway_plist_path()
+    expected = str(HERMES_VENV_PYTHON)
+    report: dict[str, Any] = {
+        "plist": str(plist),
+        "program": None,
+        "version": None,
+        "expected": expected,
+        "matches": False,
+    }
+    if not plist.is_file():
+        report["error"] = "plist 不存在"
+        return report
+    try:
+        with plist.open("rb") as handle:
+            document = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        report["error"] = f"plist 读不出：{type(exc).__name__}: {exc}"
+        return report
+    arguments = document.get("ProgramArguments") if isinstance(document, dict) else None
+    if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+        report["error"] = "plist 里没有 ProgramArguments[0]"
+        return report
+    program = arguments[0]
+    report["program"] = program
+    report["matches"] = same_interpreter(program, expected)
+    try:
+        report["version"] = python_version(Path(program))
+    except RuntimeError as exc:
+        report["error"] = f"取版本失败：{exc}"
+    return report
+
+
+def check_venvs() -> tuple[dict[str, str | None], list[str]]:
+    versions: dict[str, str | None] = {}
+    present: list[str] = []
+    for name in HERMES_VENV_NAMES:
+        root = HERMES_HOME / "hermes-agent" / name
+        if not root.exists():
+            versions[name] = None
+            continue
+        present.append(name)
+        try:
+            versions[name] = python_version(root / "bin" / "python")
+        except RuntimeError as exc:
+            versions[name] = f"error: {exc}"
+    warnings: list[str] = []
+    if len(present) > 1:
+        warnings.append(
+            "hermes-agent 下 venv 与 .venv 并存（"
+            + "、".join(f"{name}={versions[name]}" for name in present)
+            + f"）：gateway 用的是 {HERMES_VENV_PYTHON}，往另一个里装包不会生效"
+        )
+    return versions, warnings
+
+
+def check_deployment() -> dict[str, Any]:
+    """`--check` 的报告。只读：不写任何文件。"""
+    skill = skill_file_pair()
+    exists_checked = [target for _source, target in script_file_pairs()]
+    exists_checked.extend(HERMES_HOME / "scripts" / name for name in COMPILED_HELPERS)
+    exists_checked.append(skill[1])
+    exists_checked.extend(target for _source, target in maa_config_file_pairs())
+    missing = [str(path) for path in exists_checked if not path.is_file()]
+    mismatched = content_mismatches(
+        [*script_file_pairs(), skill, *maa_config_content_checked_pairs()]
+    )
+    adapter = check_adapter()
+    gateway_python = check_gateway_python()
+    venvs, warnings = check_venvs()
+    ok = (
+        not missing
+        and not mismatched
+        and adapter == "patched"
+        and gateway_python["matches"] is True
+    )
+    return {
+        "ok": ok,
+        "missing": missing,
+        "mismatched": mismatched,
+        "adapter": adapter,
+        "gateway_python": gateway_python,
+        "venvs": venvs,
+        "warnings": warnings,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--check", action="store_true", help="only report whether deployment is current (read-only)")
+    args = parser.parse_args(argv)
+    if args.check:
+        report = check_deployment()
+        print(json.dumps(report, ensure_ascii=False))
+        return 0 if report["ok"] else 1
 
     channel_id = resolve_channel_id()
     deploy_scripts()

@@ -5,6 +5,7 @@ import contextlib
 import os
 import io
 import json
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -1473,6 +1474,260 @@ CONNECT_CRASH_LOG = [
     "TouchModeNotAvailable",
     "StartUp Start",
 ]
+
+
+class DeployCheckTests(unittest.TestCase):
+    """`deploy.py --check`：只读核对脚本 / 技能内容、adapter 补丁、gateway 解释器与 venv。
+
+    每条用例自己一套假 home（`USER_HOME` / `HERMES_HOME` / `MAA_CONFIG_HOME` /
+    `HERMES_VENV_PYTHON` 全部 patch 到这里），先按仓库内容「部署干净」，再逐项弄坏。
+    假解释器是 `/bin/sh` 小脚本，只打印版本号。
+    """
+
+    UNPATCHED_ADAPTER = '''_HERMES_BUTTON_SCRIPTS = frozenset({"agent_book_action.py"})
+    async def _run_hermes_button_script(
+        self,
+        entry: dict[str, Any],
+    ) -> tuple[bool, str]:
+        raw_args = entry.get("args", [])
+        if not isinstance(raw_args, list) or len(raw_args) > 10:
+            return False, "按钮动作参数无效。"
+        args = [str(value) for value in raw_args]
+        if any(len(value) > 200 for value in args):
+            return False, "按钮动作参数过长。"
+                ok, message = await self._run_hermes_button_script(entry)
+'''
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="deploy-check-")
+        self.addCleanup(tmp.cleanup)
+        self.user_home = Path(tmp.name) / "home"
+        self.hermes = self.user_home / ".hermes"
+        self.venv_python = self.hermes / "hermes-agent" / "venv" / "bin" / "python"
+        for item in (
+            patch.object(deploy, "USER_HOME", self.user_home),
+            patch.object(deploy, "HERMES_HOME", self.hermes),
+            patch.object(deploy, "MAA_CONFIG_HOME", self.user_home / ".config" / "maa-cli"),
+            patch.object(deploy, "HERMES_VENV_PYTHON", self.venv_python),
+            patch.object(deploy, "changed", []),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+
+        pairs = [*deploy.script_file_pairs(), deploy.skill_file_pair(), *deploy.maa_config_file_pairs()]
+        for source, target in pairs:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        for name in deploy.COMPILED_HELPERS:
+            (self.hermes / "scripts" / name).write_bytes(b"\xcf\xfa\xed\xfe compiled")
+        deploy.adapter_path().parent.mkdir(parents=True)
+        deploy.adapter_path().write_text(
+            deploy.patch_adapter_source(self.UNPATCHED_ADAPTER), encoding="utf-8"
+        )
+        self.fake_python(self.venv_python, "3.11.15")
+        self.write_plist(str(self.venv_python))
+
+    @staticmethod
+    def fake_python(path: Path, version: str, exit_code: int = 0) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"#!/bin/sh\necho {version}\nexit {exit_code}\n", encoding="utf-8")
+        path.chmod(0o755)
+
+    def write_plist(self, program: str | None) -> None:
+        plist = deploy.gateway_plist_path()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        document: dict = {"Label": "ai.hermes.gateway"}
+        if program is not None:
+            document["ProgramArguments"] = [program, "-m", "hermes_cli.main", "gateway", "run"]
+        with plist.open("wb") as handle:
+            plistlib.dump(document, handle)
+
+    def snapshot(self) -> dict[str, tuple]:
+        state: dict[str, tuple] = {}
+        for directory, dirs, files in os.walk(self.user_home):
+            for name in [*dirs, *files]:
+                path = Path(directory) / name
+                info = path.lstat()
+                content = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+                state[str(path)] = (info.st_mode, info.st_mtime_ns, info.st_size, content)
+        return state
+
+    def run_check(self) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = deploy.main(["--check"])
+        return code, out.getvalue()
+
+    def test_script_names_match_the_repository_scripts(self) -> None:
+        self.assertEqual(len(deploy.SCRIPT_NAMES), len(set(deploy.SCRIPT_NAMES)))
+        self.assertEqual(
+            set(deploy.SCRIPT_NAMES),
+            {path.name for path in (deploy.ROOT / "scripts").glob("*.py")},
+        )
+
+    def test_deploy_scripts_copies_exactly_the_script_names(self) -> None:
+        for _source, target in deploy.script_file_pairs():
+            target.unlink()
+        for name in deploy.COMPILED_HELPERS:
+            (self.hermes / "scripts" / name).unlink()
+        deploy.deploy_scripts()
+        self.assertEqual(
+            sorted(path.name for path in (self.hermes / "scripts").iterdir()),
+            sorted(deploy.SCRIPT_NAMES),
+        )
+
+    def test_a_clean_deployment_is_ok_and_the_check_writes_nothing(self) -> None:
+        before = self.snapshot()
+        code, output = self.run_check()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(deploy.changed, [])
+        self.assertFalse((self.hermes / "backups").exists())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count("\n"), 1, "输出必须是一行 JSON")
+        report = json.loads(output)
+        self.assertEqual(
+            list(report),
+            ["ok", "missing", "mismatched", "adapter", "gateway_python", "venvs", "warnings"],
+        )
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["mismatched"], [])
+        self.assertEqual(report["adapter"], "patched")
+        self.assertEqual(
+            report["gateway_python"],
+            {
+                "plist": str(self.user_home / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"),
+                "program": str(self.venv_python),
+                "version": "3.11.15",
+                "expected": str(self.venv_python),
+                "matches": True,
+            },
+        )
+        self.assertEqual(report["venvs"], {"venv": "3.11.15", ".venv": None})
+        self.assertEqual(report["warnings"], [])
+
+    def test_script_and_skill_drift_is_mismatched_but_helpers_are_only_existence_checked(self) -> None:
+        script = self.hermes / "scripts" / "maa_daily.py"
+        skill = self.hermes / "skills" / "games" / "maa-operator" / "SKILL.md"
+        script.write_bytes(script.read_bytes() + b"# drift\n")
+        skill.write_bytes(b"old skill\n")
+        before = self.snapshot()
+        code, output = self.run_check()
+        self.assertEqual(self.snapshot(), before)
+        report = json.loads(output)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["mismatched"], [str(script), str(skill)])
+        self.assertEqual(report["missing"], [])
+
+        skill.unlink()
+        (self.hermes / "scripts" / "winmove").unlink()
+        report = deploy.check_deployment()
+        self.assertEqual(
+            report["missing"], [str(self.hermes / "scripts" / "winmove"), str(skill)]
+        )
+        self.assertEqual(report["mismatched"], [str(script)])
+
+    def test_adapter_patch_state_is_reported_without_touching_the_file(self) -> None:
+        adapter = deploy.adapter_path()
+        cases = [
+            (self.UNPATCHED_ADAPTER, "needs_patch"),
+            ("class DiscordAdapter:\n    pass\n", None),
+        ]
+        for text, expected in cases:
+            with self.subTest(expected=expected):
+                adapter.write_text(text, encoding="utf-8")
+                before = self.snapshot()
+                code, output = self.run_check()
+                self.assertEqual(self.snapshot(), before)
+                report = json.loads(output)
+                if expected is None:
+                    self.assertTrue(
+                        report["adapter"].startswith(
+                            "anchor_mismatch: Hermes button allowlist no longer matches"
+                        ),
+                        report["adapter"],
+                    )
+                else:
+                    self.assertEqual(report["adapter"], expected)
+                self.assertFalse(report["ok"])
+                self.assertEqual(code, 1)
+        adapter.unlink()
+        report = deploy.check_deployment()
+        self.assertEqual(report["adapter"], "missing")
+        self.assertFalse(report["ok"])
+        self.assertFalse(adapter.exists())
+
+    def test_a_gateway_on_another_interpreter_fails_the_check(self) -> None:
+        other = self.hermes / "hermes-agent" / ".venv" / "bin" / "python"
+        self.fake_python(other, "3.12.13")
+        self.write_plist(str(other))
+        report = deploy.check_deployment()
+        gateway = report["gateway_python"]
+        self.assertEqual(gateway["program"], str(other))
+        self.assertEqual(gateway["version"], "3.12.13")
+        self.assertFalse(gateway["matches"])
+        self.assertFalse(report["ok"])
+
+    def test_a_venv_symlinked_to_the_same_binary_still_does_not_match(self) -> None:
+        # 不同 venv 的 bin/python 常指向同一个 uv 解释器：只比文件 realpath 会误判一致。
+        other = self.hermes / "hermes-agent" / ".venv" / "bin" / "python"
+        other.parent.mkdir(parents=True)
+        other.symlink_to(self.venv_python)
+        self.write_plist(str(other))
+        self.assertFalse(deploy.check_deployment()["gateway_python"]["matches"])
+
+    def test_a_symlinked_hermes_home_still_matches(self) -> None:
+        alias = self.user_home / "hermes-alias"
+        alias.symlink_to(self.hermes)
+        self.write_plist(str(alias / "hermes-agent" / "venv" / "bin" / "python"))
+        report = deploy.check_deployment()
+        self.assertTrue(report["gateway_python"]["matches"])
+        self.assertTrue(report["ok"])
+
+    def test_a_missing_or_unreadable_plist_is_reported(self) -> None:
+        plist = deploy.gateway_plist_path()
+        plist.unlink()
+        gateway = deploy.check_deployment()["gateway_python"]
+        self.assertEqual(gateway["error"], "plist 不存在")
+        self.assertIsNone(gateway["program"])
+        self.assertFalse(gateway["matches"])
+
+        plist.write_bytes(b"not a plist at all")
+        report = deploy.check_deployment()
+        self.assertTrue(report["gateway_python"]["error"].startswith("plist 读不出："))
+        self.assertFalse(report["ok"])
+
+        self.write_plist(None)
+        gateway = deploy.check_deployment()["gateway_python"]
+        self.assertEqual(gateway["error"], "plist 里没有 ProgramArguments[0]")
+        self.assertFalse(gateway["matches"])
+
+    def test_version_probe_failures_are_recorded_not_raised(self) -> None:
+        self.fake_python(self.venv_python, "", exit_code=3)
+        report = deploy.check_deployment()
+        self.assertIsNone(report["gateway_python"]["version"])
+        self.assertTrue(report["gateway_python"]["error"].startswith("取版本失败：exit 3"))
+        self.assertTrue(report["gateway_python"]["matches"])
+        self.assertTrue(report["venvs"]["venv"].startswith("error: exit 3"))
+
+        with self.assertRaisesRegex(RuntimeError, "FileNotFoundError"):
+            deploy.python_version(self.user_home / "no-such-python")
+        with patch.object(
+            deploy.subprocess, "run", side_effect=subprocess.TimeoutExpired("python", 10)
+        ), self.assertRaisesRegex(RuntimeError, "TimeoutExpired"):
+            deploy.python_version(self.venv_python)
+
+    def test_coexisting_venvs_only_warn(self) -> None:
+        self.fake_python(self.hermes / "hermes-agent" / ".venv" / "bin" / "python", "3.12.13")
+        code, output = self.run_check()
+        report = json.loads(output)
+        self.assertEqual(report["venvs"], {"venv": "3.11.15", ".venv": "3.12.13"})
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("venv 与 .venv 并存", report["warnings"][0])
+        self.assertTrue(report["ok"])
+        self.assertEqual(code, 0)
 
 
 class ConnectFailureTests(unittest.TestCase):
@@ -8006,9 +8261,11 @@ class RoguelikeSubprocessTests(unittest.TestCase):
 
 class RoguelikeDeployTests(unittest.TestCase):
     def test_both_new_scripts_are_deployed_and_checked(self) -> None:
-        source = (ROOT / "deploy.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count('"maa_roguelike.py"'), 2)
-        self.assertEqual(source.count('"maa_roguelike_worker.py"'), 2)
+        # 部署和 `--check` 共用 `deploy.SCRIPT_NAMES`（DeployCheckTests 覆盖两边都用它）。
+        self.assertIn("maa_roguelike.py", deploy.SCRIPT_NAMES)
+        self.assertIn("maa_roguelike_worker.py", deploy.SCRIPT_NAMES)
+        checked = {target.name for _source, target in deploy.script_file_pairs()}
+        self.assertLessEqual({"maa_roguelike.py", "maa_roguelike_worker.py"}, checked)
 
     def test_the_single_run_timeout_is_seeded_and_not_a_runtime_cache(self) -> None:
         config = json.loads(

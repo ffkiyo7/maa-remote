@@ -408,7 +408,8 @@ hermes cron create "0 14 * * *" --name "MAA 日常·晚" --script maa_daily.py -
 > **已经建过计划卡 cron 的机器**：原来那条（`03d5e98ce8d4`，无 workdir）要改成带
 > `--workdir ~/.hermes/state/maa/am`，或者删了按上面重建，否则场次只能靠小时兜底判断。
 
-检查部署是否完整：
+检查部署是否完整（只读；脚本 / 技能 / maa-cli 配置逐字节比对、adapter 补丁是否在位、
+gateway 是否跑在 `hermes-agent/venv` 的解释器上，字段说明见 `docs/DEV_GUIDE.md` §7）：
 
 ```bash
 python3 deploy.py --check

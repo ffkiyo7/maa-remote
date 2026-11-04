@@ -1143,8 +1143,23 @@ result = normalize_plan(result)             ← 再规范化一次
 ```bash
 python3 -m unittest discover -s tests -v   # 必须在仓库根目录跑（测试要 import 根目录的 deploy.py）
 python3 deploy.py                          # 幂等；输出 {"ok":true,"changed":[…],"backup":"…"}
-python3 deploy.py --check                  # 检查脚本/ocrbox 与 7 个 maa-cli 配置是否存在，并逐字节核对其中 6 个
+python3 deploy.py --check                  # 只读：脚本/技能/maa-cli 配置逐字节、adapter 补丁、gateway 解释器、venv
 ```
+
+`--check` **只读**（不写文件、不打补丁；`DeployCheckTests` 用目录快照守着），输出一行 JSON，
+`ok` 为假时退出码 1：
+
+| 键 | 内容 | 影响 `ok` |
+| --- | --- | --- |
+| `missing` | 下列文件不存在：`deploy.SCRIPT_NAMES` 的 15 个脚本、`ocrbox` / `winmove`、`skills/games/maa-operator/SKILL.md`、全部 maa-cli 配置 | 非空即假 |
+| `mismatched` | 存在但与仓库字节不同：15 个脚本、`SKILL.md`、maa-cli 配置（`tasks/daily.toml` 豁免，见下）。`ocrbox` / `winmove` 是编译产物，只查存在 | 非空即假 |
+| `adapter` | 线上 `hermes-agent/plugins/platforms/discord/adapter.py` 在内存里跑 `patch_adapter_source()`：`patched`（结果不变）/ `needs_patch` / `anchor_mismatch: <异常>`（Hermes 升级后锚点对不上，要改补丁）/ `missing` | 非 `patched` 即假 |
+| `gateway_python` | `{plist, program, version, expected, matches}`：`~/Library/LaunchAgents/ai.hermes.gateway.plist` 的 `ProgramArguments[0]`、它自己报的版本、`deploy.HERMES_VENV_PYTHON`、两者是否一致。路径字符串相同算一致；否则要求文件 realpath **且**所在目录 realpath 都相同（不同 venv 的 `bin/python` 常指向同一个 uv 解释器，只比文件 realpath 会误判）。plist 缺失/读不出、取版本失败记在 `error`，不抛 | `matches` 假即假 |
+| `venvs` | `hermes-agent/venv` 与 `.venv` 各自的版本（不存在为 `null`） | 不影响 |
+| `warnings` | 目前只有一条：`venv` 与 `.venv` 并存 | 不影响 |
+
+脚本名单只在 `deploy.SCRIPT_NAMES` 一处，`deploy_scripts()` 与 `--check` 共用；新增脚本要加进去，
+`test_script_names_match_the_repository_scripts` 会拦。
 
 做的事：
 
@@ -1152,8 +1167,8 @@ python3 deploy.py --check                  # 检查脚本/ocrbox 与 7 个 maa-c
    `~/.hermes/backups/maa-setup/<YYYYMMDDTHHMMSS>/`。
 2. **幂等写** — `write_bytes()` 内容一致就跳过（不写、不记 changed、不备份），
    否则 `mkstemp + fsync + os.replace` 原子替换，权限 0600/0700。
-   `--check` 对仓库管理的 7 个 `config/maa-cli/**` 文件查存在，并对其中 6 个逐字节比对
-   仓库与运行时；文件存在但内容漂移会列入 `mismatched` 并返回失败，不再把“存在”误报成
+   `--check` 对仓库管理的全部 `config/maa-cli/**` 文件查存在，并对除 `tasks/daily.toml` 外的
+   逐字节比对仓库与运行时；文件存在但内容漂移会列入 `mismatched` 并返回失败，不再把“存在”误报成
    “部署干净”。
    - **`tasks/daily.toml` 是唯一的内容比对豁免项**（`deploy.RUNTIME_REWRITTEN_MAA_CONFIGS`）：
      它每场执行前都被 `render_daily_toml()` 整份重写（§0 的例外），线上内容本来就该与仓库
@@ -1654,5 +1669,5 @@ python3 -c "import json;print(json.load(open('$HOME/.hermes/state/agent-book/but
     `git` / `libgit2`，填别的 maa-cli 直接 panic）。`git` 后端 shell out 到 `git`
     二进制，环境变量代理照单全收；`git` 找不到时 maa-cli 会自己回落到 libgit2
     （字符串 `Failed to execute git, falling back to libgit2 backend`），不会更糟。
-    **改完必须 `python3 deploy.py`**：`cli.toml` 是 `--check` 逐字节守住的 5 个文件之一，
+    **改完必须 `python3 deploy.py`**：`cli.toml` 是 `--check` 逐字节守住的文件之一，
     不部署就一直 `mismatched`，而且线上跑的仍是旧的 libgit2。
