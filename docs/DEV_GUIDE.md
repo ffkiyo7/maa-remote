@@ -1179,6 +1179,106 @@ result = normalize_plan(result)             ← 再规范化一次
 
 ---
 
+### 6.2 配置项（`config.json`）
+
+`state/config.json` 是部署到 `~/.hermes/state/maa/config.json` 的种子（`update` 合并，不覆盖
+计划卡探测到的版本号）。几个值得知道的键：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `channel_id` | 占位符 | 部署时由 `MAA_CHANNEL_ID` 或本机已有配置解析，**不入库** |
+| `game_bundle_id` | `com.hypergryph.arknights` | PlayCover 设置文件 `App Settings/<bundle id>.plist` 的文件名 |
+| `playcover_app_path` | `~/Library/Containers/io.playcover.PlayCover/Applications/com.hypergryph.arknights.app` | `open -a` 拉起 / 激活游戏；`pgrep` / `pkill -f` 用它里面可执行文件的完整路径 |
+| `maatools_address` | `127.0.0.1:1717` | 只接受本机回环地址；和 PlayCover 里的端口、maa-cli profile 三处一致 |
+| `game_display_name` | `MAA-Game` | 游戏窗口常驻的虚拟屏名字（系统设置里显示器的名字）；窗口不在这块屏上就挪过来。空串 = 不管 |
+| `game_launch_timeout` / `game_quit_timeout` | `120` / `30` | 等 MaaTools 就绪 / 等 `TERM` 后进程退出的秒数，后者超时才 `pkill` |
+| `maa_run_timeout` | `3000`（50 分钟） | 为 Hermes 外层 1 小时上限预留清理时间 |
+| `connect_retry_limit` | `2` | 连接阶段崩溃的重开次数，共用同一个超时预算 |
+| `medicine_expire_days` | `2` | 只吃这个窗口内即将过期的理智药 |
+| `game_probe_timeout` | `5` | 开游戏前那次「你是不是在玩」探测的总预算（秒）；设 `0` 关闭探测 |
+| `maa_activity_cache` | 不在种子里 | 覆盖 `StageActivityV2.json` 的路径（默认 `~/Library/Caches/com.loong.maa/StageActivityV2.json`），只用于卡片上的「活动截止」 |
+| `fight_times` | `2147483647` | 生产值。配合 `series = 0` 一直打到理智不足 |
+| `report_drops` | `true` | 日常三个 Fight 块（剿灭 + 两个刷理智）**匿名上报掉落**给一图流与企鹅物流；两个上报 ID 都写空串，不带任何账号标识。关掉就一行都不写 |
+| `award_orundum` | `false` | 领「幸运墙」每日合成玉 |
+| `award_mining` | `false` | 领限时开采许可（采矿）的合成玉 |
+| `award_specialaccess` | `false` | 领周年特权（月卡）奖励 |
+| `mall_buy_first` | `[]` | 信用商店优先购买的物品名列表。**过白名单**（中日文 / 拉丁字母 / 数字 / `·`，≤20 字），不合规的项静默丢弃 |
+| `mall_blacklist` | `[]` | 信用商店不买的物品名列表，白名单同上 |
+| `mall_reserve_max_credit` | `false` | 信用点低于 300 就停止购买（囤信用） |
+| `mall_only_buy_discount` | `false` | 只买打折物品 |
+| `proxy_failure_limit` | `2` | 连续多少批代理指挥失误触发熔断 |
+| `proxy_failure_salvage` | `true` | 熔断后是否补跑去掉 Fight 的链条 |
+| `retention_days` | `14` | `runs/` 产物保留天数（子区固定 24h） |
+| `copilot_blackout_minutes` | `25` | 自动场次前多久禁止派发抄作业 |
+| `activity_search_retry_minutes` | `30` | 某关练度不满足 / 暂无作业时的重试间隔 |
+| `auto_copilot_min_lead_minutes` | `40` | 距下一场日常不足这么多分钟就不再开新的一关（比黑名单宽，因为它要覆盖整关） |
+| `auto_copilot_max_attempts_per_day` | `2` | 同一「关 + 模式」当天失败 / 未确认这么多次后，**当天不再自动排它**（卡上写「🚫 今日已尝试 N 次」），次日自动恢复。手动从下拉重打不受限。`0` = 不限制 |
+| `copilot_raid_switch_task` | `""`（关闭） | 从普通难度切到突袭用的上游任务名。**留空 = 突袭功能整体关闭**：活动关只排普通，worker 拿到突袭条目一律 `skipped`，绝不跑 `maa copilot`。重新启用见下方 |
+| `roguelike_run_timeout` | `3600`（1 小时） | 肉鸽**单局**子进程的上限。超了走 `terminate()`（SIGTERM），不是 SIGKILL，好让 MaaCore 有机会收手。整轮的长度由 blackout / Depot 窗口约束，不在这里叠加 |
+| `annihilation_sanity` | `25` | 排作业理智预算时为每日剿灭预留的理智 |
+| `farming_stage_table` | 见下 | 材料 → 关卡的手工映射 |
+| `farming_manual_weights` | 见下 | 冷启动/零消耗时的手工权重，数值越大越优先 |
+| `farming_weights` | `{"scarcity":0.5,"gap":0.3,"efficiency":0.2}` | 三项加权分的权重。**和为任意值都会归一**，写 `5/3/2` 也行 |
+| `farming_min_samples` | `300` | 掉率的最低样本量，抄一图流前端的口径；低于它的关不参与计算 |
+| `farming_target_days` | `30` | 缺口按多少天的用量算（也是 `drops` 上限的来源） |
+| `farming_activity_edge` | `1.3` | 活动关要比最优常驻关便宜多少倍才算「明显更优」，达不到就不给稀缺分 |
+| `farming_rerun_days` | `378` | 预计复刻间隔（天）。42 组 `ACT→ACT_REP` 的历史中位数，p25–p75 是 351–387 |
+| `farming_scarcity_horizon_days` | `400` | 稀缺分的视野：距下次可刷日超过这么多天就按满分 1.0 算 |
+
+#### 怎么重新打开突袭
+
+改 `state/config.json` 的 `copilot_raid_switch_task`，`python3 deploy.py` 生效
+（仓库的值会覆盖线上同名键）。两个候选写法：
+
+```jsonc
+"copilot_raid_switch_task": "ChangeToRaidDifficulty"   // 现在的默认任务名（09-09 验失败）
+```
+
+上游 MaaCore 的 `MultiCopilotTaskPlugin` 其实是**两个任务名并列**当候选跑的
+（`RaidConfirm` 先判「已经是突袭」，不是才点 `ChangeToRaidDifficulty`）。想照抄它，
+除了改这个键还要把 `scripts/maa_copilot_worker.py` 的 `RAID_SWITCH_TOML_TEMPLATE`
+改成能接受列表：
+
+```toml
+task_names = ["RaidConfirm", "ChangeToRaidDifficulty"]
+```
+
+**启用前必须真机验一关**（命令级清单在 `docs/archive/PLAN_PHASE4.md` 的
+「突袭切换真机验证（2026-09-09）」）：日志里 `[切换突袭难度] … Completed`、
+收尾截图确实停在突袭详情页、那一趟有 `Copilot Completed`、账本 `stages.<关>.raid`
+出现时间戳——四条缺一条就把开关改回 `""`。另外注意：**突袭只在复刻活动里存在**，
+首次开放的 SideStory 详情页上根本没有这个按钮，拿它验只会一直 `Custom Error`。
+
+#### 怎么改材料关卡表
+
+**大多数情况下你不用改**：材料 → 关卡的映射以上游 `stages.json` 的掉落表为主，
+新活动上线会自动跟随。手工表只在两种时候有用——**资源本**（`CE-6` / `AP-5` 这些在上游
+只有家具掉落，掉落表里查不到龙门币和红票），以及你想**钉死**某个材料去固定的关。
+
+两张表都在 `state/config.json`，改完 `python3 deploy.py` 生效（它们是**仓库拥有的
+配置**，不是运行时缓存，所以部署时仓库的值会覆盖线上同名键）：
+
+```jsonc
+"farming_stage_table":   { "固源岩组": "1-7", "碳素": "SK-5" },   // 材料 → 去哪刷
+"farming_manual_weights": { "固源岩组": 100,  "碳素": 60 }        // 越大越优先
+```
+
+- 材料名必须与 `depot.json` 里的 `items[].name` **逐字一致**（那是 MaaCore
+  `item_index.json` 的中文名）；对不上的名字只是不出现在推荐里，不会报错。
+- 手工表**优先于**上游派生表：你显式写下的映射不会被自动派生悄悄改掉。
+- 上游掉落表和手工表都查不到关卡的材料**不会被推荐**，卡片上会列出来提醒你补表——
+  **不要让代码去猜**，猜错就是每天几百理智刷错东西，而且从卡片上看不出来。
+- 种子里只放了确定的关：`1-7` 与五个资源本（`AP-5`/`CA-5`/`CE-6`/`LS-6`/`SK-5`）。
+  资源本按星期开放，当天没开的会被自动排除。
+- 上游掉落表给的是「这关掉什么」，**没有掉率**。真实的「每理智期望产出」来自
+  一图流 / 企鹅物流（见下面的致谢），抓不到时才退回启发式排序
+  （手工表钉的优先 → 理智低的优先 → 关卡名兜底）。
+
+`defaults.json` 是持久默认（关卡、任务开关），`plan.json` 是**带日期戳的今日覆盖**，
+过期自动失效。`medicine` / `stone` 已从可变状态里移除，改由 runner 硬编码策略。
+
+---
+
 ## 7. 部署链路（`deploy.py`）
 
 ```bash
