@@ -1119,6 +1119,28 @@ class SklandTests(unittest.TestCase):
             )
         )
 
+    def test_annihilation_weekly_normalization_real_shape(self) -> None:
+        import maa_skland
+
+        # 2026-11-05 player/info 实测：campaign = {records: [...], reward: {current, total}}
+        self.assertEqual(
+            maa_skland._normalize_annihilation_weekly(
+                {
+                    "currentTs": 1793857124,
+                    "campaign": {"records": [], "reward": {"current": 1800, "total": 1800}},
+                }
+            ),
+            {"current": 1800, "total": 1800, "server_current_at": 1793857124},
+        )
+        for broken in (
+            {},
+            {"currentTs": 1, "campaign": {"records": []}},
+            {"currentTs": 1, "campaign": {"reward": {"current": "x", "total": 1800}}},
+            {"currentTs": 1, "campaign": {"reward": {"current": 0, "total": 0}}},
+            {"campaign": {"reward": {"current": 1800, "total": 1800}}},
+        ):
+            self.assertIsNone(maa_skland._normalize_annihilation_weekly(broken), broken)
+
     def test_refresh_roster_packs_chars_and_progress_flat(self) -> None:
         # Regression: fetch_roster returning {"chars":…, "activity_progress":…}
         # must be unpacked, not nested under roster["chars"] (which made
@@ -1139,6 +1161,9 @@ class SklandTests(unittest.TestCase):
                          "act53side": [{"zoneId": "act53side_zone1",
                                         "clearedStage": 1, "totalStage": 13}],
                      },
+                     "annihilation_weekly": {
+                         "current": 1800, "total": 1800, "server_current_at": 1,
+                     },
                  }):
                 roster = maa_skland.refresh_roster()
             self.assertEqual(list(roster["chars"].keys()), ["char_002_amiya"])
@@ -1146,6 +1171,7 @@ class SklandTests(unittest.TestCase):
                 roster["activity_progress"]["act53side"][0]["clearedStage"], 1
             )
             self.assertEqual(roster["sanity"]["current"], 80)
+            self.assertEqual(roster["annihilation_weekly"]["current"], 1800)
             self.assertEqual(roster_path.stat().st_mode & 0o777, 0o600)
 
     def test_skland_files_are_0600_after_link(self) -> None:

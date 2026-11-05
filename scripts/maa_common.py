@@ -245,7 +245,7 @@ class Plan(TypedDict, total=False):
     """`normalize_plan()` / `effective_plan()` 吐出的一场计划。
 
     最后几个键不落盘，只在一场日常里现算：`annihilation`（`attach_annihilation()`
-    按 `last_run` 算）、`farming` / `farming_skip_reason`（`attach_sanity_yield()`）、
+    按 `last_run` 和森空岛本周进度算，本周已满时带 `annihilation_skip_reason`）、`farming` / `farming_skip_reason`（`attach_sanity_yield()`）、
     `fallback_run`（`fallback_fight_plan()` 的补跑计划）。
     """
 
@@ -259,6 +259,7 @@ class Plan(TypedDict, total=False):
     farming_fallback_stage: str
     date: str
     annihilation: bool
+    annihilation_skip_reason: str
     farming: bool
     farming_skip_reason: str
     fallback_run: bool

@@ -499,7 +499,11 @@ executed / execution_failed`，另有 `canceled` / `superseded`。
    不是另起一条自定义点击任务。剿灭复用第二个 `Fight(stage = "Annihilation")`：
    每个国服游戏日（04:00 刷新）只进一次，由 `last_run.annihilation_game_day` 记帐；
    MaaCore 从右上角待办进入当期剿灭，自动点「全权委托」消耗代理指挥卡，每次结算
-   OCR 周进度，满 1800 合成玉就停。两个 Fight 都硬编码 `stone = 0`。默认理智关
+   OCR 周进度，满 1800 合成玉就停。开跑前 `attach_annihilation()` 先看森空岛快照
+   （`roster.annihilation_weekly`，取自 `player/info` 的 `campaign.reward`）：**本周**
+   （周一 04:00 刷新，`cn_game_week()`）已满就不渲染剿灭块，战报写「⏭️ 本周剿灭合成玉已满
+   （1800/1800），本场跳过」，也不记 `annihilation_game_day`。快照是上周的、没这个字段、
+   文件坏掉一律照常进——同一周里进度只增不减，旧快照只会少判「已满」。两个 Fight 都硬编码 `stone = 0`。默认理智关
    是 `1-7`，当天仍可通过计划卡临时覆盖。
 
    `Award` 固定启用 `award = true` 与 `mail = true`，每场都会尝试领取日常、周常和
@@ -1073,7 +1077,7 @@ worker 的「连续 2 局报错就收尾」闸门不生效，会一局接一局�
   copilot/ledger-<活动>.json 换活动时归档的旧账本（0600）
   copilot/ledger-standalone.json 非活动关（资源本 / 主线）的记账（0600）。空
                       `activity_key` 只写这一份，**永不归档、永不碰活动账本**（不变量 #52）
-  copilot/roster.json      森空岛练度 + 理智 + zone 进度快照（0600，`source = "skland"`）
+  copilot/roster.json      森空岛练度 + 理智 + zone 进度 + 本周剿灭合成玉（`annihilation_weekly`）快照（0600，`source = "skland"`）
   copilot/roster-operbox.json 森空岛不可用时 Depot 那趟拿的练度后备（0600，
                       `source = "operbox"`，只有精英化 / 等级 / 潜能）。`load_roster()`
                       取两份里 `fetched_at` 更新的那一份（不变量 #53）

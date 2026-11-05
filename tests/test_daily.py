@@ -16,6 +16,7 @@ import unittest.mock
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,6 +167,65 @@ class RenderingTests(unittest.TestCase):
         self.assertFalse(maa_daily.should_run_annihilation(no_fight, monday_am, {}))
         attached = maa_daily.attach_annihilation(plan, monday_pm, last)
         self.assertFalse(attached["annihilation"])
+        self.assertNotIn("annihilation_skip_reason", attached)
+
+    def test_annihilation_skipped_when_skland_says_this_week_is_full(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        thursday = datetime(2026, 11, 5, 8, 0, tzinfo=BEIJING)
+
+        def roster(current: int, fetched: datetime) -> dict[str, Any]:
+            return {"annihilation_weekly": {
+                "current": current, "total": 1800,
+                "server_current_at": int(fetched.timestamp()),
+            }}
+
+        this_monday = datetime(2026, 11, 2, 4, 0, tzinfo=BEIJING)
+        last_sunday_night = datetime(2026, 11, 2, 3, 59, tzinfo=BEIJING)
+        self.assertEqual(maa_daily.cn_game_week(thursday), "2026-11-02")
+        self.assertEqual(maa_daily.cn_game_week(last_sunday_night), "2026-10-26")
+
+        full = maa_daily.attach_annihilation(plan, thursday, {}, roster(1800, this_monday))
+        self.assertFalse(full["annihilation"])
+        self.assertIn("1800/1800", full["annihilation_skip_reason"])
+        # 上周的满额快照不算数；没满、没字段都照常打（读不到一律照常）。
+        for snapshot in (
+            roster(1800, last_sunday_night),
+            roster(1500, thursday),
+            {},
+            {"annihilation_weekly": {"current": "bad"}},
+        ):
+            attached = maa_daily.attach_annihilation(plan, thursday, {}, snapshot)
+            self.assertTrue(attached["annihilation"], snapshot)
+            self.assertNotIn("annihilation_skip_reason", attached)
+        # 今天已刷过优先：不去看本周进度，文案仍是「今日已刷过」。
+        done = {"annihilation_game_day": maa_daily.cn_game_day(thursday)}
+        attached = maa_daily.attach_annihilation(plan, thursday, done, roster(1800, thursday))
+        self.assertNotIn("annihilation_skip_reason", attached)
+
+    def test_attach_annihilation_reads_the_skland_roster_file(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        thursday = datetime(2026, 11, 5, 8, 0, tzinfo=BEIJING)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "roster.json"
+            path.write_text(json.dumps({"chars": {}, "annihilation_weekly": {
+                "current": 1800, "total": 1800,
+                "server_current_at": int(thursday.timestamp()),
+            }}), encoding="utf-8")
+            with patch.object(maa_copilot, "ROSTER_PATH", path):
+                self.assertFalse(maa_daily.attach_annihilation(plan, thursday, {})["annihilation"])
+            path.write_text("{broken", encoding="utf-8")
+            with patch.object(maa_copilot, "ROSTER_PATH", path):
+                self.assertTrue(maa_daily.attach_annihilation(plan, thursday, {})["annihilation"])
+
+    def test_summary_names_weekly_full_annihilation_skip(self) -> None:
+        plan = maa_common.normalize_plan({"stage": "1-7"})
+        plan["annihilation"] = False
+        plan["annihilation_skip_reason"] = "本周剿灭合成玉已满（1800/1800），本场跳过"
+        summary = maa_daily.extract_summary(
+            ["StartUp Completed", "[刷理智] Completed"], [], plan=plan, ok=True
+        )
+        self.assertIn("☄️ 每日剿灭：⏭️ 本周剿灭合成玉已满（1800/1800），本场跳过", summary)
+        self.assertNotIn("今日已刷过", summary)
 
     def test_annihilation_consumed_after_startup_or_named_task(self) -> None:
         self.assertTrue(maa_daily.annihilation_consumed(["StartUp Completed"]))

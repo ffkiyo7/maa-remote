@@ -271,6 +271,31 @@ def _normalize_sanity(data: Any) -> dict[str, int] | None:
     return normalized
 
 
+def _normalize_annihilation_weekly(data: Any) -> dict[str, int] | None:
+    """本周剿灭合成玉进度：player/info 的 `campaign.reward`（2026-11-05 实测 `{current, total}`）。
+
+    `server_current_at` 是取数时的服务器时间，判「是不是本周的数」靠它——
+    同一周里 current 只增不减，所以旧快照只会让判断偏向「照常打」。
+    """
+    if not isinstance(data, dict):
+        return None
+    campaign = data.get("campaign")
+    reward = campaign.get("reward") if isinstance(campaign, dict) else None
+    if not isinstance(reward, dict):
+        return None
+    try:
+        normalized = {
+            "current": int(reward["current"]),
+            "total": int(reward["total"]),
+            "server_current_at": int(data["currentTs"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if normalized["current"] < 0 or normalized["total"] <= 0 or normalized["server_current_at"] <= 0:
+        return None
+    return normalized
+
+
 def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
     """Full grant->cred->binding->player/info chain; returns normalized chars.
 
@@ -305,6 +330,7 @@ def fetch_roster(state: dict[str, Any]) -> dict[str, Any]:
             "chars": _normalize_chars(chars, battle),
             "activity_progress": progress,
             "sanity": _normalize_sanity(data),
+            "annihilation_weekly": _normalize_annihilation_weekly(data),
         }
 
     try:
@@ -354,6 +380,8 @@ def refresh_roster() -> dict[str, Any]:
     }
     if isinstance(data.get("sanity"), dict):
         roster["sanity"] = data["sanity"]
+    if isinstance(data.get("annihilation_weekly"), dict):
+        roster["annihilation_weekly"] = data["annihilation_weekly"]
     atomic_write_json(ROSTER_PATH, roster)
     # 成功一次就把旧错误清掉：`_ensure_cred()` 只在重新换 cred 时清，
     # cred 本身没过期的成功路径会让过期告警一直挂在 skland.json 里。

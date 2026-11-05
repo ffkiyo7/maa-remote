@@ -147,7 +147,8 @@ SCREENCAP_SETTLE_INTERVAL = 30
 MIN_RUN_TIMEOUT_SECONDS = 60
 # 国服日刷新 04:00。剿灭按游戏日只进一次，避免早晚场各刷一轮。
 CN_GAME_DAY_RESET = timedelta(hours=4)
-# 周合成玉上限由 MaaCore 识别（待办消失 / 代理卡不可用）后停，这里只用于战报文案。
+# 周合成玉上限。开跑前按森空岛 `campaign.reward` 判本周是否已满（`attach_annihilation()`），
+# 已满就不进剿灭；没读到时照常进，由 MaaCore 自己停。
 ANNIHILATION_WEEKLY_ORUNDUM = 1800
 # maa-cli 最终汇总用任务名；旧日志仍是「每周剿灭」。
 ANNIHILATION_TASK_NAMES = ("每日剿灭", "每周剿灭")
@@ -205,13 +206,65 @@ def should_run_annihilation(
     return str(state.get("annihilation_game_day") or "") != cn_game_day(at)
 
 
+def cn_game_week(at: datetime | None = None) -> str:
+    """国服周刷新（周一 04:00）所在周的周一日期；剿灭合成玉上限按它记。"""
+    day = datetime.fromisoformat(cn_game_day(at)).date()
+    return (day - timedelta(days=day.weekday())).isoformat()
+
+
+def annihilation_weekly_full(
+    roster: dict[str, Any] | None, at: datetime | None = None
+) -> tuple[int, int] | None:
+    """森空岛快照显示**本周**剿灭合成玉已满时返回 `(current, total)`，否则 None。
+
+    快照是上一周的、字段缺失或坏掉一律 None（照常打）：同一周里 current 只增不减，
+    旧快照只会少判「已满」，不会把没打满的一周错判成跳过。
+    """
+    weekly = (roster or {}).get("annihilation_weekly")
+    if not isinstance(weekly, dict):
+        return None
+    try:
+        current = int(weekly["current"])
+        total = int(weekly["total"])
+        fetched = datetime.fromtimestamp(int(weekly["server_current_at"]), BEIJING)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    if total <= 0 or current < total:
+        return None
+    if cn_game_week(fetched) != cn_game_week(at):
+        return None
+    return current, total
+
+
 def attach_annihilation(
     plan: Plan,
     at: datetime | None = None,
     last_run: LastRun | dict[str, Any] | None = None,
+    roster: dict[str, Any] | None = None,
 ) -> Plan:
-    """Return a per-run plan copy with the once-per-game-day annihilation flag."""
-    return {**plan, "annihilation": should_run_annihilation(plan, at, last_run)}
+    """Return a per-run plan copy with the once-per-game-day annihilation flag.
+
+    `roster` 不传时读森空岛快照（`roster.json`，不读 OperBox 后备——那份没有剿灭进度）。
+    本周已满就摘掉剿灭并带上 `annihilation_skip_reason`；读不到一律照常打。
+    """
+    if not should_run_annihilation(plan, at, last_run):
+        return {**plan, "annihilation": False}
+    if roster is None:
+        try:
+            import maa_copilot
+
+            loaded = load_json(maa_copilot.ROSTER_PATH, None)
+        except (ValueError, OSError):
+            loaded = None
+        roster = loaded if isinstance(loaded, dict) else {}
+    full = annihilation_weekly_full(roster, at)
+    if full is None:
+        return {**plan, "annihilation": True}
+    return {
+        **plan,
+        "annihilation": False,
+        "annihilation_skip_reason": f"本周剿灭合成玉已满（{full[0]}/{full[1]}），本场跳过",
+    }
 
 
 def attach_sanity_yield(
@@ -818,7 +871,8 @@ def extract_summary(
     for key, emoji, label, _running_text in TASK_STEPS:
         if not enabled[key]:
             if key == "Annihilation" and annihilation_planned is False:
-                result.append(f"{emoji} {label}：⏭️ 今日已刷过，本场跳过")
+                reason = str((plan or {}).get("annihilation_skip_reason") or "今日已刷过，本场跳过")
+                result.append(f"{emoji} {label}：⏭️ {reason}")
             continue
         state = _task_state(lines, key, label)
         status = {"completed": "✅ 完成", "failed": "❌ 未完成", "running": "❌ 中断", "pending": "⏸️ 未执行"}[state]
@@ -1762,7 +1816,13 @@ def execute(phase: Phase, manual_token: str = "") -> int:
                                 or "理智不足以刷默认关，本场跳过刷理智。"
                             )
                         )
-                        + (" · ☄️ 今日剿灭" if plan.get("annihilation") else " · ☄️ 剿灭今日已刷")
+                        + (
+                            " · ☄️ 今日剿灭"
+                            if plan.get("annihilation")
+                            else " · ☄️ 本周剿灭已满"
+                            if plan.get("annihilation_skip_reason")
+                            else " · ☄️ 剿灭今日已刷"
+                        )
                         + f" · 🧪 {medicine_label(str(plan.get('medicine', '')))}"
                     ),
                     "allowed_mentions": {"parse": []},
