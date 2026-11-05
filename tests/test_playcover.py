@@ -394,53 +394,141 @@ class ProbeTests(unittest.TestCase):
         run.assert_not_called()
 
 
+def _win(onscreen: bool, x: int = 2141, y: int = 110, width: int = 1478, height: int = 859) -> dict:
+    return {"id": 8385, "pid": 4242, "onscreen": onscreen, "x": x, "y": y, "width": width, "height": height}
+
+
+# 2026-11-05 真机：游戏开在主屏，前台一切走就被台前调度缩成这个缩略图。
+SHELVED = _win(True, x=15, y=770, width=144, height=149)
+ON_MAIN = _win(True, x=234, y=89)
+# 同一进程挂着的几个不是游戏画面的窗口。
+STRIP = _win(False, x=1920, y=0, width=1920, height=30)
+PHANTOM = _win(False, x=0, y=580, width=500, height=500)
+
+
+class GameWindowTests(unittest.TestCase):
+    def _pick(self, windows):
+        with patch.object(maa_playcover, "game_pids", return_value=[4242]), patch.object(
+            maa_playcover, "_jxa_windows", return_value=windows
+        ):
+            return maa_playcover.game_window({})
+
+    def test_a_shelved_thumbnail_beats_the_offscreen_phantom_window(self) -> None:
+        # 11-05 晚场：缩略图被「宽 ≥ 300」滤掉，挑中了 500×500 的空窗口，挪屏一直挪错对象。
+        self.assertEqual(self._pick([STRIP, PHANTOM, SHELVED, STRIP]), SHELVED)
+        self.assertTrue(maa_playcover.window_shelved(SHELVED))
+        self.assertFalse(maa_playcover.window_usable(SHELVED))
+
+    def test_the_real_window_beats_strips_and_phantom(self) -> None:
+        self.assertEqual(self._pick([STRIP, PHANTOM, ON_MAIN]), ON_MAIN)
+        self.assertTrue(maa_playcover.window_usable(ON_MAIN))
+        # 最小化的真窗口也比空窗口大，挑它。
+        minimised = _win(False)
+        self.assertEqual(self._pick([PHANTOM, minimised, STRIP]), minimised)
+        self.assertFalse(maa_playcover.window_shelved(minimised))
+
+    def test_only_strips_means_no_window(self) -> None:
+        self.assertIsNone(self._pick([STRIP, STRIP]))
+
+
 class SettleTests(unittest.TestCase):
     def setUp(self) -> None:
         # 换屏那一步单独在 MoveToDisplayTests 里测；这里只看「在不在屏上」。
         mover = patch.object(maa_playcover, "move_to_game_display", return_value=(False, ""))
         self.mover = mover.start()
         self.addCleanup(mover.stop)
+        sleep = patch.object(maa_playcover.time, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+        # 激活后的轮询只看一次，免得 return_value 固定的用例真的空转 5 秒。
+        wait = patch.object(maa_playcover, "SETTLE_ACTIVATE_WAIT", 0)
+        wait.start()
+        self.addCleanup(wait.stop)
+        screens = patch.object(
+            maa_playcover,
+            "_screens",
+            return_value=[
+                {"name": "Q24G2", "x": 0, "y": 0, "width": 1920, "height": 1080},
+                {"name": "MAA-Game", "x": 1920, "y": 0, "width": 1920, "height": 1080},
+            ],
+        )
+        screens.start()
+        self.addCleanup(screens.stop)
+
+    def _settle(self, windows):
+        if isinstance(windows, list):
+            finder = patch.object(maa_playcover, "game_window", side_effect=windows)
+        else:
+            finder = patch.object(maa_playcover, "game_window", return_value=windows)
+        with finder, patch.object(maa_playcover, "launch_game") as launch:
+            return maa_playcover.settle_game_window({}), launch
 
     def test_a_window_on_the_wrong_display_is_moved_and_rechecked(self) -> None:
         self.mover.return_value = (True, "")
-        windows = [{"id": 1, "onscreen": False}, {"id": 1, "onscreen": True}]
-        with patch.object(maa_playcover, "game_window", side_effect=windows), patch.object(
-            maa_playcover, "launch_game"
-        ) as launch, patch.object(maa_playcover.time, "sleep"):
-            self.assertEqual(maa_playcover.settle_game_window({}), "")
+        warning, launch = self._settle([ON_MAIN, _win(True)])
+        self.assertEqual(warning, "")
         # 挪过去以后它就在台前了，不必再抢一次焦点。
         launch.assert_not_called()
+        self.mover.assert_called_once_with({}, ON_MAIN)
 
     def test_a_failed_move_is_reported_without_blocking(self) -> None:
         self.mover.return_value = (False, "没有「辅助功能」权限")
-        with patch.object(
-            maa_playcover, "game_window", return_value={"id": 1, "onscreen": True}
-        ), patch.object(maa_playcover, "launch_game") as launch:
-            self.assertIn("辅助功能", maa_playcover.settle_game_window({}))
+        warning, launch = self._settle(_win(True))
+        self.assertIn("辅助功能", warning)
         launch.assert_not_called()
 
     def test_an_onscreen_window_is_left_alone(self) -> None:
-        with patch.object(
-            maa_playcover, "game_window", return_value={"id": 1, "onscreen": True}
-        ), patch.object(maa_playcover, "launch_game") as launch:
-            self.assertEqual(maa_playcover.settle_game_window({}), "")
+        warning, launch = self._settle(_win(True))
+        self.assertEqual(warning, "")
         launch.assert_not_called()
 
-    def test_a_shelved_window_is_brought_back_once(self) -> None:
-        windows = [{"id": 1, "onscreen": False}, {"id": 1, "onscreen": True}]
-        with patch.object(maa_playcover, "game_window", side_effect=windows), patch.object(
-            maa_playcover, "launch_game"
-        ) as launch, patch.object(maa_playcover.time, "sleep"):
-            self.assertEqual(maa_playcover.settle_game_window({}), "")
+    def test_a_hidden_window_is_brought_back_once(self) -> None:
+        warning, launch = self._settle([_win(False), _win(True)])
+        self.assertEqual(warning, "")
         launch.assert_called_once()
 
+    def test_a_shelved_thumbnail_is_activated_then_moved_to_the_virtual_screen(self) -> None:
+        # 11-05 晚场的样子：缩略图算「在屏」，以前直接放行或者挪错窗口；
+        # 现在不挪缩略图，激活后一回到主屏就马上挪去虚拟屏。
+        self.mover.return_value = (True, "")
+        moved = _win(True)
+        warning, launch = self._settle([SHELVED, ON_MAIN, moved])
+        self.assertEqual(warning, "")
+        launch.assert_called_once()
+        self.mover.assert_called_once_with({}, ON_MAIN)
+
+    def test_a_window_that_comes_back_on_the_virtual_screen_is_still_recentred(self) -> None:
+        # 11-05 复现：激活后直接回到 MAA-Game，却在 (2630, 290) 伸出屏外，以前不会再挪。
+        # 最小化的窗口本来就在虚拟屏上（第一次不用挪）；激活后伸出屏外，要再挪一次。
+        self.mover.side_effect = [(False, ""), (True, "")]
+        hanging = _win(True, x=2630, y=290)
+        warning, launch = self._settle([_win(False), hanging, _win(True)])
+        self.assertEqual(warning, "")
+        launch.assert_called_once()
+        self.assertEqual(self.mover.call_args_list[-1].args, ({}, hanging))
+
+    def test_a_window_that_stays_shelved_says_so_with_geometry(self) -> None:
+        warning, launch = self._settle(SHELVED)
+        launch.assert_called_once()
+        self.mover.assert_not_called()
+        self.assertIn("侧边栏", warning)
+        self.assertIn("144×149 @ (15, 770)", warning)
+        self.assertIn("MAA-Game (1920, 0)", warning)
+
     def test_a_window_that_stays_away_warns_but_never_raises(self) -> None:
-        with patch.object(
-            maa_playcover, "game_window", return_value={"id": 1, "onscreen": False}
-        ), patch.object(maa_playcover, "launch_game"), patch.object(maa_playcover.time, "sleep"):
-            self.assertIn("不在屏上", maa_playcover.settle_game_window({}))
+        warning, _launch = self._settle(_win(False))
+        self.assertIn("不在屏上", warning)
+        self.assertIn("1478×859", warning)
+        warning, _launch = self._settle(None)
+        self.assertIn("没找到游戏窗口", warning)
         with patch.object(maa_playcover, "game_window", side_effect=OSError("jxa")):
             self.assertIn("照常开跑", maa_playcover.settle_game_window({}))
+
+    def test_an_unreadable_screen_list_does_not_hide_the_warning(self) -> None:
+        with patch.object(maa_playcover, "_screens", side_effect=RuntimeError("jxa")):
+            warning, _launch = self._settle(_win(False))
+        self.assertIn("不在屏上", warning)
+        self.assertIn("读不到（RuntimeError）", warning)
 
 
 class MoveToDisplayTests(unittest.TestCase):

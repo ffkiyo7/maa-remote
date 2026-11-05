@@ -74,6 +74,17 @@ winmove 要调用方有**辅助功能**权限，线上是 Hermes gateway 那个 
 只记一条警告，不阻断。System Events / JXA 直接设 AX 位置都不行（前者要自动化权限，
 后者 `AXValueCreate` 的结构体桥接回 -25200）。
 
+**侧边栏缩略图也算「在屏」**（2026-11-05 晚场事故，当晚复现）：游戏开在你正在用的主屏上，
+前台一切走，台前调度就把它缩成约 144×149 的缩略图收进侧边栏——`kCGWindowIsOnscreen` 仍是
+真，`SCRN` 却回 0 字节。进程另外挂着几条不在屏的 1920×30 横条和一个 500×500 的空窗口。
+以前 `game_window()` 只认宽 ≥ 300 的窗口，缩略图被滤掉、挑中了那个空窗口，挪屏挪不到真窗口；
+激活后窗口回到主屏、只要「在屏」就返回，不再挪屏，你一点别的窗口它又被收走——当晚 7 次摆窗
+全失败、整场空跑。现在：`game_window()` 只滤两边都 < 100 的横条，`window_shelved()`（在屏且宽
+< `MIN_GAME_WIDTH`）认缩略图，`window_usable()` = 在屏且不是缩略图；`settle_game_window()`
+不挪缩略图（AX 挪缩略图没验证过），激活后每 0.5 秒看一次、最多 5 秒，**一回到屏上就马上再挪
+一次虚拟屏并居中**；摆不回来时告警里带上窗口尺寸、位置、状态和各块屏的位置（`describe_window()`）。
+窗口一旦在 `MAA-Game` 上，主屏怎么切前台都不影响截图（同晚实测）。
+
 三道防线：
 
 1. 开跑前 `settle_game_window()`（含挪屏）；
@@ -1714,7 +1725,7 @@ action 一律钉 commit SHA（行尾注释写 tag），升级时 SHA 和注释�
 | 到点什么都没发生，频道无任何消息 | `run_lock` 被占（上一场没退干净）→ `pgrep -fl com.hypergryph.arknights.app`；或 cron 被 pause |
 | 场次不到 1 秒就 `return_code=1`，`runs/` 里连 `.log` 都没生成 | 失败发生在 `require_executable()`，比 `launch_game()` 还早 → `ls -l` 一下 `config.json` 的 `maa_bin`；或 `verify_game_installed()` 拒了（PlayCover 里 MaaTools 被关掉 / 端口改了） |
 | 频道有开跑消息，子区进度不动 | `runs/<date>-<phase>.log` 尾部；多半卡在客户端更新/登录页，50 分钟后会以 124 终止并告警 |
-| 场次很快就红，日志里一串 `ScreencapFailed` / `ConnectFailed` | 游戏窗口不在台前（被挤进台前调度侧边栏、被最小化、MAA-Game 虚拟屏没了）或 MaaTools 没开 → §0.5。`BetterDisplay get -nameLike=MAA -connected` 看虚拟屏在不在；看 `last_run.connect_retries` 确认重试有没有接上 |
+| 场次很快就红，日志里一串 `ScreencapFailed` / `ConnectFailed` | 游戏窗口不在台前（被挤进台前调度侧边栏、被最小化、MAA-Game 虚拟屏没了）或 MaaTools 没开 → §0.5。`BetterDisplay get -nameLike=MAA -connected` 看虚拟屏在不在；看 `last_run.connect_retries` 确认重试有没有接上。日志里「摆回台前」那行的 `[窗口 …；屏：…]` 写着窗口当时在哪、是不是侧边栏缩略图（§0.5） |
 | 战报 ❌ 但任务都是 ✅ | `cleanup_errors` 非空也会判失败——看 Embed 备注栏和 `last_run.cleanup_errors` |
 | 点按钮/下拉没反应或报未登记 | 卡片过期（07:50 与 21:50 各清一次 `hermes:btn:maa:` 前缀并重写，所以 21:50 之后早场卡必然点不动）；或 gateway 没重启；或 `buttons.json` 被别的写入方覆盖 |
 | 早场改的关晚上也生效了 / 改一场把另一场也改了 | 看 `plan.json` 的 `sessions`：是不是被写成了旧的顶层 `stage`。写路径只有 `maa_action._save_override(phase, …)` 和 `maa_plan_card.apply_auto_stage(result, phase)` 两处 |

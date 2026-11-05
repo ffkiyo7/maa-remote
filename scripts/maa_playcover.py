@@ -62,6 +62,13 @@ DEFAULT_GAME_DISPLAY = "MAA-Game"
 SAFE_DISPLAY_RE = re.compile(r"^[A-Za-z0-9 ._-]{0,64}$")
 # deploy.py 把 scripts/winmove.swift 编译到和本模块同一个目录。
 WINMOVE = Path(__file__).resolve().with_name("winmove")
+# 游戏窗口的识别（2026-11-05 实测）：进程另挂着不在屏的 1920×30 横条，按两条边都 ≥ 100 滤掉；
+# 台前调度侧边栏缩略图约 144×149、仍算在屏，比 MIN_GAME_WIDTH 窄就当缩略图。
+MIN_WINDOW_SIDE = 100
+MIN_GAME_WIDTH = 300
+# 激活游戏后最多等多久让窗口回到屏上、多久看一次。一回来就挪去虚拟屏，越早越不容易被挤走。
+SETTLE_ACTIVATE_WAIT = 5.0
+SETTLE_POLL_INTERVAL = 0.5
 # 本模块对外的坐标系：1920×1080 的游戏画面（不含标题栏）。截图、OCR 框、点击都先换到它。
 BASE_WIDTH, BASE_HEIGHT = 1920, 1080
 # 落盘截图的最大宽度。MaaTools 回的是渲染分辨率（Retina 下 3840×2160、33 MB RGBA），
@@ -386,14 +393,51 @@ def _jxa_windows(pids: list[int]) -> list[dict[str, Any]]:
 
 
 def game_window(config: Config) -> dict[str, Any] | None:
-    """游戏的主窗口（面积最大的那个普通窗口）；没有就 None。"""
+    """游戏的主窗口：优先在屏的，同类里取面积最大的；没有就 None。
+
+    游戏进程还挂着几条不在屏的 1920×30 横条和一个 500×500 的空窗口，按尺寸滤掉横条。
+    台前调度把游戏收进侧边栏时，主窗口会缩成约 144×149 的缩略图、**仍算在屏**，
+    所以下限不能卡在 300 宽——2026-11-05 晚场就是缩略图被滤掉、挑中了那个 500×500 的
+    空窗口，挪屏一直挪不到真窗口。是不是缩略图交给 `window_shelved()` 判断。
+    """
     pids = game_pids(config)
     if not pids:
         return None
-    windows = [w for w in _jxa_windows(pids) if w.get("width", 0) >= 300]
+    windows = [
+        w
+        for w in _jxa_windows(pids)
+        if w.get("width", 0) >= MIN_WINDOW_SIDE and w.get("height", 0) >= MIN_WINDOW_SIDE
+    ]
     if not windows:
         return None
     return max(windows, key=lambda w: (bool(w.get("onscreen")), w["width"] * w["height"]))
+
+
+def window_shelved(window: dict[str, Any]) -> bool:
+    """在屏、却窄得不像游戏画面 = 被台前调度收进了侧边栏（`SCRN` 回 0 字节）。"""
+    return bool(window.get("onscreen")) and window.get("width", 0) < MIN_GAME_WIDTH
+
+
+def window_usable(window: dict[str, Any] | None) -> bool:
+    """MaaTools 截得到画面的窗口：在屏、不是侧边栏缩略图。"""
+    return bool(window and window.get("onscreen")) and not window_shelved(window or {})
+
+
+def describe_window(window: dict[str, Any] | None) -> str:
+    """排障用的一句话：窗口尺寸、位置、在不在屏，加上各块屏的位置。自身永不抛异常。"""
+    if not window:
+        text = "没找到游戏窗口"
+    else:
+        state = "侧边栏缩略图" if window_shelved(window) else ("在屏" if window.get("onscreen") else "不在屏")
+        text = (
+            f"窗口 {window.get('width')}×{window.get('height')} @ "
+            f"({window.get('x')}, {window.get('y')})，{state}"
+        )
+    try:
+        screens = "、".join(f"{s.get('name') or '(无名)'} ({s.get('x')}, {s.get('y')})" for s in _screens())
+    except Exception as exc:  # noqa: BLE001 — (c) 只是排障附注，读不到屏幕列表不影响告警本身
+        screens = f"读不到（{type(exc).__name__}）"
+    return f"{text}；屏：{screens}"
 
 
 def game_display_name(config: Config) -> str:
@@ -493,6 +537,19 @@ def move_to_game_display(config: Config, window: dict[str, Any]) -> tuple[bool, 
     return True, ""
 
 
+def _wait_usable_window(config: Config, seconds: float) -> dict[str, Any] | None:
+    """激活后轮询到窗口截得到为止（最多 `seconds` 秒），返回最后一次看到的窗口。
+
+    一回到屏上就返回，好让调用方赶在用户点别的窗口之前把它挪去虚拟屏。
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        time.sleep(SETTLE_POLL_INTERVAL)
+        window = game_window(config)
+        if window_usable(window) or time.monotonic() >= deadline:
+            return window
+
+
 def settle_game_window(config: Config) -> str:
     """确认游戏窗口在虚拟屏上、在屏上（没被最小化 / 隐藏 / 被台前调度收进侧边栏）。
 
@@ -501,29 +558,43 @@ def settle_game_window(config: Config) -> str:
 
     1. 窗口不在 `game_display_name` 那块虚拟屏上（PlayCover 每次都开在当前活动的屏上）
        → `move_to_game_display()` 挪过去，主屏上你干什么都不会再把它挤下台；
-    2. 还是不在屏上 → 激活一次游戏：台前调度会把它请回台前，最小化的窗口也会还原——
-       代价是抢一下焦点，只在真的掉出屏幕时才做。
+       侧边栏缩略图不挪（AX 挪缩略图的效果没验证过），直接走第 2 步；
+    2. 还是截不到（不在屏 / 是侧边栏缩略图）→ 激活一次游戏：台前调度会把它请回台前，
+       最小化的窗口也会还原——代价是抢一下焦点，只在真的截不到时才做。激活后窗口多半
+       回到**当前活动的那块屏**（你正在用的主屏），你一点别的窗口它就又被收进侧边栏
+       （2026-11-05 晚场连续 7 次都这样），所以一回到屏上就**马上**再挪一次虚拟屏。
 
     查不出来**不阻断**，交给 MaaCore 自己的截图报错，比在这儿猜更准。
     """
     warnings: list[str] = []
+
+    def move(window: dict[str, Any]) -> dict[str, Any]:
+        moved, warning = move_to_game_display(config, window)
+        if warning:
+            warnings.append(warning)
+        if not moved:
+            return window
+        time.sleep(1)
+        return game_window(config) or window
+
     try:
         window = game_window(config)
-        if window:
-            moved, warning = move_to_game_display(config, window)
-            if warning:
-                warnings.append(warning)
-            if moved:
-                time.sleep(1)
-                window = game_window(config) or window
-        if window and window.get("onscreen"):
+        if window and not window_shelved(window):
+            window = move(window)
+        if window_usable(window):
             return " ".join(warnings)
         launch_game(config)
-        time.sleep(3)
-        window = game_window(config)
-        if window and window.get("onscreen"):
+        window = _wait_usable_window(config, SETTLE_ACTIVATE_WAIT)
+        if window is not None and window_usable(window):
+            window = move(window)
+        if window_usable(window):
             return " ".join(warnings)
-        warnings.append("游戏窗口不在屏上（可能被最小化或隐藏了），后台截图可能失败。")
+        reason = (
+            "游戏窗口被台前调度收进了侧边栏"
+            if window and window_shelved(window)
+            else "游戏窗口不在屏上（可能被最小化或隐藏了）"
+        )
+        warnings.append(f"{reason}，后台截图可能失败。[{describe_window(window)}]")
         return " ".join(warnings)
     except Exception as exc:  # noqa: BLE001 — (c) 只是体检，不阻断
         warnings.append(f"没能确认游戏窗口状态（{type(exc).__name__}），照常开跑。")
@@ -574,8 +645,12 @@ def capture_geometry(config: Config, path: Path) -> dict[str, Any]:
     window = game_window(config)
     if not window:
         raise RuntimeError("游戏在后台且找不到它的窗口")
-    if not window.get("onscreen"):
-        raise RuntimeError("游戏窗口不在屏上（最小化 / 隐藏），截不到")
+    if not window_usable(window):
+        raise RuntimeError(
+            "游戏窗口被台前调度收进了侧边栏，截不到"
+            if window_shelved(window)
+            else "游戏窗口不在屏上（最小化 / 隐藏），截不到"
+        )
     result = subprocess.run(
         ["screencapture", "-x", "-o", f"-l{int(window['id'])}", str(path)],
         capture_output=True,
