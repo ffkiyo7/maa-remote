@@ -11,6 +11,15 @@
       "Stop"
     ]
   },
+  "OriginiteExchangeCancel": {
+    "algorithm": "OcrDetect",
+    "text": ["源石兑换"],
+    "roi": [740, 525, 460, 70],
+    "action": "ClickRect",
+    "specificRect": [760, 590, 130, 45],
+    "postDelay": 1000,
+    "maxTimes": 3
+  },
   "Friends-Entry": {
     "algorithm": "JustReturn",
     "action": "DoNothing",
@@ -19,11 +28,16 @@
       "mask": []
     },
     "next": ["FriendsDefault", "FriendsSanrio"],
-    "onErrorNext": ["Friends-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["FriendsOriginiteExchangeCancel"]
   },
   "FriendsSanrio": {
     "baseTask": "FriendsDefault",
-    "template": "Sanrio/Friends.png"
+    "template": "Sanrio/Friends.png",
+    "rectMove": [26, 8, 52, 17]
+  },
+  "FriendsOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["FriendsDefault", "FriendsSanrio"]
   },
   "Mall-Entry": {
     "algorithm": "JustReturn",
@@ -33,11 +47,16 @@
       "mask": []
     },
     "next": ["MallDefault", "MallSanrio"],
-    "onErrorNext": ["Mall-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["MallOriginiteExchangeCancel"]
   },
   "MallSanrio": {
     "baseTask": "MallDefault",
-    "template": "Sanrio/Mall.png"
+    "template": "Sanrio/Mall.png",
+    "rectMove": [10, 5, 20, 10]
+  },
+  "MallOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["MallDefault", "MallSanrio"]
   },
   "Task-Entry": {
     "algorithm": "JustReturn",
@@ -47,11 +66,16 @@
       "mask": []
     },
     "next": ["TaskDefault", "TaskSanrio"],
-    "onErrorNext": ["Task-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["TaskOriginiteExchangeCancel"]
   },
   "TaskSanrio": {
     "baseTask": "TaskDefault",
-    "template": "Sanrio/Task.png"
+    "template": "Sanrio/Task.png",
+    "rectMove": [17, 8, 35, 17]
+  },
+  "TaskOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["TaskDefault", "TaskSanrio"]
   },
   "Terminal-Entry": {
     "algorithm": "JustReturn",
@@ -62,11 +86,16 @@
       "mask": []
     },
     "next": ["TerminalDefault", "TerminalSanrio"],
-    "onErrorNext": ["Terminal-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["TerminalOriginiteExchangeCancel"]
   },
   "TerminalSanrio": {
     "baseTask": "TerminalDefault",
-    "template": "Sanrio/Terminal.png"
+    "template": "Sanrio/Terminal.png",
+    "rectMove": [24, 28, 48, 24]
+  },
+  "TerminalOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["TerminalDefault", "TerminalSanrio"]
   },
   "Recruit-Entry": {
     "algorithm": "JustReturn",
@@ -76,11 +105,16 @@
       "mask": [125, 0, 25, 20]
     },
     "next": ["RecruitDefault", "RecruitSanrio"],
-    "onErrorNext": ["Recruit-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["RecruitOriginiteExchangeCancel"]
   },
   "RecruitSanrio": {
     "baseTask": "RecruitDefault",
-    "template": "Sanrio/Recruit.png"
+    "template": "Sanrio/Recruit.png",
+    "rectMove": [36, 15, 72, 30]
+  },
+  "RecruitOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["RecruitDefault", "RecruitSanrio"]
   },
   "Infrast-Entry": {
     "algorithm": "JustReturn",
@@ -90,11 +124,16 @@
       "mask": []
     },
     "next": ["InfrastDefault", "InfrastSanrio"],
-    "onErrorNext": ["Infrast-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["InfrastOriginiteExchangeCancel"]
   },
   "InfrastSanrio": {
     "baseTask": "InfrastDefault",
-    "template": "Sanrio/EnterInfrast.png"
+    "template": "Sanrio/EnterInfrast.png",
+    "rectMove": [12, 6, 25, 12]
+  },
+  "InfrastOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["InfrastDefault", "InfrastSanrio"]
   },
   "Depot-Entry": {
     "algorithm": "JustReturn",
@@ -104,11 +143,16 @@
       "mask": []
     },
     "next": ["DepotDefault", "DepotSanrio"],
-    "onErrorNext": ["Depot-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["DepotOriginiteExchangeCancel"]
   },
   "DepotSanrio": {
     "baseTask": "DepotDefault",
-    "template": "Sanrio/DepotEnter.png"
+    "template": "Sanrio/DepotEnter.png",
+    "rectMove": [19, 19, 38, 39]
+  },
+  "DepotOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["DepotDefault", "DepotSanrio"]
   },
   "OperBox-Entry": {
     "algorithm": "JustReturn",
@@ -118,11 +162,16 @@
       "mask": []
     },
     "next": ["OperBoxDefault", "OperBoxSanrio"],
-    "onErrorNext": ["OperBox-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["OperBoxOriginiteExchangeCancel"]
   },
   "OperBoxSanrio": {
     "baseTask": "OperBoxDefault",
-    "template": "Sanrio/OperBoxEnter.png"
+    "template": "Sanrio/OperBoxEnter.png",
+    "rectMove": [12, 6, 25, 12]
+  },
+  "OperBoxOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["OperBoxDefault", "OperBoxSanrio"]
   },
   "Gacha-Entry": {
     "algorithm": "JustReturn",
@@ -132,10 +181,15 @@
       "mask": []
     },
     "next": ["GachaDefault", "GachaSanrio"],
-    "onErrorNext": ["Gacha-Entry@SwitchTheme@ToggleSettingsMenu"]
+    "onErrorNext": ["GachaOriginiteExchangeCancel"]
   },
   "GachaSanrio": {
     "baseTask": "GachaDefault",
-    "template": "Sanrio/GachaEnter.png"
+    "template": "Sanrio/GachaEnter.png",
+    "rectMove": [41, 14, 83, 28]
+  },
+  "GachaOriginiteExchangeCancel": {
+    "baseTask": "OriginiteExchangeCancel",
+    "next": ["GachaDefault", "GachaSanrio"]
   }
 }

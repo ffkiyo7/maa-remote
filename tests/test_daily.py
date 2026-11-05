@@ -8,6 +8,7 @@ import ast
 import contextlib
 import io
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -1251,26 +1252,53 @@ class HomeScreenshotTests(unittest.TestCase):
             },
         )
 
-    def test_sanrio_theme_entries_fall_back_to_upstream_and_ship_their_templates(self) -> None:
+    def test_sanrio_theme_entries_never_switch_theme_and_ship_their_templates(self) -> None:
         resource = ROOT / "config" / "maa-cli" / "resource"
         override = json.loads((resource / "tasks" / "tasks.json").read_text(encoding="utf-8"))
         deployed = set(deploy.MAA_CONFIG_RELATIVE_PATHS)
         entries = [key for key in override if key.endswith("-Entry")]
         self.assertEqual(len(entries), 9)
+        self.assertNotIn("SwitchTheme", json.dumps(override))
         for entry in entries:
             name = entry.removesuffix("-Entry")
-            # Upstream's day-theme template stays first, and a miss still ends
-            # in upstream's own theme switch rather than a dead end.
+            # Upstream's day-theme template stays first.  A miss first tries to
+            # dismiss the originite exchange popup, then fails loudly — never
+            # upstream's SwitchTheme, which resets the user's theme.
             self.assertEqual(override[entry]["next"], [f"{name}Default", f"{name}Sanrio"])
-            self.assertEqual(
-                override[entry]["onErrorNext"],
-                [f"{entry}@SwitchTheme@ToggleSettingsMenu"],
-            )
+            self.assertEqual(override[entry]["onErrorNext"], [f"{name}OriginiteExchangeCancel"])
+            cancel = override[f"{name}OriginiteExchangeCancel"]
+            self.assertEqual(cancel, {
+                "baseTask": "OriginiteExchangeCancel",
+                "next": [f"{name}Default", f"{name}Sanrio"],
+            })
             sanrio = override[f"{name}Sanrio"]
             self.assertEqual(sanrio["baseTask"], f"{name}Default")
             template = Path("resource/template/UiTheme") / sanrio["template"]
             self.assertTrue((resource.parent / template).is_file(), template)
             self.assertIn(template, deployed)
+            # The click stays inside the matched template, away from its edges
+            # (2026-11-05: a click 10px under the Terminal template's top edge
+            # hit the orundum bar and opened the originite exchange popup).
+            width, height = struct.unpack(">II", (resource.parent / template).read_bytes()[16:24])
+            dx, dy, w, h = sanrio["rectMove"]
+            self.assertGreaterEqual(dx, width // 5, entry)
+            self.assertGreaterEqual(dy, height // 5, entry)
+            self.assertLessEqual(dx + w, width - width // 5, entry)
+            self.assertLessEqual(dy + h, height - height // 10, entry)
+        terminal_dy = override["TerminalSanrio"]["rectMove"][1]
+        self.assertGreaterEqual(terminal_dy, 25)
+
+    def test_originite_exchange_popup_is_only_ever_cancelled(self) -> None:
+        override = json.loads(
+            (ROOT / "config/maa-cli/resource/tasks/tasks.json").read_text(encoding="utf-8")
+        )
+        cancel = override["OriginiteExchangeCancel"]
+        self.assertEqual(cancel["algorithm"], "OcrDetect")
+        self.assertEqual(cancel["action"], "ClickRect")
+        x, _y, w, _h = cancel["specificRect"]
+        # The popup's ✗ half ends at x≈955 (1280×720); ✓ starts at 958.
+        self.assertLessEqual(x + w, 940)
+        self.assertLessEqual(cancel["maxTimes"], 3)
 
 
 class LockConflictTests(unittest.TestCase):
