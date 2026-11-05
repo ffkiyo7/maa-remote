@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import io
 import plistlib
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -599,6 +601,12 @@ class MoveToDisplayTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # 窗口恢复那一步单独在 WindowRestoreTests 里测；这里只看 `open -a`。
+        self.restore = patch.object(maa_playcover, "ensure_window_restore", return_value="").start()
+        self.pids = patch.object(maa_playcover, "game_pids", return_value=[]).start()
+        self.addCleanup(patch.stopall)
+
     def test_launch_opens_the_container_app_by_path(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             app = Path(raw) / "com.hypergryph.arknights.app"
@@ -606,6 +614,7 @@ class LaunchTests(unittest.TestCase):
             with patch.object(maa_playcover.subprocess, "run", return_value=_completed(0)) as run:
                 maa_playcover.launch_game({"playcover_app_path": str(app)})
         self.assertEqual(run.call_args.args[0], ["open", "-a", str(app)])
+        self.restore.assert_called_once()
 
     def test_launch_retries_then_gives_up_loudly(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -618,6 +627,69 @@ class LaunchTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "-10670"):
                     maa_playcover.launch_game({"playcover_app_path": str(app)})
         self.assertEqual(run.call_count, 3)
+
+    def test_activating_a_running_game_leaves_its_settings_alone(self) -> None:
+        # settle_game_window() 也用 launch_game() 激活游戏；那时游戏在跑，别去动它的偏好设置。
+        self.pids.return_value = [4242]
+        with tempfile.TemporaryDirectory() as raw:
+            app = Path(raw) / "a.app"
+            app.mkdir()
+            with patch.object(maa_playcover.subprocess, "run", return_value=_completed(0)):
+                maa_playcover.launch_game({"playcover_app_path": str(app)})
+        self.restore.assert_not_called()
+
+    def test_a_failed_restore_or_probe_never_blocks_the_launch(self) -> None:
+        self.restore.return_value = "没能打开游戏的窗口恢复（x）"
+        with tempfile.TemporaryDirectory() as raw:
+            app = Path(raw) / "a.app"
+            app.mkdir()
+            for pids in (None, subprocess.TimeoutExpired("pgrep", 2)):
+                if pids is not None:
+                    self.pids.side_effect = pids
+                with patch.object(maa_playcover.subprocess, "run", return_value=_completed(0)) as run, patch(
+                    "sys.stderr", new_callable=io.StringIO
+                ) as err:
+                    maa_playcover.launch_game({"playcover_app_path": str(app)})
+                self.assertEqual(run.call_args.args[0], ["open", "-a", str(app)])
+                self.assertTrue(err.getvalue().strip())
+
+
+class WindowRestoreTests(unittest.TestCase):
+    """2026-11-05：不开窗口恢复，游戏每次都开在主屏正中，得再从台前挪去 MAA-Game。"""
+
+    DOMAIN = str(
+        Path.home() / "Library/Containers/com.hypergryph.arknights/Data/Library/Preferences/com.hypergryph.arknights"
+    )
+
+    def _ensure(self, *results):
+        with patch.object(maa_playcover.subprocess, "run", side_effect=list(results)) as run:
+            warning = maa_playcover.ensure_window_restore({})
+        return warning, [call.args[0] for call in run.call_args_list]
+
+    def test_an_already_enabled_setting_is_only_read(self) -> None:
+        warning, argvs = self._ensure(_completed(0, "1\n"))
+        self.assertEqual(warning, "")
+        self.assertEqual(argvs, [["defaults", "read", self.DOMAIN, "NSQuitAlwaysKeepsWindows"]])
+
+    def test_a_missing_or_off_setting_is_turned_on(self) -> None:
+        for current in (SimpleNamespace(returncode=1, stdout="", stderr="does not exist"), _completed(0, "0\n")):
+            warning, argvs = self._ensure(current, _completed(0))
+            self.assertEqual(warning, "")
+            self.assertEqual(
+                argvs[-1], ["defaults", "write", self.DOMAIN, "NSQuitAlwaysKeepsWindows", "-bool", "true"]
+            )
+
+    def test_failures_are_warnings_not_exceptions(self) -> None:
+        denied = SimpleNamespace(returncode=1, stdout="", stderr="Could not write domain")
+        warning, _argvs = self._ensure(_completed(0, "0\n"), denied)
+        self.assertIn("Could not write domain", warning)
+        warning, _argvs = self._ensure(subprocess.TimeoutExpired("defaults", 10))
+        self.assertIn("TimeoutExpired", warning)
+
+    def test_the_domain_follows_the_configured_bundle_id(self) -> None:
+        domain = maa_playcover.game_prefs_domain({"game_bundle_id": "com.example.game"})
+        self.assertEqual(domain.name, "com.example.game")
+        self.assertEqual(domain.parent.parent.parent.parent.name, "com.example.game")
 
 
 class CloseTests(unittest.TestCase):

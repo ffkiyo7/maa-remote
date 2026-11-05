@@ -39,6 +39,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import time
 import zlib
 from pathlib import Path
@@ -69,6 +70,8 @@ MIN_GAME_WIDTH = 300
 # 激活游戏后最多等多久让窗口回到屏上、多久看一次。一回来就挪去虚拟屏，越早越不容易被挤走。
 SETTLE_ACTIVATE_WAIT = 5.0
 SETTLE_POLL_INTERVAL = 0.5
+# 游戏自己的「退出时保留窗口」开关：开着才会在下次启动时开回上次的位置（见 ensure_window_restore）。
+WINDOW_RESTORE_KEY = "NSQuitAlwaysKeepsWindows"
 # 本模块对外的坐标系：1920×1080 的游戏画面（不含标题栏）。截图、OCR 框、点击都先换到它。
 BASE_WIDTH, BASE_HEIGHT = 1920, 1080
 # 落盘截图的最大宽度。MaaTools 回的是渲染分辨率（Retina 下 3840×2160、33 MB RGBA），
@@ -326,16 +329,70 @@ def verify_game_installed(config: Config) -> None:
         )
 
 
+def game_prefs_domain(config: Config) -> Path:
+    """游戏沙盒容器里自己的偏好设置域（`defaults` 用的路径，不带 `.plist`）。"""
+    bid = bundle_id(config)
+    return Path.home() / "Library" / "Containers" / bid / "Data" / "Library" / "Preferences" / bid
+
+
+def ensure_window_restore(config: Config) -> str:
+    """确保游戏开着窗口恢复（`NSQuitAlwaysKeepsWindows`），返回告警文本，空串 = 已开着。
+
+    不开时游戏每次都按「新开窗口」启动，开在**当前主屏**正中——显示器开着就是 Q24G2，
+    得再从台前调度的台前挪去 MAA-Game，2026-11-05 晚场就是挪完以后窗口再也不在屏上。
+    开着时它按「恢复上次的窗口」启动，直接回到上次关闭时的位置（MAA-Game 上），
+    `close_game()` 的 TERM 关掉也照样恢复（同晚真机连续两次实测）。
+
+    只在拉起游戏前调用；写失败**不阻断**，后面还有 `settle_game_window()` 挪屏兜底。
+    """
+    domain = str(game_prefs_domain(config))
+    try:
+        current = subprocess.run(
+            ["defaults", "read", domain, WINDOW_RESTORE_KEY],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if current.returncode == 0 and current.stdout.strip() == "1":
+            return ""
+        written = subprocess.run(
+            ["defaults", "write", domain, WINDOW_RESTORE_KEY, "-bool", "true"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"没能打开游戏的窗口恢复（{type(exc).__name__}），窗口会开在主屏、靠挪屏兜底。"
+    if written.returncode != 0:
+        detail = (written.stderr or written.stdout).strip()[:120]
+        return f"没能打开游戏的窗口恢复（{detail}），窗口会开在主屏、靠挪屏兜底。"
+    return ""
+
+
 def launch_game(config: Config) -> None:
     """`open -a <容器里的 .app>`：没在跑就拉起，在跑就激活（把窗口请回台前）。
 
     不用 `open -b`：bundle id 会被 LaunchServices 解析到 `~/Applications/PlayCover/`
     下那个软链接壳，游戏已在跑时报 -10670、什么也不做（2026-11-04 实测）。
     上一个进程还在退出时也会报错，所以稍等重试。
+
+    游戏没在跑时先 `ensure_window_restore()`，让它直接开回上次的位置（MAA-Game 上）。
     """
     app = app_path(config)
     if not app.is_dir():
         raise RuntimeError(f"PlayCover 里没有明日方舟：{app}")
+    try:
+        running = bool(game_pids(config))
+    except (OSError, subprocess.SubprocessError) as exc:
+        # 探测不了就不碰游戏的设置，照常拉起；挪屏兜底还在。
+        print(f"拉起前探测游戏进程失败（{type(exc).__name__}），跳过窗口恢复检查。", file=sys.stderr)
+        running = True
+    if not running:
+        warning = ensure_window_restore(config)
+        if warning:
+            print(warning, file=sys.stderr)
     last = ""
     for attempt in range(3):
         result = subprocess.run(
